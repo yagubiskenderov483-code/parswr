@@ -159,6 +159,8 @@ venv.bak/
 
 # Runtime / secrets
 data/
+*.db
+*.db-journal
 *.session
 *.session-journal
 

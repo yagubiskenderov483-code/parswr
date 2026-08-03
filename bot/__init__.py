@@ -1,1 +1,3 @@
-"""Монитор новых лотов Telegram Gift маркетов: Tonnel, MRKT, Portals."""
+"""Telegram gift markets lot monitor bot."""
+
+__version__ = "2.0.0"

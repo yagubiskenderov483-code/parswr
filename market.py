@@ -102,26 +102,22 @@ class Lot:
     def seller_label(self) -> str:
         if self.seller and USERNAME_RE.fullmatch(self.seller):
             return f"@{self.seller}"
-        if self.seller_id:
-            return f"id:{self.seller_id}"
         return "скрыт"
 
     @property
     def write_url(self) -> str | None:
         if self.seller and USERNAME_RE.fullmatch(self.seller):
             return f"https://t.me/{self.seller}"
-        if self.seller_id:
-            return f"tg://user?id={self.seller_id}"
         return None
 
     @property
     def writable(self) -> bool:
-        """Есть контакт: юзернейм или user_id владельца (даже при скрытом профиле)."""
+        """Только реальный @username. Скрытых / id-only не выдаём."""
         if self.paid_dm:
             return False
-        if self.seller and USERNAME_RE.fullmatch(self.seller):
-            return True
-        return self.seller_id is not None
+        if self.owner_hidden:
+            return False
+        return bool(self.seller and USERNAME_RE.fullmatch(self.seller))
 
 
 @dataclass
@@ -383,55 +379,43 @@ class TelegramMarket:
         scan_task = asyncio.create_task(scan())
         worker_tasks = [asyncio.create_task(worker()) for _ in range(workers_n)]
 
+        mixer = EmitMixer(gap=3)  # минимум 3 других коллекции между одинаковыми
         finished = 0
         emitted = 0
-        last_title = ""
-        last_seller = ""
-        deferred: list[Lot] = []
-
-        def _can_emit(lot: Lot) -> bool:
-            if last_title and lot.title == last_title:
-                return False
-            if last_seller and lot.seller and lot.seller == last_seller:
-                return False
-            return True
 
         try:
             while finished < workers_n and emitted < limit_results:
                 item = await ready.get()
                 if item is None:
                     finished += 1
-                    continue
-                if not _can_emit(item):
-                    deferred.append(item)
-                    continue
-                emitted += 1
-                stats.kept = emitted
-                last_title = item.title
-                last_seller = item.seller
-                yield item
-                i = 0
-                while i < len(deferred) and emitted < limit_results:
-                    cand = deferred[i]
-                    if _can_emit(cand):
-                        deferred.pop(i)
+                    # при каждом завершённом воркере пробуем вытолкнуть из буфера
+                    while emitted < limit_results:
+                        nxt = mixer.pop()
+                        if nxt is None:
+                            break
                         emitted += 1
                         stats.kept = emitted
-                        last_title = cand.title
-                        last_seller = cand.seller
-                        yield cand
-                    else:
-                        i += 1
-            for cand in deferred:
-                if emitted >= limit_results:
-                    break
-                if not _can_emit(cand):
+                        yield nxt
                     continue
+                out = mixer.push(item)
+                for lot in out:
+                    if emitted >= limit_results:
+                        break
+                    emitted += 1
+                    stats.kept = emitted
+                    yield lot
+            # финальный слив без подряд одинаковых
+            while emitted < limit_results:
+                nxt = mixer.pop()
+                if nxt is None:
+                    break
                 emitted += 1
                 stats.kept = emitted
-                last_title = cand.title
-                last_seller = cand.seller
-                yield cand
+                yield nxt
+            # остаток одной коллекции — НЕ кидаем подряд, дропаем
+            dropped = mixer.drop_rest()
+            if dropped:
+                logger.info("dropped consecutive same-title leftovers=%s", dropped)
         finally:
             if not scan_task.done():
                 scan_task.cancel()
@@ -672,55 +656,37 @@ class TelegramMarket:
         done = 0
         emitted = 0
         total = len(tasks)
-        last_title = ""
-        last_seller = ""
-        deferred: list[Lot] = []
-
-        def _can_emit(lot: Lot) -> bool:
-            if last_title and lot.title == last_title:
-                return False
-            if last_seller and lot.seller and lot.seller == last_seller:
-                return False
-            return True
+        mixer = EmitMixer(gap=3)
 
         while done < total and emitted < cap:
             item = await queue.get()
             done += 1
             if item is None:
-                continue
-            if not _can_emit(item):
-                deferred.append(item)
-                continue
-            emitted += 1
-            stats.kept = emitted
-            last_title = item.title
-            last_seller = item.seller
-            yield item
-            # попробовать вытолкнуть отложенные, чередуя
-            i = 0
-            while i < len(deferred) and emitted < cap:
-                cand = deferred[i]
-                if _can_emit(cand):
-                    deferred.pop(i)
+                while emitted < cap:
+                    nxt = mixer.pop()
+                    if nxt is None:
+                        break
                     emitted += 1
                     stats.kept = emitted
-                    last_title = cand.title
-                    last_seller = cand.seller
-                    yield cand
-                else:
-                    i += 1
-
-        # хвост deferred — всё равно отдаём, но уже без жёсткого блока
-        for cand in deferred:
-            if emitted >= cap:
-                break
-            if not _can_emit(cand):
+                    yield nxt
                 continue
+            for lot in mixer.push(item):
+                if emitted >= cap:
+                    break
+                emitted += 1
+                stats.kept = emitted
+                yield lot
+
+        while emitted < cap:
+            nxt = mixer.pop()
+            if nxt is None:
+                break
             emitted += 1
             stats.kept = emitted
-            last_title = cand.title
-            last_seller = cand.seller
-            yield cand
+            yield nxt
+        dropped = mixer.drop_rest()
+        if dropped:
+            logger.info("stream dropped consecutive leftovers=%s", dropped)
 
         while done < total:
             await queue.get()
@@ -774,7 +740,11 @@ class TelegramMarket:
 
         if lot.paid_dm or not lot.writable:
             stats.paid_skip += 1
-            lot.skip_reason = "paid_or_no_user"
+            lot.skip_reason = (
+                "no_username"
+                if (not lot.seller or lot.owner_hidden)
+                else "paid_or_no_user"
+            )
             return False
 
         stats.with_user += 1
@@ -1494,45 +1464,89 @@ class TelegramMarket:
 
 
 def diversify_lots(lots: list[Lot]) -> list[Lot]:
-    """Не выдавать подряд одну коллекцию / одного продавца."""
-    by_title: dict[str, deque[Lot]] = defaultdict(deque)
-    for lot in lots:
-        by_title[lot.title or "?"].append(lot)
-
-    mixed: list[Lot] = []
-    keys = list(by_title.keys())
-    random.shuffle(keys)
-    while by_title:
-        progress = False
-        for key in list(keys):
-            bucket = by_title.get(key)
-            if not bucket:
-                by_title.pop(key, None)
-                continue
-            mixed.append(bucket.popleft())
-            progress = True
-            if not bucket:
-                by_title.pop(key, None)
-        keys = list(by_title.keys())
-        if not progress:
-            break
-
-    # второй проход: развести одинаковых продавцов
+    """Жёстко перемешать: round-robin по коллекциям, без подряд."""
+    mixer = EmitMixer(gap=3)
+    # сначала раскидать по бакетам в случайном порядке
+    shuffled = list(lots)
+    random.shuffle(shuffled)
     out: list[Lot] = []
-    pending = deque(mixed)
-    last_seller = ""
-    guard = 0
-    while pending and guard < len(mixed) * 3:
-        guard += 1
-        lot = pending.popleft()
-        if lot.seller and lot.seller == last_seller and pending:
-            pending.append(lot)
-            continue
-        out.append(lot)
-        last_seller = lot.seller
-    while pending:
-        out.append(pending.popleft())
+    for lot in shuffled:
+        out.extend(mixer.push(lot))
+    while True:
+        nxt = mixer.pop()
+        if nxt is None:
+            break
+        out.append(nxt)
+    # хвост одной коллекции не дописываем подряд
+    mixer.drop_rest()
     return out
+
+
+class EmitMixer:
+    """Буфер выдачи: одна и та же коллекция не чаще чем раз в `gap` лотов."""
+
+    def __init__(self, gap: int = 3) -> None:
+        self.gap = max(2, int(gap))
+        self.buckets: dict[str, deque[Lot]] = defaultdict(deque)
+        self.recent_titles: deque[str] = deque(maxlen=self.gap)
+        self.recent_sellers: deque[str] = deque(maxlen=self.gap)
+
+    def _key(self, lot: Lot) -> str:
+        return (lot.title or "?").strip() or "?"
+
+    def _allowed(self, lot: Lot) -> bool:
+        title = self._key(lot)
+        if title in self.recent_titles:
+            return False
+        seller = (lot.seller or "").lower()
+        if seller and seller in self.recent_sellers:
+            return False
+        return True
+
+    def _emit(self, lot: Lot) -> Lot:
+        title = self._key(lot)
+        self.recent_titles.append(title)
+        if lot.seller:
+            self.recent_sellers.append(lot.seller.lower())
+        return lot
+
+    def push(self, lot: Lot) -> list[Lot]:
+        """Кладёт лот в бакет; возвращает то, что можно выдать сейчас."""
+        self.buckets[self._key(lot)].append(lot)
+        out: list[Lot] = []
+        # несколько попыток вытолкнуть разные
+        for _ in range(len(self.buckets) + 2):
+            nxt = self.pop()
+            if nxt is None:
+                break
+            out.append(nxt)
+        return out
+
+    def pop(self) -> Lot | None:
+        if not self.buckets:
+            return None
+        # предпочитаем ключ, которого нет в recent
+        keys = list(self.buckets.keys())
+        random.shuffle(keys)
+        for key in keys:
+            bucket = self.buckets.get(key)
+            if not bucket:
+                self.buckets.pop(key, None)
+                continue
+            cand = bucket[0]
+            if not self._allowed(cand):
+                continue
+            bucket.popleft()
+            if not bucket:
+                self.buckets.pop(key, None)
+            return self._emit(cand)
+        return None
+
+    def drop_rest(self) -> int:
+        """Выбросить остаток (чтобы не слать одну коллекцию пачкой)."""
+        n = sum(len(b) for b in self.buckets.values())
+        self.buckets.clear()
+        return n
 
 
 def _has_cyrillic(text: str) -> bool:

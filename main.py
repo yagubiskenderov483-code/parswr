@@ -101,6 +101,7 @@ class App:
         self.last_error = ""
         self._notify_times: list[float] = []
         self.session_users: list[str] = []
+        self._last_titles: list[str] = []
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -204,6 +205,7 @@ class App:
         self._status_msg_id = None
         self._notify_times.clear()
         self.session_users.clear()
+        self._last_titles.clear()
         self.apply_filters_to_market()
         self._task = asyncio.create_task(self._loop(), name="monitor")
 
@@ -403,38 +405,42 @@ class App:
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
         if not self.bot or not self.chat_id:
             return
-        if lot.paid_dm or not lot.writable:
+        # только реальный @username
+        if lot.paid_dm or not lot.writable or not lot.seller:
+            return
+        # страховка: не слать одну коллекцию подряд даже если mixer пропустил
+        title_key = (lot.title or "").strip().lower()
+        if title_key and title_key in self._last_titles[-3:]:
+            logger.info("skip consecutive title=%s", lot.title)
             return
         await self._throttle_notify()
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
         lvl = lot.level if lot.level is not None else "?"
         gifts = lot.gifts_count if lot.gifts_count is not None else "?"
         floor = f"{lot.floor_stars:.0f}" if lot.floor_stars is not None else "?"
-        hide = " · <i>скрытый профиль</i>" if lot.owner_hidden else ""
         online = "🟢" if lot.online else ("🟡" if lot.recently else "⚪")
         text = (
             f"{title}\n\n"
             f"🎁 <b>{_esc(lot.display)}</b>\n"
             f"💰 <b>{_fmt(lot.stars)} ⭐</b> · floor <b>{floor}</b>\n"
-            f"👤 {lot.seller_label} {online} · lvl <b>{lvl}</b> · "
-            f"gifts <b>{gifts}</b> · RU {lot.ru_score}{hide}\n"
+            f"👤 @{lot.seller} {online} · lvl <b>{lvl}</b> · "
+            f"gifts <b>{gifts}</b> · RU {lot.ru_score}\n"
             f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
         )
         rows: list[list[InlineKeyboardButton]] = [
-            [InlineKeyboardButton(text="🖼 NFT", url=lot.nft_url)]
+            [
+                InlineKeyboardButton(text="🖼 NFT", url=lot.nft_url),
+                InlineKeyboardButton(
+                    text="✍️ Написать", url=f"https://t.me/{lot.seller}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚫 В ЧС",
+                    callback_data=f"ban:{lot.seller[:40]}",
+                )
+            ],
         ]
-        write = lot.write_url
-        if write:
-            rows[0].append(InlineKeyboardButton(text="✍️ Написать", url=write))
-        if lot.seller and re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="🚫 В ЧС",
-                        callback_data=f"ban:{lot.seller[:40]}",
-                    )
-                ]
-            )
         try:
             await self.bot.send_message(
                 self.chat_id,
@@ -442,24 +448,23 @@ class App:
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
-            if lot.seller:
-                store.add_found(
-                    lot.seller,
-                    {
-                        "lvl": lot.level,
-                        "gifts": lot.gifts_count,
-                        "stars": lot.stars,
-                        "slug": lot.slug,
-                        "hidden": lot.owner_hidden,
-                    },
-                )
-                if lot.seller not in self.session_users:
-                    self.session_users.append(lot.seller)
-                if creds.AUTO_BLACKLIST:
-                    store.block(lot.seller, lot.seller_id, reason="shown")
-                store.save_users()
-            elif lot.seller_id and creds.AUTO_BLACKLIST:
-                store.block(user_id=lot.seller_id, reason="shown")
+            self._last_titles.append(title_key)
+            if len(self._last_titles) > 30:
+                self._last_titles = self._last_titles[-20:]
+            store.add_found(
+                lot.seller,
+                {
+                    "lvl": lot.level,
+                    "gifts": lot.gifts_count,
+                    "stars": lot.stars,
+                    "slug": lot.slug,
+                },
+            )
+            if lot.seller not in self.session_users:
+                self.session_users.append(lot.seller)
+            if creds.AUTO_BLACKLIST:
+                store.block(lot.seller, lot.seller_id, reason="shown")
+            store.save_users()
         except Exception as exc:  # noqa: BLE001
             logger.error("notify: %s", exc)
 
@@ -898,10 +903,11 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Меню"),
+            BotCommand(command="settings", description="Settings · фильтры"),
             BotCommand(command="stop", description="Стоп"),
-            BotCommand(command="logout", description="Сброс акка"),
             BotCommand(command="export", description="Экспорт юзов"),
             BotCommand(command="ban", description="В ЧС: /ban user"),
+            BotCommand(command="logout", description="Сброс акка"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())

@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import shutil
 import time
 from pathlib import Path
 
@@ -46,6 +45,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 
 import credentials as creds
+from db import GiftDB
 from market import Lot, TelegramMarket
 
 logging.basicConfig(
@@ -75,6 +75,7 @@ class App:
         Path("data").mkdir(exist_ok=True)
         self.client = TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
         self.market = TelegramMarket(self.client)
+        self.db = GiftDB()
         self.bot: Bot | None = None
         self.chat_id: int | None = None
         self.running = False
@@ -92,6 +93,8 @@ class App:
         self.checks = 0
         self.last_check_lots = 0
         self.last_error = ""
+        self.db_total = self.db.count()
+        self.db_last_saved = 0
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -226,6 +229,14 @@ class App:
         if msg:
             self._status_msg_id = msg.message_id
 
+    def _save_gifts(self, lots: list[Lot]) -> tuple[int, int]:
+        if not lots:
+            return 0, 0
+        inserted, updated = self.db.upsert_lots(lots)
+        self.db_last_saved = inserted + updated
+        self.db_total = self.db.count()
+        return inserted, updated
+
     async def _loop(self) -> None:
         # 1) Быстрый выброс как FreeGiftsParser
         await self._say(f"⚡ Ищу свежие лоты · <b>{self.range_label}</b>…")
@@ -247,12 +258,21 @@ class App:
 
         now = time.monotonic()
         if burst and burst.lots:
+            # Сначала сохраняем ВСЕ найденные гифты в БД
+            to_save = burst.all_lots or burst.lots
+            ins, upd = self._save_gifts(to_save)
+            await self._say(
+                f"💾 В БД: +<b>{ins}</b> новых / <b>{upd}</b> обновл. · всего <b>{self.db_total}</b>"
+            )
+
             await self.market.resolve_owners(burst.lots, timeout=creds.OWNER_TIMEOUT)
+            # после юзов — допишем seller в БД
+            self._save_gifts(burst.lots)
+
             await self._say(
                 f"🔍 Найдено подарков: <b>{len(burst.lots)}</b> шт. "
                 f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})"
             )
-            # Список как у FreeGiftsParser
             lines = []
             for lot in burst.lots[: creds.PREVIEW_COUNT]:
                 self._seen[lot.id] = now
@@ -261,12 +281,9 @@ class App:
                     f'🔍 <a href="{lot.nft_url}">NFT</a> | {user} | '
                     f"{_fmt(lot.stars)}⭐"
                 )
-            # чанками по 10
             for i in range(0, len(lines), 10):
-                chunk = lines[i : i + 10]
-                await self._say("\n".join(chunk))
+                await self._say("\n".join(lines[i : i + 10]))
 
-            # карточки первых нескольких
             for lot in burst.lots[:5]:
                 await self._notify_lot(lot, count_as_new=False)
         else:
@@ -276,11 +293,12 @@ class App:
                 f"({_esc(err)})\nЖду новые…"
             )
 
-        # всё что увидели в burst — в seen (даже вне карточек)
         if burst:
             for lot in burst.lots:
                 self._seen.setdefault(lot.id, now)
-            # и пометим сырые id из полного unique через повтор? уже в lots matched only
+            if burst.all_lots:
+                for lot in burst.all_lots:
+                    self._seen.setdefault(lot.id, now)
             self.checks = burst.check_no
 
         await self._say(
@@ -303,6 +321,10 @@ class App:
                 self.last_check_lots = len(result.lots)
                 self.last_error = result.error
 
+                # все лоты чека — в БД
+                if result.lots:
+                    self._save_gifts(result.lots)
+
                 now = time.monotonic()
                 fresh = []
                 for lot in result.lots:
@@ -314,11 +336,11 @@ class App:
 
                 if fresh:
                     await self.market.resolve_owners(fresh, timeout=creds.OWNER_TIMEOUT)
+                    self._save_gifts(fresh)
                     for lot in fresh:
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
 
-                # статус чека (edit одного сообщения)
                 await self._edit_status(
                     f"💓 <b>Чек #{self.checks}</b>\n"
                     f"Режим: <b>{self.range_label}</b>\n"
@@ -328,6 +350,7 @@ class App:
                     f"Новых за чек: <b>{len(fresh)}</b>\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
                     f"Seen: <b>{len(self._seen)}</b>\n"
+                    f"🗄 БД: <b>{self.db_total}</b> (last {self.db_last_saved})\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
                     f"⏱ {result.elapsed:.2f}с"
                     + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
@@ -433,12 +456,24 @@ def _fmt(value: float) -> str:
 
 
 def wipe_disk_junk() -> None:
+    """Чистит session-мусор. gifts.db НЕ трогаем."""
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
+    keep = {"gifts.db", "gifts.db-wal", "gifts.db-shm"}
     for folder in (data, root):
-        for pattern in ("*session*", "*.db", "*.db-*", "*.sqlite*"):
+        for pattern in ("*session*", "*.session*", "*.session-journal"):
             for path in folder.glob(pattern):
+                if path.is_file():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+        # старые telethon sqlite-сессии, но не наша БД гифтов
+        for pattern in ("*.db", "*.db-*", "*.sqlite*"):
+            for path in folder.glob(pattern):
+                if path.name in keep:
+                    continue
                 if path.is_file():
                     try:
                         path.unlink()
@@ -598,6 +633,7 @@ async def cb_status(callback: CallbackQuery) -> None:
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
         f"Seen: <b>{len(app._seen)}</b>\n"
+        f"🗄 БД гифтов: <b>{app.db.count()}</b>\n"
         f"Err: {_esc(app.last_error[:120]) if app.last_error else '—'}",
         reply_markup=settings_inline(),
     )
@@ -666,6 +702,7 @@ async def main() -> None:
         await app.stop_monitor()
         if app.client.is_connected():
             await app.client.disconnect()
+        app.db.close()
         await bot.session.close()
 
 

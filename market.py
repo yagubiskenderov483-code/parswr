@@ -70,6 +70,7 @@ class CheckResult:
     floods: int = 0
     elapsed: float = 0.0
     error: str = ""
+    all_lots: list[Lot] | None = None  # все найденные (для БД), не только matched
 
 
 class TelegramMarket:
@@ -167,9 +168,9 @@ class TelegramMarket:
                     gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
                 )
 
-        # кусками, чтобы не зависнуть навсегда
+        # кусками; стоп когда набрали preview или вышли по времени
         for i in range(0, len(batch), parallel):
-            if time.monotonic() - started > 4.5:
+            if time.monotonic() - started > 3.5:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
@@ -179,10 +180,14 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
+            matched_now = sum(
+                1 for lot in _dedupe(lots) if min_stars <= lot.stars <= max_stars
+            )
+            if matched_now >= limit_results:
+                break
 
         unique = _dedupe(lots)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
-        # newest-first уже от API; режем до preview
         matched = matched[:limit_results]
 
         return CheckResult(
@@ -195,6 +200,7 @@ class TelegramMarket:
             floods=stats["floods"],
             elapsed=time.monotonic() - started,
             error=self.last_error,
+            all_lots=unique,
         )
 
     async def run_check(
@@ -256,16 +262,18 @@ class TelegramMarket:
             else:
                 stats["errors"] += 1
 
+        unique = _dedupe(lots)
         return CheckResult(
             check_no=self.check_no,
             scanned=stats["scanned"],
-            lots=_dedupe(lots),
+            lots=unique,
             collections_total=n,
             ok=stats["ok"],
             errors=stats["errors"],
             floods=stats["floods"],
             elapsed=time.monotonic() - started,
             error=self.last_error,
+            all_lots=unique,
         )
 
     async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:

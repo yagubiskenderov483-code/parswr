@@ -1,4 +1,4 @@
-"""Telegram Market — ultra-fast newest Stars listings."""
+"""Telegram Market — newest Stars gift listings."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.payments import GetResaleStarGiftsRequest, GetStarGiftsRequest
 from telethon.tl.types import StarsAmount, StarsTonAmount
 
 logger = logging.getLogger(__name__)
 
-FRESH_WINDOW_SEC = 3600  # ~1 hour
+FRESH_WINDOW_SEC = 3600
 
 
 @dataclass(slots=True)
@@ -68,16 +68,18 @@ class Lot:
 
 
 class TelegramMarket:
-    """
-    Official Telegram Market (payments.getResaleStarGifts).
-    Needs user login. No sort flags → newest by last resell change first.
-    """
-
-    def __init__(self, client: TelegramClient, concurrency: int = 24) -> None:
+    def __init__(self, client: TelegramClient, concurrency: int = 8) -> None:
         self.client = client
         self._gift_ids: list[int] = []
         self._sem = asyncio.Semaphore(concurrency)
         self._cursor = 0
+        self.last_stats: dict[str, int] = {
+            "collections": 0,
+            "ok": 0,
+            "empty": 0,
+            "errors": 0,
+            "lots": 0,
+        }
 
     def set_client(self, client: TelegramClient) -> None:
         self.client = client
@@ -85,6 +87,7 @@ class TelegramMarket:
     async def load_collections(self, force: bool = False) -> list[int]:
         if self._gift_ids and not force:
             return self._gift_ids
+
         result = await self.client(GetStarGiftsRequest(hash=0))
         gifts = getattr(result, "gifts", []) or []
         ids: list[int] = []
@@ -92,35 +95,60 @@ class TelegramMarket:
             gift_id = getattr(gift, "id", None)
             if gift_id is None:
                 continue
+            # availability_resale > 0 means collectibles are on market
             resale = getattr(gift, "availability_resale", None)
-            if resale is None or resale:
+            if resale is None:
                 ids.append(int(gift_id))
+            else:
+                try:
+                    if int(resale) > 0:
+                        ids.append(int(gift_id))
+                except (TypeError, ValueError):
+                    ids.append(int(gift_id))
+
         if not ids:
             ids = [int(g.id) for g in gifts if getattr(g, "id", None) is not None]
+
         self._gift_ids = ids
-        logger.info("collections=%s", len(self._gift_ids))
+        self.last_stats["collections"] = len(ids)
+        logger.info("collections with resale=%s / total_gifts=%s", len(ids), len(gifts))
         return self._gift_ids
 
-    async def fetch_newest(self, per_collection: int = 20) -> list[Lot]:
-        """Full parallel scan of all collections."""
+    async def fetch_newest(self, per_collection: int = 15) -> list[Lot]:
         gift_ids = await self.load_collections()
         if not gift_ids:
             return []
+
+        stats = {"ok": 0, "empty": 0, "errors": 0, "lots": 0}
         results = await asyncio.gather(
-            *[self._fetch_one(gid, per_collection) for gid in gift_ids],
+            *[self._fetch_one(gid, per_collection, stats) for gid in gift_ids],
             return_exceptions=True,
         )
-        return _dedupe(_flatten(results))
+        lots: list[Lot] = []
+        for item in results:
+            if isinstance(item, list):
+                lots.extend(item)
+            else:
+                stats["errors"] += 1
+                logger.warning("gather error: %s", item)
+
+        unique = _dedupe(lots)
+        stats["lots"] = len(unique)
+        self.last_stats.update(stats)
+        logger.info(
+            "scan done lots=%s ok=%s empty=%s errors=%s",
+            stats["lots"],
+            stats["ok"],
+            stats["empty"],
+            stats["errors"],
+        )
+        return unique
 
     async def iter_wave(
         self,
-        per_collection: int = 20,
-        batch_size: int = 30,
+        per_collection: int = 15,
+        batch_size: int = 12,
     ) -> AsyncIterator[list[Lot]]:
-        """
-        Rotate through collections in hot waves — yields batches ASAP
-        instead of waiting for the entire market.
-        """
         gift_ids = await self.load_collections()
         if not gift_ids:
             return
@@ -130,71 +158,98 @@ class TelegramMarket:
         batch = [gift_ids[(start + i) % n] for i in range(min(batch_size, n))]
         self._cursor = (start + len(batch)) % n
 
-        tasks = [asyncio.create_task(self._fetch_one(gid, per_collection)) for gid in batch]
+        stats = {"ok": 0, "empty": 0, "errors": 0, "lots": 0}
+        tasks = [
+            asyncio.create_task(self._fetch_one(gid, per_collection, stats))
+            for gid in batch
+        ]
         pending = set(tasks)
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
             chunk: list[Lot] = []
             for task in done:
                 try:
                     chunk.extend(task.result())
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("wave task failed: %s", exc)
+                    stats["errors"] += 1
+                    logger.debug("wave fail: %s", exc)
             if chunk:
                 yield _dedupe(chunk)
+        self.last_stats.update(stats)
 
-    async def _fetch_one(self, gift_id: int, limit: int) -> list[Lot]:
+    async def _fetch_one(
+        self,
+        gift_id: int,
+        limit: int,
+        stats: dict[str, int] | None = None,
+    ) -> list[Lot]:
         async with self._sem:
-            for attempt in range(3):
-                try:
-                    result = await self.client(
-                        GetResaleStarGiftsRequest(
-                            gift_id=gift_id,
-                            offset="",
-                            limit=limit,
-                            stars_only=True,
-                        )
+            result = await self._request(gift_id, limit, stars_only=True)
+            lots = _parse_result(result) if result is not None else []
+
+            # Fallback: without stars_only, keep only StarsAmount prices
+            if not lots:
+                result2 = await self._request(gift_id, limit, stars_only=False)
+                if result2 is not None:
+                    lots = _parse_result(result2)
+
+            if stats is not None:
+                if result is None and not lots:
+                    stats["errors"] += 1
+                elif not lots:
+                    stats["empty"] += 1
+                else:
+                    stats["ok"] += 1
+            return lots
+
+    async def _request(
+        self,
+        gift_id: int,
+        limit: int,
+        stars_only: bool,
+    ) -> Any | None:
+        for attempt in range(4):
+            try:
+                return await self.client(
+                    GetResaleStarGiftsRequest(
+                        gift_id=gift_id,
+                        offset="",
+                        limit=min(limit, 100),
+                        stars_only=stars_only if stars_only else None,
                     )
-                    break
-                except FloodWaitError as exc:
-                    wait = min(int(exc.seconds) + 0.05, 3.0)
-                    logger.warning("FloodWait %ss gift_id=%s", wait, gift_id)
-                    await asyncio.sleep(wait)
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    if attempt == 2:
-                        logger.debug("gift_id=%s: %s", gift_id, exc)
-                        return []
-                    await asyncio.sleep(0.05 * (attempt + 1))
-                    continue
-            else:
-                return []
-
-        users = {
-            int(u.id): u
-            for u in (getattr(result, "users", None) or [])
-            if getattr(u, "id", None) is not None
-        }
-        lots: list[Lot] = []
-        now = time.time()
-        for gift in getattr(result, "gifts", []) or []:
-            lot = _parse(gift, users)
-            if lot:
-                lot.seen_at = now
-                lots.append(lot)
-        return lots
+                )
+            except FloodWaitError as exc:
+                wait = min(float(exc.seconds) + 0.1, 5.0)
+                logger.warning("FloodWait %.1fs gift_id=%s", wait, gift_id)
+                await asyncio.sleep(wait)
+            except RPCError as exc:
+                logger.debug("RPC gift_id=%s: %s", gift_id, exc)
+                if attempt >= 2:
+                    return None
+                await asyncio.sleep(0.15 * (attempt + 1))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("gift_id=%s: %s", gift_id, exc)
+                if attempt >= 2:
+                    return None
+                await asyncio.sleep(0.1 * (attempt + 1))
+        return None
 
 
-def _flatten(results: list) -> list[Lot]:
+def _parse_result(result: Any) -> list[Lot]:
+    users = {
+        int(u.id): u
+        for u in (getattr(result, "users", None) or [])
+        if getattr(u, "id", None) is not None
+    }
+    now = time.time()
     lots: list[Lot] = []
-    errors = 0
-    for item in results:
-        if isinstance(item, list):
-            lots.extend(item)
-        else:
-            errors += 1
-    if errors:
-        logger.warning("collection errors=%s", errors)
+    for gift in getattr(result, "gifts", []) or []:
+        lot = _parse(gift, users)
+        if lot:
+            lot.seen_at = now
+            lots.append(lot)
     return lots
 
 
@@ -210,9 +265,9 @@ def _dedupe(lots: list[Lot]) -> list[Lot]:
 
 
 def _extract_stars(gift: Any) -> float | None:
+    """Only Stars prices (skip TON). resell_amount is a LIST."""
     amounts = getattr(gift, "resell_amount", None)
     if isinstance(amounts, list):
-        stars_val: float | None = None
         for item in amounts:
             name = item.__class__.__name__
             if name == "StarsTonAmount" or isinstance(item, StarsTonAmount):
@@ -224,13 +279,33 @@ def _extract_stars(gift: Any) -> float | None:
                 val = float(amount)
             except (TypeError, ValueError):
                 continue
-            if val <= 0:
+            if val > 0 and (
+                name == "StarsAmount"
+                or isinstance(item, StarsAmount)
+                or name != "StarsTonAmount"
+            ):
+                # Prefer explicit StarsAmount
+                if name == "StarsAmount" or isinstance(item, StarsAmount):
+                    return val
+        # second pass: any non-TON
+        for item in amounts:
+            name = item.__class__.__name__
+            if name == "StarsTonAmount" or isinstance(item, StarsTonAmount):
                 continue
-            if name == "StarsAmount" or isinstance(item, StarsAmount):
+            amount = getattr(item, "amount", None)
+            if amount is None:
+                continue
+            try:
+                val = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
                 return val
-            if stars_val is None:
-                stars_val = val
-        return stars_val
+        return None
+
+    # If only TON resale — skip (we want Stars)
+    if getattr(gift, "resale_ton_only", False):
+        return None
 
     for attr in ("resell_stars", "stars", "price"):
         val = getattr(gift, attr, None)

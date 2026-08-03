@@ -63,6 +63,18 @@ PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r60_100", "60k–100k ⭐", 60000, 100000),
 ]
 
+# Рекламные акки — не показываем
+_AD_RE = re.compile(
+    r"("
+    r"дарю\s*гифт|дарю\s*gift|дарю\s*подар|раздач|"
+    r"бесплатн|free\s*gift|giveaway|акци[яи]|"
+    r"пиши\s*в\s*лс|реклам|продам\s*гифт|купл[юу]\s*гифт|"
+    r"взаимн|nft\s*drop|airdrop|крипт|казино|заработок|инвест|"
+    r"100%\s*profit|ставки"
+    r")",
+    re.IGNORECASE,
+)
+
 
 class AuthStates(StatesGroup):
     phone = State()
@@ -82,6 +94,8 @@ class App:
         self._task: asyncio.Task | None = None
         self._status_msg_id: int | None = None
         self._seen: dict[str, float] = {}
+        self._seen_sellers: set[str] = set()
+        self._seen_models: set[str] = set()
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = 2000.0
@@ -177,6 +191,8 @@ class App:
         self.chat_id = chat_id
         self.running = True
         self._seen.clear()
+        self._seen_sellers.clear()
+        self._seen_models.clear()
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -199,6 +215,72 @@ class App:
 
     def _in_price(self, lot: Lot) -> bool:
         return self.min_stars <= lot.stars <= self.max_stars
+
+    def _is_ad(self, lot: Lot) -> bool:
+        blob = " ".join(x for x in (lot.about, lot.first_name, lot.last_name) if x)
+        return bool(blob and _AD_RE.search(blob))
+
+    def _pick_clean(self, lots: list[Lot], *, limit: int | None = None) -> list[Lot]:
+        """Без рекламы, без повторных продавцов и моделей; модели вразнобой."""
+        buckets: dict[str, list[Lot]] = {}
+        keys: list[str] = []
+        for lot in lots:
+            if not lot.seller:
+                continue
+            if self._is_ad(lot):
+                continue
+            if lot.owner_key in self._seen_sellers:
+                continue
+            if lot.model_key in self._seen_models:
+                continue
+            mk = lot.model_key
+            if mk not in buckets:
+                buckets[mk] = []
+                keys.append(mk)
+            buckets[mk].append(lot)
+
+        out: list[Lot] = []
+        last = ""
+        while True:
+            progressed = False
+            ordered = sorted(keys, key=lambda k: (k == last, -len(buckets.get(k, []))))
+            for mk in ordered:
+                bucket = buckets.get(mk) or []
+                while bucket:
+                    lot = bucket.pop(0)
+                    if lot.owner_key in self._seen_sellers:
+                        continue
+                    if lot.model_key in self._seen_models:
+                        continue
+                    if out and out[-1].model_key == mk:
+                        continue
+                    out.append(lot)
+                    self._seen_sellers.add(lot.owner_key)
+                    self._seen_models.add(lot.model_key)
+                    last = mk
+                    progressed = True
+                    break
+                if progressed:
+                    break
+            if not progressed:
+                break
+            if limit is not None and len(out) >= limit:
+                break
+        return out
+
+    async def _prepare_show(
+        self, lots: list[Lot], *, limit: int | None = None
+    ) -> list[Lot]:
+        await self.market.resolve_owners(lots, timeout=creds.OWNER_TIMEOUT)
+        # bio только у тех, кого потенциально покажем
+        candidates = [lot for lot in lots if lot.seller]
+        if candidates:
+            await self.market.load_abouts(
+                candidates[: max((limit or 30) * 2, 20)],
+                timeout=min(creds.OWNER_TIMEOUT, 0.7),
+                parallel=10,
+            )
+        return self._pick_clean(candidates, limit=limit)
 
     async def _say(self, text: str, reply_markup=None) -> Message | None:
         if not self.bot or not self.chat_id:
@@ -265,27 +347,30 @@ class App:
                 f"💾 В БД: +<b>{ins}</b> новых / <b>{upd}</b> обновл. · всего <b>{self.db_total}</b>"
             )
 
-            await self.market.resolve_owners(burst.lots, timeout=creds.OWNER_TIMEOUT)
-            # после юзов — допишем seller в БД
+            shown = await self._prepare_show(burst.lots, limit=creds.PREVIEW_COUNT)
             self._save_gifts(burst.lots)
 
             await self._say(
-                f"🔍 Найдено подарков: <b>{len(burst.lots)}</b> шт. "
-                f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})"
+                f"🔍 К выдаче: <b>{len(shown)}</b> "
+                f"(сырых {len(burst.lots)}) · ~{burst.elapsed:.1f}с · "
+                f"{burst.scanned}/{burst.collections_total}\n"
+                f"без рекламы · уникальные продавцы/модели"
             )
-            lines = []
-            for lot in burst.lots[: creds.PREVIEW_COUNT]:
-                self._seen[lot.id] = now
-                user = f"@{lot.seller}" if lot.seller else "скрыт"
-                lines.append(
-                    f'🔍 <a href="{lot.nft_url}">NFT</a> | {user} | '
-                    f"{_fmt(lot.stars)}⭐"
-                )
-            for i in range(0, len(lines), 10):
-                await self._say("\n".join(lines[i : i + 10]))
-
-            for lot in burst.lots[:5]:
-                await self._notify_lot(lot, count_as_new=False)
+            if shown:
+                lines = []
+                for lot in shown:
+                    self._seen[lot.id] = now
+                    model = lot.model or lot.title
+                    lines.append(
+                        f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | '
+                        f"@{lot.seller} | {_fmt(lot.stars)}⭐"
+                    )
+                for i in range(0, len(lines), 10):
+                    await self._say("\n".join(lines[i : i + 10]))
+                for lot in shown[:5]:
+                    await self._notify_lot(lot, count_as_new=False)
+            else:
+                await self._say("После фильтров пусто — мониторю дальше…")
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
             await self._say(
@@ -326,17 +411,18 @@ class App:
                     self._save_gifts(result.lots)
 
                 now = time.monotonic()
-                fresh = []
+                candidates = []
                 for lot in result.lots:
                     if lot.id in self._seen:
                         continue
                     self._seen[lot.id] = now
                     if self._in_price(lot):
-                        fresh.append(lot)
+                        candidates.append(lot)
 
-                if fresh:
-                    await self.market.resolve_owners(fresh, timeout=creds.OWNER_TIMEOUT)
-                    self._save_gifts(fresh)
+                fresh: list[Lot] = []
+                if candidates:
+                    fresh = await self._prepare_show(candidates)
+                    self._save_gifts(candidates)
                     for lot in fresh:
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
@@ -349,7 +435,9 @@ class App:
                     f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
                     f"Новых за чек: <b>{len(fresh)}</b>\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
-                    f"Seen: <b>{len(self._seen)}</b>\n"
+                    f"Seen: <b>{len(self._seen)}</b> · "
+                    f"sellers: <b>{len(self._seen_sellers)}</b> · "
+                    f"models: <b>{len(self._seen_models)}</b>\n"
                     f"🗄 БД: <b>{self.db_total}</b> (last {self.db_last_saved})\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
                     f"⏱ {result.elapsed:.2f}с"
@@ -368,9 +456,9 @@ class App:
             await asyncio.sleep(max(0.05, creds.CHECK_INTERVAL - elapsed))
 
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
-        if not self.bot or not self.chat_id:
+        if not self.bot or not self.chat_id or not lot.seller:
             return
-        seller = f"@{lot.seller}" if lot.seller else "скрыт"
+        seller = f"@{lot.seller}"
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
         text = (
             f"{title}\n\n"

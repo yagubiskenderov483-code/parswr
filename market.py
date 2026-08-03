@@ -14,12 +14,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest,
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import StarsAmount, StarsTonAmount
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,24 @@ class Lot:
     symbol: str = ""
     seller: str = ""
     seller_id: int | None = None
+    first_name: str = ""
+    last_name: str = ""
+    about: str = ""
     seen_at: float = field(default_factory=time.time)
+
+    @property
+    def model_key(self) -> str:
+        title = (self.title or "").strip().lower()
+        model = (self.model or "").strip().lower()
+        return f"{title}|{model}" if model else (title or self.id)
+
+    @property
+    def owner_key(self) -> str:
+        if self.seller:
+            return self.seller.lower()
+        if self.seller_id is not None:
+            return f"id:{self.seller_id}"
+        return f"lot:{self.id}"
 
     @property
     def nft_url(self) -> str:
@@ -82,6 +100,7 @@ class TelegramMarket:
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
+        self._about_cache: dict[int, str] = {}
         self.check_no = 0
         self.last_error = ""
 
@@ -89,6 +108,7 @@ class TelegramMarket:
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
+        self._about_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -280,22 +300,22 @@ class TelegramMarket:
         await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
 
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
-        if lot.seller:
+        if lot.seller and lot.seller_id is not None:
             return
-        if lot.slug and lot.slug in self._owner_cache:
+        if lot.slug and lot.slug in self._owner_cache and not lot.seller:
             lot.seller = self._owner_cache[lot.slug]
-            return
+            if lot.seller:
+                return
         if lot.seller_id:
             try:
                 await self._wait_flood()
                 ent = await asyncio.wait_for(
                     self.client.get_entity(lot.seller_id), timeout=timeout
                 )
-                username = str(getattr(ent, "username", "") or "").lstrip("@")
-                if username:
-                    lot.seller = username
-                    if lot.slug:
-                        self._owner_cache[lot.slug] = username
+                _fill_user(lot, ent)
+                if lot.seller and lot.slug:
+                    self._owner_cache[lot.slug] = lot.seller
+                if lot.seller:
                     return
             except Exception:  # noqa: BLE001
                 pass
@@ -323,12 +343,45 @@ class TelegramMarket:
                 seller_id = int(seller_id) if seller_id is not None else None
             except (TypeError, ValueError):
                 seller_id = None
+        if seller_id:
+            lot.seller_id = seller_id
         if seller_id and seller_id in users:
-            username = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
-            if username:
-                lot.seller = username
-                lot.seller_id = seller_id
-                self._owner_cache[lot.slug] = username
+            _fill_user(lot, users[seller_id])
+            if lot.seller:
+                self._owner_cache[lot.slug] = lot.seller
+
+    async def load_abouts(
+        self, lots: list[Lot], *, timeout: float = 0.7, parallel: int = 8
+    ) -> None:
+        """Bio для анти-рекламы. Поиск лотов не трогает."""
+        sem = asyncio.Semaphore(parallel)
+
+        async def one(lot: Lot) -> None:
+            if not lot.seller_id:
+                return
+            if lot.seller_id in self._about_cache:
+                lot.about = self._about_cache[lot.seller_id]
+                return
+            async with sem:
+                try:
+                    await self._wait_flood()
+                    full = await asyncio.wait_for(
+                        self.client(GetFullUserRequest(lot.seller_id)),
+                        timeout=timeout,
+                    )
+                except Exception:  # noqa: BLE001
+                    self._about_cache[lot.seller_id] = ""
+                    return
+                uf = getattr(full, "full_user", None)
+                about = str(getattr(uf, "about", "") or "") if uf else ""
+                lot.about = about
+                self._about_cache[lot.seller_id] = about
+                for u in getattr(full, "users", None) or []:
+                    if getattr(u, "id", None) == lot.seller_id:
+                        _fill_user(lot, u)
+                        break
+
+        await asyncio.gather(*[one(lot) for lot in lots])
 
     async def _fetch_one(
         self,
@@ -403,6 +456,30 @@ class TelegramMarket:
         delay = self._flood_until - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
+
+
+def _fill_user(lot: Lot, user: Any) -> None:
+    username = str(getattr(user, "username", "") or "").lstrip("@").strip()
+    if not username:
+        for alt in getattr(user, "usernames", None) or []:
+            name = str(getattr(alt, "username", "") or "").lstrip("@").strip()
+            if name and getattr(alt, "active", True):
+                username = name
+                break
+    if username:
+        lot.seller = username
+    sid = getattr(user, "id", None)
+    if sid is not None:
+        try:
+            lot.seller_id = int(sid)
+        except (TypeError, ValueError):
+            pass
+    fn = str(getattr(user, "first_name", "") or "")
+    ln = str(getattr(user, "last_name", "") or "")
+    if fn:
+        lot.first_name = fn
+    if ln:
+        lot.last_name = ln
 
 
 def _parse_result(result: Any) -> list[Lot]:
@@ -502,6 +579,8 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
 
     seller = ""
     seller_id: int | None = None
+    first_name = ""
+    last_name = ""
     owner = getattr(gift, "owner_id", None)
     if owner is not None:
         seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
@@ -509,16 +588,9 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
             seller_id = int(seller_id) if seller_id is not None else None
         except (TypeError, ValueError):
             seller_id = None
-        if seller_id and users and seller_id in users:
-            seller = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
-
-    if not seller:
-        raw = str(getattr(gift, "owner_name", "") or "").strip().lstrip("@")
-        if raw and raw.lower() not in {"hidden", "anonymous", "telegram"} and " " not in raw:
-            seller = raw
 
     number_i = int(number) if number is not None else None
-    return Lot(
+    lot = Lot(
         id=str(gift_id or slug or f"{title}-{number_i}"),
         title=title,
         number=number_i,
@@ -529,4 +601,9 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         symbol=symbol,
         seller=seller,
         seller_id=seller_id,
+        first_name=first_name,
+        last_name=last_name,
     )
+    if seller_id and users and seller_id in users:
+        _fill_user(lot, users[seller_id])
+    return lot

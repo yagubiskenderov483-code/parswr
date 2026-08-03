@@ -42,6 +42,9 @@ class Lot:
     first_name: str = ""
     last_name: str = ""
     about: str = ""
+    is_premium: bool | None = None
+    account_level: int | None = None
+    gifts_count: int | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -101,7 +104,7 @@ class TelegramMarket:
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
-        self._about_cache: dict[int, str] = {}
+        self._profile_cache: dict[int, dict[str, Any]] = {}
         self.check_no = 0
         self.last_error = ""
 
@@ -109,7 +112,7 @@ class TelegramMarket:
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
-        self._about_cache.clear()
+        self._profile_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -221,7 +224,11 @@ class TelegramMarket:
                 break
 
         unique = _dedupe(lots)
+        random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
+        random.shuffle(matched)
+        # ещё раз перемешаем «окна», чтобы первые N не были из одних коллекций
+        matched = matched[: max(limit_results * 2, limit_results)]
         random.shuffle(matched)
         matched = matched[:limit_results]
 
@@ -298,6 +305,7 @@ class TelegramMarket:
                 stats["errors"] += 1
 
         unique = _dedupe(lots)
+        random.shuffle(unique)
         return CheckResult(
             check_no=self.check_no,
             scanned=stats["scanned"],
@@ -308,7 +316,7 @@ class TelegramMarket:
             floods=stats["floods"],
             elapsed=time.monotonic() - started,
             error=self.last_error,
-            all_lots=unique,
+            all_lots=list(unique),
         )
 
     async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:
@@ -368,14 +376,20 @@ class TelegramMarket:
     async def load_abouts(
         self, lots: list[Lot], *, timeout: float = 0.7, parallel: int = 8
     ) -> None:
-        """Bio для анти-рекламы. Поиск лотов не трогает."""
+        """Bio / lvl / gifts / premium для фильтров. Поиск лотов не трогает."""
+        await self.enrich_profiles(lots, timeout=timeout, parallel=parallel)
+
+    async def enrich_profiles(
+        self, lots: list[Lot], *, timeout: float = 0.7, parallel: int = 8
+    ) -> None:
         sem = asyncio.Semaphore(parallel)
 
         async def one(lot: Lot) -> None:
             if not lot.seller_id:
                 return
-            if lot.seller_id in self._about_cache:
-                lot.about = self._about_cache[lot.seller_id]
+            cached = self._profile_cache.get(lot.seller_id)
+            if cached:
+                _apply_profile(lot, cached)
                 return
             async with sem:
                 try:
@@ -385,16 +399,44 @@ class TelegramMarket:
                         timeout=timeout,
                     )
                 except Exception:  # noqa: BLE001
-                    self._about_cache[lot.seller_id] = ""
+                    self._profile_cache[lot.seller_id] = {"about": ""}
                     return
-                uf = getattr(full, "full_user", None)
-                about = str(getattr(uf, "about", "") or "") if uf else ""
-                lot.about = about
-                self._about_cache[lot.seller_id] = about
                 for u in getattr(full, "users", None) or []:
                     if getattr(u, "id", None) == lot.seller_id:
                         _fill_user(lot, u)
                         break
+                uf = getattr(full, "full_user", None)
+                about = str(getattr(uf, "about", "") or "") if uf else ""
+                level = None
+                gifts = None
+                if uf is not None:
+                    raw_gifts = getattr(uf, "stargifts_count", None)
+                    if raw_gifts is not None:
+                        try:
+                            gifts = int(raw_gifts)
+                        except (TypeError, ValueError):
+                            gifts = None
+                    rating = getattr(uf, "stars_rating", None)
+                    if rating is not None:
+                        try:
+                            level = int(getattr(rating, "level", 0))
+                        except (TypeError, ValueError):
+                            level = None
+                lot.about = about
+                if level is not None:
+                    lot.account_level = level
+                if gifts is not None:
+                    lot.gifts_count = gifts
+                info = {
+                    "username": lot.seller,
+                    "first_name": lot.first_name,
+                    "last_name": lot.last_name,
+                    "about": about,
+                    "is_premium": lot.is_premium,
+                    "account_level": level,
+                    "gifts_count": gifts,
+                }
+                self._profile_cache[lot.seller_id] = info
 
         await asyncio.gather(*[one(lot) for lot in lots])
 
@@ -562,6 +604,25 @@ def _fill_user(lot: Lot, user: Any) -> None:
         lot.first_name = fn
     if ln:
         lot.last_name = ln
+    if getattr(user, "premium", None) is not None:
+        lot.is_premium = bool(user.premium)
+
+
+def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
+    if info.get("username") and not lot.seller:
+        lot.seller = str(info["username"])
+    if info.get("first_name") and not lot.first_name:
+        lot.first_name = str(info["first_name"])
+    if info.get("last_name") and not lot.last_name:
+        lot.last_name = str(info["last_name"])
+    if "about" in info:
+        lot.about = str(info.get("about") or "")
+    if info.get("is_premium") is not None:
+        lot.is_premium = bool(info["is_premium"])
+    if info.get("account_level") is not None:
+        lot.account_level = int(info["account_level"])
+    if info.get("gifts_count") is not None:
+        lot.gifts_count = int(info["gifts_count"])
 
 
 def _parse_result(result: Any) -> list[Lot]:

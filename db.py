@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import sqlite3
 import time
 from pathlib import Path
@@ -47,6 +48,8 @@ class GiftDB:
                 backdrop TEXT NOT NULL DEFAULT '',
                 symbol TEXT NOT NULL DEFAULT '',
                 nft_url TEXT NOT NULL DEFAULT '',
+                seller TEXT NOT NULL DEFAULT '',
+                seller_id INTEGER,
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -57,10 +60,13 @@ class GiftDB:
             r["name"]
             for r in self._conn.execute("PRAGMA table_info(gifts)").fetchall()
         }
-        if "model_key" not in cols:
-            self._conn.execute(
-                "ALTER TABLE gifts ADD COLUMN model_key TEXT NOT NULL DEFAULT ''"
-            )
+        for col, decl in (
+            ("model_key", "TEXT NOT NULL DEFAULT ''"),
+            ("seller", "TEXT NOT NULL DEFAULT ''"),
+            ("seller_id", "INTEGER"),
+        ):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE gifts ADD COLUMN {col} {decl}")
 
         self._conn.execute(
             """
@@ -69,11 +75,26 @@ class GiftDB:
                 username TEXT NOT NULL DEFAULT '',
                 first_name TEXT NOT NULL DEFAULT '',
                 last_name TEXT NOT NULL DEFAULT '',
+                is_premium INTEGER,
+                account_level INTEGER,
+                gifts_count INTEGER,
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL
             )
             """
         )
+        ucols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        for col, decl in (
+            ("is_premium", "INTEGER"),
+            ("account_level", "INTEGER"),
+            ("gifts_count", "INTEGER"),
+        ):
+            if col not in ucols:
+                self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS collections (
@@ -96,6 +117,9 @@ class GiftDB:
             "CREATE INDEX IF NOT EXISTS idx_gifts_model_key ON gifts(model_key)"
         )
         self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gifts_seller ON gifts(seller)"
+        )
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)"
         )
         self._conn.commit()
@@ -108,15 +132,20 @@ class GiftDB:
             mk = _model_key(lot)
             model = _model_name(lot)
             row = cur.execute(
-                "SELECT id FROM gifts WHERE id = ?", (lot.id,)
+                "SELECT id, seller, seller_id FROM gifts WHERE id = ?", (lot.id,)
             ).fetchone()
+            seller = lot.seller or (row["seller"] if row else "") or ""
+            seller_id = lot.seller_id
+            if seller_id is None and row is not None:
+                seller_id = row["seller_id"]
             if row is None:
                 cur.execute(
                     """
                     INSERT INTO gifts (
                         id, title, number, stars, slug, model, model_key,
-                        backdrop, symbol, nft_url, first_seen, last_seen, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        backdrop, symbol, nft_url, seller, seller_id,
+                        first_seen, last_seen, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         lot.id,
@@ -129,6 +158,8 @@ class GiftDB:
                         lot.backdrop,
                         lot.symbol,
                         lot.nft_url,
+                        seller,
+                        seller_id,
                         now,
                         now,
                         now,
@@ -140,7 +171,10 @@ class GiftDB:
                     """
                     UPDATE gifts SET
                         title=?, number=?, stars=?, slug=?, model=?, model_key=?,
-                        backdrop=?, symbol=?, nft_url=?, last_seen=?, updated_at=?
+                        backdrop=?, symbol=?, nft_url=?,
+                        seller=CASE WHEN ? != '' THEN ? ELSE seller END,
+                        seller_id=COALESCE(?, seller_id),
+                        last_seen=?, updated_at=?
                     WHERE id=?
                     """,
                     (
@@ -153,6 +187,9 @@ class GiftDB:
                         lot.backdrop,
                         lot.symbol,
                         lot.nft_url,
+                        seller,
+                        seller,
+                        seller_id,
                         now,
                         now,
                         lot.id,
@@ -171,7 +208,6 @@ class GiftDB:
         *,
         cap: int = USER_CAP,
     ) -> tuple[int, int, int]:
-        """Save users. Returns (inserted, updated, total). Stops inserting at cap."""
         now = time.time()
         inserted = updated = 0
         cur = self._conn.cursor()
@@ -187,6 +223,9 @@ class GiftDB:
             username = str(u.get("username") or "").lstrip("@").strip()
             first_name = str(u.get("first_name") or "")
             last_name = str(u.get("last_name") or "")
+            premium = u.get("is_premium")
+            level = u.get("account_level")
+            gifts = u.get("gifts_count")
             row = cur.execute(
                 "SELECT user_id FROM users WHERE user_id = ?", (uid,)
             ).fetchone()
@@ -196,10 +235,22 @@ class GiftDB:
                 cur.execute(
                     """
                     INSERT INTO users (
-                        user_id, username, first_name, last_name, first_seen, last_seen
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        user_id, username, first_name, last_name,
+                        is_premium, account_level, gifts_count,
+                        first_seen, last_seen
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (uid, username, first_name, last_name, now, now),
+                    (
+                        uid,
+                        username,
+                        first_name,
+                        last_name,
+                        None if premium is None else int(bool(premium)),
+                        level,
+                        gifts,
+                        now,
+                        now,
+                    ),
                 )
                 inserted += 1
                 total += 1
@@ -210,6 +261,9 @@ class GiftDB:
                         username = CASE WHEN ? != '' THEN ? ELSE username END,
                         first_name = CASE WHEN ? != '' THEN ? ELSE first_name END,
                         last_name = CASE WHEN ? != '' THEN ? ELSE last_name END,
+                        is_premium = COALESCE(?, is_premium),
+                        account_level = COALESCE(?, account_level),
+                        gifts_count = COALESCE(?, gifts_count),
                         last_seen = ?
                     WHERE user_id = ?
                     """,
@@ -220,6 +274,9 @@ class GiftDB:
                         first_name,
                         last_name,
                         last_name,
+                        None if premium is None else int(bool(premium)),
+                        level,
+                        gifts,
                         now,
                         uid,
                     ),
@@ -233,21 +290,76 @@ class GiftDB:
     ) -> tuple[int, int, int]:
         users = []
         for lot in lots:
-            if lot.seller_id is None and not lot.seller:
+            if lot.seller_id is None:
                 continue
             users.append(
                 {
-                    "user_id": lot.seller_id
-                    if lot.seller_id is not None
-                    else hash(lot.seller) & 0x7FFFFFFF,
+                    "user_id": lot.seller_id,
                     "username": lot.seller,
                     "first_name": lot.first_name,
                     "last_name": lot.last_name,
+                    "is_premium": lot.is_premium,
+                    "account_level": lot.account_level,
+                    "gifts_count": lot.gifts_count,
                 }
             )
-        # без seller_id не надёжно — лучше только с id
-        users = [u for u in users if u.get("user_id") is not None]
         return self.upsert_users(users, cap=cap)
+
+    def fetch_random_lots(
+        self,
+        *,
+        min_stars: float,
+        max_stars: float,
+        limit: int = 40,
+        require_seller: bool = False,
+    ) -> list[Lot]:
+        """Старые лоты из БД в диапазоне цены (рандом) + профиль юзера если есть."""
+        sql = """
+            SELECT
+                g.id, g.title, g.number, g.stars, g.slug, g.model,
+                g.backdrop, g.symbol, g.nft_url, g.seller, g.seller_id,
+                u.username AS u_username,
+                u.first_name AS u_first_name,
+                u.last_name AS u_last_name,
+                u.is_premium AS u_is_premium,
+                u.account_level AS u_account_level,
+                u.gifts_count AS u_gifts_count
+            FROM gifts g
+            LEFT JOIN users u ON u.user_id = g.seller_id
+            WHERE g.stars >= ? AND g.stars <= ?
+        """
+        params: list[Any] = [float(min_stars), float(max_stars)]
+        if require_seller:
+            sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+        sql += " ORDER BY RANDOM() LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        lots: list[Lot] = []
+        for r in rows:
+            seller = str(r["seller"] or "").lstrip("@").strip()
+            if not seller:
+                seller = str(r["u_username"] or "").lstrip("@").strip()
+            premium = r["u_is_premium"]
+            lot = Lot(
+                id=str(r["id"]),
+                title=str(r["title"] or "Gift"),
+                number=r["number"],
+                stars=float(r["stars"]),
+                slug=str(r["slug"] or ""),
+                model=str(r["model"] or ""),
+                backdrop=str(r["backdrop"] or ""),
+                symbol=str(r["symbol"] or ""),
+                seller=seller,
+                seller_id=r["seller_id"],
+                first_name=str(r["u_first_name"] or ""),
+                last_name=str(r["u_last_name"] or ""),
+                is_premium=None if premium is None else bool(premium),
+                account_level=r["u_account_level"],
+                gifts_count=r["u_gifts_count"],
+            )
+            lots.append(lot)
+        random.shuffle(lots)
+        return lots
 
     def touch_collection(
         self,

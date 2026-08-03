@@ -3,6 +3,9 @@ Telegram Market scanner.
 
 burst_search() — быстрый проход (пара секунд), как FreeGiftsParser.
 run_check() — регулярный чек по кругу.
+
+Фильтр: не отдаём @username продавцов, у кого ЛС только за Stars
+(send_paid_messages_stars / requirementToContactPaidMessages).
 """
 
 from __future__ import annotations
@@ -14,15 +17,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest,
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
-from telethon.tl.types import StarsAmount, StarsTonAmount
+from telethon.tl.functions.users import GetRequirementsToContactRequest
+from telethon.tl.types import (
+    RequirementToContactPaidMessages,
+    StarsAmount,
+    StarsTonAmount,
+)
+
+import credentials as creds
 
 logger = logging.getLogger(__name__)
+
+NANOTON = 1_000_000_000.0
 
 
 @dataclass(slots=True)
@@ -37,6 +49,7 @@ class Lot:
     symbol: str = ""
     seller: str = ""
     seller_id: int | None = None
+    paid_dm: bool = False
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -58,6 +71,11 @@ class Lot:
             parts.append(f"({extra})")
         return " ".join(parts)
 
+    @property
+    def writable(self) -> bool:
+        """Можно писать в ЛС без Stars."""
+        return bool(self.seller) and not self.paid_dm
+
 
 @dataclass
 class CheckResult:
@@ -70,6 +88,7 @@ class CheckResult:
     floods: int = 0
     elapsed: float = 0.0
     error: str = ""
+    price_samples: list[str] = field(default_factory=list)
 
 
 class TelegramMarket:
@@ -81,6 +100,7 @@ class TelegramMarket:
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
+        self._paid_cache: dict[int | str, bool] = {}
         self.check_no = 0
         self.last_error = ""
 
@@ -88,6 +108,7 @@ class TelegramMarket:
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
+        self._paid_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -136,12 +157,13 @@ class TelegramMarket:
         max_collections: int = 40,
         gap: float = 0.02,
         timeout: float = 8.0,
-        limit_results: int = 25,
+        limit_results: int = 100,
     ) -> CheckResult:
         """Быстрый поиск свежих лотов в диапазоне — цель ~2–4 сек."""
         started = time.monotonic()
         self.check_no += 1
         stats = {"ok": 0, "errors": 0, "floods": 0, "scanned": 0}
+        samples: list[str] = []
 
         try:
             gift_ids = await self.load_collections()
@@ -167,9 +189,8 @@ class TelegramMarket:
                     gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
                 )
 
-        # кусками, чтобы не зависнуть навсегда
         for i in range(0, len(batch), parallel):
-            if time.monotonic() - started > 4.5:
+            if time.monotonic() - started > 5.5:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
@@ -177,13 +198,22 @@ class TelegramMarket:
                 stats["scanned"] += 1
                 if isinstance(part, list):
                     lots.extend(part)
+                    for lot in part[:2]:
+                        if len(samples) < 8:
+                            samples.append(f"{lot.stars:.0f}⭐ {lot.title[:24]}")
                 else:
                     stats["errors"] += 1
 
         unique = _dedupe(lots)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
-        # newest-first уже от API; режем до preview
         matched = matched[:limit_results]
+
+        err = self.last_error
+        if not matched and unique:
+            vals = sorted({round(l.stars) for l in unique})[:12]
+            err = (err + " | " if err else "") + f"цены вне диапазона, примеры: {vals}"
+        elif not matched and not unique:
+            err = (err + " | " if err else "") + "0 лотов (проверь Stars/TON parse)"
 
         return CheckResult(
             check_no=self.check_no,
@@ -194,7 +224,8 @@ class TelegramMarket:
             errors=stats["errors"],
             floods=stats["floods"],
             elapsed=time.monotonic() - started,
-            error=self.last_error,
+            error=err,
+            price_samples=samples,
         )
 
     async def run_check(
@@ -271,6 +302,123 @@ class TelegramMarket:
     async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:
         await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
 
+    async def filter_paid_dms(self, lots: list[Lot], timeout: float = 2.5) -> list[Lot]:
+        """Убирает @username / лоты, где ЛС только за Stars."""
+        if not lots:
+            return []
+
+        # 1) уже помеченные из User.send_paid_messages_stars
+        for lot in lots:
+            if lot.paid_dm and lot.seller:
+                self._paid_cache[lot.seller.lower()] = True
+                if lot.seller_id:
+                    self._paid_cache[lot.seller_id] = True
+                lot.seller = ""
+
+        # 2) bulk check через GetRequirementsToContact
+        need_check: list[Lot] = []
+        for lot in lots:
+            if lot.paid_dm:
+                continue
+            if not lot.seller and not lot.seller_id:
+                continue
+            key = lot.seller_id if lot.seller_id else lot.seller.lower()
+            cached = self._paid_cache.get(key)
+            if cached is True:
+                lot.paid_dm = True
+                lot.seller = ""
+                continue
+            if cached is False:
+                continue
+            need_check.append(lot)
+
+        if need_check:
+            await self._check_paid_batch(need_check, timeout=timeout)
+
+        # Отдаём только тех, кому можно писать бесплатно (с юзом),
+        # плюс лоты без юза не показываем в выдаче юзов.
+        writable: list[Lot] = []
+        for lot in lots:
+            if lot.paid_dm:
+                continue
+            if not lot.seller:
+                continue
+            writable.append(lot)
+        return writable
+
+    async def _check_paid_batch(self, lots: list[Lot], timeout: float) -> None:
+        # уникальные peer-ключи
+        peers: list[Any] = []
+        index: list[Lot] = []
+        seen: set[int | str] = set()
+        for lot in lots:
+            key: int | str
+            peer: Any
+            if lot.seller_id:
+                key = lot.seller_id
+                peer = lot.seller_id
+            elif lot.seller:
+                key = lot.seller.lower()
+                peer = lot.seller
+            else:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            peers.append(peer)
+            index.append(lot)
+
+        if not peers:
+            return
+
+        # чанками по 20
+        for i in range(0, len(peers), 20):
+            chunk_peers = peers[i : i + 20]
+            chunk_lots = index[i : i + 20]
+            try:
+                await self._wait_flood()
+                result = await asyncio.wait_for(
+                    self.client(GetRequirementsToContactRequest(id=chunk_peers)),
+                    timeout=timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("paid-dm check failed: %s", exc)
+                continue
+
+            reqs = list(result) if result is not None else []
+            for lot, req in zip(chunk_lots, reqs):
+                is_paid = isinstance(req, RequirementToContactPaidMessages) or (
+                    req is not None
+                    and req.__class__.__name__ == "RequirementToContactPaidMessages"
+                )
+                stars_amt = getattr(req, "stars_amount", None) if req else None
+                try:
+                    stars_amt_i = int(stars_amt) if stars_amt is not None else 0
+                except (TypeError, ValueError):
+                    stars_amt_i = 0
+                if is_paid or stars_amt_i > 0:
+                    lot.paid_dm = True
+                    if lot.seller_id:
+                        self._paid_cache[lot.seller_id] = True
+                    if lot.seller:
+                        self._paid_cache[lot.seller.lower()] = True
+                    lot.seller = ""
+                else:
+                    if lot.seller_id:
+                        self._paid_cache[lot.seller_id] = False
+                    if lot.seller:
+                        self._paid_cache[lot.seller.lower()] = False
+
+            for lot in lots:
+                if lot.paid_dm:
+                    continue
+                if lot.seller_id and self._paid_cache.get(lot.seller_id) is True:
+                    lot.paid_dm = True
+                    lot.seller = ""
+                elif lot.seller and self._paid_cache.get(lot.seller.lower()) is True:
+                    lot.paid_dm = True
+                    lot.seller = ""
+
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
         if lot.seller:
             return
@@ -283,6 +431,10 @@ class TelegramMarket:
                 ent = await asyncio.wait_for(
                     self.client.get_entity(lot.seller_id), timeout=timeout
                 )
+                if _user_paid_dm(ent):
+                    lot.paid_dm = True
+                    self._paid_cache[lot.seller_id] = True
+                    return
                 username = str(getattr(ent, "username", "") or "").lstrip("@")
                 if username:
                     lot.seller = username
@@ -316,7 +468,13 @@ class TelegramMarket:
             except (TypeError, ValueError):
                 seller_id = None
         if seller_id and seller_id in users:
-            username = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
+            user = users[seller_id]
+            if _user_paid_dm(user):
+                lot.paid_dm = True
+                lot.seller_id = seller_id
+                self._paid_cache[seller_id] = True
+                return
+            username = str(getattr(user, "username", "") or "").lstrip("@")
             if username:
                 lot.seller = username
                 lot.seller_id = seller_id
@@ -333,16 +491,16 @@ class TelegramMarket:
         sem: asyncio.Semaphore | None,
     ) -> list[Lot]:
         async def _do() -> list[Lot]:
+            # сначала Stars, потом все (TON→Stars)
             result = await self._request(gift_id, limit, True, stats, gap, timeout)
             lots = _parse_result(result) if result is not None else []
-            if not lots:
-                result2 = await self._request(gift_id, limit, False, stats, gap, timeout)
-                if result2 is not None:
-                    lots = _parse_result(result2)
-                    result = result2
+            result2 = await self._request(gift_id, limit, False, stats, gap, timeout)
+            if result2 is not None:
+                lots.extend(_parse_result(result2))
+            lots = _dedupe(lots)
             if lots:
                 stats["ok"] += 1
-            elif result is None:
+            elif result is None and result2 is None:
                 stats["errors"] += 1
             return lots
 
@@ -397,6 +555,16 @@ class TelegramMarket:
             await asyncio.sleep(delay)
 
 
+def _user_paid_dm(user: Any) -> bool:
+    stars = getattr(user, "send_paid_messages_stars", None)
+    if stars is None:
+        return False
+    try:
+        return int(stars) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _parse_result(result: Any) -> list[Lot]:
     users = {
         int(u.id): u
@@ -417,20 +585,31 @@ def _dedupe(lots: list[Lot]) -> list[Lot]:
     seen: set[str] = set()
     out: list[Lot] = []
     for lot in lots:
-        if lot.id in seen:
+        keys = [lot.id]
+        if lot.slug:
+            keys.append(f"slug:{lot.slug}")
+        if any(k in seen for k in keys):
             continue
-        seen.add(lot.id)
+        for k in keys:
+            seen.add(k)
         out.append(lot)
     return out
 
 
+def _ton_nano_to_stars(nano: float) -> float:
+    ton = float(nano) / NANOTON
+    return ton * float(creds.STARS_PER_TON)
+
+
 def _extract_stars(gift: Any) -> float | None:
+    """Stars напрямую; если только TON — конвертим nanotons→TON→Stars."""
     amounts = getattr(gift, "resell_amount", None)
+    stars_val: float | None = None
+    ton_val: float | None = None
+
     if isinstance(amounts, list):
         for item in amounts:
             name = item.__class__.__name__
-            if name == "StarsTonAmount" or isinstance(item, StarsTonAmount):
-                continue
             amount = getattr(item, "amount", None)
             if amount is None:
                 continue
@@ -438,33 +617,37 @@ def _extract_stars(gift: Any) -> float | None:
                 val = float(amount)
             except (TypeError, ValueError):
                 continue
-            if val > 0 and (name == "StarsAmount" or isinstance(item, StarsAmount)):
-                return val
-        for item in amounts:
-            name = item.__class__.__name__
+            if val <= 0:
+                continue
             if name == "StarsTonAmount" or isinstance(item, StarsTonAmount):
-                continue
-            amount = getattr(item, "amount", None)
-            if amount is None:
-                continue
-            try:
-                val = float(amount)
-            except (TypeError, ValueError):
-                continue
-            if val > 0:
-                return val
+                ton_val = val
+            elif name == "StarsAmount" or isinstance(item, StarsAmount):
+                stars_val = val
+            elif stars_val is None:
+                # неизвестный тип с amount — пробуем как Stars
+                stars_val = val
+        if stars_val is not None:
+            return stars_val
+        if ton_val is not None:
+            return _ton_nano_to_stars(ton_val)
         return None
+
     if getattr(gift, "resale_ton_only", False):
-        return None
+        # всё равно пробуем атрибуты ниже
+        pass
+
     for attr in ("resell_stars", "stars", "price"):
         val = getattr(gift, attr, None)
         if val is None:
             continue
         if hasattr(val, "amount"):
             try:
-                return float(val.amount)
+                raw = float(val.amount)
             except (TypeError, ValueError):
                 continue
+            if val.__class__.__name__ == "StarsTonAmount" or isinstance(val, StarsTonAmount):
+                return _ton_nano_to_stars(raw)
+            return raw
         try:
             return float(val)
         except (TypeError, ValueError):
@@ -494,6 +677,7 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
 
     seller = ""
     seller_id: int | None = None
+    paid_dm = False
     owner = getattr(gift, "owner_id", None)
     if owner is not None:
         seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
@@ -502,16 +686,21 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         except (TypeError, ValueError):
             seller_id = None
         if seller_id and users and seller_id in users:
-            seller = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
+            user = users[seller_id]
+            if _user_paid_dm(user):
+                paid_dm = True
+            else:
+                seller = str(getattr(user, "username", "") or "").lstrip("@")
 
-    if not seller:
+    if not seller and not paid_dm:
         raw = str(getattr(gift, "owner_name", "") or "").strip().lstrip("@")
         if raw and raw.lower() not in {"hidden", "anonymous", "telegram"} and " " not in raw:
             seller = raw
 
     number_i = int(number) if number is not None else None
+    lot_id = str(slug or gift_id or f"{title}-{number_i}")
     return Lot(
-        id=str(gift_id or slug or f"{title}-{number_i}"),
+        id=lot_id,
         title=title,
         number=number_i,
         stars=float(stars),
@@ -519,6 +708,7 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         model=model,
         backdrop=backdrop,
         symbol=symbol,
-        seller=seller,
+        seller=seller if not paid_dm else "",
         seller_id=seller_id,
+        paid_dm=paid_dm,
     )

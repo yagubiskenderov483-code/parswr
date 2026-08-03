@@ -238,7 +238,7 @@ class App:
                 max_collections=creds.BURST_MAX_COLLECTIONS,
                 gap=creds.BURST_GAP,
                 timeout=creds.API_TIMEOUT,
-                limit_results=creds.PREVIEW_COUNT,
+                limit_results=creds.RESULT_LIMIT,
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -248,39 +248,42 @@ class App:
         now = time.monotonic()
         if burst and burst.lots:
             await self.market.resolve_owners(burst.lots, timeout=creds.OWNER_TIMEOUT)
-            await self._say(
-                f"🔍 Найдено подарков: <b>{len(burst.lots)}</b> шт. "
-                f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})"
+            # не выдаём юзы тех, кому в ЛС только за Stars
+            writable = await self.market.filter_paid_dms(
+                burst.lots, timeout=creds.PAID_DM_TIMEOUT
             )
-            # Список как у FreeGiftsParser
+            writable = writable[: creds.RESULT_LIMIT]
+            skipped_paid = sum(1 for l in burst.lots if l.paid_dm)
+            await self._say(
+                f"🔍 Найдено подарков: <b>{len(writable)}</b> шт. "
+                f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})"
+                + (f"\n🚫 без платных ЛС: −{skipped_paid}" if skipped_paid else "")
+            )
             lines = []
-            for lot in burst.lots[: creds.PREVIEW_COUNT]:
+            for lot in writable[: creds.PREVIEW_COUNT]:
                 self._seen[lot.id] = now
-                user = f"@{lot.seller}" if lot.seller else "скрыт"
                 lines.append(
-                    f'🔍 <a href="{lot.nft_url}">NFT</a> | {user} | '
+                    f'🔍 <a href="{lot.nft_url}">NFT</a> | @{lot.seller} | '
                     f"{_fmt(lot.stars)}⭐"
                 )
-            # чанками по 10
             for i in range(0, len(lines), 10):
-                chunk = lines[i : i + 10]
-                await self._say("\n".join(chunk))
+                await self._say("\n".join(lines[i : i + 10]))
 
-            # карточки первых нескольких
-            for lot in burst.lots[:5]:
+            for lot in writable[:5]:
                 await self._notify_lot(lot, count_as_new=False)
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
+            samples = ""
+            if burst and burst.price_samples:
+                samples = "\nпримеры цен: " + ", ".join(burst.price_samples[:5])
             await self._say(
                 f"Пока в диапазоне ничего не нашёл за {getattr(burst, 'elapsed', 0):.1f}с.\n"
-                f"({_esc(err)})\nЖду новые…"
+                f"({_esc(err)}){samples}\nЖду новые…"
             )
 
-        # всё что увидели в burst — в seen (даже вне карточек)
         if burst:
             for lot in burst.lots:
                 self._seen.setdefault(lot.id, now)
-            # и пометим сырые id из полного unique через повтор? уже в lots matched only
             self.checks = burst.check_no
 
         await self._say(
@@ -314,7 +317,12 @@ class App:
 
                 if fresh:
                     await self.market.resolve_owners(fresh, timeout=creds.OWNER_TIMEOUT)
-                    for lot in fresh:
+                    writable = await self.market.filter_paid_dms(
+                        fresh, timeout=creds.PAID_DM_TIMEOUT
+                    )
+                    for lot in writable:
+                        if self.lots_notified >= creds.RESULT_LIMIT:
+                            break
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
 
@@ -347,7 +355,10 @@ class App:
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
         if not self.bot or not self.chat_id:
             return
-        seller = f"@{lot.seller}" if lot.seller else "скрыт"
+        # юзы платных ЛС не показываем
+        if lot.paid_dm or not lot.seller:
+            return
+        seller = f"@{lot.seller}"
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
         text = (
             f"{title}\n\n"
@@ -359,7 +370,7 @@ class App:
         rows: list[list[InlineKeyboardButton]] = [
             [InlineKeyboardButton(text="🖼 NFT / LINK", url=lot.nft_url)]
         ]
-        if lot.seller and re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
+        if re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
             rows.append(
                 [
                     InlineKeyboardButton(

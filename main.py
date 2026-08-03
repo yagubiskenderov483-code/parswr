@@ -109,6 +109,14 @@ class App:
         self.last_error = ""
         self.db_total = self.db.count()
         self.db_last_saved = 0
+        self.afk_running = False
+        self._afk_task: asyncio.Task | None = None
+        self.afk_pages = 0
+        self.afk_users_added = 0
+        self.afk_last_error = ""
+        self._afk_status_msg_id: int | None = None
+        self.afk_collections_total = 0
+        self.afk_cursor = 0
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -165,6 +173,7 @@ class App:
 
     async def reset_auth(self) -> None:
         await self.stop_monitor()
+        await self.stop_afk()
         try:
             if self.client.is_connected():
                 await self.client.disconnect()
@@ -272,7 +281,11 @@ class App:
         self, lots: list[Lot], *, limit: int | None = None
     ) -> list[Lot]:
         await self.market.resolve_owners(lots, timeout=creds.OWNER_TIMEOUT)
-        # bio только у тех, кого потенциально покажем
+        # попутно копим юзов (если есть seller_id)
+        self.db.upsert_users_from_lots(
+            [lot for lot in lots if lot.seller_id is not None],
+            cap=creds.AFK_USER_CAP,
+        )
         candidates = [lot for lot in lots if lot.seller]
         if candidates:
             await self.market.load_abouts(
@@ -312,13 +325,185 @@ class App:
             self._status_msg_id = msg.message_id
 
     def _save_models(self, lots: list[Lot]) -> tuple[int, int]:
-        """Сохраняет модели в БД. Юзы сюда не пишем."""
+        """Сохраняет модели в БД."""
         if not lots:
             return 0, 0
         inserted, updated = self.db.upsert_models(lots)
         self.db_last_saved = inserted + updated
         self.db_total = self.db.count()
         return inserted, updated
+
+    async def start_afk(self, chat_id: int) -> str:
+        if not self.logged_in:
+            raise RuntimeError("Сначала вход.")
+        if self.afk_running:
+            return (
+                f"🌙 AFK уже крутится.\n"
+                f"Юзов: <b>{self.db.count_users():,}</b> / {creds.AFK_USER_CAP:,}\n"
+                f"Коллекций: <b>{self.db.count_collections()}</b>/"
+                f"{self.afk_collections_total or '?'}"
+            )
+        self.chat_id = chat_id
+        self.afk_running = True
+        self.afk_pages = 0
+        self.afk_users_added = 0
+        self.afk_last_error = ""
+        self._afk_status_msg_id = None
+        self._afk_task = asyncio.create_task(self._afk_loop(), name="afk")
+        return (
+            f"🌙 AFK старт · коплю юзов до <b>{creds.AFK_USER_CAP:,}</b>\n"
+            f"Сейчас в БД: <b>{self.db.count_users():,}</b> юзов · "
+            f"<b>{self.db.count()}</b> моделей"
+        )
+
+    async def stop_afk(self) -> str:
+        if not self.afk_running and self._afk_task is None:
+            return "🌙 AFK уже стоп."
+        self.afk_running = False
+        if self._afk_task:
+            self._afk_task.cancel()
+            try:
+                await self._afk_task
+            except asyncio.CancelledError:
+                pass
+            self._afk_task = None
+        return (
+            f"🌙 AFK стоп.\n"
+            f"Юзов в БД: <b>{self.db.count_users():,}</b>\n"
+            f"Коллекций: <b>{self.db.count_collections()}</b>\n"
+            f"Страниц: <b>{self.afk_pages}</b> · +юзов за сессию: "
+            f"<b>{self.afk_users_added}</b>"
+        )
+
+    async def _edit_afk(self, text: str) -> None:
+        if not self.bot or not self.chat_id:
+            return
+        try:
+            if self._afk_status_msg_id:
+                await self.bot.edit_message_text(
+                    text,
+                    chat_id=self.chat_id,
+                    message_id=self._afk_status_msg_id,
+                    reply_markup=main_inline(),
+                )
+                return
+        except Exception:  # noqa: BLE001
+            self._afk_status_msg_id = None
+        msg = await self._say(text, reply_markup=main_inline())
+        if msg:
+            self._afk_status_msg_id = msg.message_id
+
+    async def _afk_loop(self) -> None:
+        """Фарм по всем коллекциям с пагинацией, пока юзов < 5M."""
+        try:
+            gift_ids = await self.market.load_collections()
+        except Exception as exc:  # noqa: BLE001
+            self.afk_last_error = str(exc)
+            await self._say(f"🌙 AFK ошибка коллекций: {_esc(str(exc)[:180])}")
+            self.afk_running = False
+            return
+
+        self.afk_collections_total = len(gift_ids)
+        # зарегистрируем все ~149 коллекций
+        for gid in gift_ids:
+            self.db.touch_collection(gid, title="", last_offset=self.db.get_collection_offset(gid))
+
+        await self._say(
+            f"🌙 AFK: коллекций <b>{len(gift_ids)}</b> · "
+            f"цель <b>{creds.AFK_USER_CAP:,}</b> юзов\n"
+            f"Сейчас: <b>{self.db.count_users():,}</b>"
+        )
+
+        last_status = 0.0
+        n = len(gift_ids)
+        if n == 0:
+            await self._say("🌙 Нет коллекций.")
+            self.afk_running = False
+            return
+
+        while self.afk_running:
+            users_now = self.db.count_users()
+            if users_now >= creds.AFK_USER_CAP:
+                await self._say(
+                    f"🌙 AFK готов · набрано <b>{users_now:,}</b> юзов "
+                    f"(лимит {creds.AFK_USER_CAP:,})"
+                )
+                self.afk_running = False
+                break
+
+            gid = gift_ids[self.afk_cursor % n]
+            self.afk_cursor = (self.afk_cursor + 1) % n
+            offset = self.db.get_collection_offset(gid)
+
+            try:
+                lots, users, next_offset, total = await self.market.afk_fetch_page(
+                    gid,
+                    offset=offset,
+                    limit=creds.AFK_PAGE_LIMIT,
+                    gap=creds.AFK_GAP,
+                    timeout=creds.API_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.afk_last_error = str(exc)
+                await asyncio.sleep(0.5)
+                continue
+
+            title = lots[0].title if lots else ""
+            if lots:
+                self._save_models(lots)
+            # юзы из ответа API + продавцы лотов
+            batch_users = list(users)
+            for lot in lots:
+                if lot.seller_id is not None:
+                    batch_users.append(
+                        {
+                            "user_id": lot.seller_id,
+                            "username": lot.seller,
+                            "first_name": lot.first_name,
+                            "last_name": lot.last_name,
+                        }
+                    )
+            ins_u, _upd_u, total_u = self.db.upsert_users(
+                batch_users, cap=creds.AFK_USER_CAP
+            )
+            self.afk_users_added += ins_u
+            self.afk_pages += 1
+
+            # если страница пустая / нет next — с начала коллекции
+            new_offset = next_offset if (lots and next_offset) else ""
+            self.db.touch_collection(
+                gid,
+                title=title,
+                last_offset=new_offset,
+                pages_inc=1,
+                lots_inc=len(lots),
+            )
+
+            now = time.monotonic()
+            if now - last_status >= creds.AFK_STATUS_EVERY:
+                last_status = now
+                await self._edit_afk(
+                    f"🌙 <b>AFK фарм</b>\n"
+                    f"Коллекций: <b>{self.db.count_collections()}</b>/"
+                    f"<b>{self.afk_collections_total}</b>\n"
+                    f"Юзов: <b>{total_u:,}</b> / <b>{creds.AFK_USER_CAP:,}</b>\n"
+                    f"+ за сессию: <b>{self.afk_users_added:,}</b>\n"
+                    f"Моделей в БД: <b>{self.db.count():,}</b>\n"
+                    f"Страниц: <b>{self.afk_pages}</b>\n"
+                    f"Сейчас gift_id=<code>{gid}</code> · listed≈{total}\n"
+                    f"offset: <code>{_esc((offset or '∅')[:40])}</code>"
+                    + (
+                        f"\n⚠️ {_esc(self.afk_last_error[:100])}"
+                        if self.afk_last_error
+                        else ""
+                    )
+                )
+
+            await asyncio.sleep(0.01)
+
+        self._afk_task = None
 
     async def _loop(self) -> None:
         # 1) Быстрый выброс как FreeGiftsParser
@@ -492,9 +677,11 @@ app = App()
 
 
 def main_inline() -> InlineKeyboardMarkup:
+    afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK фарм юзов"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔍 Парсинг", callback_data="menu:parse")],
+            [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
         ]
     )
@@ -510,11 +697,13 @@ def prices_inline(prefix: str = "price") -> InlineKeyboardMarkup:
 
 
 def settings_inline() -> InlineKeyboardMarkup:
-    stop = "⏹ Стоп" if app.running else "▶️ Выкл"
+    stop = "⏹ Стоп парсинг" if app.running else "▶️ Парсинг выкл"
+    afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK старт"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Цена поиска", callback_data="menu:search")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
+            [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="📊 Статус", callback_data="menu:status")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
@@ -711,17 +900,40 @@ async def cb_stop(callback: CallbackQuery) -> None:
     await callback.answer("Стоп")
 
 
+@router.callback_query(F.data == "menu:afk")
+async def cb_afk(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    if app.afk_running:
+        text = await app.stop_afk()
+        await callback.message.edit_text(text, reply_markup=main_inline())
+        await callback.answer("AFK стоп")
+        return
+    try:
+        text = await app.start_afk(callback.from_user.id)
+    except RuntimeError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.message.edit_text(text, reply_markup=main_inline())
+    await callback.answer("AFK старт")
+
+
 @router.callback_query(F.data == "menu:status")
 async def cb_status(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "📊 <b>Статус</b>\n"
         f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
+        f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
         f"Цена: <b>{app.range_label}</b>\n"
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
         f"Seen: <b>{len(app._seen)}</b>\n"
-        f"🗄 Моделей в БД: <b>{app.db.count()}</b> "
+        f"🗄 Моделей: <b>{app.db.count()}</b> "
         f"(уник. {app.db.count_models()})\n"
+        f"👤 Юзов: <b>{app.db.count_users():,}</b> / {creds.AFK_USER_CAP:,}\n"
+        f"🎁 Коллекций: <b>{app.db.count_collections()}</b>"
+        f"/{app.afk_collections_total or '?'}\n"
         f"Err: {_esc(app.last_error[:120]) if app.last_error else '—'}",
         reply_markup=settings_inline(),
     )
@@ -788,6 +1000,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await app.stop_monitor()
+        await app.stop_afk()
         if app.client.is_connected():
             await app.client.disconnect()
         app.db.close()

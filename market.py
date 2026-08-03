@@ -383,6 +383,41 @@ class TelegramMarket:
 
         await asyncio.gather(*[one(lot) for lot in lots])
 
+    async def afk_fetch_page(
+        self,
+        gift_id: int,
+        *,
+        offset: str = "",
+        limit: int = 50,
+        gap: float = 0.05,
+        timeout: float = 8.0,
+    ) -> tuple[list[Lot], list[dict[str, Any]], str, int]:
+        """
+        Одна страница resale для AFK-фарма.
+        Returns: (lots, users, next_offset, total_count)
+        """
+        stats = {"ok": 0, "errors": 0, "floods": 0}
+        result = await self._request(
+            gift_id, limit, True, stats, gap, timeout, offset=offset
+        )
+        if result is None:
+            result = await self._request(
+                gift_id, limit, False, stats, gap, timeout, offset=offset
+            )
+        if result is None:
+            return [], [], "", 0
+
+        lots = _parse_result(result)
+        users = _extract_users(result)
+        next_offset = str(getattr(result, "next_offset", "") or "")
+        try:
+            total = int(getattr(result, "count", 0) or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if lots:
+            stats["ok"] += 1
+        return lots, users, next_offset, total
+
     async def _fetch_one(
         self,
         gift_id: int,
@@ -397,7 +432,9 @@ class TelegramMarket:
             result = await self._request(gift_id, limit, True, stats, gap, timeout)
             lots = _parse_result(result) if result is not None else []
             if not lots:
-                result2 = await self._request(gift_id, limit, False, stats, gap, timeout)
+                result2 = await self._request(
+                    gift_id, limit, False, stats, gap, timeout
+                )
                 if result2 is not None:
                     lots = _parse_result(result2)
                     result = result2
@@ -420,6 +457,8 @@ class TelegramMarket:
         stats: dict[str, int],
         gap: float,
         timeout: float,
+        *,
+        offset: str = "",
     ) -> Any | None:
         for attempt in range(2):
             try:
@@ -434,7 +473,7 @@ class TelegramMarket:
                     self.client(
                         GetResaleStarGiftsRequest(
                             gift_id=gift_id,
-                            offset="",
+                            offset=offset or "",
                             limit=min(limit, 50),
                             stars_only=True if stars_only else None,
                         )
@@ -456,6 +495,34 @@ class TelegramMarket:
         delay = self._flood_until - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
+
+
+def _extract_users(result: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for u in getattr(result, "users", None) or []:
+        uid = getattr(u, "id", None)
+        if uid is None:
+            continue
+        try:
+            uid_i = int(uid)
+        except (TypeError, ValueError):
+            continue
+        username = str(getattr(u, "username", "") or "").lstrip("@").strip()
+        if not username:
+            for alt in getattr(u, "usernames", None) or []:
+                name = str(getattr(alt, "username", "") or "").lstrip("@").strip()
+                if name and getattr(alt, "active", True):
+                    username = name
+                    break
+        out.append(
+            {
+                "user_id": uid_i,
+                "username": username,
+                "first_name": str(getattr(u, "first_name", "") or ""),
+                "last_name": str(getattr(u, "last_name", "") or ""),
+            }
+        )
+    return out
 
 
 def _fill_user(lot: Lot, user: Any) -> None:

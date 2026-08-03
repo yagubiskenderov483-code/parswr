@@ -9,20 +9,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest,
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
-from telethon.tl.types import StarsAmount, StarsTonAmount
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import (
+    StarsAmount,
+    StarsTonAmount,
+    UserStatusOnline,
+)
 
 logger = logging.getLogger(__name__)
+
+# Лот «оправдывает цену»: floor коллекции не ниже X% от мин. диапазона
+FLOOR_MIN_RATIO = 0.50
+# И лот не дороже floor * N (редкие модели — запас)
+MAX_OVERPRICE_RATIO = 2.5
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
 
 
 @dataclass(slots=True)
@@ -37,6 +50,14 @@ class Lot:
     symbol: str = ""
     seller: str = ""
     seller_id: int | None = None
+    gift_type_id: int | None = None
+    floor_stars: float | None = None
+    lang_code: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    is_online: bool | None = None
+    account_level: int | None = None
+    gifts_count: int | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -58,6 +79,18 @@ class Lot:
             parts.append(f"({extra})")
         return " ".join(parts)
 
+    @property
+    def model_key(self) -> str:
+        return (self.model or self.title or self.id).strip().lower()
+
+    @property
+    def owner_key(self) -> str:
+        if self.seller:
+            return self.seller.lower()
+        if self.seller_id is not None:
+            return f"id:{self.seller_id}"
+        return f"lot:{self.id}"
+
 
 @dataclass
 class CheckResult:
@@ -72,6 +105,20 @@ class CheckResult:
     error: str = ""
 
 
+@dataclass
+class FilterSettings:
+    """Фильтры выдачи (настраиваются в /settings)."""
+
+    require_username: bool = True
+    russian_only: bool = True
+    online_only: bool = False
+    max_level: int | None = None
+    max_gifts: int | None = None
+    unique_owners: bool = True
+    diversify_models: bool = True
+    fair_price: bool = True
+
+
 class TelegramMarket:
     def __init__(self, client: TelegramClient) -> None:
         self.client = client
@@ -81,6 +128,8 @@ class TelegramMarket:
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
+        self._floor_cache: dict[int, float] = {}
+        self._user_cache: dict[int, dict[str, Any]] = {}
         self.check_no = 0
         self.last_error = ""
 
@@ -88,6 +137,8 @@ class TelegramMarket:
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
+        self._floor_cache.clear()
+        self._user_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -164,10 +215,16 @@ class TelegramMarket:
         async def one(gid: int) -> list[Lot]:
             async with sem:
                 return await self._fetch_one(
-                    gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
+                    gid,
+                    per_collection,
+                    stats,
+                    gap=gap,
+                    timeout=timeout,
+                    sort_by_price=True,
+                    min_stars=min_stars,
+                    max_stars=max_stars,
                 )
 
-        # кусками, чтобы не зависнуть навсегда
         for i in range(0, len(batch), parallel):
             if time.monotonic() - started > 4.5:
                 break
@@ -181,8 +238,11 @@ class TelegramMarket:
                     stats["errors"] += 1
 
         unique = _dedupe(lots)
-        matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
-        # newest-first уже от API; режем до preview
+        matched = [
+            lot
+            for lot in unique
+            if min_stars <= lot.stars <= max_stars and is_fair_price(lot, min_stars)
+        ]
         matched = matched[:limit_results]
 
         return CheckResult(
@@ -205,6 +265,8 @@ class TelegramMarket:
         batch_size: int = 15,
         gap: float = 0.08,
         timeout: float = 8.0,
+        min_stars: float | None = None,
+        max_stars: float | None = None,
     ) -> CheckResult:
         started = time.monotonic()
         self.check_no += 1
@@ -243,8 +305,17 @@ class TelegramMarket:
 
         async def one(gid: int) -> list[Lot]:
             async with sem:
+                # Новые — без sort_by_price; floor подтянем из кэша/пробы
                 return await self._fetch_one(
-                    gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
+                    gid,
+                    per_collection,
+                    stats,
+                    gap=gap,
+                    timeout=timeout,
+                    sort_by_price=False,
+                    min_stars=min_stars,
+                    max_stars=max_stars,
+                    probe_floor=True,
                 )
 
         parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
@@ -269,58 +340,98 @@ class TelegramMarket:
         )
 
     async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:
-        await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
+        await asyncio.gather(
+            *[self.enrich_seller(lot, timeout=timeout) for lot in lots]
+        )
 
-    async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
-        if lot.seller:
-            return
-        if lot.slug and lot.slug in self._owner_cache:
+    async def enrich_seller(self, lot: Lot, timeout: float = 1.2) -> None:
+        """Резолв юзернейма + lang/online/level/gifts. Без юза — seller останется пустым."""
+        user_obj: Any | None = None
+
+        if lot.slug and lot.slug in self._owner_cache and not lot.seller:
             lot.seller = self._owner_cache[lot.slug]
-            return
-        if lot.seller_id:
+
+        # 1) Unique gift → users vector (точный username владельца)
+        if lot.slug and (not lot.seller or lot.seller_id is None):
+            try:
+                await self._wait_flood()
+                result = await asyncio.wait_for(
+                    self.client(GetUniqueStarGiftRequest(slug=lot.slug)),
+                    timeout=timeout,
+                )
+            except Exception:  # noqa: BLE001
+                result = None
+            if result is not None:
+                gift = getattr(result, "gift", None)
+                users = {
+                    int(u.id): u
+                    for u in (getattr(result, "users", None) or [])
+                    if getattr(u, "id", None) is not None
+                }
+                owner = getattr(gift, "owner_id", None) if gift else None
+                seller_id = _peer_user_id(owner)
+                if seller_id:
+                    lot.seller_id = seller_id
+                    if seller_id in users:
+                        user_obj = users[seller_id]
+                        _apply_user_basic(lot, user_obj)
+
+        # 2) get_entity по id — если юз всё ещё пуст
+        if lot.seller_id and not lot.seller:
             try:
                 await self._wait_flood()
                 ent = await asyncio.wait_for(
                     self.client.get_entity(lot.seller_id), timeout=timeout
                 )
-                username = str(getattr(ent, "username", "") or "").lstrip("@")
-                if username:
-                    lot.seller = username
-                    if lot.slug:
-                        self._owner_cache[lot.slug] = username
-                    return
+                user_obj = ent
+                _apply_user_basic(lot, ent)
             except Exception:  # noqa: BLE001
                 pass
-        if not lot.slug:
-            return
-        try:
-            await self._wait_flood()
-            result = await asyncio.wait_for(
-                self.client(GetUniqueStarGiftRequest(slug=lot.slug)),
-                timeout=timeout,
-            )
-        except Exception:  # noqa: BLE001
-            return
-        gift = getattr(result, "gift", None)
-        users = {
-            int(u.id): u
-            for u in (getattr(result, "users", None) or [])
-            if getattr(u, "id", None) is not None
-        }
-        owner = getattr(gift, "owner_id", None) if gift else None
-        seller_id = None
-        if owner is not None:
-            seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-            try:
-                seller_id = int(seller_id) if seller_id is not None else None
-            except (TypeError, ValueError):
-                seller_id = None
-        if seller_id and seller_id in users:
-            username = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
-            if username:
-                lot.seller = username
-                lot.seller_id = seller_id
-                self._owner_cache[lot.slug] = username
+
+        if lot.seller and lot.slug:
+            self._owner_cache[lot.slug] = lot.seller
+
+        # 3) Full user — level + gifts_count (+ статус/lang если не было)
+        if lot.seller_id:
+            cached = self._user_cache.get(lot.seller_id)
+            if cached:
+                _apply_user_cache(lot, cached)
+            else:
+                try:
+                    await self._wait_flood()
+                    full = await asyncio.wait_for(
+                        self.client(GetFullUserRequest(lot.seller_id)),
+                        timeout=timeout,
+                    )
+                    uf = getattr(full, "full_user", None)
+                    for u in getattr(full, "users", None) or []:
+                        if getattr(u, "id", None) == lot.seller_id:
+                            _apply_user_basic(lot, u)
+                            break
+                    if uf is not None:
+                        gifts = getattr(uf, "stargifts_count", None)
+                        if gifts is not None:
+                            try:
+                                lot.gifts_count = int(gifts)
+                            except (TypeError, ValueError):
+                                pass
+                        rating = getattr(uf, "stars_rating", None)
+                        if rating is not None:
+                            try:
+                                lot.account_level = int(getattr(rating, "level", 0))
+                            except (TypeError, ValueError):
+                                pass
+                    self._user_cache[lot.seller_id] = {
+                        "username": lot.seller,
+                        "lang_code": lot.lang_code,
+                        "first_name": lot.first_name,
+                        "last_name": lot.last_name,
+                        "is_online": lot.is_online,
+                        "account_level": lot.account_level,
+                        "gifts_count": lot.gifts_count,
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _fetch_one(
         self,
@@ -330,26 +441,85 @@ class TelegramMarket:
         *,
         gap: float,
         timeout: float,
-        sem: asyncio.Semaphore | None,
+        sort_by_price: bool = False,
+        min_stars: float | None = None,
+        max_stars: float | None = None,
+        probe_floor: bool = False,
     ) -> list[Lot]:
-        async def _do() -> list[Lot]:
-            result = await self._request(gift_id, limit, True, stats, gap, timeout)
-            lots = _parse_result(result) if result is not None else []
-            if not lots:
-                result2 = await self._request(gift_id, limit, False, stats, gap, timeout)
-                if result2 is not None:
-                    lots = _parse_result(result2)
-                    result = result2
-            if lots:
-                stats["ok"] += 1
-            elif result is None:
-                stats["errors"] += 1
-            return lots
+        floor: float | None = self._floor_cache.get(gift_id)
 
-        if sem is None:
-            return await _do()
-        async with sem:
-            return await _do()
+        if probe_floor and floor is None:
+            floor = await self._probe_floor(gift_id, stats, gap, timeout)
+            if floor is not None:
+                self._floor_cache[gift_id] = floor
+
+        # Коллекция слишком дешёвая для выбранного диапазона — не тратим выдачу
+        if (
+            min_stars is not None
+            and floor is not None
+            and floor < float(min_stars) * FLOOR_MIN_RATIO
+        ):
+            return []
+
+        result = await self._request(
+            gift_id,
+            limit,
+            True,
+            stats,
+            gap,
+            timeout,
+            sort_by_price=sort_by_price,
+        )
+        lots = _parse_result(result, gift_type_id=gift_id) if result is not None else []
+        if not lots:
+            result2 = await self._request(
+                gift_id,
+                limit,
+                False,
+                stats,
+                gap,
+                timeout,
+                sort_by_price=sort_by_price,
+            )
+            if result2 is not None:
+                lots = _parse_result(result2, gift_type_id=gift_id)
+
+        if lots:
+            batch_floor = min(l.stars for l in lots)
+            if floor is None or batch_floor < floor:
+                floor = batch_floor
+                self._floor_cache[gift_id] = floor
+            for lot in lots:
+                lot.floor_stars = floor
+                lot.gift_type_id = gift_id
+            stats["ok"] += 1
+        elif result is None:
+            stats["errors"] += 1
+
+        if min_stars is not None and max_stars is not None:
+            lots = [
+                lot
+                for lot in lots
+                if min_stars <= lot.stars <= max_stars and is_fair_price(lot, min_stars)
+            ]
+        return lots
+
+    async def _probe_floor(
+        self,
+        gift_id: int,
+        stats: dict[str, int],
+        gap: float,
+        timeout: float,
+    ) -> float | None:
+        result = await self._request(
+            gift_id, 3, True, stats, gap, timeout, sort_by_price=True
+        )
+        if result is None:
+            return None
+        lots = _parse_result(result, gift_type_id=gift_id)
+        if not lots:
+            return None
+        return min(l.stars for l in lots)
 
     async def _request(
         self,
@@ -359,6 +529,8 @@ class TelegramMarket:
         stats: dict[str, int],
         gap: float,
         timeout: float,
+        *,
+        sort_by_price: bool = False,
     ) -> Any | None:
         for attempt in range(2):
             try:
@@ -376,6 +548,7 @@ class TelegramMarket:
                             offset="",
                             limit=min(limit, 50),
                             stars_only=True if stars_only else None,
+                            sort_by_price=True if sort_by_price else None,
                         )
                     ),
                     timeout=timeout,
@@ -397,7 +570,186 @@ class TelegramMarket:
             await asyncio.sleep(delay)
 
 
-def _parse_result(result: Any) -> list[Lot]:
+def is_fair_price(lot: Lot, min_stars: float) -> bool:
+    """Отсекает «снуп догов за 300⭐, выставленных за 55к»."""
+    floor = lot.floor_stars
+    if floor is None:
+        return True
+    if floor < float(min_stars) * FLOOR_MIN_RATIO:
+        return False
+    if lot.stars > floor * MAX_OVERPRICE_RATIO and lot.stars > floor + 5000:
+        return False
+    return True
+
+
+def is_russian_seller(lot: Lot) -> bool:
+    lang = (lot.lang_code or "").strip().lower()
+    if lang.startswith("ru"):
+        return True
+    if lang and not lang.startswith("ru"):
+        return False
+    name = f"{lot.first_name} {lot.last_name}"
+    return bool(_CYRILLIC_RE.search(name))
+
+
+def passes_filters(lot: Lot, settings: FilterSettings, min_stars: float) -> bool:
+    if settings.require_username and not lot.seller:
+        return False
+    if settings.russian_only and not is_russian_seller(lot):
+        return False
+    if settings.online_only and lot.is_online is not True:
+        return False
+    if settings.max_level is not None and lot.account_level is not None:
+        if lot.account_level > settings.max_level:
+            return False
+    if settings.max_gifts is not None and lot.gifts_count is not None:
+        if lot.gifts_count > settings.max_gifts:
+            return False
+    if settings.fair_price and not is_fair_price(lot, min_stars):
+        return False
+    return True
+
+
+def diversify_lots(
+    lots: list[Lot],
+    *,
+    unique_owners: bool = True,
+    diversify_models: bool = True,
+    limit: int | None = None,
+) -> list[Lot]:
+    """Один владелец — один раз; модели чередуются, без одинаковых подряд."""
+    if not lots:
+        return []
+
+    seen_owners: set[str] = set()
+    buckets: dict[str, list[Lot]] = {}
+    order_keys: list[str] = []
+
+    for lot in lots:
+        if unique_owners:
+            key = lot.owner_key
+            if key in seen_owners:
+                continue
+            # резервируем после фактического выбора
+        mk = lot.model_key if diversify_models else "_all"
+        if mk not in buckets:
+            buckets[mk] = []
+            order_keys.append(mk)
+        buckets[mk].append(lot)
+
+    out: list[Lot] = []
+    last_model = ""
+    picked_owners: set[str] = set()
+
+    while True:
+        progressed = False
+        # сначала ключи, отличные от last_model
+        keys = sorted(order_keys, key=lambda k: (k == last_model, -len(buckets.get(k, []))))
+        for mk in keys:
+            bucket = buckets.get(mk) or []
+            while bucket:
+                lot = bucket.pop(0)
+                if unique_owners:
+                    ok = lot.owner_key
+                    if ok in picked_owners:
+                        continue
+                    picked_owners.add(ok)
+                out.append(lot)
+                last_model = mk
+                progressed = True
+                if limit is not None and len(out) >= limit:
+                    return out
+                break
+            if progressed:
+                break
+        if not progressed:
+            break
+    return out
+
+
+def filter_and_diversify(
+    lots: list[Lot],
+    settings: FilterSettings,
+    min_stars: float,
+    *,
+    limit: int | None = None,
+) -> list[Lot]:
+    filtered = [lot for lot in lots if passes_filters(lot, settings, min_stars)]
+    return diversify_lots(
+        filtered,
+        unique_owners=settings.unique_owners,
+        diversify_models=settings.diversify_models,
+        limit=limit,
+    )
+
+
+def _apply_user_basic(lot: Lot, user: Any) -> None:
+    username = _extract_username(user)
+    if username:
+        lot.seller = username
+    sid = getattr(user, "id", None)
+    if sid is not None:
+        try:
+            lot.seller_id = int(sid)
+        except (TypeError, ValueError):
+            pass
+    lang = str(getattr(user, "lang_code", "") or "").strip()
+    if lang:
+        lot.lang_code = lang
+    fn = str(getattr(user, "first_name", "") or "")
+    ln = str(getattr(user, "last_name", "") or "")
+    if fn:
+        lot.first_name = fn
+    if ln:
+        lot.last_name = ln
+    status = getattr(user, "status", None)
+    if status is not None:
+        lot.is_online = isinstance(status, UserStatusOnline) or status.__class__.__name__ == (
+            "UserStatusOnline"
+        )
+
+
+def _apply_user_cache(lot: Lot, info: dict[str, Any]) -> None:
+    if info.get("username") and not lot.seller:
+        lot.seller = str(info["username"])
+    if info.get("lang_code") and not lot.lang_code:
+        lot.lang_code = str(info["lang_code"])
+    if info.get("first_name") and not lot.first_name:
+        lot.first_name = str(info["first_name"])
+    if info.get("last_name") and not lot.last_name:
+        lot.last_name = str(info["last_name"])
+    if info.get("is_online") is not None and lot.is_online is None:
+        lot.is_online = bool(info["is_online"])
+    if info.get("account_level") is not None:
+        lot.account_level = int(info["account_level"])
+    if info.get("gifts_count") is not None:
+        lot.gifts_count = int(info["gifts_count"])
+
+
+def _extract_username(user: Any) -> str:
+    raw = str(getattr(user, "username", "") or "").lstrip("@").strip()
+    if raw:
+        return raw
+    for alt in getattr(user, "usernames", None) or []:
+        name = str(getattr(alt, "username", "") or "").lstrip("@").strip()
+        if not name:
+            continue
+        if getattr(alt, "active", True):
+            return name
+    return ""
+
+
+def _peer_user_id(owner: Any) -> int | None:
+    if owner is None:
+        return None
+    seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
+    try:
+        return int(seller_id) if seller_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_result(result: Any, gift_type_id: int | None = None) -> list[Lot]:
     users = {
         int(u.id): u
         for u in (getattr(result, "users", None) or [])
@@ -406,7 +758,7 @@ def _parse_result(result: Any) -> list[Lot]:
     now = time.time()
     lots: list[Lot] = []
     for gift in getattr(result, "gifts", []) or []:
-        lot = _parse(gift, users)
+        lot = _parse(gift, users, gift_type_id=gift_type_id)
         if lot:
             lot.seen_at = now
             lots.append(lot)
@@ -472,7 +824,11 @@ def _extract_stars(gift: Any) -> float | None:
     return None
 
 
-def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
+def _parse(
+    gift: Any,
+    users: dict[int, Any] | None = None,
+    gift_type_id: int | None = None,
+) -> Lot | None:
     gift_id = getattr(gift, "id", None)
     slug = str(getattr(gift, "slug", None) or "")
     title = str(getattr(gift, "title", None) or "Gift")
@@ -494,21 +850,26 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
 
     seller = ""
     seller_id: int | None = None
+    lang_code = ""
+    first_name = ""
+    last_name = ""
+    is_online: bool | None = None
+
     owner = getattr(gift, "owner_id", None)
-    if owner is not None:
-        seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-        try:
-            seller_id = int(seller_id) if seller_id is not None else None
-        except (TypeError, ValueError):
-            seller_id = None
-        if seller_id and users and seller_id in users:
-            seller = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
+    seller_id = _peer_user_id(owner)
+    if seller_id and users and seller_id in users:
+        u = users[seller_id]
+        seller = _extract_username(u)
+        lang_code = str(getattr(u, "lang_code", "") or "").strip()
+        first_name = str(getattr(u, "first_name", "") or "")
+        last_name = str(getattr(u, "last_name", "") or "")
+        status = getattr(u, "status", None)
+        if status is not None:
+            is_online = isinstance(status, UserStatusOnline) or (
+                status.__class__.__name__ == "UserStatusOnline"
+            )
 
-    if not seller:
-        raw = str(getattr(gift, "owner_name", "") or "").strip().lstrip("@")
-        if raw and raw.lower() not in {"hidden", "anonymous", "telegram"} and " " not in raw:
-            seller = raw
-
+    # Не берём owner_name как @username — часто это имя, из‑за этого «скрыт» / мусор
     number_i = int(number) if number is not None else None
     return Lot(
         id=str(gift_id or slug or f"{title}-{number_i}"),
@@ -521,4 +882,9 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         symbol=symbol,
         seller=seller,
         seller_id=seller_id,
+        gift_type_id=gift_type_id,
+        lang_code=lang_code,
+        first_name=first_name,
+        last_name=last_name,
+        is_online=is_online,
     )

@@ -1,8 +1,9 @@
 """
 Бот: Telegram Market · только лоты за Stars.
 
-Без SQLite / без файла сессии. Каждый /start — только номер+код.
-Старый аккаунт сам не подхватывается.
+- Без файла сессии на диске (RAM StringSession)
+- Если НЕ вошёл → /start просит номер+код
+- Если УЖЕ вошёл → /start сразу жжёт парсинг
 """
 
 from __future__ import annotations
@@ -63,9 +64,8 @@ class AuthStates(StatesGroup):
 class App:
     def __init__(self) -> None:
         Path("data").mkdir(exist_ok=True)
-        # Только RAM — никакого .session sqlite на диске
         self.client = TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
-        self.market = TelegramMarket(self.client, concurrency=16)
+        self.market = TelegramMarket(self.client, concurrency=creds.CONCURRENCY)
         self.bot: Bot | None = None
         self.owner_id: int | None = None
         self.running = False
@@ -76,6 +76,7 @@ class App:
         self.min_stars = float(creds.MIN_STARS)
         self.max_stars = float(creds.MAX_STARS)
         self.logged_in = False
+        self.account_name = ""
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -115,32 +116,39 @@ class App:
             raise ValueError("Неверный код.") from exc
         except PhoneCodeExpiredError as exc:
             raise ValueError("Код истёк. Нажми /start заново.") from exc
-        self.logged_in = True
+        await self._mark_logged_in()
         return "OK"
 
     async def confirm_password(self, password: str) -> None:
         await self.client.sign_in(password=password.strip())
+        await self._mark_logged_in()
+
+    async def _mark_logged_in(self) -> None:
         self.logged_in = True
+        me = await self.client.get_me()
+        self.account_name = (
+            f"@{me.username}" if me.username else (me.first_name or str(me.id))
+        )
+        self.market.set_client(self.client)
 
     async def reset_auth(self) -> None:
-        """Полный сброс: стоп парсинга + новый пустой клиент без сессии."""
         await self.stop_monitor()
         try:
             if self.client.is_connected():
                 await self.client.disconnect()
         except Exception as exc:  # noqa: BLE001
             logger.warning("disconnect: %s", exc)
-
         self.phone = None
         self.phone_code_hash = None
         self.logged_in = False
+        self.account_name = ""
         self.client = self._new_client()
-        self.market = TelegramMarket(self.client, concurrency=16)
-        wipe_all_storage()
+        self.market = TelegramMarket(self.client, concurrency=creds.CONCURRENCY)
+        wipe_disk_junk()
 
     async def start_monitor(self, user_id: int) -> str:
         if not self.logged_in:
-            raise RuntimeError("Сначала пройди авторизацию (номер + код).")
+            raise RuntimeError("Сначала авторизация (номер + код).")
         if self.running:
             await self.stop_monitor()
         self.owner_id = user_id
@@ -148,9 +156,10 @@ class App:
         self._seen.clear()
         self._task = asyncio.create_task(self._loop(), name="market-loop")
         return (
-            "▶️ Telegram Market · только ⭐\n"
+            "▶️ <b>Парсинг запущен</b>\n"
+            f"Акк: <b>{self.account_name}</b>\n"
             f"Диапазон: <b>{int(self.min_stars)}–{int(self.max_stars)} ⭐</b>\n"
-            "Ищу свежие выставления (~1 час). Старьё не кидаю."
+            "Жгу свежие лоты Telegram Market (~1 час)…"
         )
 
     async def stop_monitor(self) -> str:
@@ -171,57 +180,68 @@ class App:
 
     def _purge_old_seen(self) -> None:
         now = time.monotonic()
-        old = [k for k, ts in self._seen.items() if now - ts > FRESH_WINDOW_SEC]
-        for k in old:
+        for k in [k for k, ts in self._seen.items() if now - ts > FRESH_WINDOW_SEC]:
             del self._seen[k]
 
     async def _loop(self) -> None:
         primed = False
         ticks = 0
+        # First tick: full market snapshot (seed), then hot waves forever
         while self.running:
             started = time.monotonic()
             try:
-                lots = await self.market.fetch_newest(per_collection=creds.PER_COLLECTION)
-                in_range = [lot for lot in lots if self._in_price(lot)]
-                self._purge_old_seen()
-
                 if not primed:
+                    lots = await self.market.fetch_newest(per_collection=creds.PER_COLLECTION)
                     now = time.monotonic()
                     for lot in lots:
                         self._seen[lot.id] = now
                     primed = True
+                    in_range = [lot for lot in lots if self._in_price(lot)]
                     preview = in_range[: creds.PREVIEW_LOTS]
                     if self.owner_id and self.bot:
                         await self.bot.send_message(
                             self.owner_id,
-                            "📡 Живой парсер · Telegram Market (Stars)\n"
-                            f"В диапазоне сейчас: <b>{len(in_range)}</b>\n"
-                            f"Топ-{len(preview)} свежих, дальше только новые:",
+                            "📡 Парсер живой · Telegram Market (Stars)\n"
+                            f"Коллекций просканировано, в диапазоне: <b>{len(in_range)}</b>\n"
+                            f"Кидаю топ-{len(preview)}, дальше только новые выставления:",
                         )
                     for lot in preview:
                         await self._notify(lot)
+                    logger.info("primed lots=%s in_range=%s", len(lots), len(in_range))
                 else:
-                    fresh = [lot for lot in in_range if lot.id not in self._seen]
-                    now = time.monotonic()
-                    for lot in lots:
-                        if lot.id not in self._seen and not self._in_price(lot):
+                    self._purge_old_seen()
+                    fresh_total = 0
+                    scanned = 0
+                    async for chunk in self.market.iter_wave(
+                        per_collection=creds.PER_COLLECTION,
+                        batch_size=creds.WAVE_BATCH,
+                    ):
+                        if not self.running:
+                            break
+                        scanned += len(chunk)
+                        now = time.monotonic()
+                        for lot in chunk:
+                            if lot.id in self._seen:
+                                continue
                             self._seen[lot.id] = now
-                    for lot in fresh:
-                        self._seen[lot.id] = now
+                            if not self._in_price(lot):
+                                continue
+                            fresh_total += 1
+                            logger.info(
+                                "NEW %.0f⭐ [%s] %s",
+                                lot.stars,
+                                lot.category,
+                                lot.display,
+                            )
+                            await self._notify(lot)
+
+                    if ticks % 10 == 0:
                         logger.info(
-                            "NEW %.0f⭐ [%s] %s",
-                            lot.stars,
-                            lot.category,
-                            lot.display,
-                        )
-                        await self._notify(lot)
-                    if ticks % 20 == 0:
-                        logger.info(
-                            "tick#%s lots=%s in_range=%s fresh=%s",
+                            "wave#%s scanned=%s fresh=%s seen=%s",
                             ticks,
-                            len(lots),
-                            len(in_range),
-                            len(fresh),
+                            scanned,
+                            fresh_total,
+                            len(self._seen),
                         )
                 ticks += 1
             except asyncio.CancelledError:
@@ -230,7 +250,7 @@ class App:
                 logger.exception("poll failed: %s", exc)
 
             elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.05, creds.POLL_INTERVAL - elapsed))
+            await asyncio.sleep(max(0.02, creds.POLL_INTERVAL - elapsed))
 
     async def _notify(self, lot: Lot) -> None:
         if not self.bot or not self.owner_id:
@@ -294,56 +314,60 @@ def _fmt(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ")
 
 
-def wipe_all_storage() -> None:
-    """Сносит любые .session / .db — никакой автоподхвата старого акка."""
+def wipe_disk_junk() -> None:
+    """Сносит старые .session/.db с диска — автоподхвата акка нет."""
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
     removed: list[str] = []
-
-    patterns = [
-        "*session*",
-        "*.session",
-        "*.session-journal",
-        "*.db",
-        "*.db-*",
-        "*.sqlite",
-        "*.sqlite3",
-    ]
     for folder in (data, root):
-        for pattern in patterns:
+        for pattern in ("*session*", "*.db", "*.db-*", "*.sqlite*"):
             for path in folder.glob(pattern):
                 if path.is_file():
                     try:
                         path.unlink()
                         removed.append(str(path))
-                    except OSError as exc:
-                        logger.warning("cannot delete %s: %s", path, exc)
-
+                    except OSError:
+                        pass
     old_pkg = root / "bot"
     if old_pkg.is_dir():
         shutil.rmtree(old_pkg, ignore_errors=True)
         removed.append(str(old_pkg))
-
     if removed:
-        logger.info("Storage wiped: %s", removed)
-    else:
-        logger.info("No on-disk session/db found")
+        logger.info("Wiped disk junk: %s", removed)
+
+
+async def _ask_phone(message: Message, state: FSMContext) -> None:
+    await state.set_state(AuthStates.phone)
+    await message.answer(
+        "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
+        "Нужен вход (номер → код), потом /start сразу парсит.\n\n"
+        "📱 Номер: <code>+79991234567</code>",
+        reply_markup=_phone_kb(),
+    )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    # Всегда с нуля: не читаем старый акк с диска
-    await app.reset_auth()
-    await state.set_state(AuthStates.phone)
-    await message.answer(
-        "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
-        "Старые сессии сброшены. Базы нет.\n"
-        "Чтобы парсить — нужна авторизация <b>сейчас</b>.\n\n"
-        "📱 Пришли номер: <code>+79991234567</code>",
-        reply_markup=_phone_kb(),
-    )
+
+    # Уже авторизован в этой сессии процесса → сразу парсинг
+    if app.logged_in:
+        try:
+            text = await app.start_monitor(message.from_user.id)
+        except RuntimeError as exc:
+            await message.answer(f"⚠️ {exc}")
+            await _ask_phone(message, state)
+            return
+        await message.answer(
+            f"{text}\n\nСтоп — /stop · сменить акк — /logout",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # Не вошёл — просим номер (старый диск-акк не подтягиваем)
+    wipe_disk_junk()
+    await _ask_phone(message, state)
 
 
 @router.message(Command("stop"))
@@ -351,7 +375,7 @@ async def cmd_stop(message: Message, state: FSMContext) -> None:
     await state.clear()
     text = await app.stop_monitor()
     await message.answer(
-        f"{text}\nНажми /start и заново пройди вход.",
+        f"{text}\n/start — снова парсить (если уже вошёл).",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -360,11 +384,7 @@ async def cmd_stop(message: Message, state: FSMContext) -> None:
 async def cmd_logout(message: Message, state: FSMContext) -> None:
     await state.clear()
     await app.reset_auth()
-    await state.set_state(AuthStates.phone)
-    await message.answer(
-        "Сброшено. Пришли номер:",
-        reply_markup=_phone_kb(),
-    )
+    await _ask_phone(message, state)
 
 
 @router.message(StateFilter(AuthStates.phone), F.text == "❌ Отмена")
@@ -374,7 +394,7 @@ async def cancel_auth(message: Message, state: FSMContext) -> None:
     await state.clear()
     await app.reset_auth()
     await message.answer(
-        "Отменено. Парсинг без входа не стартует.\n/start — заново.",
+        "Отменено. Без входа парсинг не стартует.\n/start — заново.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -413,11 +433,10 @@ async def got_code(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    me = await app.client.get_me()
-    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
     text = await app.start_monitor(message.from_user.id)
     await message.answer(
-        f"✅ Вошли как <b>{who}</b>\n\n{text}\nСтоп — /stop",
+        f"✅ Вошли как <b>{app.account_name}</b>\n\n{text}\n"
+        "Дальше /start сразу парсит. Стоп — /stop.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -430,17 +449,16 @@ async def got_password(message: Message, state: FSMContext) -> None:
         await message.answer(f"⚠️ Пароль не принят: {exc}")
         return
     await state.clear()
-    me = await app.client.get_me()
-    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
     text = await app.start_monitor(message.from_user.id)
     await message.answer(
-        f"✅ Вошли как <b>{who}</b>\n\n{text}\nСтоп — /stop",
+        f"✅ Вошли как <b>{app.account_name}</b>\n\n{text}\n"
+        "Дальше /start сразу парсит. Стоп — /stop.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
 async def main() -> None:
-    wipe_all_storage()
+    wipe_disk_junk()
     bot = Bot(
         token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -448,9 +466,9 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт · вход по номеру"),
+            BotCommand(command="start", description="Старт парсинга / вход"),
             BotCommand(command="stop", description="Стоп"),
-            BotCommand(command="logout", description="Сбросить вход"),
+            BotCommand(command="logout", description="Сменить аккаунт"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -458,7 +476,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Ready | no disk session/db | /start always asks phone")
+    logger.info("Ready | RAM session | /start parses if logged in")
     try:
         await dp.start_polling(bot)
     finally:

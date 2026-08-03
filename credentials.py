@@ -3,7 +3,8 @@
 BOT_TOKEN = "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
-SESSION = "data/market_session"
+# v2 — старая сессия сброшена, бот снова попросит номер
+SESSION = "data/market_session_v2"
 
 # Price filter (Stars)
 MIN_STARS = 2000

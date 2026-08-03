@@ -8,6 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from bot import credentials as creds
 from bot.config import get_settings
 from bot.database import init_db
 from bot.handlers import setup_routers
@@ -24,6 +25,13 @@ async def main() -> None:
     setup_logging(settings.log_level)
     await init_db()
 
+    logger.info(
+        "Credentials loaded from code: api_id=%s hash=%s… token=%s…",
+        creds.API_ID,
+        creds.API_HASH[:6],
+        creds.BOT_TOKEN[:8],
+    )
+
     rates = RateService()
     await rates.load_cached()
     try:
@@ -32,7 +40,6 @@ async def main() -> None:
         logger.warning("Initial rates refresh failed: %s", exc)
 
     auth = AuthService(settings)
-    logger.info("Telethon API_ID loaded: %s", bool(settings.api_id and settings.api_hash))
     if await auth.is_authorized():
         logger.info("Telethon session OK: %s", auth.authorized_as)
         try:
@@ -41,23 +48,33 @@ async def main() -> None:
             logger.warning("Token refresh failed: %s", exc)
         parsers = await auth.build_authorized_parsers()
     else:
-        logger.warning("No Telethon session — /start will ask phone+code")
+        logger.warning("No Telethon session — press 🚀 Старт / 🔐 Войти")
         parsers = await build_parsers(settings)
 
     converter = PriceConverter(rates)
     bot = Bot(
-        token=settings.bot_token,
+        token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
-    monitor = MonitorService(bot=bot, parsers=parsers, rates=rates, converter=converter)
+    monitor = MonitorService(
+        bot=bot,
+        parsers=parsers,
+        rates=rates,
+        converter=converter,
+        owner_resolver=auth.owner_resolver,
+    )
 
     dp["monitor"] = monitor
     dp["rates"] = rates
     dp["auth"] = auth
     dp.include_router(setup_routers())
 
-    logger.info("Bot started. Markets: %s", ", ".join(p.title for p in parsers))
+    logger.info(
+        "Bot started. Markets: %s | poll≈%ss",
+        ", ".join(p.title for p in parsers),
+        creds.DEFAULT_POLL_INTERVAL,
+    )
     try:
         await dp.start_polling(bot)
     finally:

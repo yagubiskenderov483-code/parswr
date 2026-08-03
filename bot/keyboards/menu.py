@@ -80,7 +80,7 @@ def price_presets(kind: str) -> InlineKeyboardMarkup:
     presets = {
         "min": [2000, 5000, 10000, 15000, 30000],
         "max": [5000, 10000, 30000, 65000, 100000],
-        "interval": [1, 2, 3, 5, 10],
+        "interval": [0.3, 0.5, 1, 2, 3],
     }
     rows: list[list[InlineKeyboardButton]] = []
     for value in presets[kind]:

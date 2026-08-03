@@ -62,7 +62,7 @@ class TonnelParser(BaseMarketParser):
             json=payload,
             headers=self._headers(),
             impersonate="chrome",
-            timeout=30,
+            timeout=12,
         )
         response.raise_for_status()
         data = response.json()

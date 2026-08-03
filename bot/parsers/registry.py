@@ -9,6 +9,7 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import RequestAppWebViewRequest
 from telethon.tl.types import InputBotAppShortName, InputUser
 
+from bot import credentials as creds
 from bot.config import Settings
 from bot.parsers.base import BaseMarketParser
 from bot.parsers.mrkt import MrktParser
@@ -48,7 +49,7 @@ async def fetch_mrkt_token(client: TelegramClient) -> str:
         "https://api.tgmrkt.io/api/v1/auth",
         json={"data": init_data},
         impersonate="chrome",
-        timeout=30,
+        timeout=20,
     )
     response.raise_for_status()
     token = response.json().get("token")
@@ -62,9 +63,14 @@ async def fetch_portals_auth(client: TelegramClient) -> str:
     return f"tma {init_data}"
 
 
-def build_telethon(settings: Settings) -> TelegramClient:
-    settings.require_telethon()
-    return TelegramClient(str(settings.session_path), settings.api_id, settings.api_hash)
+def build_telethon(settings: Settings | None = None) -> TelegramClient:
+    session = settings.session_path if settings else Path(creds.TELETHON_SESSION)
+    if not session.is_absolute():
+        from bot.config.settings import ROOT_DIR
+
+        session = ROOT_DIR / session
+    session.parent.mkdir(parents=True, exist_ok=True)
+    return TelegramClient(str(session), creds.API_ID, creds.API_HASH)
 
 
 async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
@@ -75,7 +81,7 @@ async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
 
     telethon_client: TelegramClient | None = None
     session_file = Path(str(settings.session_path) + ".session")
-    if settings.api_id and settings.api_hash and session_file.exists():
+    if session_file.exists():
         try:
             telethon_client = build_telethon(settings)
             await telethon_client.connect()
@@ -93,17 +99,23 @@ async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
                 if not portals_auth:
                     try:
                         portals_auth = await fetch_portals_auth(telethon_client)
-                        logger.info("Portal auth acquired via Telethon")
+                        logger.info("Portal auth ready")
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Portal auth failed: %s", exc)
+                if not tonnel_auth:
+                    try:
+                        tonnel_auth = await get_webapp_init_data(
+                            telethon_client, "tonnel_network_bot", "gifts"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Tonnel auth failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Telethon init failed: %s", exc)
             telethon_client = None
 
-    parsers: list[BaseMarketParser] = [
+    return [
         TonnelParser(auth=tonnel_auth),
         MrktParser(token=mrkt_token),
         PortalParser(auth=portals_auth),
         TelegramMarketParser(client=telethon_client),
     ]
-    return parsers

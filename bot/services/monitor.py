@@ -10,11 +10,11 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import LinkPreviewOptions
 
+from bot import credentials as creds
 from bot.database import session_scope
 from bot.database.models import AppSettings
 from bot.database.repositories import (
     get_or_create_settings,
-    is_seen,
     mark_seen,
     seed_seen,
     start_parse_run,
@@ -24,7 +24,9 @@ from bot.models import MarketName, UnifiedLot
 from bot.parsers.base import BaseMarketParser
 from bot.services.converter import PriceConverter
 from bot.services.notifier import format_lot_message, lot_keyboard
+from bot.services.owner import OwnerResolver
 from bot.services.rates import RateService
+from bot.utils.links import write_url
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +51,16 @@ class MonitorService:
         parsers: list[BaseMarketParser],
         rates: RateService,
         converter: PriceConverter,
+        owner_resolver: OwnerResolver | None = None,
     ) -> None:
         self.bot = bot
         self.parsers = parsers
         self.rates = rates
         self.converter = converter
+        self.owner_resolver = owner_resolver or OwnerResolver()
         self.state = MonitorState()
         self._task: asyncio.Task | None = None
+        self._seen_memory: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -75,7 +80,7 @@ class MonitorService:
         self.state.primed = False
         self._task = asyncio.create_task(self._loop(user_id), name="monitor-loop")
         logger.info("Parser started by user %s", user_id)
-        return "▶️ Парсинг запущен по всем включённым маркетам."
+        return "▶️ Парсинг запущен (быстрый режим)."
 
     async def stop(self) -> str:
         if not self.state.running:
@@ -97,12 +102,13 @@ class MonitorService:
     async def _loop(self, user_id: int) -> None:
         while self.state.running:
             started = datetime.now(timezone.utc)
-            poll_interval = 2.0
+            poll_interval = creds.DEFAULT_POLL_INTERVAL
             try:
                 async with session_scope() as session:
                     settings = await get_or_create_settings(session, user_id)
                     cfg = _Snapshot.from_row(settings)
-                    poll_interval = cfg.poll_interval
+                    # Force fast polling floor
+                    poll_interval = max(0.25, min(cfg.poll_interval, 1.0))
 
                 await self._tick(cfg)
                 self.state.last_tick_at = datetime.now(timezone.utc)
@@ -112,7 +118,7 @@ class MonitorService:
                 logger.exception("Monitor tick failed: %s", exc)
 
             elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-            await asyncio.sleep(max(0.5, poll_interval - elapsed))
+            await asyncio.sleep(max(0.05, poll_interval - elapsed))
 
     async def _tick(self, cfg: "_Snapshot") -> None:
         active = [p for p in self.parsers if _market_enabled(p.name, cfg)]
@@ -121,7 +127,7 @@ class MonitorService:
             return
 
         results = await asyncio.gather(
-            *[p.safe_fetch(limit=30) for p in active],
+            *[p.safe_fetch(limit=20) for p in active],
             return_exceptions=False,
         )
 
@@ -141,31 +147,38 @@ class MonitorService:
                     unified.append(lot)
 
         if not self.state.primed:
+            self._seen_memory |= {fp for fp, _, _ in seed_payload}
             async with session_scope() as session:
                 added = await seed_seen(session, seed_payload)
             self.state.primed = True
             logger.info("Seeded %s existing lots (no notifications)", added)
             return
 
-        # Deduplicate within tick
-        seen_local: set[str] = set()
         fresh: list[UnifiedLot] = []
-        async with session_scope() as session:
-            for lot in unified:
-                if lot.fingerprint in seen_local:
-                    continue
-                seen_local.add(lot.fingerprint)
-                if await is_seen(session, lot.fingerprint):
-                    continue
-                await mark_seen(session, lot)
-                fresh.append(lot)
+        for lot in unified:
+            if lot.fingerprint in self._seen_memory:
+                continue
+            self._seen_memory.add(lot.fingerprint)
+            fresh.append(lot)
 
+        if not fresh:
+            return
+
+        # Enrich owners in parallel (fast, best-effort)
+        await asyncio.gather(*[self._enrich_owner(lot) for lot in fresh])
+
+        async with session_scope() as session:
+            for lot in fresh:
+                await mark_seen(session, lot)
+
+        # Notify ASAP — don't wait between sends more than needed
         for lot in fresh:
             logger.info(
-                "New lot [%s] %s | %.0f⭐ | %s",
+                "New lot [%s] %s | %.0f⭐ | @%s | %s",
                 lot.market.value,
-                lot.display_title()[:60],
+                lot.display_title()[:50],
                 lot.price_stars,
+                lot.seller_username or "—",
                 lot.difficulty.value,
             )
             if cfg.notifications_enabled and self.state.owner_id:
@@ -175,6 +188,30 @@ class MonitorService:
                     reply_markup=lot_keyboard(lot),
                 )
             self.state.lots_found += 1
+
+    async def _enrich_owner(self, lot: UnifiedLot) -> None:
+        if lot.seller_username:
+            return
+        try:
+            username = await asyncio.wait_for(
+                self.owner_resolver.resolve(
+                    title=lot.title,
+                    number=lot.number,
+                    nft_url=lot.nft_url,
+                    current_username=lot.seller_username,
+                ),
+                timeout=1.5,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if not username:
+            return
+        lot.seller_username = username.lstrip("@")
+        lot.write_url = write_url(
+            seller_username=lot.seller_username,
+            seller_id=lot.seller_id,
+            market_url=lot.url,
+        )
 
     async def reload_parsers(self, parsers: list[BaseMarketParser]) -> None:
         self.parsers = parsers
@@ -189,7 +226,7 @@ class MonitorService:
                 reply_markup=reply_markup,
             )
         except TelegramRetryAfter as exc:
-            await asyncio.sleep(exc.retry_after + 0.5)
+            await asyncio.sleep(exc.retry_after + 0.2)
             await self.bot.send_message(
                 user_id,
                 text,

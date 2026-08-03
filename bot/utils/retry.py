@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 async def with_retries(
     func: Callable[[], Awaitable[T]],
     *,
-    attempts: int = 3,
-    delay: float = 1.0,
+    attempts: int = 2,
+    delay: float = 0.25,
     label: str = "operation",
 ) -> T:
     last_exc: Exception | None = None

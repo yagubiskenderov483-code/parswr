@@ -6,7 +6,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
-from bot.config import get_settings
 from bot.keyboards import main_menu
 from bot.services.auth import AuthService
 from bot.services.monitor import MonitorService
@@ -28,22 +27,16 @@ def _phone_kb() -> ReplyKeyboardMarkup:
 
 
 async def _ensure_api_keys(message: Message) -> bool:
-    settings = get_settings()
-    try:
-        settings.require_telethon()
-        return True
-    except RuntimeError as exc:
-        await message.answer(f"⚠️ {exc}", reply_markup=main_menu())
-        return False
+    # Credentials are hardcoded in bot.credentials — always OK.
+    return True
 
 
 async def begin_auth(message: Message, state: FSMContext) -> None:
-    if not await _ensure_api_keys(message):
-        return
     await state.set_state(AuthStates.phone)
     await message.answer(
         "🔐 <b>Авторизация Telegram-аккаунта</b>\n\n"
-        "Нужна, чтобы парсить MRKT / Portal / Telegram Market.\n"
+        "Нужна, чтобы парсить MRKT / Portal / Telegram Market "
+        "и находить юз владельца подарка.\n\n"
         "Пришли номер в формате:\n"
         "<code>+79991234567</code>",
         reply_markup=_phone_kb(),
@@ -115,9 +108,6 @@ async def got_phone(message: Message, state: FSMContext, auth: AuthService) -> N
         "📊 Статистика",
         "🔄 Обновить курсы валют",
     }:
-        return
-
-    if not await _ensure_api_keys(message):
         return
 
     try:

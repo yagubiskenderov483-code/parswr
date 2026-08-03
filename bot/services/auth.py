@@ -13,7 +13,8 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
-from bot.config import Settings, get_settings
+from bot import credentials as creds
+from bot.config import Settings
 from bot.parsers.registry import (
     build_parsers,
     build_telethon,
@@ -21,6 +22,7 @@ from bot.parsers.registry import (
     fetch_portals_auth,
     get_webapp_init_data,
 )
+from bot.services.owner import OwnerResolver
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +39,18 @@ class AuthService:
         self.mrkt_token: str = ""
         self.portals_auth: str = ""
         self.tonnel_auth: str = ""
+        self.owner_resolver = OwnerResolver()
 
     @property
     def session_file(self) -> Path:
         return Path(str(self.settings.session_path) + ".session")
 
     async def ensure_client(self) -> TelegramClient:
-        # Always re-read settings (.env may be filled after start)
-        self.settings = get_settings()
-        self.settings.require_telethon()
         if self.client is None:
             self.client = build_telethon(self.settings)
         if not self.client.is_connected():
             await self.client.connect()
+        self.owner_resolver.set_client(self.client)
         return self.client
 
     async def is_authorized(self) -> bool:
@@ -59,6 +60,7 @@ class AuthService:
             if ok and not self.authorized_as:
                 me = await client.get_me()
                 self.authorized_as = _format_user(me)
+                self.owner_resolver.set_client(client)
             return ok
         except Exception as exc:  # noqa: BLE001
             logger.warning("Auth check failed: %s", exc)
@@ -93,7 +95,7 @@ class AuthService:
         except PhoneCodeInvalidError as exc:
             raise ValueError("Неверный код. Попробуй ещё раз.") from exc
         except PhoneCodeExpiredError as exc:
-            raise ValueError("Код истёк. Нажми /start и введи номер заново.") from exc
+            raise ValueError("Код истёк. Нажми 🚀 Старт и введи номер заново.") from exc
         await self._on_success()
         return "OK"
 
@@ -110,6 +112,7 @@ class AuthService:
         client = await self.ensure_client()
         me = await client.get_me()
         self.authorized_as = _format_user(me)
+        self.owner_resolver.set_client(client)
         await self.refresh_market_tokens()
         logger.info("Telethon authorized as %s", self.authorized_as)
 
@@ -136,7 +139,6 @@ class AuthService:
             logger.warning("Tonnel auth failed: %s", exc)
 
     async def build_authorized_parsers(self):
-        # Prefer freshly obtained tokens; env fallbacks handled inside build_parsers
         import os
 
         if self.mrkt_token:

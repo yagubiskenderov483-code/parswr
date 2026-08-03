@@ -18,7 +18,7 @@ class AppSettings(Base):
     user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
     min_stars: Mapped[float] = mapped_column(Float, default=2000.0)
     max_stars: Mapped[float] = mapped_column(Float, default=100000.0)
-    poll_interval: Mapped[float] = mapped_column(Float, default=2.0)
+    poll_interval: Mapped[float] = mapped_column(Float, default=0.4)
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     market_telegram: Mapped[bool] = mapped_column(Boolean, default=True)
     market_portal: Mapped[bool] = mapped_column(Boolean, default=True)

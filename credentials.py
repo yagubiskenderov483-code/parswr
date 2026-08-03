@@ -1,4 +1,4 @@
-"""Hardcoded Telegram credentials."""
+"""Hardcoded Telegram credentials + tunables."""
 
 BOT_TOKEN = "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"
 API_ID = 36101343
@@ -7,18 +7,20 @@ API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 MIN_STARS = 2000
 MAX_STARS = 5000
 
-# TON (nanograms) → Stars для фильтра цен
 STARS_PER_TON = 300.0
 
-# Качество выдачи
-# lvl 5 / 6 / 8+ режем — оставляем только ≤4
-MAX_ACCOUNT_LEVEL = 4
-# киты с кучей гифтов на профиле
+# Качество
+MAX_ACCOUNT_LEVEL = 4  # режем 5/6/8+
 MAX_PROFILE_GIFTS = 40
-MIN_RU_SCORE = 2  # кириллица в био/имени/канале/подарках
-GIFTS_PROBE_LIMIT = 10
+MIN_RU_SCORE = 2
+GIFTS_PROBE_LIMIT = 8
 
-# Быстрый первый выброс — жёсткий потолок ~3с
+# Свежесть: лоты ~1–2 минуты (первое появление / смена цены)
+FRESH_MAX_AGE_SEC = 120
+# в ответе маркета только топ-N «самых новых» на коллекцию
+FRESH_MAX_RANK = 2
+
+# Burst ≤3с
 BURST_PARALLEL = 24
 BURST_PER_COLLECTION = 8
 BURST_MAX_COLLECTIONS = 80
@@ -29,7 +31,7 @@ RESULT_LIMIT = 100
 PREVIEW_COUNT = 100
 
 # Чеки
-CHECK_INTERVAL = 0.8
+CHECK_INTERVAL = 0.75
 CHECK_PARALLEL = 12
 CHECK_PER_COLLECTION = 8
 CHECK_BATCH = 30
@@ -38,6 +40,10 @@ CHECK_GAP = 0.025
 OWNER_TIMEOUT = 0.55
 OWNER_PARALLEL = 14
 PAID_DM_TIMEOUT = 1.4
-PROFILE_TIMEOUT = 1.6
+PROFILE_TIMEOUT = 1.5
 PROFILE_PARALLEL = 10
-NOTIFY_GAP = 0.1  # пауза между карточками, чтобы не шли пачкой
+
+# Антифлуд: 50 карточек / мин, пауза между
+NOTIFY_PER_MIN = 50
+NOTIFY_GAP = 0.12
+AUTO_BLACKLIST = True  # после выдачи юз в чёрный список (не дублировать)

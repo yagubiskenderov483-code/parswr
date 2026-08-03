@@ -41,6 +41,7 @@ from telethon.tl.types import (
 )
 
 import credentials as creds
+from store import store
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ class Lot:
     ru_score: int = 0
     ru_ok: bool = False
     skip_reason: str = ""
+    market_rank: int = 0  # 0 = самый свежий в ответе коллекции
+    listing_age: float = 0.0
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -115,6 +118,8 @@ class PrepareStats:
     level_skip: int = 0
     gifts_skip: int = 0
     ru_skip: int = 0
+    fresh_skip: int = 0
+    black_skip: int = 0
     kept: int = 0
 
 
@@ -131,8 +136,29 @@ class TelegramMarket:
         self._profile_cache: dict[int | str, dict[str, Any]] = {}
         self.check_no = 0
         self.last_error = ""
+        # runtime filters (Settings может менять)
+        self.max_level = creds.MAX_ACCOUNT_LEVEL
+        self.max_gifts = creds.MAX_PROFILE_GIFTS
+        self.min_ru = creds.MIN_RU_SCORE
+        self.fresh_age = float(creds.FRESH_MAX_AGE_SEC)
+        self.fresh_rank = int(creds.FRESH_MAX_RANK)
+        self._hydrate_profiles()
+
+    def _hydrate_profiles(self) -> None:
+        for key, val in store.profiles.items():
+            try:
+                ikey: int | str = int(key) if key.isdigit() else key
+            except ValueError:
+                ikey = key
+            self._profile_cache[ikey] = val
+            if val.get("paid_dm") and isinstance(ikey, int):
+                self._paid_cache[ikey] = True
+            user = val.get("username")
+            if val.get("paid_dm") and user:
+                self._paid_cache[str(user).lower()] = True
 
     def set_client(self, client: TelegramClient) -> None:
+        store.flush()
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
@@ -142,6 +168,7 @@ class TelegramMarket:
         self._flood_until = 0.0
         self.check_no = 0
         self.last_error = ""
+        self._hydrate_profiles()
 
     async def ensure_connected(self) -> None:
         if not self.client.is_connected():
@@ -352,53 +379,146 @@ class TelegramMarket:
         owner_timeout: float | None = None,
         paid_timeout: float | None = None,
         profile_timeout: float | None = None,
+        require_fresh: bool = True,
     ) -> tuple[list[Lot], PrepareStats]:
-        """Резолв скрытых → без paid DM → RU + lvl≤6 → вразнобой."""
-        stats = PrepareStats(input=len(lots))
-        if not lots:
-            return [], stats
-
-        await self.resolve_owners(
-            lots, timeout=owner_timeout or creds.OWNER_TIMEOUT
-        )
-        await self.filter_paid_dms(lots, timeout=paid_timeout or creds.PAID_DM_TIMEOUT)
-
-        candidates = [lot for lot in lots if lot.writable]
-        stats.with_user = len(candidates)
-        stats.paid_skip = sum(1 for lot in lots if lot.paid_dm)
-
-        await self.enrich_profiles(
-            candidates, timeout=profile_timeout or creds.PROFILE_TIMEOUT
-        )
-
         kept: list[Lot] = []
-        for lot in candidates:
-            if lot.paid_dm or not lot.seller:
-                stats.paid_skip += 1
-                lot.skip_reason = "paid_dm"
-                continue
-            level = lot.level if lot.level is not None else 0
-            # режем 5 / 6 / 8+ (и всё выше MAX_ACCOUNT_LEVEL)
-            if level > creds.MAX_ACCOUNT_LEVEL:
-                stats.level_skip += 1
-                lot.skip_reason = f"lvl{level}"
-                continue
-            gifts_n = lot.gifts_count if lot.gifts_count is not None else 0
-            if gifts_n > creds.MAX_PROFILE_GIFTS:
-                stats.gifts_skip += 1
-                lot.skip_reason = f"gifts>{creds.MAX_PROFILE_GIFTS}"
-                continue
-            if not lot.ru_ok:
-                stats.ru_skip += 1
-                lot.skip_reason = "no_ru"
-                continue
+        stats = PrepareStats(input=len(lots))
+        async for lot in self.stream_prepared(
+            lots,
+            limit=limit,
+            owner_timeout=owner_timeout,
+            paid_timeout=paid_timeout,
+            profile_timeout=profile_timeout,
+            require_fresh=require_fresh,
+            stats=stats,
+        ):
             kept.append(lot)
-
-        kept = diversify_lots(kept)
-        if limit is not None:
-            kept = kept[:limit]
-        stats.kept = len(kept)
+        store.flush()
         return kept, stats
+
+    async def stream_prepared(
+        self,
+        lots: list[Lot],
+        *,
+        limit: int | None = None,
+        owner_timeout: float | None = None,
+        paid_timeout: float | None = None,
+        profile_timeout: float | None = None,
+        require_fresh: bool = True,
+        check_rank: bool = True,
+        stats: PrepareStats | None = None,
+    ):
+        """Квалифицирует лоты параллельно и отдаёт готовые сразу (не ждёт всех)."""
+        stats = stats or PrepareStats(input=len(lots))
+        if not lots:
+            return
+
+        ordered = diversify_lots(_dedupe(lots))
+        stats.input = len(ordered)
+        queue: asyncio.Queue[Lot | None] = asyncio.Queue()
+        sem = asyncio.Semaphore(creds.PROFILE_PARALLEL)
+        cap = limit if limit is not None else len(ordered)
+
+        async def worker(lot: Lot) -> None:
+            async with sem:
+                ok = await self.qualify_one(
+                    lot,
+                    stats,
+                    owner_timeout=owner_timeout or creds.OWNER_TIMEOUT,
+                    paid_timeout=paid_timeout or creds.PAID_DM_TIMEOUT,
+                    profile_timeout=profile_timeout or creds.PROFILE_TIMEOUT,
+                    require_fresh=require_fresh,
+                    check_rank=check_rank,
+                )
+            await queue.put(lot if ok else None)
+
+        tasks = [asyncio.create_task(worker(lot)) for lot in ordered]
+        done = 0
+        emitted = 0
+        total = len(tasks)
+        while done < total and emitted < cap:
+            item = await queue.get()
+            done += 1
+            if item is None:
+                continue
+            emitted += 1
+            stats.kept = emitted
+            yield item
+
+        while done < total:
+            await queue.get()
+            done += 1
+        await asyncio.gather(*tasks, return_exceptions=True)
+        store.flush()
+
+    async def qualify_one(
+        self,
+        lot: Lot,
+        stats: PrepareStats,
+        *,
+        owner_timeout: float,
+        paid_timeout: float,
+        profile_timeout: float,
+        require_fresh: bool,
+        check_rank: bool = True,
+    ) -> bool:
+        # свежесть по позиции в маркете + возраст наблюдения
+        if require_fresh and check_rank and lot.market_rank > self.fresh_rank:
+            stats.fresh_skip += 1
+            lot.skip_reason = f"rank>{self.fresh_rank}"
+            return False
+
+        age = store.touch_listing(lot.slug or lot.id, lot.stars)
+        lot.listing_age = age
+        if require_fresh and age > self.fresh_age:
+            stats.fresh_skip += 1
+            lot.skip_reason = f"age>{self.fresh_age:.0f}s"
+            return False
+
+        await self.resolve_owner(lot, timeout=owner_timeout)
+        if lot.seller or lot.seller_id:
+            await self.filter_paid_dms([lot], timeout=paid_timeout)
+
+        if lot.paid_dm or not lot.seller:
+            stats.paid_skip += 1
+            lot.skip_reason = "paid_or_no_user"
+            return False
+
+        stats.with_user += 1
+
+        if store.is_blocked(lot.seller, lot.seller_id):
+            stats.black_skip += 1
+            lot.skip_reason = "blacklist"
+            return False
+
+        await self.enrich_profiles([lot], timeout=profile_timeout)
+
+        if lot.paid_dm or not lot.seller:
+            stats.paid_skip += 1
+            lot.skip_reason = "paid_dm"
+            return False
+        if store.is_blocked(lot.seller, lot.seller_id):
+            stats.black_skip += 1
+            lot.skip_reason = "blacklist"
+            return False
+
+        level = lot.level if lot.level is not None else 0
+        if level > self.max_level:
+            stats.level_skip += 1
+            lot.skip_reason = f"lvl{level}"
+            return False
+        gifts_n = lot.gifts_count if lot.gifts_count is not None else 0
+        if gifts_n > self.max_gifts:
+            stats.gifts_skip += 1
+            lot.skip_reason = f"gifts>{self.max_gifts}"
+            return False
+        # ru_ok пересчитаем относительно текущего порога
+        lot.ru_ok = lot.ru_score >= self.min_ru
+        if not lot.ru_ok:
+            stats.ru_skip += 1
+            lot.skip_reason = "no_ru"
+            return False
+        return True
 
     async def resolve_owners(self, lots: list[Lot], timeout: float = 0.8) -> None:
         sem = asyncio.Semaphore(creds.OWNER_PARALLEL)
@@ -474,7 +594,7 @@ class TelegramMarket:
             lot.level = cached.get("level")
             lot.gifts_count = cached.get("gifts_count")
             lot.ru_score = int(cached.get("ru_score", 0))
-            lot.ru_ok = bool(cached.get("ru_ok", False))
+            lot.ru_ok = lot.ru_score >= self.min_ru
             if cached.get("paid_dm"):
                 lot.paid_dm = True
                 lot.seller = ""
@@ -488,7 +608,7 @@ class TelegramMarket:
             lot.level = cached.get("level")
             lot.gifts_count = cached.get("gifts_count")
             lot.ru_score = int(cached.get("ru_score", 0))
-            lot.ru_ok = bool(cached.get("ru_ok", False))
+            lot.ru_ok = lot.ru_score >= self.min_ru
             if cached.get("paid_dm"):
                 lot.paid_dm = True
                 lot.seller = ""
@@ -525,7 +645,7 @@ class TelegramMarket:
             lot.level = level
             lot.gifts_count = gifts_count
             lot.ru_score = score
-            lot.ru_ok = score >= creds.MIN_RU_SCORE
+            lot.ru_ok = score >= self.min_ru
             if paid:
                 lot.paid_dm = True
                 lot.seller = ""
@@ -617,7 +737,7 @@ class TelegramMarket:
         lot.level = level if level is not None else 0
         lot.gifts_count = gifts_count
         lot.ru_score = score
-        lot.ru_ok = score >= creds.MIN_RU_SCORE
+        lot.ru_ok = score >= self.min_ru
         if paid:
             lot.paid_dm = True
             lot.seller = ""
@@ -639,15 +759,18 @@ class TelegramMarket:
         score: int,
         paid: bool,
     ) -> None:
-        self._profile_cache[key] = {
+        payload = {
             "level": 0 if level is None else level,
             "gifts_count": gifts_count,
             "ru_score": score,
-            "ru_ok": score >= creds.MIN_RU_SCORE,
+            "ru_ok": score >= self.min_ru,
             "paid_dm": paid,
             "username": username,
             "seller_id": seller_id,
+            "ts": time.time(),
         }
+        self._profile_cache[key] = payload
+        store.set_profile(key, payload)
 
     async def _ru_from_gifts(self, peer: Any, timeout: float) -> int:
         await self._wait_flood()
@@ -1035,10 +1158,11 @@ def _parse_result(result: Any) -> list[Lot]:
     }
     now = time.time()
     lots: list[Lot] = []
-    for gift in getattr(result, "gifts", []) or []:
+    for rank, gift in enumerate(getattr(result, "gifts", []) or []):
         lot = _parse(gift, users)
         if lot:
             lot.seen_at = now
+            lot.market_rank = rank
             lots.append(lot)
     return lots
 

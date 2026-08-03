@@ -22,6 +22,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -116,6 +117,34 @@ class App:
 
     async def confirm_password(self, password: str) -> None:
         await self.client.sign_in(password=password.strip())
+
+    async def logout(self) -> None:
+        """Drop Telethon session so bot asks for a new phone bind."""
+        await self.stop_monitor()
+        try:
+            if self.client.is_connected():
+                if await self.client.is_user_authorized():
+                    try:
+                        await self.client.log_out()
+                    except Exception:  # noqa: BLE001
+                        pass
+                await self.client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("logout disconnect: %s", exc)
+
+        root = Path(__file__).resolve().parent
+        data = root / "data"
+        for path in data.glob("market_session*"):
+            try:
+                path.unlink(missing_ok=True)
+                logger.info("removed session file %s", path)
+            except OSError as exc:
+                logger.warning("cannot remove %s: %s", path, exc)
+
+        self.phone = None
+        self.phone_code_hash = None
+        self.client = TelegramClient(creds.SESSION, creds.API_ID, creds.API_HASH)
+        self.market = TelegramMarket(self.client, concurrency=16)
 
     async def start_monitor(self, user_id: int) -> str:
         if self.running:
@@ -261,6 +290,15 @@ class App:
 app = App()
 
 
+def _auth_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Парсить с этим акком", callback_data="auth:continue")],
+            [InlineKeyboardButton(text="🔄 Привязать новый аккаунт", callback_data="auth:rebind")],
+        ]
+    )
+
+
 def _phone_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
@@ -296,19 +334,65 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     if await app.is_authorized():
         me = await app.client.get_me()
         who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
-        text = await app.start_monitor(message.from_user.id)
         await message.answer(
-            f"✅ Вход: <b>{who}</b>\n\n{text}\n\nСтоп — /stop",
-            reply_markup=ReplyKeyboardRemove(),
+            f"Сейчас привязан аккаунт: <b>{who}</b>\n\n"
+            "Продолжить с ним или привязать новый?",
+            reply_markup=_auth_choice_kb(),
         )
         return
 
+    await _ask_phone(message, state)
+
+
+@router.callback_query(F.data == "auth:continue")
+async def on_auth_continue(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    if not await app.is_authorized():
+        await callback.message.answer("Сессии нет. Пришли номер:")
+        await _ask_phone(callback.message, state)
+        return
+    me = await app.client.get_me()
+    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
+    text = await app.start_monitor(callback.from_user.id)
+    await callback.message.answer(
+        f"✅ Вход: <b>{who}</b>\n\n{text}\n\nСтоп — /stop",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.callback_query(F.data == "auth:rebind")
+async def on_auth_rebind(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Сбрасываю старый аккаунт…")
+    await app.logout()
+    await state.clear()
+    await callback.message.answer(
+        "Старая привязка сброшена.\n"
+        "Пришли номер нового аккаунта:",
+        reply_markup=_phone_kb(),
+    )
+    await state.set_state(AuthStates.phone)
+
+
+@router.message(Command("logout"))
+@router.message(Command("relogin"))
+async def cmd_logout(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await app.logout()
+    await message.answer(
+        "🔄 Старый аккаунт отвязан.\n"
+        "Пришли номер для новой привязки:",
+        reply_markup=_phone_kb(),
+    )
+    await state.set_state(AuthStates.phone)
+
+
+async def _ask_phone(message: Message, state: FSMContext) -> None:
     await state.set_state(AuthStates.phone)
     await message.answer(
         "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
-        "⚠️ Для парсинга официального маркета <b>нужен вход</b> "
-        "(Telegram API не отдаёт маркет ботам без юзер-сессии).\n"
-        "Один раз: номер → код. Потом сессия сохраняется.\n\n"
+        "⚠️ Нужна привязка Telegram-аккаунта (номер → код).\n"
+        "Без этого официальный маркет не парсится.\n\n"
         "📱 Номер: <code>+79991234567</code>",
         reply_markup=_phone_kb(),
     )
@@ -393,6 +477,20 @@ def wipe_old_data() -> None:
     data = root / "data"
     data.mkdir(exist_ok=True)
     removed: list[str] = []
+
+    # Старые сессии (v1) — форсим новую привязку
+    for path in [
+        data / "market_session.session",
+        data / "market_session.session-journal",
+        *data.glob("market_session.session*"),
+    ]:
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as exc:
+            logger.warning("cannot delete %s: %s", path, exc)
+
     for path in [
         data / "bot.db",
         root / "bot.db",
@@ -426,8 +524,9 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт · свежие Stars-лоты"),
+            BotCommand(command="start", description="Старт / сменить аккаунт"),
             BotCommand(command="stop", description="Стоп"),
+            BotCommand(command="logout", description="Отвязать аккаунт"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -435,7 +534,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Telegram Market Stars parser ready | need user login | fresh≤1h")
+    logger.info("Telegram Market Stars parser ready | session=%s", creds.SESSION)
     try:
         await dp.start_polling(bot)
     finally:

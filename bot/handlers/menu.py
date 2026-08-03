@@ -7,7 +7,6 @@ from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from bot.database import session_scope
 from bot.database.repositories import get_or_create_settings, update_settings
 from bot.keyboards import price_presets, settings_keyboard
-from bot.services.monitor import MonitorService
 from bot.services.rates import RateService
 from bot.services.stats import build_stats_text
 
@@ -15,28 +14,12 @@ router = Router(name="main")
 
 
 def _settings_text(cfg) -> str:
-    markets = []
-    if cfg.market_tonnel:
-        markets.append("Tonnel")
-    if cfg.market_mrkt:
-        markets.append("MRKT")
-    if cfg.market_portal:
-        markets.append("Portal")
-    if cfg.market_telegram:
-        markets.append("Telegram")
     return (
         "⚙️ <b>Настройки</b>\n\n"
         f"💰 Диапазон: <b>{int(cfg.min_stars)}–{int(cfg.max_stars)} ⭐</b>\n"
         f"⏱ Интервал: <b>{cfg.poll_interval:g} сек</b>\n"
-        f"🔔 Уведомления: <b>{'вкл' if cfg.notifications_enabled else 'выкл'}</b>\n"
-        f"🌐 Маркеты: <b>{', '.join(markets) or 'нет'}</b>"
+        f"🔔 Уведомления: <b>{'вкл' if cfg.notifications_enabled else 'выкл'}</b>"
     )
-
-
-@router.message(Command("stop"))
-async def stop_parsing(message: Message, monitor: MonitorService) -> None:
-    text = await monitor.stop()
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Command("stats"))
@@ -51,7 +34,7 @@ async def refresh_rates(message: Message, rates: RateService) -> None:
         "🔄 Курсы обновлены\n\n"
         f"1 TON = <b>${current.ton_usd:.4f}</b>\n"
         f"1 ⭐ = <b>${current.stars_usd:.5f}</b>\n"
-        f"1 TON ≈ <b>{current.ton_to_stars:.2f} ⭐</b>",
+        f"1 TON ≈ <b>{max(current.ton_to_stars, 300):.0f} ⭐</b>",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -81,7 +64,7 @@ async def settings_choose_value(callback: CallbackQuery) -> None:
     titles = {
         "min": "Минимальная цена ⭐",
         "max": "Максимальная цена ⭐",
-        "interval": "Интервал проверки",
+        "interval": "Интервал",
     }
     await callback.message.edit_text(titles[kind], reply_markup=price_presets(kind))
     await callback.answer()
@@ -97,7 +80,7 @@ async def settings_set_value(callback: CallbackQuery) -> None:
     elif kind == "max":
         fields["max_stars"] = value
     elif kind == "interval":
-        fields["poll_interval"] = max(0.2, value)
+        fields["poll_interval"] = max(0.15, value)
 
     async with session_scope() as session:
         cfg = await update_settings(session, callback.from_user.id, **fields)
@@ -111,7 +94,7 @@ async def settings_set_value(callback: CallbackQuery) -> None:
         text = _settings_text(cfg)
         kb = settings_keyboard(cfg)
     await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer("Сохранено")
+    await callback.answer("OK")
 
 
 @router.callback_query(F.data == "settings:notify")
@@ -122,29 +105,6 @@ async def toggle_notify(callback: CallbackQuery) -> None:
             session,
             callback.from_user.id,
             notifications_enabled=not cfg.notifications_enabled,
-        )
-        text = _settings_text(cfg)
-        kb = settings_keyboard(cfg)
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer("OK")
-
-
-@router.callback_query(F.data.startswith("settings:market:"))
-async def toggle_market(callback: CallbackQuery) -> None:
-    market = callback.data.split(":")[-1]
-    field_map = {
-        "tonnel": "market_tonnel",
-        "mrkt": "market_mrkt",
-        "portal": "market_portal",
-        "telegram": "market_telegram",
-    }
-    field = field_map[market]
-    async with session_scope() as session:
-        cfg = await get_or_create_settings(session, callback.from_user.id)
-        cfg = await update_settings(
-            session,
-            callback.from_user.id,
-            **{field: not getattr(cfg, field)},
         )
         text = _settings_text(cfg)
         kb = settings_keyboard(cfg)

@@ -24,7 +24,7 @@ class MrktParser(BaseMarketParser):
 
     def _sync_fetch(self, limit: int) -> list[RawLot]:
         if not self.token:
-            raise RuntimeError("MRKT token missing. Set MRKT_TOKEN or run Telethon login.")
+            raise RuntimeError("MRKT token missing — войди через /start")
         try:
             ua = UserAgent().random
         except Exception:  # noqa: BLE001
@@ -40,7 +40,7 @@ class MrktParser(BaseMarketParser):
             "modelNames": [],
             "backdropNames": [],
             "symbolNames": [],
-            "ordering": None,
+            "ordering": None,  # newest first
             "lowToHigh": False,
             "maxPrice": None,
             "minPrice": None,
@@ -56,7 +56,7 @@ class MrktParser(BaseMarketParser):
             headers=headers,
             json=payload,
             impersonate="chrome",
-            timeout=30,
+            timeout=10,
         )
         response.raise_for_status()
         gifts = response.json().get("gifts") or []
@@ -80,13 +80,7 @@ class MrktParser(BaseMarketParser):
                 or item.get("title")
                 or "Gift"
             )
-            owner = item.get("owner") or item.get("seller") or item.get("user") or {}
-            if isinstance(owner, dict):
-                seller = owner.get("username") or owner.get("name") or ""
-                seller_id = owner.get("id") or owner.get("telegramId")
-            else:
-                seller = item.get("ownerUsername") or item.get("sellerUsername") or ""
-                seller_id = item.get("ownerId") or item.get("sellerId")
+            seller, seller_id = _extract_seller(item)
             lots.append(
                 RawLot(
                     market=self.name,
@@ -99,8 +93,8 @@ class MrktParser(BaseMarketParser):
                     backdrop=str(item.get("backdropName") or item.get("backdrop") or ""),
                     symbol=str(item.get("symbolName") or item.get("symbol") or ""),
                     number=number_i,
-                    seller_username=str(seller).lstrip("@") if seller else "",
-                    seller_id=int(seller_id) if seller_id else None,
+                    seller_username=seller,
+                    seller_id=seller_id,
                     nft_url=nft_url(title, number_i),
                 )
             )
@@ -108,6 +102,53 @@ class MrktParser(BaseMarketParser):
 
     async def fetch_latest(self, limit: int = 30) -> list[RawLot]:
         return await asyncio.to_thread(self._sync_fetch, limit)
+
+
+def _extract_seller(item: dict) -> tuple[str, int | None]:
+    candidates = [
+        item.get("owner"),
+        item.get("seller"),
+        item.get("user"),
+        item.get("saleOwner"),
+        item.get("giftOwner"),
+        item.get("telegramUser"),
+    ]
+    for owner in candidates:
+        if isinstance(owner, dict):
+            seller = (
+                owner.get("username")
+                or owner.get("userName")
+                or owner.get("name")
+                or owner.get("firstName")
+                or ""
+            )
+            seller_id = (
+                owner.get("telegramId")
+                or owner.get("telegram_id")
+                or owner.get("userId")
+                or owner.get("id")
+            )
+            if seller or seller_id:
+                try:
+                    sid = int(seller_id) if seller_id is not None else None
+                except (TypeError, ValueError):
+                    sid = None
+                return str(seller).lstrip("@"), sid
+        elif isinstance(owner, str) and owner.strip():
+            return owner.lstrip("@"), None
+
+    seller = (
+        item.get("ownerUsername")
+        or item.get("sellerUsername")
+        or item.get("username")
+        or ""
+    )
+    seller_id = item.get("ownerId") or item.get("sellerId") or item.get("telegramId")
+    try:
+        sid = int(seller_id) if seller_id is not None else None
+    except (TypeError, ValueError):
+        sid = None
+    return str(seller).lstrip("@") if seller else "", sid
 
 
 def _extract_price(item: dict) -> float:

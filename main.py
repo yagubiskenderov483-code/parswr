@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, MenuButtonCommands
+from aiogram.types import MenuButtonCommands
 
 from bot import credentials as creds
 from bot.config import get_settings
@@ -27,14 +27,14 @@ async def main() -> None:
     setup_logging(settings.log_level)
     await init_db()
 
-    logger.info("API_ID=%s BOT=%s…", creds.API_ID, creds.BOT_TOKEN[:12])
+    logger.info("API_ID=%s", creds.API_ID)
 
     rates = RateService()
     await rates.load_cached()
     try:
         await rates.refresh()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Rates refresh failed: %s", exc)
+        logger.warning("Rates failed: %s", exc)
 
     auth = AuthService(settings)
     if await auth.is_authorized():
@@ -45,16 +45,13 @@ async def main() -> None:
             logger.warning("Token refresh failed: %s", exc)
         parsers = await auth.build_authorized_parsers()
     else:
-        logger.warning("No TG login yet — Tonnel-only until /start auth")
+        logger.warning("No login — Tonnel+Portal available")
         parsers = await build_parsers(settings)
 
-    converter = PriceConverter(rates)
     bot = Bot(
         token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
-    # Blue menu above keyboard: only Start
     await bot.set_my_commands(bot_commands())
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
@@ -63,7 +60,7 @@ async def main() -> None:
         bot=bot,
         parsers=parsers,
         rates=rates,
-        converter=converter,
+        converter=PriceConverter(rates),
         owner_resolver=auth.owner_resolver,
     )
     dp["monitor"] = monitor
@@ -71,11 +68,7 @@ async def main() -> None:
     dp["auth"] = auth
     dp.include_router(setup_routers())
 
-    logger.info(
-        "Bot ready | markets=%s | poll=%ss",
-        [p.title for p in parsers],
-        creds.DEFAULT_POLL_INTERVAL,
-    )
+    logger.info("Ready parsers=%s poll=%s", [p.title for p in parsers], creds.DEFAULT_POLL_INTERVAL)
     try:
         await dp.start_polling(bot)
     finally:

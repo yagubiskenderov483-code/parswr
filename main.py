@@ -239,6 +239,7 @@ class App:
                 gap=creds.BURST_GAP,
                 timeout=creds.API_TIMEOUT,
                 limit_results=creds.RESULT_LIMIT,
+                time_budget=creds.BURST_TIME_BUDGET,
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -320,11 +321,13 @@ class App:
                     writable = await self.market.filter_paid_dms(
                         fresh, timeout=creds.PAID_DM_TIMEOUT
                     )
+                    paid_skip = sum(1 for l in fresh if l.paid_dm)
                     for lot in writable:
-                        if self.lots_notified >= creds.RESULT_LIMIT:
-                            break
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
+                else:
+                    writable = []
+                    paid_skip = 0
 
                 # статус чека (edit одного сообщения)
                 await self._edit_status(
@@ -333,7 +336,9 @@ class App:
                     f"Обошёл коллекций: <b>{result.scanned}</b>/"
                     f"{result.collections_total}\n"
                     f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
-                    f"Новых за чек: <b>{len(fresh)}</b>\n"
+                    f"Новых за чек: <b>{len(writable)}</b>"
+                    + (f" · 🚫paid {paid_skip}" if paid_skip else "")
+                    + "\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
                     f"Seen: <b>{len(self._seen)}</b>\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"

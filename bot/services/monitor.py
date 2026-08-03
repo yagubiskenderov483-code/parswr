@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -30,8 +29,6 @@ from bot.utils.links import write_url
 
 logger = logging.getLogger(__name__)
 
-NotifyFn = Callable[[int, str], Awaitable[None]]
-
 
 @dataclass
 class MonitorState:
@@ -42,6 +39,7 @@ class MonitorState:
     last_tick_at: datetime | None = None
     primed: bool = False
     errors: dict[str, str] = field(default_factory=dict)
+    ticks: int = 0
 
 
 class MonitorService:
@@ -61,6 +59,8 @@ class MonitorService:
         self.state = MonitorState()
         self._task: asyncio.Task | None = None
         self._seen_memory: set[str] = set()
+        self._cfg_cache: _Snapshot | None = None
+        self._cfg_user: int | None = None
 
     @property
     def is_running(self) -> bool:
@@ -68,23 +68,31 @@ class MonitorService:
 
     async def start(self, user_id: int) -> str:
         if self.is_running:
-            return "Парсинг уже запущен."
+            return "♻️ Парсинг уже запущен."
 
         async with session_scope() as session:
             run = await start_parse_run(session, user_id)
             self.state.run_id = run.id
+            settings = await get_or_create_settings(session, user_id)
+            # Force fast interval
+            if settings.poll_interval > 0.5:
+                settings.poll_interval = creds.DEFAULT_POLL_INTERVAL
+            self._cfg_cache = _Snapshot.from_row(settings)
+            self._cfg_user = user_id
 
         self.state.running = True
         self.state.owner_id = user_id
         self.state.lots_found = 0
         self.state.primed = False
+        self.state.ticks = 0
+        self._seen_memory.clear()
         self._task = asyncio.create_task(self._loop(user_id), name="monitor-loop")
-        logger.info("Parser started by user %s", user_id)
-        return "▶️ Парсинг запущен (быстрый режим)."
+        logger.info("Parser STARTED user=%s parsers=%s", user_id, [p.title for p in self.parsers])
+        return "▶️ Парсинг запущен."
 
     async def stop(self) -> str:
         if not self.state.running:
-            return "Парсинг и так остановлен."
+            return "Парсинг уже остановлен."
         self.state.running = False
         if self._task:
             self._task.cancel()
@@ -96,7 +104,7 @@ class MonitorService:
         if self.state.run_id is not None:
             async with session_scope() as session:
                 await stop_parse_run(session, self.state.run_id, self.state.lots_found)
-        logger.info("Parser stopped. lots_found=%s", self.state.lots_found)
+        logger.info("Parser STOPPED lots=%s", self.state.lots_found)
         return "⏹ Парсинг остановлен."
 
     async def _loop(self, user_id: int) -> None:
@@ -104,14 +112,16 @@ class MonitorService:
             started = datetime.now(timezone.utc)
             poll_interval = creds.DEFAULT_POLL_INTERVAL
             try:
-                async with session_scope() as session:
-                    settings = await get_or_create_settings(session, user_id)
-                    cfg = _Snapshot.from_row(settings)
-                    # Force fast polling floor
-                    poll_interval = max(0.25, min(cfg.poll_interval, 1.0))
-
+                # Refresh settings every ~20 ticks only
+                if self._cfg_cache is None or self.state.ticks % 20 == 0:
+                    async with session_scope() as session:
+                        settings = await get_or_create_settings(session, user_id)
+                        self._cfg_cache = _Snapshot.from_row(settings)
+                cfg = self._cfg_cache
+                poll_interval = max(0.15, min(cfg.poll_interval, 0.5))
                 await self._tick(cfg)
                 self.state.last_tick_at = datetime.now(timezone.utc)
+                self.state.ticks += 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -127,17 +137,19 @@ class MonitorService:
             return
 
         results = await asyncio.gather(
-            *[p.safe_fetch(limit=20) for p in active],
+            *[p.safe_fetch(limit=25) for p in active],
             return_exceptions=False,
         )
 
         unified: list[UnifiedLot] = []
         seed_payload: list[tuple[str, MarketName, str]] = []
+        matched_preview: list[UnifiedLot] = []
 
         for parser, raw_lots in zip(active, results):
             if parser.last_error:
                 self.state.errors[parser.name.value] = parser.last_error
-            elif parser.name.value in self.state.errors:
+                logger.warning("Market %s error: %s", parser.title, parser.last_error)
+            else:
                 self.state.errors.pop(parser.name.value, None)
 
             for raw in raw_lots:
@@ -145,41 +157,67 @@ class MonitorService:
                 seed_payload.append((lot.fingerprint, lot.market, lot.external_id))
                 if cfg.min_stars <= lot.price_stars <= cfg.max_stars:
                     unified.append(lot)
+                    matched_preview.append(lot)
+
+        logger.info(
+            "tick#%s markets=%s fetched=%s matched=%s",
+            self.state.ticks,
+            {p.title: len(batch) if not isinstance(batch, Exception) else 0 for p, batch in zip(active, results)},
+            len(seed_payload),
+            len(matched_preview),
+        )
 
         if not self.state.primed:
             self._seen_memory |= {fp for fp, _, _ in seed_payload}
             async with session_scope() as session:
-                added = await seed_seen(session, seed_payload)
+                await seed_seen(session, seed_payload)
             self.state.primed = True
-            logger.info("Seeded %s existing lots (no notifications)", added)
+            logger.info("Seeded %s lots", len(seed_payload))
+
+            # Send up to 3 newest matched lots RIGHT NOW so user sees it works
+            preview = matched_preview[:3]
+            if preview and cfg.notifications_enabled and self.state.owner_id:
+                await self.bot.send_message(
+                    self.state.owner_id,
+                    f"📡 Парсер живой. Свежие лоты в диапазоне "
+                    f"{int(cfg.min_stars)}–{int(cfg.max_stars)} ⭐ "
+                    f"(показал {len(preview)} шт., дальше только новые):",
+                )
+                for lot in preview:
+                    await self._enrich_owner(lot)
+                    async with session_scope() as session:
+                        await mark_seen(session, lot)
+                    await self._notify(
+                        self.state.owner_id,
+                        format_lot_message(lot),
+                        reply_markup=lot_keyboard(lot),
+                    )
+                    self.state.lots_found += 1
+            elif self.state.owner_id:
+                await self.bot.send_message(
+                    self.state.owner_id,
+                    f"📡 Парсер живой, лотов в диапазоне пока нет "
+                    f"({int(cfg.min_stars)}–{int(cfg.max_stars)} ⭐). Жду новые…\n"
+                    f"Ошибки: {self.state.errors or 'нет'}",
+                )
             return
 
-        fresh: list[UnifiedLot] = []
-        for lot in unified:
-            if lot.fingerprint in self._seen_memory:
-                continue
+        fresh = [lot for lot in unified if lot.fingerprint not in self._seen_memory]
+        for lot in fresh:
             self._seen_memory.add(lot.fingerprint)
-            fresh.append(lot)
 
         if not fresh:
             return
 
-        # Enrich owners in parallel (fast, best-effort)
-        await asyncio.gather(*[self._enrich_owner(lot) for lot in fresh])
-
-        async with session_scope() as session:
-            for lot in fresh:
-                await mark_seen(session, lot)
-
-        # Notify ASAP — don't wait between sends more than needed
+        # Notify immediately, enrich owner best-effort without blocking too long
         for lot in fresh:
+            await self._enrich_owner(lot)
             logger.info(
-                "New lot [%s] %s | %.0f⭐ | @%s | %s",
+                "NEW [%s] %.0f⭐ %s @%s",
                 lot.market.value,
-                lot.display_title()[:50],
                 lot.price_stars,
+                lot.display_title()[:40],
                 lot.seller_username or "—",
-                lot.difficulty.value,
             )
             if cfg.notifications_enabled and self.state.owner_id:
                 await self._notify(
@@ -188,6 +226,10 @@ class MonitorService:
                     reply_markup=lot_keyboard(lot),
                 )
             self.state.lots_found += 1
+
+        async with session_scope() as session:
+            for lot in fresh:
+                await mark_seen(session, lot)
 
     async def _enrich_owner(self, lot: UnifiedLot) -> None:
         if lot.seller_username:
@@ -200,7 +242,7 @@ class MonitorService:
                     nft_url=lot.nft_url,
                     current_username=lot.seller_username,
                 ),
-                timeout=1.5,
+                timeout=0.8,
             )
         except Exception:  # noqa: BLE001
             return
@@ -215,7 +257,7 @@ class MonitorService:
 
     async def reload_parsers(self, parsers: list[BaseMarketParser]) -> None:
         self.parsers = parsers
-        logger.info("Parsers reloaded: %s", ", ".join(p.title for p in parsers))
+        logger.info("Parsers reloaded: %s", [p.title for p in parsers])
 
     async def _notify(self, user_id: int, text: str, reply_markup=None) -> None:
         try:
@@ -226,7 +268,7 @@ class MonitorService:
                 reply_markup=reply_markup,
             )
         except TelegramRetryAfter as exc:
-            await asyncio.sleep(exc.retry_after + 0.2)
+            await asyncio.sleep(exc.retry_after + 0.1)
             await self.bot.send_message(
                 user_id,
                 text,

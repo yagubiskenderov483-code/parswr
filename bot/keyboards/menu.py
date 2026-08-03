@@ -1,21 +1,17 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 from bot.database.models import AppSettings
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="▶️ Запустить парсинг"), KeyboardButton(text="⏹ Остановить парсинг")],
-            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="🔄 Обновить курсы валют"), KeyboardButton(text="🔐 Войти")],
-            [KeyboardButton(text="🚀 Старт")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
+def main_menu() -> ReplyKeyboardRemove:
+    """No reply-keyboard buttons — only the blue Menu (BotCommands)."""
+    return ReplyKeyboardRemove()
+
+
+def bot_commands() -> list[BotCommand]:
+    return [BotCommand(command="start", description="Старт")]
 
 
 def settings_keyboard(cfg: AppSettings) -> InlineKeyboardMarkup:
@@ -25,14 +21,8 @@ def settings_keyboard(cfg: AppSettings) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text=f"Min: {int(cfg.min_stars)} ⭐",
-                    callback_data="settings:min",
-                ),
-                InlineKeyboardButton(
-                    text=f"Max: {int(cfg.max_stars)} ⭐",
-                    callback_data="settings:max",
-                ),
+                InlineKeyboardButton(text=f"Min: {int(cfg.min_stars)} ⭐", callback_data="settings:min"),
+                InlineKeyboardButton(text=f"Max: {int(cfg.max_stars)} ⭐", callback_data="settings:max"),
             ],
             [
                 InlineKeyboardButton(
@@ -66,32 +56,21 @@ def settings_keyboard(cfg: AppSettings) -> InlineKeyboardMarkup:
                     callback_data="settings:market:telegram",
                 ),
             ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить курсы",
-                    callback_data="settings:rates",
-                )
-            ],
         ]
     )
 
 
 def price_presets(kind: str) -> InlineKeyboardMarkup:
     presets = {
-        "min": [2000, 5000, 10000, 15000, 30000],
+        "min": [500, 1000, 2000, 5000, 10000],
         "max": [5000, 10000, 30000, 65000, 100000],
-        "interval": [0.3, 0.5, 1, 2, 3],
+        "interval": [0.2, 0.3, 0.5, 1],
     }
     rows: list[list[InlineKeyboardButton]] = []
     for value in presets[kind]:
         suffix = "⭐" if kind != "interval" else "с"
         rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{value} {suffix}",
-                    callback_data=f"set:{kind}:{value}",
-                )
-            ]
+            [InlineKeyboardButton(text=f"{value} {suffix}", callback_data=f"set:{kind}:{value}")]
         )
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

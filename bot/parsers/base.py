@@ -32,7 +32,7 @@ class BaseMarketParser(ABC):
             return await self.fetch_latest(limit=limit)
 
         try:
-            lots = await with_retries(_run, attempts=3, delay=0.8, label=self.title)
+            lots = await with_retries(_run, attempts=1, delay=0.2, label=self.title)
             self.last_error = None
             self.last_count = len(lots)
             return lots

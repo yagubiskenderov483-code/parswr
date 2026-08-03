@@ -49,7 +49,7 @@ async def fetch_mrkt_token(client: TelegramClient) -> str:
         "https://api.tgmrkt.io/api/v1/auth",
         json={"data": init_data},
         impersonate="chrome",
-        timeout=20,
+        timeout=15,
     )
     response.raise_for_status()
     token = response.json().get("token")
@@ -74,7 +74,6 @@ def build_telethon(settings: Settings | None = None) -> TelegramClient:
 
 
 async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
-    """Construct marketplace parsers. Missing auth disables only that market."""
     mrkt_token = os.getenv("MRKT_TOKEN", "").strip()
     portals_auth = os.getenv("PORTALS_AUTH", "").strip()
     tonnel_auth = os.getenv("TONNEL_AUTH", "").strip()
@@ -86,20 +85,20 @@ async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
             telethon_client = build_telethon(settings)
             await telethon_client.connect()
             if not await telethon_client.is_user_authorized():
-                logger.warning("Telethon session exists but unauthorized")
+                logger.warning("Session file exists but not authorized — remove it")
                 await telethon_client.disconnect()
                 telethon_client = None
             else:
                 if not mrkt_token:
                     try:
                         mrkt_token = await fetch_mrkt_token(telethon_client)
-                        logger.info("MRKT token acquired via Telethon")
+                        logger.info("MRKT token OK")
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("MRKT auth failed: %s", exc)
                 if not portals_auth:
                     try:
                         portals_auth = await fetch_portals_auth(telethon_client)
-                        logger.info("Portal auth ready")
+                        logger.info("Portal auth OK")
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Portal auth failed: %s", exc)
                 if not tonnel_auth:
@@ -113,9 +112,18 @@ async def build_parsers(settings: Settings) -> list[BaseMarketParser]:
             logger.warning("Telethon init failed: %s", exc)
             telethon_client = None
 
-    return [
-        TonnelParser(auth=tonnel_auth),
-        MrktParser(token=mrkt_token),
-        PortalParser(auth=portals_auth),
-        TelegramMarketParser(client=telethon_client),
-    ]
+    parsers: list[BaseMarketParser] = [TonnelParser(auth=tonnel_auth)]
+    # Only add markets that can actually work (no endless errors)
+    if mrkt_token:
+        parsers.append(MrktParser(token=mrkt_token))
+    else:
+        logger.info("MRKT skipped (no token)")
+    if portals_auth:
+        parsers.append(PortalParser(auth=portals_auth))
+    else:
+        logger.info("Portal skipped (no auth)")
+    if telethon_client is not None:
+        parsers.append(TelegramMarketParser(client=telethon_client))
+    else:
+        logger.info("Telegram Market skipped (no session)")
+    return parsers

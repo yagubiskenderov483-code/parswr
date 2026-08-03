@@ -311,10 +311,11 @@ class App:
         if msg:
             self._status_msg_id = msg.message_id
 
-    def _save_gifts(self, lots: list[Lot]) -> tuple[int, int]:
+    def _save_models(self, lots: list[Lot]) -> tuple[int, int]:
+        """Сохраняет модели в БД. Юзы сюда не пишем."""
         if not lots:
             return 0, 0
-        inserted, updated = self.db.upsert_lots(lots)
+        inserted, updated = self.db.upsert_models(lots)
         self.db_last_saved = inserted + updated
         self.db_total = self.db.count()
         return inserted, updated
@@ -339,22 +340,25 @@ class App:
             burst = None
 
         now = time.monotonic()
-        if burst and burst.lots:
-            # Сначала сохраняем ВСЕ найденные гифты в БД
+        if burst and (burst.all_lots or burst.lots):
+            # 1) СНАЧАЛА сохраняем все МОДЕЛИ (не юзы)
             to_save = burst.all_lots or burst.lots
-            ins, upd = self._save_gifts(to_save)
+            for lot in to_save:
+                self._seen.setdefault(lot.id, now)
+            ins, upd = self._save_models(to_save)
+            uniq_models = self.db.count_models()
             await self._say(
-                f"💾 В БД: +<b>{ins}</b> новых / <b>{upd}</b> обновл. · всего <b>{self.db_total}</b>"
+                f"💾 Сохранено моделей: <b>{len(to_save)}</b> "
+                f"(+{ins} новых / {upd} обновл.)\n"
+                f"🗄 В БД лотов: <b>{self.db_total}</b> · уникальных моделей: <b>{uniq_models}</b>\n"
+                f"~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total}"
             )
 
+            # 2) Потом уже фильтр выдачи (юз/реклама) — в БД это не пишем
             shown = await self._prepare_show(burst.lots, limit=creds.PREVIEW_COUNT)
-            self._save_gifts(burst.lots)
-
             await self._say(
                 f"🔍 К выдаче: <b>{len(shown)}</b> "
-                f"(сырых {len(burst.lots)}) · ~{burst.elapsed:.1f}с · "
-                f"{burst.scanned}/{burst.collections_total}\n"
-                f"без рекламы · уникальные продавцы/модели"
+                f"(без рекламы · без повторов продавцов/моделей)"
             )
             if shown:
                 lines = []
@@ -379,11 +383,6 @@ class App:
             )
 
         if burst:
-            for lot in burst.lots:
-                self._seen.setdefault(lot.id, now)
-            if burst.all_lots:
-                for lot in burst.all_lots:
-                    self._seen.setdefault(lot.id, now)
             self.checks = burst.check_no
 
         await self._say(
@@ -406,9 +405,9 @@ class App:
                 self.last_check_lots = len(result.lots)
                 self.last_error = result.error
 
-                # все лоты чека — в БД
+                # сразу сохраняем МОДЕЛИ из чека
                 if result.lots:
-                    self._save_gifts(result.lots)
+                    self._save_models(result.lots)
 
                 now = time.monotonic()
                 candidates = []
@@ -422,7 +421,6 @@ class App:
                 fresh: list[Lot] = []
                 if candidates:
                     fresh = await self._prepare_show(candidates)
-                    self._save_gifts(candidates)
                     for lot in fresh:
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
@@ -438,7 +436,8 @@ class App:
                     f"Seen: <b>{len(self._seen)}</b> · "
                     f"sellers: <b>{len(self._seen_sellers)}</b> · "
                     f"models: <b>{len(self._seen_models)}</b>\n"
-                    f"🗄 БД: <b>{self.db_total}</b> (last {self.db_last_saved})\n"
+                    f"🗄 Моделей в БД: <b>{self.db_total}</b> "
+                    f"(уник. {self.db.count_models()}, last {self.db_last_saved})\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
                     f"⏱ {result.elapsed:.2f}с"
                     + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
@@ -721,7 +720,8 @@ async def cb_status(callback: CallbackQuery) -> None:
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
         f"Seen: <b>{len(app._seen)}</b>\n"
-        f"🗄 БД гифтов: <b>{app.db.count()}</b>\n"
+        f"🗄 Моделей в БД: <b>{app.db.count()}</b> "
+        f"(уник. {app.db.count_models()})\n"
         f"Err: {_esc(app.last_error[:120]) if app.last_error else '—'}",
         reply_markup=settings_inline(),
     )

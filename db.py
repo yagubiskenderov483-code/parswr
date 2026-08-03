@@ -1,4 +1,4 @@
-"""SQLite storage for all parsed gifts."""
+"""SQLite storage for parsed gift MODELS (not usernames)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,16 @@ from market import Lot
 DB_PATH = Path("data") / "gifts.db"
 
 
+def _model_name(lot: Lot) -> str:
+    return (lot.model or lot.title or "").strip()
+
+
+def _model_key(lot: Lot) -> str:
+    title = (lot.title or "").strip().lower()
+    model = (lot.model or "").strip().lower()
+    return f"{title}|{model}" if model else (title or lot.id)
+
+
 class GiftDB:
     def __init__(self, path: Path | str = DB_PATH) -> None:
         self.path = Path(path)
@@ -23,6 +33,7 @@ class GiftDB:
         self._init()
 
     def _init(self) -> None:
+        # Конкретные NFT-лоты (модели с номером)
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS gifts (
@@ -32,10 +43,9 @@ class GiftDB:
                 stars REAL NOT NULL,
                 slug TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
+                model_key TEXT NOT NULL DEFAULT '',
                 backdrop TEXT NOT NULL DEFAULT '',
                 symbol TEXT NOT NULL DEFAULT '',
-                seller TEXT NOT NULL DEFAULT '',
-                seller_id INTEGER,
                 nft_url TEXT NOT NULL DEFAULT '',
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL,
@@ -43,34 +53,46 @@ class GiftDB:
             )
             """
         )
+        # На случай старой схемы — добавим model_key если нет
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(gifts)").fetchall()
+        }
+        if "model_key" not in cols:
+            self._conn.execute(
+                "ALTER TABLE gifts ADD COLUMN model_key TEXT NOT NULL DEFAULT ''"
+            )
+        # seller колонки могут остаться от старой версии — не используем как суть сейва
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gifts_stars ON gifts(stars)"
         )
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_gifts_seller ON gifts(seller)"
+            "CREATE INDEX IF NOT EXISTS idx_gifts_slug ON gifts(slug)"
         )
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_gifts_slug ON gifts(slug)"
+            "CREATE INDEX IF NOT EXISTS idx_gifts_model_key ON gifts(model_key)"
         )
         self._conn.commit()
 
-    def upsert_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
-        """Save/update gifts. Returns (inserted, updated)."""
+    def upsert_models(self, lots: Iterable[Lot]) -> tuple[int, int]:
+        """Сохраняет МОДЕЛИ/лоты. Юзернеймы не трогаем. Returns (inserted, updated)."""
         now = time.time()
         inserted = 0
         updated = 0
         cur = self._conn.cursor()
         for lot in lots:
+            mk = _model_key(lot)
+            model = _model_name(lot)
             row = cur.execute(
-                "SELECT id, seller FROM gifts WHERE id = ?", (lot.id,)
+                "SELECT id FROM gifts WHERE id = ?", (lot.id,)
             ).fetchone()
             if row is None:
                 cur.execute(
                     """
                     INSERT INTO gifts (
-                        id, title, number, stars, slug, model, backdrop, symbol,
-                        seller, seller_id, nft_url, first_seen, last_seen, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, title, number, stars, slug, model, model_key,
+                        backdrop, symbol, nft_url, first_seen, last_seen, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         lot.id,
@@ -78,11 +100,10 @@ class GiftDB:
                         lot.number,
                         float(lot.stars),
                         lot.slug,
-                        lot.model,
+                        model,
+                        mk,
                         lot.backdrop,
                         lot.symbol,
-                        lot.seller or "",
-                        lot.seller_id,
                         lot.nft_url,
                         now,
                         now,
@@ -91,7 +112,6 @@ class GiftDB:
                 )
                 inserted += 1
             else:
-                seller = lot.seller or row["seller"] or ""
                 cur.execute(
                     """
                     UPDATE gifts SET
@@ -100,10 +120,9 @@ class GiftDB:
                         stars = ?,
                         slug = ?,
                         model = ?,
+                        model_key = ?,
                         backdrop = ?,
                         symbol = ?,
-                        seller = ?,
-                        seller_id = COALESCE(?, seller_id),
                         nft_url = ?,
                         last_seen = ?,
                         updated_at = ?
@@ -114,11 +133,10 @@ class GiftDB:
                         lot.number,
                         float(lot.stars),
                         lot.slug,
-                        lot.model,
+                        model,
+                        mk,
                         lot.backdrop,
                         lot.symbol,
-                        seller,
-                        lot.seller_id,
                         lot.nft_url,
                         now,
                         now,
@@ -129,8 +147,18 @@ class GiftDB:
         self._conn.commit()
         return inserted, updated
 
+    # alias for old call sites
+    def upsert_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
+        return self.upsert_models(lots)
+
     def count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM gifts").fetchone()
+        return int(row["c"] if row else 0)
+
+    def count_models(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(DISTINCT model_key) AS c FROM gifts WHERE model_key != ''"
+        ).fetchone()
         return int(row["c"] if row else 0)
 
     def close(self) -> None:

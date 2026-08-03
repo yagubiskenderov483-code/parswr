@@ -25,9 +25,15 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    bot_token: str = Field(default="", alias="BOT_TOKEN")
-    api_id: int = Field(default=0, alias="API_ID")
-    api_hash: str = Field(default="", alias="API_HASH")
+    bot_token: str = Field(
+        default="8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc",
+        alias="BOT_TOKEN",
+    )
+    api_id: int = Field(default=36101343, alias="API_ID")
+    api_hash: str = Field(
+        default="116195fa5e0459d25a9a6266b40807d7",
+        alias="API_HASH",
+    )
     telethon_session: str = Field(default="data/market_session", alias="TELETHON_SESSION")
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/bot.db",
@@ -66,8 +72,12 @@ class Settings(BaseSettings):
         return path
 
     def require_telethon(self) -> None:
-        api_id = self.api_id or int(os.getenv("API_ID") or 0)
-        api_hash = self.api_hash or os.getenv("API_HASH", "").strip()
+        api_id = self.api_id or int(os.getenv("API_ID") or 36101343)
+        api_hash = (
+            self.api_hash
+            or os.getenv("API_HASH", "").strip()
+            or "116195fa5e0459d25a9a6266b40807d7"
+        )
         if not api_id or not api_hash:
             raise RuntimeError(
                 "Не заданы API_ID/API_HASH.\n"
@@ -76,8 +86,7 @@ class Settings(BaseSettings):
                 "API_HASH=...\n"
                 "(взять на https://my.telegram.org)"
             )
-        # keep object in sync if recovered from os.environ
-        object.__setattr__(self, "api_id", api_id)
+        object.__setattr__(self, "api_id", int(api_id))
         object.__setattr__(self, "api_hash", api_hash)
 
 
@@ -86,9 +95,17 @@ def get_settings() -> Settings:
     settings = Settings()  # type: ignore[call-arg]
     # Fallbacks if pydantic missed env for any reason
     if not settings.bot_token:
-        object.__setattr__(settings, "bot_token", os.getenv("BOT_TOKEN", ""))
+        object.__setattr__(
+            settings,
+            "bot_token",
+            os.getenv("BOT_TOKEN", "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"),
+        )
     if not settings.api_id:
-        object.__setattr__(settings, "api_id", int(os.getenv("API_ID") or 0))
+        object.__setattr__(settings, "api_id", int(os.getenv("API_ID") or 36101343))
     if not settings.api_hash:
-        object.__setattr__(settings, "api_hash", os.getenv("API_HASH", "").strip())
+        object.__setattr__(
+            settings,
+            "api_hash",
+            os.getenv("API_HASH", "116195fa5e0459d25a9a6266b40807d7").strip(),
+        )
     return settings

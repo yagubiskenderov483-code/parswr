@@ -67,6 +67,7 @@ PRICE_RANGES: list[tuple[str, str, int, int]] = [
 LEVEL_PRESETS: list[int | None] = [None, 3, 5, 10, 20, 50]
 GIFTS_PRESETS: list[int | None] = [None, 3, 5, 10, 25, 50]
 
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
 # Реклама / раздачи в bio — скипаем
 _AD_BIO_RE = re.compile(
     r"("
@@ -118,6 +119,7 @@ class App:
         self._status_msg_id: int | None = None
         self._seen: dict[str, float] = {}
         self._seen_owners: set[str] = set()
+        self._recent_collections: list[str] = []
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = 2000.0
@@ -213,6 +215,7 @@ class App:
         self.running = True
         self._seen.clear()
         self._seen_owners.clear()
+        self._recent_collections.clear()
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -240,7 +243,7 @@ class App:
         f = self.filters
         if f.require_username and not lot.seller:
             return False
-        if f.russian_only and _is_foreign(lot):
+        if f.russian_only and not _is_russian(lot):
             return False
         if f.online_only and lot.is_online is not True:
             return False
@@ -254,8 +257,14 @@ class App:
                 return False
         return True
 
+    def _diversity_key(self, lot: Lot) -> str:
+        """Ключ разнообразия: коллекция + модель — чтобы подряд не шли одинаковые гифты."""
+        title = (lot.title or "").strip().lower()
+        model = (lot.model or "").strip().lower()
+        return f"{title}|{model}" if model else title or lot.id
+
     def _pick_diverse(self, lots: list[Lot], limit: int | None = None) -> list[Lot]:
-        """Владелец 1 раз + модели вразнобой."""
+        """Владелец 1 раз + коллекции/модели вразнобой, без одинаковых подряд."""
         f = self.filters
         buckets: dict[str, list[Lot]] = {}
         keys: list[str] = []
@@ -264,33 +273,66 @@ class App:
                 continue
             if f.unique_owners and lot.owner_key in self._seen_owners:
                 continue
-            mk = lot.model_key if f.diversify_models else "_all"
+            mk = self._diversity_key(lot) if f.diversify_models else "_all"
             if mk not in buckets:
                 buckets[mk] = []
                 keys.append(mk)
             buckets[mk].append(lot)
 
         out: list[Lot] = []
-        last = ""
+        last = self._recent_collections[-1] if self._recent_collections else ""
+        recent = set(self._recent_collections[-6:])
+
         while True:
             progressed = False
-            ordered = sorted(keys, key=lambda k: (k == last, -len(buckets.get(k, []))))
+            # Сначала ключи, которых давно не было / не last
+            ordered = sorted(
+                keys,
+                key=lambda k: (
+                    k == last,
+                    k in recent,
+                    -len(buckets.get(k, [])),
+                ),
+            )
             for mk in ordered:
                 bucket = buckets.get(mk) or []
                 while bucket:
                     lot = bucket.pop(0)
                     if f.unique_owners and lot.owner_key in self._seen_owners:
                         continue
+                    # жёстко: не ставим ту же коллекцию/модель подряд
+                    if out and self._diversity_key(out[-1]) == mk:
+                        continue
                     out.append(lot)
                     if f.unique_owners:
                         self._seen_owners.add(lot.owner_key)
                     last = mk
+                    self._recent_collections.append(mk)
+                    if len(self._recent_collections) > 40:
+                        self._recent_collections = self._recent_collections[-40:]
+                    recent = set(self._recent_collections[-6:])
                     progressed = True
                     break
                 if progressed:
                     break
             if not progressed:
-                break
+                # если остались только одинаковые — добираем, но всё равно через владельцев
+                leftover = False
+                for mk in keys:
+                    bucket = buckets.get(mk) or []
+                    while bucket:
+                        lot = bucket.pop(0)
+                        if f.unique_owners and lot.owner_key in self._seen_owners:
+                            continue
+                        out.append(lot)
+                        if f.unique_owners:
+                            self._seen_owners.add(lot.owner_key)
+                        leftover = True
+                        break
+                    if leftover:
+                        break
+                if not leftover:
+                    break
             if limit is not None and len(out) >= limit:
                 break
         return out
@@ -325,45 +367,47 @@ class App:
             self._status_msg_id = msg.message_id
 
     async def _stream_burst(self, lots: list[Lot]) -> list[Lot]:
-        """Сразу кидаем модели чанками; Settings (bio/lvl) — параллельно, не тормозя список."""
+        """Сразу кидаем разношерстные RU-модели; Settings (bio/lvl) — параллельно."""
         now = time.monotonic()
-        # 1) Быстро юзы
         await self.market.resolve_owners(lots, timeout=creds.OWNER_TIMEOUT)
 
-        quick_lines: list[str] = []
-        quick_lots: list[Lot] = []
+        candidates: list[Lot] = []
         for lot in lots:
             self._seen[lot.id] = now
             if self.filters.require_username and not lot.seller:
                 continue
-            if self.filters.russian_only and _is_foreign(lot):
+            if self.filters.russian_only and not _is_russian(lot):
                 continue
-            quick_lots.append(lot)
-            user = f"@{lot.seller}" if lot.seller else "—"
-            model = lot.model or lot.title
-            quick_lines.append(
-                f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | {user} | '
-                f"{_fmt(lot.stars)}⭐"
-            )
+            candidates.append(lot)
 
-        # 2) Full profile в фоне — пока шлём список моделей
+        # Сразу разнообразие — одинаковые гифты подряд не летят
+        quick = self._pick_diverse(candidates, limit=creds.PREVIEW_COUNT)
+
         enrich_task: asyncio.Task | None = None
-        if self.filters.needs_full_profile() and quick_lots:
+        if self.filters.needs_full_profile() and quick:
             enrich_task = asyncio.create_task(
                 self.market.enrich_profiles(
-                    quick_lots,
+                    quick,
                     need_full=True,
                     timeout=creds.OWNER_TIMEOUT,
                     parallel=12,
                 )
             )
 
-        if quick_lines:
-            await self._say(f"⚡️ Модели · <b>{len(quick_lines)}</b> шт. сразу:")
-            for i in range(0, len(quick_lines), 10):
-                await self._say("\n".join(quick_lines[i : i + 10]))
+        if quick:
+            lines = []
+            for lot in quick:
+                user = f"@{lot.seller}"
+                model = lot.model or lot.title
+                lines.append(
+                    f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | {user} | '
+                    f"{_fmt(lot.stars)}⭐"
+                )
+            await self._say(f"⚡️ Модели · <b>{len(lines)}</b> шт. (RU · вразнобой):")
+            for i in range(0, len(lines), 10):
+                await self._say("\n".join(lines[i : i + 10]))
         else:
-            await self._say("⚡️ Нет моделей с @username в этой пачке.")
+            await self._say("⚡️ Нет RU-моделей с @username в этой пачке.")
 
         if enrich_task is not None:
             try:
@@ -371,8 +415,17 @@ class App:
             except Exception:  # noqa: BLE001
                 logger.exception("enrich failed")
 
-        picked = self._pick_diverse(quick_lots, limit=creds.PREVIEW_COUNT)
-        return picked
+        # после bio/lvl — ещё раз отфильтровать (owners уже учтены)
+        # не дублируем seen_owners: временно откатим ключи quick и пересоберём
+        for lot in quick:
+            self._seen_owners.discard(lot.owner_key)
+        if self._recent_collections:
+            # уберём ключи этой пачки из recent, пересоберём порядок
+            keys = {self._diversity_key(lot) for lot in quick}
+            self._recent_collections = [
+                k for k in self._recent_collections if k not in keys
+            ]
+        return self._pick_diverse(quick, limit=creds.PREVIEW_COUNT)
 
     async def _loop(self) -> None:
         await self._say(f"⚡ Ищу модели · <b>{self.range_label}</b>…")
@@ -450,7 +503,7 @@ class App:
                         lot
                         for lot in candidates
                         if (not self.filters.require_username or lot.seller)
-                        and not (self.filters.russian_only and _is_foreign(lot))
+                        and (not self.filters.russian_only or _is_russian(lot))
                     ]
                     if self.filters.needs_full_profile() and basic:
                         await self.market.enrich_profiles(
@@ -538,13 +591,15 @@ class App:
 app = App()
 
 
-def _is_foreign(lot: Lot) -> bool:
-    """True = точно не RU. Неизвестных не режем — иначе пустая выдача."""
+def _is_russian(lot: Lot) -> bool:
+    """Только русские: lang=ru или кириллица в имени. Остальных режем."""
     lang = (lot.lang_code or "").strip().lower()
     if lang.startswith("ru"):
-        return False
+        return True
     if lang and not lang.startswith("ru"):
-        # en/zh/... — иностранец
+        return False
+    name = f"{lot.first_name} {lot.last_name}".strip()
+    if name and _CYRILLIC_RE.search(name):
         return True
     return False
 

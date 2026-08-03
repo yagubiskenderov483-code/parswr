@@ -190,7 +190,7 @@ class TelegramMarket:
                 )
 
         for i in range(0, len(batch), parallel):
-            if time.monotonic() - started > 4.5:
+            if time.monotonic() - started > 3.8:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
@@ -200,6 +200,14 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
+            # достаточно набрали — не долбим дальше
+            matched_now = sum(
+                1
+                for lot in _dedupe(lots)
+                if min_stars <= lot.stars <= max_stars
+            )
+            if matched_now >= limit_results:
+                break
 
         unique = _dedupe(lots)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]

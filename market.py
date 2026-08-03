@@ -1,7 +1,8 @@
 """
-Telegram Market parser — стабильный, без самоубийства FloodWait.
+Telegram Market scanner.
 
-Крутит коллекции по кругу по 2–3 за раз, ловит свежие Stars-лоты.
+burst_search() — быстрый проход (пара секунд), как FreeGiftsParser.
+run_check() — регулярный чек по кругу.
 """
 
 from __future__ import annotations
@@ -22,8 +23,6 @@ from telethon.tl.functions.payments import (
 from telethon.tl.types import StarsAmount, StarsTonAmount
 
 logger = logging.getLogger(__name__)
-
-FRESH_WINDOW_SEC = 3600
 
 
 @dataclass(slots=True)
@@ -60,25 +59,30 @@ class Lot:
         return " ".join(parts)
 
 
+@dataclass
+class CheckResult:
+    check_no: int
+    scanned: int
+    lots: list[Lot]
+    collections_total: int
+    ok: int = 0
+    errors: int = 0
+    floods: int = 0
+    elapsed: float = 0.0
+    error: str = ""
+
+
 class TelegramMarket:
-    def __init__(self, client: TelegramClient, parallel: int = 3) -> None:
+    def __init__(self, client: TelegramClient) -> None:
         self.client = client
-        self.parallel = max(1, parallel)
         self._gift_ids: list[int] = []
         self._cursor = 0
         self._flood_until = 0.0
-        self._sem = asyncio.Semaphore(self.parallel)
-        self._last_req = 0.0
         self._gap_lock = asyncio.Lock()
+        self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
-        self.last_stats = {
-            "collections": 0,
-            "ok": 0,
-            "empty": 0,
-            "errors": 0,
-            "lots": 0,
-            "floods": 0,
-        }
+        self.check_no = 0
+        self.last_error = ""
 
     def set_client(self, client: TelegramClient) -> None:
         self.client = client
@@ -86,6 +90,8 @@ class TelegramMarket:
         self._owner_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
+        self.check_no = 0
+        self.last_error = ""
 
     async def ensure_connected(self) -> None:
         if not self.client.is_connected():
@@ -95,7 +101,10 @@ class TelegramMarket:
         if self._gift_ids and not force:
             return self._gift_ids
         await self.ensure_connected()
-        result = await self.client(GetStarGiftsRequest(hash=0))
+        result = await asyncio.wait_for(
+            self.client(GetStarGiftsRequest(hash=0)),
+            timeout=12.0,
+        )
         gifts = getattr(result, "gifts", []) or []
         ids: list[int] = []
         for gift in gifts:
@@ -114,68 +123,160 @@ class TelegramMarket:
         if not ids:
             ids = [int(g.id) for g in gifts if getattr(g, "id", None) is not None]
         self._gift_ids = ids
-        self.last_stats["collections"] = len(ids)
         logger.info("collections=%s", len(ids))
         return ids
 
-    async def seed_market(self, per_collection: int = 12) -> list[Lot]:
-        """Один спокойный проход по всем коллекциям (для seen)."""
-        gift_ids = await self.load_collections(force=True)
-        lots: list[Lot] = []
-        stats = {"ok": 0, "empty": 0, "errors": 0, "floods": 0}
-        for i in range(0, len(gift_ids), self.parallel):
-            batch = gift_ids[i : i + self.parallel]
-            chunk = await asyncio.gather(
-                *[self._fetch_one(gid, per_collection, stats) for gid in batch]
+    async def burst_search(
+        self,
+        min_stars: float,
+        max_stars: float,
+        *,
+        parallel: int = 12,
+        per_collection: int = 8,
+        max_collections: int = 40,
+        gap: float = 0.02,
+        timeout: float = 8.0,
+        limit_results: int = 25,
+    ) -> CheckResult:
+        """Быстрый поиск свежих лотов в диапазоне — цель ~2–4 сек."""
+        started = time.monotonic()
+        self.check_no += 1
+        stats = {"ok": 0, "errors": 0, "floods": 0, "scanned": 0}
+
+        try:
+            gift_ids = await self.load_collections()
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            return CheckResult(
+                check_no=self.check_no,
+                scanned=0,
+                lots=[],
+                collections_total=0,
+                errors=1,
+                elapsed=time.monotonic() - started,
+                error=str(exc),
             )
-            for part in chunk:
-                lots.extend(part)
-            await asyncio.sleep(0.05)
+
+        batch = gift_ids[:max_collections]
+        sem = asyncio.Semaphore(parallel)
+        lots: list[Lot] = []
+
+        async def one(gid: int) -> list[Lot]:
+            async with sem:
+                return await self._fetch_one(
+                    gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
+                )
+
+        # кусками, чтобы не зависнуть навсегда
+        for i in range(0, len(batch), parallel):
+            if time.monotonic() - started > 4.5:
+                break
+            group = batch[i : i + parallel]
+            parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
+            for part in parts:
+                stats["scanned"] += 1
+                if isinstance(part, list):
+                    lots.extend(part)
+                else:
+                    stats["errors"] += 1
+
         unique = _dedupe(lots)
-        self.last_stats.update(stats)
-        self.last_stats["lots"] = len(unique)
-        logger.info(
-            "seed lots=%s ok=%s empty=%s err=%s flood=%s",
-            len(unique),
-            stats["ok"],
-            stats["empty"],
-            stats["errors"],
-            stats["floods"],
-        )
-        return unique
+        matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
+        # newest-first уже от API; режем до preview
+        matched = matched[:limit_results]
 
-    async def poll_batch(self, per_collection: int = 12) -> list[Lot]:
-        """Следующие N коллекций по кругу — свежие лоты."""
-        gift_ids = await self.load_collections()
+        return CheckResult(
+            check_no=self.check_no,
+            scanned=stats["scanned"],
+            lots=matched,
+            collections_total=len(gift_ids),
+            ok=stats["ok"],
+            errors=stats["errors"],
+            floods=stats["floods"],
+            elapsed=time.monotonic() - started,
+            error=self.last_error,
+        )
+
+    async def run_check(
+        self,
+        *,
+        parallel: int = 5,
+        per_collection: int = 8,
+        batch_size: int = 15,
+        gap: float = 0.08,
+        timeout: float = 8.0,
+    ) -> CheckResult:
+        started = time.monotonic()
+        self.check_no += 1
+        stats = {"ok": 0, "errors": 0, "floods": 0, "scanned": 0}
+
+        try:
+            gift_ids = await self.load_collections()
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(
+                check_no=self.check_no,
+                scanned=0,
+                lots=[],
+                collections_total=0,
+                errors=1,
+                elapsed=time.monotonic() - started,
+                error=str(exc),
+            )
+
         if not gift_ids:
-            return []
-        n = len(gift_ids)
-        batch: list[int] = []
-        for _ in range(min(self.parallel, n)):
-            batch.append(gift_ids[self._cursor % n])
-            self._cursor = (self._cursor + 1) % n
+            return CheckResult(
+                check_no=self.check_no,
+                scanned=0,
+                lots=[],
+                collections_total=0,
+                errors=1,
+                elapsed=time.monotonic() - started,
+                error="Нет коллекций",
+            )
 
-        stats = {"ok": 0, "empty": 0, "errors": 0, "floods": 0}
-        parts = await asyncio.gather(
-            *[self._fetch_one(gid, per_collection, stats) for gid in batch]
-        )
+        n = len(gift_ids)
+        take = min(n, batch_size)
+        batch = [gift_ids[(self._cursor + i) % n] for i in range(take)]
+        self._cursor = (self._cursor + take) % n
+
+        sem = asyncio.Semaphore(parallel)
+
+        async def one(gid: int) -> list[Lot]:
+            async with sem:
+                return await self._fetch_one(
+                    gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
+                )
+
+        parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
         lots: list[Lot] = []
         for part in parts:
-            lots.extend(part)
-        self.last_stats["ok"] = self.last_stats.get("ok", 0) + stats["ok"]
-        self.last_stats["empty"] = self.last_stats.get("empty", 0) + stats["empty"]
-        self.last_stats["errors"] = self.last_stats.get("errors", 0) + stats["errors"]
-        self.last_stats["floods"] = self.last_stats.get("floods", 0) + stats["floods"]
-        self.last_stats["lots"] = len(lots)
-        return _dedupe(lots)
+            stats["scanned"] += 1
+            if isinstance(part, list):
+                lots.extend(part)
+            else:
+                stats["errors"] += 1
 
-    async def resolve_owner(self, lot: Lot, timeout: float = 1.0) -> None:
+        return CheckResult(
+            check_no=self.check_no,
+            scanned=stats["scanned"],
+            lots=_dedupe(lots),
+            collections_total=n,
+            ok=stats["ok"],
+            errors=stats["errors"],
+            floods=stats["floods"],
+            elapsed=time.monotonic() - started,
+            error=self.last_error,
+        )
+
+    async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:
+        await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
+
+    async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
         if lot.seller:
             return
         if lot.slug and lot.slug in self._owner_cache:
             lot.seller = self._owner_cache[lot.slug]
             return
-
         if lot.seller_id:
             try:
                 await self._wait_flood()
@@ -190,7 +291,6 @@ class TelegramMarket:
                     return
             except Exception:  # noqa: BLE001
                 pass
-
         if not lot.slug:
             return
         try:
@@ -199,12 +299,8 @@ class TelegramMarket:
                 self.client(GetUniqueStarGiftRequest(slug=lot.slug)),
                 timeout=timeout,
             )
-        except FloodWaitError as exc:
-            await self._note_flood(exc.seconds)
-            return
         except Exception:  # noqa: BLE001
             return
-
         gift = getattr(result, "gift", None)
         users = {
             int(u.id): u
@@ -231,21 +327,29 @@ class TelegramMarket:
         gift_id: int,
         limit: int,
         stats: dict[str, int],
+        *,
+        gap: float,
+        timeout: float,
+        sem: asyncio.Semaphore | None,
     ) -> list[Lot]:
-        result = await self._request(gift_id, limit, stars_only=True, stats=stats)
-        lots = _parse_result(result) if result is not None else []
-        if not lots:
-            result2 = await self._request(gift_id, limit, stars_only=False, stats=stats)
-            if result2 is not None:
-                lots = _parse_result(result2)
-                result = result2
-        if lots:
-            stats["ok"] += 1
-        elif result is not None:
-            stats["empty"] += 1
-        else:
-            stats["errors"] += 1
-        return lots
+        async def _do() -> list[Lot]:
+            result = await self._request(gift_id, limit, True, stats, gap, timeout)
+            lots = _parse_result(result) if result is not None else []
+            if not lots:
+                result2 = await self._request(gift_id, limit, False, stats, gap, timeout)
+                if result2 is not None:
+                    lots = _parse_result(result2)
+                    result = result2
+            if lots:
+                stats["ok"] += 1
+            elif result is None:
+                stats["errors"] += 1
+            return lots
+
+        if sem is None:
+            return await _do()
+        async with sem:
+            return await _do()
 
     async def _request(
         self,
@@ -253,54 +357,44 @@ class TelegramMarket:
         limit: int,
         stars_only: bool,
         stats: dict[str, int],
+        gap: float,
+        timeout: float,
     ) -> Any | None:
-        from credentials import REQUEST_GAP
-
-        for attempt in range(4):
+        for attempt in range(2):
             try:
                 await self._wait_flood()
                 await self.ensure_connected()
-                async with self._sem:
-                    async with self._gap_lock:
-                        gap = REQUEST_GAP - (time.monotonic() - self._last_req)
-                        if gap > 0:
-                            await asyncio.sleep(gap)
-                        self._last_req = time.monotonic()
-                    return await self.client(
+                async with self._gap_lock:
+                    wait = gap - (time.monotonic() - self._last_req)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self._last_req = time.monotonic()
+                return await asyncio.wait_for(
+                    self.client(
                         GetResaleStarGiftsRequest(
                             gift_id=gift_id,
                             offset="",
                             limit=min(limit, 50),
                             stars_only=True if stars_only else None,
                         )
-                    )
+                    ),
+                    timeout=timeout,
+                )
             except FloodWaitError as exc:
                 stats["floods"] += 1
-                await self._note_flood(exc.seconds)
-                logger.warning("FloodWait %ss (gift=%s)", exc.seconds, gift_id)
-            except RPCError as exc:
-                stats["errors"] += 1
-                logger.debug("RPC gift=%s: %s", gift_id, exc)
-                await asyncio.sleep(0.2 * (attempt + 1))
+                self._flood_until = time.monotonic() + min(float(exc.seconds) + 0.2, 20.0)
+                self.last_error = f"FloodWait {exc.seconds}s"
+                await asyncio.sleep(min(float(exc.seconds), 2.0))
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
-                logger.debug("err gift=%s: %s", gift_id, exc)
-                try:
-                    await self.ensure_connected()
-                except Exception:  # noqa: BLE001
-                    pass
-                await asyncio.sleep(0.25 * (attempt + 1))
+                self.last_error = str(exc)
+                await asyncio.sleep(0.1 * (attempt + 1))
         return None
 
     async def _wait_flood(self) -> None:
         delay = self._flood_until - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
-
-    async def _note_flood(self, seconds: int | float) -> None:
-        wait = min(float(seconds) + 0.3, 60.0)
-        self._flood_until = max(self._flood_until, time.monotonic() + wait)
-        await asyncio.sleep(min(wait, 5.0))
 
 
 def _parse_result(result: Any) -> list[Lot]:

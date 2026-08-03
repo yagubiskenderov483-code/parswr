@@ -32,6 +32,7 @@ async def main() -> None:
         logger.warning("Initial rates refresh failed: %s", exc)
 
     auth = AuthService(settings)
+    logger.info("Telethon API_ID loaded: %s", bool(settings.api_id and settings.api_hash))
     if await auth.is_authorized():
         logger.info("Telethon session OK: %s", auth.authorized_as)
         try:

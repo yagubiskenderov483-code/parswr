@@ -13,7 +13,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
-from bot.config import Settings
+from bot.config import Settings, get_settings
 from bot.parsers.registry import (
     build_parsers,
     build_telethon,
@@ -43,6 +43,9 @@ class AuthService:
         return Path(str(self.settings.session_path) + ".session")
 
     async def ensure_client(self) -> TelegramClient:
+        # Always re-read settings (.env may be filled after start)
+        self.settings = get_settings()
+        self.settings.require_telethon()
         if self.client is None:
             self.client = build_telethon(self.settings)
         if not self.client.is_connected():

@@ -10,9 +10,11 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="▶️ Запустить парсинг"), KeyboardButton(text="⏹ Остановить парсинг")],
             [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="🔄 Обновить курсы валют")],
+            [KeyboardButton(text="🔄 Обновить курсы валют"), KeyboardButton(text="🔐 Войти")],
+            [KeyboardButton(text="🚀 Старт")],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 

@@ -6,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
+from bot.config import get_settings
 from bot.keyboards import main_menu
 from bot.services.auth import AuthService
 from bot.services.monitor import MonitorService
@@ -26,7 +27,19 @@ def _phone_kb() -> ReplyKeyboardMarkup:
     )
 
 
+async def _ensure_api_keys(message: Message) -> bool:
+    settings = get_settings()
+    try:
+        settings.require_telethon()
+        return True
+    except RuntimeError as exc:
+        await message.answer(f"⚠️ {exc}", reply_markup=main_menu())
+        return False
+
+
 async def begin_auth(message: Message, state: FSMContext) -> None:
+    if not await _ensure_api_keys(message):
+        return
     await state.set_state(AuthStates.phone)
     await message.answer(
         "🔐 <b>Авторизация Telegram-аккаунта</b>\n\n"
@@ -37,30 +50,42 @@ async def begin_auth(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(CommandStart())
-async def cmd_start(
+async def show_start_screen(
     message: Message,
     state: FSMContext,
     auth: AuthService,
-    monitor: MonitorService,
 ) -> None:
     await state.clear()
     if await auth.is_authorized():
         await message.answer(
             f"✅ Аккаунт уже авторизован: <b>{auth.authorized_as}</b>\n\n"
             "🎁 Парсю новые лоты с Tonnel / Portal / MRKT / Telegram Market.\n"
-            "Нажми ▶️ чтобы начать.",
+            "Нажми ▶️ Запустить парсинг.",
             reply_markup=main_menu(),
         )
-        # Ensure parsers are wired with tokens
-        if not any(p.last_count or p.last_error is None for p in monitor.parsers):
-            pass
         return
+    await message.answer(
+        "🎁 <b>Gift Lots Monitor</b>\n\n"
+        "Чтобы парсить все маркеты — войди в TG-аккаунт.\n"
+        "Нажми <b>🔐 Войти</b> или пришли номер.",
+        reply_markup=main_menu(),
+    )
     await begin_auth(message, state)
 
 
+@router.message(CommandStart())
+@router.message(F.text == "🚀 Старт")
+async def cmd_start(
+    message: Message,
+    state: FSMContext,
+    auth: AuthService,
+) -> None:
+    await show_start_screen(message, state, auth)
+
+
 @router.message(Command("login"))
-async def cmd_login(message: Message, state: FSMContext, auth: AuthService) -> None:
+@router.message(F.text == "🔐 Войти")
+async def cmd_login(message: Message, state: FSMContext) -> None:
     await state.clear()
     await begin_auth(message, state)
 
@@ -72,16 +97,31 @@ async def cancel_auth(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Авторизация отменена. Без неё будет работать только Tonnel.\n"
-        "Чтобы войти позже: /login",
+        "Чтобы войти позже: нажми 🔐 Войти",
         reply_markup=main_menu(),
     )
 
 
 @router.message(StateFilter(AuthStates.phone))
 async def got_phone(message: Message, state: FSMContext, auth: AuthService) -> None:
-    phone = (message.text or "").strip()
+    # Ignore menu buttons pressed while waiting for phone
+    text = (message.text or "").strip()
+    if text in {
+        "🚀 Старт",
+        "🔐 Войти",
+        "▶️ Запустить парсинг",
+        "⏹ Остановить парсинг",
+        "⚙️ Настройки",
+        "📊 Статистика",
+        "🔄 Обновить курсы валют",
+    }:
+        return
+
+    if not await _ensure_api_keys(message):
+        return
+
     try:
-        text = await auth.send_code(phone)
+        reply = await auth.send_code(text)
     except ValueError as exc:
         await message.answer(f"⚠️ {exc}")
         return
@@ -90,7 +130,7 @@ async def got_phone(message: Message, state: FSMContext, auth: AuthService) -> N
         return
     await state.set_state(AuthStates.code)
     await message.answer(
-        f"{text}\n\nПришли код из Telegram/SMS:",
+        f"{reply}\n\nПришли код из Telegram/SMS:",
         reply_markup=_phone_kb(),
     )
 

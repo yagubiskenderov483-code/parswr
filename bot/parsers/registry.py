@@ -63,8 +63,7 @@ async def fetch_portals_auth(client: TelegramClient) -> str:
 
 
 def build_telethon(settings: Settings) -> TelegramClient:
-    if not settings.api_id or not settings.api_hash:
-        raise RuntimeError("API_ID/API_HASH required for Telethon")
+    settings.require_telethon()
     return TelegramClient(str(settings.session_path), settings.api_id, settings.api_hash)
 
 

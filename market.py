@@ -8,7 +8,7 @@ Telegram Market scanner.
 - Stars Rating level ≤ MAX_ACCOUNT_LEVEL (режем 5/6/8+)
 - режем китов с кучей гифтов на профиле
 - выдача вразнобой (не пачками одной коллекции)
-- burst-парсинг маркета ≤ ~3с
+- burst-парсинг маркета по многим коллекциям (live emit)
 """
 
 from __future__ import annotations
@@ -233,8 +233,12 @@ class TelegramMarket:
             matched.append(gid)
         random.shuffle(matched)
         random.shuffle(unknown)
-        # сначала подходящие по floor, потом неизвестные (чтобы узнать floor)
-        ordered = matched + unknown
+        # при активном floor-фильтре почти не берём unknown — иначе 3k-коллекции
+        if delta is not None:
+            extra = max(20, max_collections // 10) if max_collections > 0 else 40
+            ordered = matched + unknown[:extra]
+        else:
+            ordered = matched + unknown
         if max_collections > 0:
             ordered = ordered[:max_collections]
         logger.info(
@@ -787,8 +791,13 @@ class TelegramMarket:
         floor = self._fair_floor(lot)
         lot.floor_stars = floor
         delta = self.floor_delta()
-        if floor is not None and floor > 0 and delta is not None:
-            # коллекция слишком дешёвая для этого режима — даже floor+Δ < min
+        if delta is not None:
+            # без известного floor не выдаём — иначе в 60–100k лезет мусор
+            if floor is None or floor <= 0:
+                stats.price_skip += 1
+                lot.skip_reason = "no_floor"
+                return False
+            # коллекция слишком дешёвая для этого режима
             if floor + float(delta) < self.search_min:
                 stats.price_skip += 1
                 lot.skip_reason = f"cheap_col fl{floor:.0f}+{delta}<{self.search_min:.0f}"
@@ -845,13 +854,20 @@ class TelegramMarket:
             lot.skip_reason = "offline"
             return False
 
-        level = lot.level if lot.level is not None else 0
-        if level > self.max_level:
+        # fail-closed: без lvl / gifts не выдаём
+        if lot.level is None:
             stats.level_skip += 1
-            lot.skip_reason = f"lvl{level}"
+            lot.skip_reason = "no_lvl"
             return False
-        gifts_n = lot.gifts_count if lot.gifts_count is not None else 0
-        if gifts_n > self.max_gifts:
+        if lot.level > self.max_level:
+            stats.level_skip += 1
+            lot.skip_reason = f"lvl{lot.level}"
+            return False
+        if lot.gifts_count is None:
+            stats.gifts_skip += 1
+            lot.skip_reason = "no_gifts"
+            return False
+        if lot.gifts_count > self.max_gifts:
             stats.gifts_skip += 1
             lot.skip_reason = f"gifts>{self.max_gifts}"
             return False
@@ -996,16 +1012,22 @@ class TelegramMarket:
         key: int | str = lot.seller_id if lot.seller_id else lot.seller.lower()
         if key in self._profile_cache:
             cached = self._profile_cache[key]
-            lot.level = cached.get("level")
-            lot.gifts_count = cached.get("gifts_count")
-            lot.ru_score = int(cached.get("ru_score", 0))
-            lot.ru_ok = lot.ru_score >= self.min_ru
-            lot.online = bool(cached.get("online", False))
-            lot.recently = bool(cached.get("recently", False))
-            if cached.get("paid_dm"):
-                lot.paid_dm = True
-                lot.seller = ""
-            return
+            # неполный кэш не используем как финал — перезапросим
+            if cached.get("complete") or (
+                cached.get("level") is not None and cached.get("gifts_count") is not None
+            ):
+                lot.level = cached.get("level")
+                lot.gifts_count = cached.get("gifts_count")
+                lot.ru_score = int(cached.get("ru_score", 0))
+                lot.ru_ok = lot.ru_score >= self.min_ru
+                lot.online = bool(cached.get("online", False))
+                lot.recently = bool(cached.get("recently", False))
+                if cached.get("paid_dm"):
+                    lot.paid_dm = True
+                    lot.seller = ""
+                elif cached.get("username") and not lot.seller:
+                    lot.seller = cached["username"]
+                return
 
         peer: Any = lot.seller_id if lot.seller_id else lot.seller
         score = 0
@@ -1125,6 +1147,12 @@ class TelegramMarket:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("gifts ru fail: %s", exc)
 
+        # после успешного FullUser: нет rating/gifts → 0, не «unknown»
+        if level is None:
+            level = 0
+        if gifts_count is None:
+            gifts_count = 0
+
         self._store_profile(
             key,
             lot.seller_id,
@@ -1161,7 +1189,7 @@ class TelegramMarket:
                 lot.recently,
             )
 
-        lot.level = level if level is not None else 0
+        lot.level = level
         lot.gifts_count = gifts_count
         lot.ru_score = score
         lot.ru_ok = score >= self.min_ru
@@ -1189,8 +1217,9 @@ class TelegramMarket:
         recently: bool = False,
     ) -> None:
         payload = {
-            "level": 0 if level is None else level,
+            "level": level,
             "gifts_count": gifts_count,
+            "complete": level is not None and gifts_count is not None,
             "ru_score": score,
             "ru_ok": score >= self.min_ru,
             "paid_dm": paid,
@@ -1646,11 +1675,10 @@ def _ru_points_from_user(user: Any) -> int:
     last = str(getattr(user, "last_name", "") or "")
     if _has_cyrillic(first) or _has_cyrillic(last):
         score += 2
-    username = _best_username(user)
-    # транслит-ники не считаем, только явная кириллица в имени
+    # lang сам по себе не хватает на MIN_RU_SCORE=2 — нужна кириллица
     lang = str(getattr(user, "lang_code", "") or "").lower()
     if lang.startswith("ru") or lang.startswith("uk") or lang.startswith("be"):
-        score += 2
+        score += 1
     return score
 
 

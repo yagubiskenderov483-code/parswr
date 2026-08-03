@@ -34,7 +34,7 @@ FLOOR_DELTA_BY_RANGE = {
 FRESH_MAX_AGE_SEC = 120
 FRESH_MAX_RANK = 2
 
-# Live-парс: обходим много коллекций (не 10–15)
+# Live-парс: много коллекций + мгновенная выдача
 BURST_PARALLEL = 40
 BURST_PER_COLLECTION = 16
 BURST_MAX_COLLECTIONS = 400
@@ -42,7 +42,6 @@ BURST_GAP = 0.0
 BURST_TIME_BUDGET = 12.0
 API_TIMEOUT = 2.5
 RESULT_LIMIT = 100
-PREVIEW_COUNT = 100
 
 # Чеки — широкий срез за тик
 CHECK_INTERVAL = 0.55

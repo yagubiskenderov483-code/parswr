@@ -64,9 +64,9 @@ PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r60_100", "60k–100k ⭐", 60000, 100000),
 ]
 
-FRESH_OPTIONS = [(60, "1 мин"), (120, "2 мин"), (180, "3 мин")]
-LEVEL_OPTIONS = [3, 4, 5]
-GIFTS_OPTIONS = [20, 40, 60]
+FRESH_OPTIONS = [(60, "1 мин"), (120, "2 мин")]
+LEVEL_OPTIONS = [3, 4]  # жёстко ≤4, без lvl5
+GIFTS_OPTIONS = [20, 40]  # без 60 — киты режем
 RU_OPTIONS = [1, 2, 3]
 
 
@@ -74,7 +74,6 @@ class AuthStates(StatesGroup):
     phone = State()
     code = State()
     password = State()
-    ban = State()
 
 
 class App:
@@ -109,6 +108,13 @@ class App:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
 
     def apply_filters_to_market(self) -> None:
+        # clamp к допустимым опциям
+        if int(creds.MAX_ACCOUNT_LEVEL) > 4:
+            creds.MAX_ACCOUNT_LEVEL = 4
+        if int(creds.MAX_PROFILE_GIFTS) > 40:
+            creds.MAX_PROFILE_GIFTS = 40
+        if int(creds.FRESH_MAX_AGE_SEC) > 120:
+            creds.FRESH_MAX_AGE_SEC = 120
         self.market.max_level = creds.MAX_ACCOUNT_LEVEL
         self.market.max_gifts = creds.MAX_PROFILE_GIFTS
         self.market.min_ru = creds.MIN_RU_SCORE
@@ -362,7 +368,7 @@ class App:
                     async for lot in self.market.stream_prepared(
                         fresh,
                         require_fresh=True,
-                        check_rank=False,
+                        check_rank=True,
                         stats=prep,
                     ):
                         if await self._notify_lot(lot, count_as_new=True):
@@ -634,10 +640,23 @@ def _cycle(options: list, current):
 ONLINE_OPTIONS = ["any", "recent", "online"]
 
 
+def _settings_hub_text() -> str:
+    return (
+        "⚙️ <b>Настройки</b>\n"
+        f"Цена: <b>{app.range_label}</b>\n"
+        f"Свежесть: ≤<b>{int(creds.FRESH_MAX_AGE_SEC)}с</b>\n"
+        f"lvl≤{creds.MAX_ACCOUNT_LEVEL} · gifts≤{creds.MAX_PROFILE_GIFTS} · "
+        f"RU≥{creds.MIN_RU_SCORE}\n"
+        f"Чеков: <b>{app.checks}</b> · новых: <b>{app.lots_notified}</b>\n"
+        f"Юзов в сессии: <b>{len(app.session_users)}</b>\n"
+        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>"
+    )
+
+
 def _filters_text() -> str:
     delta = app.market.floor_delta() if app.logged_in else "?"
     return (
-        "⚙️ <b>Settings</b>\n"
+        "⚙️ <b>Settings · фильтры</b>\n"
         f"Свежесть: ≤ <b>{int(creds.FRESH_MAX_AGE_SEC)}с</b>\n"
         f"lvl ≤ <b>{creds.MAX_ACCOUNT_LEVEL}</b>\n"
         f"gifts ≤ <b>{creds.MAX_PROFILE_GIFTS}</b>\n"
@@ -697,6 +716,30 @@ async def cmd_logout(message: Message, state: FSMContext) -> None:
     await app.reset_auth()
     await state.set_state(AuthStates.phone)
     await message.answer("Сброшено. Номер:")
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Юз: /ban username")
+        return
+    username = parts[1].strip().lstrip("@")
+    store.block(username, reason="manual")
+    await message.answer(f"🚫 В ЧС @{username}")
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text = store.export_usernames() or "\n".join(f"@{u}" for u in app.session_users)
+    if not text:
+        await message.answer("Пока пусто")
+        return
+    await message.answer_document(
+        BufferedInputFile(text.encode("utf-8"), filename="usernames.txt")
+    )
 
 
 @router.message(StateFilter(AuthStates.phone))
@@ -772,8 +815,10 @@ async def cb_parse(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:settings")
 async def cb_settings(callback: CallbackQuery) -> None:
-    # сразу фильтры — то же, что /settings
-    await callback.message.edit_text(_filters_text(), reply_markup=filters_inline())
+    await callback.message.edit_text(
+        _settings_hub_text(),
+        reply_markup=settings_inline(),
+    )
     await callback.answer()
 
 
@@ -833,28 +878,6 @@ async def cb_ban(callback: CallbackQuery) -> None:
         return
     store.block(username, reason="manual")
     await callback.answer(f"В ЧС @{username}", show_alert=True)
-
-
-@router.message(Command("ban"))
-async def cmd_ban(message: Message) -> None:
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Юз: /ban username")
-        return
-    username = parts[1].strip().lstrip("@")
-    store.block(username, reason="manual")
-    await message.answer(f"🚫 В ЧС @{username}")
-
-
-@router.message(Command("export"))
-async def cmd_export(message: Message) -> None:
-    text = store.export_usernames() or "\n".join(f"@{u}" for u in app.session_users)
-    if not text:
-        await message.answer("Пока пусто")
-        return
-    await message.answer_document(
-        BufferedInputFile(text.encode("utf-8"), filename="usernames.txt")
-    )
 
 
 @router.callback_query(F.data == "menu:search")

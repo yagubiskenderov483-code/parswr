@@ -257,14 +257,16 @@ class App:
                 f"🔍 Найдено: <b>{prep.kept}</b> шт. "
                 f"(~{burst.elapsed:.1f}с · {burst.scanned}/{burst.collections_total})\n"
                 f"фильтр: paid−{prep.paid_skip} · lvl−{prep.level_skip} · "
-                f"ru−{prep.ru_skip} · юзы {prep.with_user}/{prep.input}"
+                f"gifts−{prep.gifts_skip} · ru−{prep.ru_skip} · "
+                f"юзы {prep.with_user}/{prep.input}"
             )
             lines = []
             for lot in writable[: creds.PREVIEW_COUNT]:
                 lvl = lot.level if lot.level is not None else "?"
+                gifts = lot.gifts_count if lot.gifts_count is not None else "?"
                 lines.append(
                     f'🔍 <a href="{lot.nft_url}">NFT</a> | @{lot.seller} | '
-                    f"{_fmt(lot.stars)}⭐ · lvl{lvl}"
+                    f"{_fmt(lot.stars)}⭐ · lvl{lvl} · g{gifts}"
                 )
             for i in range(0, len(lines), 10):
                 await self._say("\n".join(lines[i : i + 10]))
@@ -324,6 +326,7 @@ class App:
                     filter_note = (
                         f" · 🚫paid {paid_skip}"
                         f" lvl {prep.level_skip}"
+                        f" gifts {prep.gifts_skip}"
                         f" ru {prep.ru_skip}"
                     )
                 else:
@@ -342,6 +345,7 @@ class App:
                     f"Seen: <b>{len(self._seen)}</b>\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
                     f"⏱ {result.elapsed:.2f}с · RU+lvl≤{creds.MAX_ACCOUNT_LEVEL}"
+                    f"+gifts≤{creds.MAX_PROFILE_GIFTS}"
                     + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
                 )
             except asyncio.CancelledError:
@@ -364,11 +368,12 @@ class App:
         seller = f"@{lot.seller}"
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
         lvl = lot.level if lot.level is not None else "?"
+        gifts = lot.gifts_count if lot.gifts_count is not None else "?"
         text = (
             f"{title}\n\n"
             f"🎁 <b>{_esc(lot.display)}</b>\n"
             f"💰 <b>{_fmt(lot.stars)} ⭐</b>\n"
-            f"👤 {seller} · lvl <b>{lvl}</b> · RU {lot.ru_score}\n"
+            f"👤 {seller} · lvl <b>{lvl}</b> · gifts <b>{gifts}</b> · RU {lot.ru_score}\n"
             f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
         )
         rows: list[list[InlineKeyboardButton]] = [

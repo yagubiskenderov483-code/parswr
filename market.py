@@ -5,8 +5,10 @@ Telegram Market scanner.
 - резолв скрытых гифтов → @username
 - без юзов с ЛС за Stars
 - только RU-признаки (био/ник/канал/подарки)
-- Stars Rating level ≤ MAX_ACCOUNT_LEVEL
+- Stars Rating level ≤ MAX_ACCOUNT_LEVEL (режем 5/6/8+)
+- режем китов с кучей гифтов на профиле
 - выдача вразнобой (не пачками одной коллекции)
+- burst-парсинг маркета ≤ ~3с
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ class Lot:
     seller_id: int | None = None
     paid_dm: bool = False
     level: int | None = None
+    gifts_count: int | None = None
     ru_score: int = 0
     ru_ok: bool = False
     skip_reason: str = ""
@@ -110,6 +113,7 @@ class PrepareStats:
     with_user: int = 0
     paid_skip: int = 0
     level_skip: int = 0
+    gifts_skip: int = 0
     ru_skip: int = 0
     kept: int = 0
 
@@ -185,12 +189,14 @@ class TelegramMarket:
         gap: float = 0.01,
         timeout: float = 6.0,
         limit_results: int = 100,
-        time_budget: float = 5.0,
+        time_budget: float = 3.0,
     ) -> CheckResult:
         started = time.monotonic()
         self.check_no += 1
         stats = {"ok": 0, "errors": 0, "floods": 0, "scanned": 0}
         samples: list[str] = []
+        # жёсткий потолок: запросы не длиннее остатка бюджета
+        hard_deadline = started + max(0.8, time_budget)
 
         try:
             gift_ids = await self.load_collections()
@@ -214,13 +220,17 @@ class TelegramMarket:
         lots: list[Lot] = []
 
         async def one(gid: int) -> list[Lot]:
+            left = hard_deadline - time.monotonic()
+            if left <= 0.05:
+                return []
+            req_timeout = min(timeout, max(0.35, left - 0.05))
             async with sem:
                 return await self._fetch_one(
-                    gid, per_collection, stats, gap=gap, timeout=timeout
+                    gid, per_collection, stats, gap=gap, timeout=req_timeout
                 )
 
         for i in range(0, len(batch), parallel):
-            if time.monotonic() - started > time_budget:
+            if time.monotonic() >= hard_deadline:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
@@ -368,9 +378,15 @@ class TelegramMarket:
                 lot.skip_reason = "paid_dm"
                 continue
             level = lot.level if lot.level is not None else 0
+            # режем 5 / 6 / 8+ (и всё выше MAX_ACCOUNT_LEVEL)
             if level > creds.MAX_ACCOUNT_LEVEL:
                 stats.level_skip += 1
-                lot.skip_reason = f"lvl>{creds.MAX_ACCOUNT_LEVEL}"
+                lot.skip_reason = f"lvl{level}"
+                continue
+            gifts_n = lot.gifts_count if lot.gifts_count is not None else 0
+            if gifts_n > creds.MAX_PROFILE_GIFTS:
+                stats.gifts_skip += 1
+                lot.skip_reason = f"gifts>{creds.MAX_PROFILE_GIFTS}"
                 continue
             if not lot.ru_ok:
                 stats.ru_skip += 1
@@ -456,6 +472,7 @@ class TelegramMarket:
             if not cached:
                 continue
             lot.level = cached.get("level")
+            lot.gifts_count = cached.get("gifts_count")
             lot.ru_score = int(cached.get("ru_score", 0))
             lot.ru_ok = bool(cached.get("ru_ok", False))
             if cached.get("paid_dm"):
@@ -469,6 +486,7 @@ class TelegramMarket:
         if key in self._profile_cache:
             cached = self._profile_cache[key]
             lot.level = cached.get("level")
+            lot.gifts_count = cached.get("gifts_count")
             lot.ru_score = int(cached.get("ru_score", 0))
             lot.ru_ok = bool(cached.get("ru_ok", False))
             if cached.get("paid_dm"):
@@ -479,6 +497,7 @@ class TelegramMarket:
         peer: Any = lot.seller_id if lot.seller_id else lot.seller
         score = 0
         level: int | None = None
+        gifts_count: int | None = None
         paid = False
         username = lot.seller
 
@@ -490,7 +509,6 @@ class TelegramMarket:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("full user fail %s: %s", peer, exc)
-            # без full — слабый RU по самому нику/имени из entity
             try:
                 ent = await asyncio.wait_for(
                     self.client.get_entity(peer), timeout=min(timeout, 1.0)
@@ -501,8 +519,11 @@ class TelegramMarket:
                     paid = True
             except Exception:  # noqa: BLE001
                 pass
-            self._store_profile(key, lot.seller_id, username, level, score, paid)
+            self._store_profile(
+                key, lot.seller_id, username, level, gifts_count, score, paid
+            )
             lot.level = level
+            lot.gifts_count = gifts_count
             lot.ru_score = score
             lot.ru_ok = score >= creds.MIN_RU_SCORE
             if paid:
@@ -520,7 +541,6 @@ class TelegramMarket:
         chats = list(getattr(full, "chats", None) or [])
         full_user = getattr(full, "full_user", None)
 
-        # user object
         user = None
         if lot.seller_id and lot.seller_id in users:
             user = users[lot.seller_id]
@@ -556,8 +576,13 @@ class TelegramMarket:
                     level = int(rating.level)
                 except (TypeError, ValueError):
                     level = None
+            raw_gifts = getattr(full_user, "stargifts_count", None)
+            if raw_gifts is not None:
+                try:
+                    gifts_count = int(raw_gifts)
+                except (TypeError, ValueError):
+                    gifts_count = None
 
-            # личный канал
             channel_id = getattr(full_user, "personal_channel_id", None)
             if channel_id is not None:
                 for chat in chats:
@@ -569,19 +594,28 @@ class TelegramMarket:
                         continue
 
         # подарки на профиле: ники/тексты отправителей
-        if not paid and (lot.seller_id or username):
+        # для китов с кучей гифтов RU-probe не нужен — всё равно отсечём
+        whale = gifts_count is not None and gifts_count > creds.MAX_PROFILE_GIFTS
+        if not paid and not whale and (lot.seller_id or username):
             try:
                 score += await self._ru_from_gifts(peer, timeout=timeout)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("gifts ru fail: %s", exc)
 
-        self._store_profile(key, lot.seller_id, username, level, score, paid)
+        self._store_profile(
+            key, lot.seller_id, username, level, gifts_count, score, paid
+        )
         if lot.seller_id and lot.seller_id != key:
-            self._store_profile(lot.seller_id, lot.seller_id, username, level, score, paid)
+            self._store_profile(
+                lot.seller_id, lot.seller_id, username, level, gifts_count, score, paid
+            )
         if username:
-            self._store_profile(username.lower(), lot.seller_id, username, level, score, paid)
+            self._store_profile(
+                username.lower(), lot.seller_id, username, level, gifts_count, score, paid
+            )
 
         lot.level = level if level is not None else 0
+        lot.gifts_count = gifts_count
         lot.ru_score = score
         lot.ru_ok = score >= creds.MIN_RU_SCORE
         if paid:
@@ -601,11 +635,13 @@ class TelegramMarket:
         seller_id: int | None,
         username: str,
         level: int | None,
+        gifts_count: int | None,
         score: int,
         paid: bool,
     ) -> None:
         self._profile_cache[key] = {
             "level": 0 if level is None else level,
+            "gifts_count": gifts_count,
             "ru_score": score,
             "ru_ok": score >= creds.MIN_RU_SCORE,
             "paid_dm": paid,

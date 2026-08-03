@@ -14,14 +14,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.payments import (
     GetResaleStarGiftsRequest,
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import StarsAmount, StarsTonAmount, UserStatusOnline
+from telethon.tl.types import StarsAmount, StarsTonAmount
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +37,6 @@ class Lot:
     symbol: str = ""
     seller: str = ""
     seller_id: int | None = None
-    lang_code: str = ""
-    first_name: str = ""
-    last_name: str = ""
-    about: str = ""
-    is_online: bool | None = None
-    account_level: int | None = None
-    gifts_count: int | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -65,20 +57,6 @@ class Lot:
         if extra:
             parts.append(f"({extra})")
         return " ".join(parts)
-
-    @property
-    def model_key(self) -> str:
-        title = (self.title or "").strip().lower()
-        model = (self.model or "").strip().lower()
-        return f"{title}|{model}" if model else (title or self.id)
-
-    @property
-    def owner_key(self) -> str:
-        if self.seller:
-            return self.seller.lower()
-        if self.seller_id is not None:
-            return f"id:{self.seller_id}"
-        return f"lot:{self.id}"
 
 
 @dataclass
@@ -103,7 +81,6 @@ class TelegramMarket:
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
-        self._profile_cache: dict[int, dict[str, Any]] = {}
         self.check_no = 0
         self.last_error = ""
 
@@ -111,7 +88,6 @@ class TelegramMarket:
         self.client = client
         self._gift_ids.clear()
         self._owner_cache.clear()
-        self._profile_cache.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -296,26 +272,22 @@ class TelegramMarket:
         await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
 
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
-        if lot.seller and lot.seller_id is not None:
+        if lot.seller:
             return
-        if lot.slug and lot.slug in self._owner_cache and not lot.seller:
+        if lot.slug and lot.slug in self._owner_cache:
             lot.seller = self._owner_cache[lot.slug]
-            if lot.seller:
-                return
+            return
         if lot.seller_id:
-            cached = self._profile_cache.get(lot.seller_id)
-            if cached and cached.get("username"):
-                _apply_profile(lot, cached)
-                return
             try:
                 await self._wait_flood()
                 ent = await asyncio.wait_for(
                     self.client.get_entity(lot.seller_id), timeout=timeout
                 )
-                _apply_user(lot, ent)
-                if lot.seller and lot.slug:
-                    self._owner_cache[lot.slug] = lot.seller
-                if lot.seller:
+                username = str(getattr(ent, "username", "") or "").lstrip("@")
+                if username:
+                    lot.seller = username
+                    if lot.slug:
+                        self._owner_cache[lot.slug] = username
                     return
             except Exception:  # noqa: BLE001
                 pass
@@ -336,78 +308,19 @@ class TelegramMarket:
             if getattr(u, "id", None) is not None
         }
         owner = getattr(gift, "owner_id", None) if gift else None
-        seller_id = _peer_user_id(owner)
-        if seller_id:
-            lot.seller_id = seller_id
+        seller_id = None
+        if owner is not None:
+            seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
+            try:
+                seller_id = int(seller_id) if seller_id is not None else None
+            except (TypeError, ValueError):
+                seller_id = None
         if seller_id and seller_id in users:
-            _apply_user(lot, users[seller_id])
-            if lot.seller:
-                self._owner_cache[lot.slug] = lot.seller
-
-    async def enrich_profiles(
-        self,
-        lots: list[Lot],
-        *,
-        timeout: float = 0.8,
-        parallel: int = 8,
-    ) -> None:
-        """Для Settings: about / lvl / gifts. Сам поиск не трогает."""
-        sem = asyncio.Semaphore(parallel)
-
-        async def one(lot: Lot) -> None:
-            if not lot.seller_id:
-                return
-            cached = self._profile_cache.get(lot.seller_id)
-            if cached and "about" in cached:
-                _apply_profile(lot, cached)
-                return
-            async with sem:
-                try:
-                    await self._wait_flood()
-                    full = await asyncio.wait_for(
-                        self.client(GetFullUserRequest(lot.seller_id)),
-                        timeout=timeout,
-                    )
-                except Exception:  # noqa: BLE001
-                    return
-                for u in getattr(full, "users", None) or []:
-                    if getattr(u, "id", None) == lot.seller_id:
-                        _apply_user(lot, u)
-                        break
-                uf = getattr(full, "full_user", None)
-                about = str(getattr(uf, "about", "") or "") if uf is not None else ""
-                level = None
-                gifts = None
-                if uf is not None:
-                    raw_gifts = getattr(uf, "stargifts_count", None)
-                    if raw_gifts is not None:
-                        try:
-                            gifts = int(raw_gifts)
-                        except (TypeError, ValueError):
-                            gifts = None
-                    rating = getattr(uf, "stars_rating", None)
-                    if rating is not None:
-                        try:
-                            level = int(getattr(rating, "level", 0))
-                        except (TypeError, ValueError):
-                            level = None
-                lot.about = about
-                if level is not None:
-                    lot.account_level = level
-                if gifts is not None:
-                    lot.gifts_count = gifts
-                self._profile_cache[lot.seller_id] = {
-                    "username": lot.seller,
-                    "lang_code": lot.lang_code,
-                    "first_name": lot.first_name,
-                    "last_name": lot.last_name,
-                    "is_online": lot.is_online,
-                    "about": about,
-                    "account_level": level,
-                    "gifts_count": gifts,
-                }
-
-        await asyncio.gather(*[one(lot) for lot in lots])
+            username = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
+            if username:
+                lot.seller = username
+                lot.seller_id = seller_id
+                self._owner_cache[lot.slug] = username
 
     async def _fetch_one(
         self,
@@ -482,72 +395,6 @@ class TelegramMarket:
         delay = self._flood_until - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
-
-
-def _apply_user(lot: Lot, user: Any) -> None:
-    username = _extract_username(user)
-    if username:
-        lot.seller = username
-    sid = getattr(user, "id", None)
-    if sid is not None:
-        try:
-            lot.seller_id = int(sid)
-        except (TypeError, ValueError):
-            pass
-    lang = str(getattr(user, "lang_code", "") or "").strip()
-    if lang:
-        lot.lang_code = lang
-    fn = str(getattr(user, "first_name", "") or "")
-    ln = str(getattr(user, "last_name", "") or "")
-    if fn:
-        lot.first_name = fn
-    if ln:
-        lot.last_name = ln
-    status = getattr(user, "status", None)
-    if status is not None:
-        lot.is_online = isinstance(status, UserStatusOnline) or (
-            status.__class__.__name__ == "UserStatusOnline"
-        )
-
-
-def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
-    if info.get("username") and not lot.seller:
-        lot.seller = str(info["username"])
-    if info.get("lang_code") and not lot.lang_code:
-        lot.lang_code = str(info["lang_code"])
-    if info.get("first_name") and not lot.first_name:
-        lot.first_name = str(info["first_name"])
-    if info.get("last_name") and not lot.last_name:
-        lot.last_name = str(info["last_name"])
-    if info.get("is_online") is not None and lot.is_online is None:
-        lot.is_online = bool(info["is_online"])
-    if "about" in info:
-        lot.about = str(info.get("about") or "")
-    if info.get("account_level") is not None:
-        lot.account_level = int(info["account_level"])
-    if info.get("gifts_count") is not None:
-        lot.gifts_count = int(info["gifts_count"])
-
-
-def _extract_username(user: Any) -> str:
-    raw = str(getattr(user, "username", "") or "").lstrip("@").strip()
-    if raw:
-        return raw
-    for alt in getattr(user, "usernames", None) or []:
-        name = str(getattr(alt, "username", "") or "").lstrip("@").strip()
-        if name and getattr(alt, "active", True):
-            return name
-    return ""
-
-
-def _peer_user_id(owner: Any) -> int | None:
-    if owner is None:
-        return None
-    seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-    try:
-        return int(seller_id) if seller_id is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _parse_result(result: Any) -> list[Lot]:
@@ -647,23 +494,20 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
 
     seller = ""
     seller_id: int | None = None
-    lang_code = ""
-    first_name = ""
-    last_name = ""
-    is_online: bool | None = None
+    owner = getattr(gift, "owner_id", None)
+    if owner is not None:
+        seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
+        try:
+            seller_id = int(seller_id) if seller_id is not None else None
+        except (TypeError, ValueError):
+            seller_id = None
+        if seller_id and users and seller_id in users:
+            seller = str(getattr(users[seller_id], "username", "") or "").lstrip("@")
 
-    seller_id = _peer_user_id(getattr(gift, "owner_id", None))
-    if seller_id and users and seller_id in users:
-        u = users[seller_id]
-        seller = _extract_username(u)
-        lang_code = str(getattr(u, "lang_code", "") or "").strip()
-        first_name = str(getattr(u, "first_name", "") or "")
-        last_name = str(getattr(u, "last_name", "") or "")
-        status = getattr(u, "status", None)
-        if status is not None:
-            is_online = isinstance(status, UserStatusOnline) or (
-                status.__class__.__name__ == "UserStatusOnline"
-            )
+    if not seller:
+        raw = str(getattr(gift, "owner_name", "") or "").strip().lstrip("@")
+        if raw and raw.lower() not in {"hidden", "anonymous", "telegram"} and " " not in raw:
+            seller = raw
 
     number_i = int(number) if number is not None else None
     return Lot(
@@ -677,8 +521,4 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         symbol=symbol,
         seller=seller,
         seller_id=seller_id,
-        lang_code=lang_code,
-        first_name=first_name,
-        last_name=last_name,
-        is_online=is_online,
     )

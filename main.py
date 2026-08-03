@@ -1,8 +1,8 @@
 """
 Бот: Telegram Market · только лоты за Stars.
-Нужен вход один раз (номер+код) — официальный API маркета без юзера не работает.
 
-Кидает самые свежие выставления (окно ~1 час), фильтр по Stars.
+Без SQLite / без файла сессии. Каждый /start — только номер+код.
+Старый аккаунт сам не подхватывается.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -22,7 +23,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
-    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -40,6 +40,7 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
+from telethon.sessions import StringSession
 
 import credentials as creds
 from market import FRESH_WINDOW_SEC, Lot, TelegramMarket
@@ -62,27 +63,27 @@ class AuthStates(StatesGroup):
 class App:
     def __init__(self) -> None:
         Path("data").mkdir(exist_ok=True)
-        self.client = TelegramClient(creds.SESSION, creds.API_ID, creds.API_HASH)
+        # Только RAM — никакого .session sqlite на диске
+        self.client = TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
         self.market = TelegramMarket(self.client, concurrency=16)
         self.bot: Bot | None = None
         self.owner_id: int | None = None
         self.running = False
         self._task: asyncio.Task | None = None
-        # id → first_seen_monotonic
         self._seen: dict[str, float] = {}
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = float(creds.MIN_STARS)
         self.max_stars = float(creds.MAX_STARS)
+        self.logged_in = False
+
+    def _new_client(self) -> TelegramClient:
+        return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
 
     async def ensure_connected(self) -> TelegramClient:
         if not self.client.is_connected():
             await self.client.connect()
         return self.client
-
-    async def is_authorized(self) -> bool:
-        await self.ensure_connected()
-        return await self.client.is_user_authorized()
 
     async def send_code(self, phone: str) -> str:
         phone = _normalize_phone(phone)
@@ -95,6 +96,7 @@ class App:
             raise ValueError(f"Слишком много попыток. Подожди {exc.seconds} сек.") from exc
         self.phone = phone
         self.phone_code_hash = result.phone_code_hash
+        self.logged_in = False
         return "Код отправлен в Telegram / SMS."
 
     async def confirm_code(self, code: str) -> str:
@@ -113,40 +115,32 @@ class App:
             raise ValueError("Неверный код.") from exc
         except PhoneCodeExpiredError as exc:
             raise ValueError("Код истёк. Нажми /start заново.") from exc
+        self.logged_in = True
         return "OK"
 
     async def confirm_password(self, password: str) -> None:
         await self.client.sign_in(password=password.strip())
+        self.logged_in = True
 
-    async def logout(self) -> None:
-        """Drop Telethon session so bot asks for a new phone bind."""
+    async def reset_auth(self) -> None:
+        """Полный сброс: стоп парсинга + новый пустой клиент без сессии."""
         await self.stop_monitor()
         try:
             if self.client.is_connected():
-                if await self.client.is_user_authorized():
-                    try:
-                        await self.client.log_out()
-                    except Exception:  # noqa: BLE001
-                        pass
                 await self.client.disconnect()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("logout disconnect: %s", exc)
-
-        root = Path(__file__).resolve().parent
-        data = root / "data"
-        for path in data.glob("market_session*"):
-            try:
-                path.unlink(missing_ok=True)
-                logger.info("removed session file %s", path)
-            except OSError as exc:
-                logger.warning("cannot remove %s: %s", path, exc)
+            logger.warning("disconnect: %s", exc)
 
         self.phone = None
         self.phone_code_hash = None
-        self.client = TelegramClient(creds.SESSION, creds.API_ID, creds.API_HASH)
+        self.logged_in = False
+        self.client = self._new_client()
         self.market = TelegramMarket(self.client, concurrency=16)
+        wipe_all_storage()
 
     async def start_monitor(self, user_id: int) -> str:
+        if not self.logged_in:
+            raise RuntimeError("Сначала пройди авторизацию (номер + код).")
         if self.running:
             await self.stop_monitor()
         self.owner_id = user_id
@@ -156,8 +150,7 @@ class App:
         return (
             "▶️ Telegram Market · только ⭐\n"
             f"Диапазон: <b>{int(self.min_stars)}–{int(self.max_stars)} ⭐</b>\n"
-            "Ищу лоты, выставленные только что (окно ~1 час).\n"
-            "Старый инвентарь не спамлю — только свежие выставления."
+            "Ищу свежие выставления (~1 час). Старьё не кидаю."
         )
 
     async def stop_monitor(self) -> str:
@@ -193,61 +186,43 @@ class App:
                 self._purge_old_seen()
 
                 if not primed:
-                    # Seed current market silently — это «уже висит», не «только что выставили»
                     now = time.monotonic()
                     for lot in lots:
                         self._seen[lot.id] = now
                     primed = True
-
-                    # Показать срез самых свежих в диапазоне (верх выдачи API = newest)
                     preview = in_range[: creds.PREVIEW_LOTS]
                     if self.owner_id and self.bot:
                         await self.bot.send_message(
                             self.owner_id,
                             "📡 Живой парсер · Telegram Market (Stars)\n"
-                            f"Сканирую все коллекции. В диапазоне сейчас: <b>{len(in_range)}</b>\n"
-                            f"Показываю топ-{len(preview)} самых свежих, "
-                            "дальше кидаю только новые выставления (~1 час):",
+                            f"В диапазоне сейчас: <b>{len(in_range)}</b>\n"
+                            f"Топ-{len(preview)} свежих, дальше только новые:",
                         )
                     for lot in preview:
                         await self._notify(lot)
-                    logger.info(
-                        "primed seen=%s in_range=%s preview=%s",
-                        len(self._seen),
-                        len(in_range),
-                        len(preview),
-                    )
                 else:
                     fresh = [lot for lot in in_range if lot.id not in self._seen]
                     now = time.monotonic()
-                    # Also mark out-of-range as seen so we don't later notify on price drift spam
                     for lot in lots:
-                        if lot.id not in self._seen:
-                            if self._in_price(lot):
-                                continue  # handled below
+                        if lot.id not in self._seen and not self._in_price(lot):
                             self._seen[lot.id] = now
-
                     for lot in fresh:
                         self._seen[lot.id] = now
                         logger.info(
-                            "NEW %.0f⭐ [%s] %s @%s",
+                            "NEW %.0f⭐ [%s] %s",
                             lot.stars,
                             lot.category,
                             lot.display,
-                            lot.seller or "—",
                         )
                         await self._notify(lot)
-
                     if ticks % 20 == 0:
                         logger.info(
-                            "tick#%s lots=%s in_range=%s fresh=%s seen=%s",
+                            "tick#%s lots=%s in_range=%s fresh=%s",
                             ticks,
                             len(lots),
                             len(in_range),
                             len(fresh),
-                            len(self._seen),
                         )
-
                 ticks += 1
             except asyncio.CancelledError:
                 raise
@@ -290,15 +265,6 @@ class App:
 app = App()
 
 
-def _auth_choice_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Парсить с этим акком", callback_data="auth:continue")],
-            [InlineKeyboardButton(text="🔄 Привязать новый аккаунт", callback_data="auth:rebind")],
-        ]
-    )
-
-
 def _phone_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
@@ -328,72 +294,54 @@ def _fmt(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ")
 
 
+def wipe_all_storage() -> None:
+    """Сносит любые .session / .db — никакой автоподхвата старого акка."""
+    root = Path(__file__).resolve().parent
+    data = root / "data"
+    data.mkdir(exist_ok=True)
+    removed: list[str] = []
+
+    patterns = [
+        "*session*",
+        "*.session",
+        "*.session-journal",
+        "*.db",
+        "*.db-*",
+        "*.sqlite",
+        "*.sqlite3",
+    ]
+    for folder in (data, root):
+        for pattern in patterns:
+            for path in folder.glob(pattern):
+                if path.is_file():
+                    try:
+                        path.unlink()
+                        removed.append(str(path))
+                    except OSError as exc:
+                        logger.warning("cannot delete %s: %s", path, exc)
+
+    old_pkg = root / "bot"
+    if old_pkg.is_dir():
+        shutil.rmtree(old_pkg, ignore_errors=True)
+        removed.append(str(old_pkg))
+
+    if removed:
+        logger.info("Storage wiped: %s", removed)
+    else:
+        logger.info("No on-disk session/db found")
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if await app.is_authorized():
-        me = await app.client.get_me()
-        who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
-        await message.answer(
-            f"Сейчас привязан аккаунт: <b>{who}</b>\n\n"
-            "Продолжить с ним или привязать новый?",
-            reply_markup=_auth_choice_kb(),
-        )
-        return
-
-    await _ask_phone(message, state)
-
-
-@router.callback_query(F.data == "auth:continue")
-async def on_auth_continue(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await state.clear()
-    if not await app.is_authorized():
-        await callback.message.answer("Сессии нет. Пришли номер:")
-        await _ask_phone(callback.message, state)
-        return
-    me = await app.client.get_me()
-    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
-    text = await app.start_monitor(callback.from_user.id)
-    await callback.message.answer(
-        f"✅ Вход: <b>{who}</b>\n\n{text}\n\nСтоп — /stop",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.callback_query(F.data == "auth:rebind")
-async def on_auth_rebind(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer("Сбрасываю старый аккаунт…")
-    await app.logout()
-    await state.clear()
-    await callback.message.answer(
-        "Старая привязка сброшена.\n"
-        "Пришли номер нового аккаунта:",
-        reply_markup=_phone_kb(),
-    )
-    await state.set_state(AuthStates.phone)
-
-
-@router.message(Command("logout"))
-@router.message(Command("relogin"))
-async def cmd_logout(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await app.logout()
-    await message.answer(
-        "🔄 Старый аккаунт отвязан.\n"
-        "Пришли номер для новой привязки:",
-        reply_markup=_phone_kb(),
-    )
-    await state.set_state(AuthStates.phone)
-
-
-async def _ask_phone(message: Message, state: FSMContext) -> None:
+    # Всегда с нуля: не читаем старый акк с диска
+    await app.reset_auth()
     await state.set_state(AuthStates.phone)
     await message.answer(
         "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
-        "⚠️ Нужна привязка Telegram-аккаунта (номер → код).\n"
-        "Без этого официальный маркет не парсится.\n\n"
-        "📱 Номер: <code>+79991234567</code>",
+        "Старые сессии сброшены. Базы нет.\n"
+        "Чтобы парсить — нужна авторизация <b>сейчас</b>.\n\n"
+        "📱 Пришли номер: <code>+79991234567</code>",
         reply_markup=_phone_kb(),
     )
 
@@ -403,8 +351,19 @@ async def cmd_stop(message: Message, state: FSMContext) -> None:
     await state.clear()
     text = await app.stop_monitor()
     await message.answer(
-        f"{text}\nНажми Старт, чтобы снова искать лоты.",
+        f"{text}\nНажми /start и заново пройди вход.",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("logout"))
+async def cmd_logout(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await app.reset_auth()
+    await state.set_state(AuthStates.phone)
+    await message.answer(
+        "Сброшено. Пришли номер:",
+        reply_markup=_phone_kb(),
     )
 
 
@@ -413,7 +372,11 @@ async def cmd_stop(message: Message, state: FSMContext) -> None:
 @router.message(StateFilter(AuthStates.password), F.text == "❌ Отмена")
 async def cancel_auth(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Отменено. Нажми /start.", reply_markup=ReplyKeyboardRemove())
+    await app.reset_auth()
+    await message.answer(
+        "Отменено. Парсинг без входа не стартует.\n/start — заново.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(StateFilter(AuthStates.phone))
@@ -450,9 +413,11 @@ async def got_code(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
+    me = await app.client.get_me()
+    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
     text = await app.start_monitor(message.from_user.id)
     await message.answer(
-        f"✅ Вход выполнен.\n\n{text}\nСтоп — /stop",
+        f"✅ Вошли как <b>{who}</b>\n\n{text}\nСтоп — /stop",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -465,58 +430,17 @@ async def got_password(message: Message, state: FSMContext) -> None:
         await message.answer(f"⚠️ Пароль не принят: {exc}")
         return
     await state.clear()
+    me = await app.client.get_me()
+    who = f"@{me.username}" if me.username else (me.first_name or str(me.id))
     text = await app.start_monitor(message.from_user.id)
     await message.answer(
-        f"✅ Вход выполнен.\n\n{text}\nСтоп — /stop",
+        f"✅ Вошли как <b>{who}</b>\n\n{text}\nСтоп — /stop",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
-def wipe_old_data() -> None:
-    root = Path(__file__).resolve().parent
-    data = root / "data"
-    data.mkdir(exist_ok=True)
-    removed: list[str] = []
-
-    # Старые сессии (v1) — форсим новую привязку
-    for path in [
-        data / "market_session.session",
-        data / "market_session.session-journal",
-        *data.glob("market_session.session*"),
-    ]:
-        try:
-            if path.is_file():
-                path.unlink()
-                removed.append(str(path))
-        except OSError as exc:
-            logger.warning("cannot delete %s: %s", path, exc)
-
-    for path in [
-        data / "bot.db",
-        root / "bot.db",
-        *data.glob("*.db"),
-        *data.glob("*.db-*"),
-    ]:
-        try:
-            if path.is_file() and "market_session" not in path.name:
-                path.unlink()
-                removed.append(str(path))
-        except OSError as exc:
-            logger.warning("cannot delete %s: %s", path, exc)
-
-    old_pkg = root / "bot"
-    if old_pkg.is_dir():
-        import shutil
-
-        shutil.rmtree(old_pkg, ignore_errors=True)
-        removed.append(str(old_pkg))
-
-    if removed:
-        logger.info("Wiped old data: %s", removed)
-
-
 async def main() -> None:
-    wipe_old_data()
+    wipe_all_storage()
     bot = Bot(
         token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -524,9 +448,9 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт / сменить аккаунт"),
+            BotCommand(command="start", description="Старт · вход по номеру"),
             BotCommand(command="stop", description="Стоп"),
-            BotCommand(command="logout", description="Отвязать аккаунт"),
+            BotCommand(command="logout", description="Сбросить вход"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -534,7 +458,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Telegram Market Stars parser ready | session=%s", creds.SESSION)
+    logger.info("Ready | no disk session/db | /start always asks phone")
     try:
         await dp.start_polling(bot)
     finally:

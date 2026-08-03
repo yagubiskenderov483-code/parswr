@@ -10,40 +10,53 @@ MAX_STARS = 5000
 STARS_PER_TON = 300.0
 
 # Качество
-MAX_ACCOUNT_LEVEL = 4  # режем 5/6/8+
+MAX_ACCOUNT_LEVEL = 4
 MAX_PROFILE_GIFTS = 40
 MIN_RU_SCORE = 2
 GIFTS_PROBE_LIMIT = 8
 
-# Свежесть: лоты ~1–2 минуты (первое появление / смена цены)
+# online | recent | any
+ONLINE_MODE = "recent"
+
+# Макс. надбавка над floor (мин. ценой коллекции) по режиму поиска.
+# None = не фильтровать по флору.
+# Пример: floor Snoop=87k, режим 60-100k → delta=8k → берём только ≤95k.
+FLOOR_DELTA_BY_RANGE = {
+    (2000, 5000): 0,
+    (5000, 15000): 1000,
+    (15000, 30000): 2000,
+    (30000, 60000): 5000,
+    (60000, 100000): 8000,
+    (0, 2000): None,  # пох
+}
+
+# Свежесть
 FRESH_MAX_AGE_SEC = 120
-# в ответе маркета только топ-N «самых новых» на коллекцию
 FRESH_MAX_RANK = 2
 
-# Burst ≤3с
-BURST_PARALLEL = 24
-BURST_PER_COLLECTION = 8
-BURST_MAX_COLLECTIONS = 80
-BURST_GAP = 0.005
+# Мгновенный live-парс (без ожидания конца скана)
+BURST_PARALLEL = 28
+BURST_PER_COLLECTION = 12
+BURST_MAX_COLLECTIONS = 100
+BURST_GAP = 0.0
 BURST_TIME_BUDGET = 3.0
-API_TIMEOUT = 2.8
+API_TIMEOUT = 2.2
 RESULT_LIMIT = 100
 PREVIEW_COUNT = 100
 
 # Чеки
-CHECK_INTERVAL = 0.75
-CHECK_PARALLEL = 12
-CHECK_PER_COLLECTION = 8
-CHECK_BATCH = 30
-CHECK_GAP = 0.025
+CHECK_INTERVAL = 0.7
+CHECK_PARALLEL = 14
+CHECK_PER_COLLECTION = 10
+CHECK_BATCH = 32
+CHECK_GAP = 0.02
 
 OWNER_TIMEOUT = 0.55
-OWNER_PARALLEL = 14
-PAID_DM_TIMEOUT = 1.4
-PROFILE_TIMEOUT = 1.5
-PROFILE_PARALLEL = 10
+OWNER_PARALLEL = 16
+PAID_DM_TIMEOUT = 1.2
+PROFILE_TIMEOUT = 1.3
+PROFILE_PARALLEL = 12
 
-# Антифлуд: 50 карточек / мин, пауза между
 NOTIFY_PER_MIN = 50
-NOTIFY_GAP = 0.12
-AUTO_BLACKLIST = True  # после выдачи юз в чёрный список (не дублировать)
+NOTIFY_GAP = 0.08
+AUTO_BLACKLIST = True

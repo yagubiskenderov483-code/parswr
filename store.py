@@ -14,6 +14,7 @@ DATA = Path(__file__).resolve().parent / "data"
 PROFILES_PATH = DATA / "profile_cache.json"
 BLACKLIST_PATH = DATA / "blacklist.json"
 LISTINGS_PATH = DATA / "listings.json"
+FLOORS_PATH = DATA / "floors.json"
 USERS_PATH = DATA / "found_users.json"
 
 
@@ -40,9 +41,11 @@ class Store:
         self.blacklist: dict[str, Any] = _load(BLACKLIST_PATH)
         self.listings: dict[str, Any] = _load(LISTINGS_PATH)
         self.found_users: dict[str, Any] = _load(USERS_PATH)
+        self.floors: dict[str, Any] = _load(FLOORS_PATH)
         self._dirty_profiles = False
         self._dirty_listings = False
         self._dirty_users = False
+        self._dirty_floors = False
 
     # --- profiles ---
     def get_profile(self, key: int | str) -> dict[str, Any] | None:
@@ -148,10 +151,45 @@ class Store:
         names = sorted(self.found_users.keys())
         return "\n".join(f"@{n}" for n in names)
 
+    def get_floor(self, key: str) -> float | None:
+        row = self.floors.get(key)
+        if not row:
+            return None
+        try:
+            return float(row.get("floor"))
+        except (TypeError, ValueError):
+            return None
+
+    def note_floor(self, key: str, price: float, title: str = "") -> float:
+        """Обновляет минимальную цену коллекции, возвращает актуальный floor."""
+        if not key or price <= 0:
+            return price
+        row = self.floors.get(key)
+        now = time.time()
+        if not row:
+            self.floors[key] = {"floor": float(price), "title": title, "ts": now}
+            self._dirty_floors = True
+            return float(price)
+        old = float(row.get("floor", price))
+        if price < old:
+            row["floor"] = float(price)
+            row["ts"] = now
+            if title:
+                row["title"] = title
+            self._dirty_floors = True
+            return float(price)
+        return old
+
+    def save_floors(self) -> None:
+        if self._dirty_floors:
+            _save(FLOORS_PATH, self.floors)
+            self._dirty_floors = False
+
     def flush(self) -> None:
         self.save_profiles()
         self.save_listings()
         self.save_users()
+        self.save_floors()
 
 
 store = Store()

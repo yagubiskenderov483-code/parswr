@@ -1,8 +1,8 @@
 """
-Простой бот: парсит Telegram Market (только лоты за Stars)
-и кидает самые свежие.
+Бот: Telegram Market · только лоты за Stars.
+Нужен вход один раз (номер+код) — официальный API маркета без юзера не работает.
 
-Старт / Стоп — в синем меню бота.
+Кидает самые свежие выставления (окно ~1 час), фильтр по Stars.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -40,7 +41,7 @@ from telethon.errors import (
 )
 
 import credentials as creds
-from market import Lot, TelegramMarket
+from market import FRESH_WINDOW_SEC, Lot, TelegramMarket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,12 +62,13 @@ class App:
     def __init__(self) -> None:
         Path("data").mkdir(exist_ok=True)
         self.client = TelegramClient(creds.SESSION, creds.API_ID, creds.API_HASH)
-        self.market = TelegramMarket(self.client)
+        self.market = TelegramMarket(self.client, concurrency=16)
         self.bot: Bot | None = None
         self.owner_id: int | None = None
         self.running = False
         self._task: asyncio.Task | None = None
-        self._seen: set[str] = set()
+        # id → first_seen_monotonic
+        self._seen: dict[str, float] = {}
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = float(creds.MIN_STARS)
@@ -123,9 +125,10 @@ class App:
         self._seen.clear()
         self._task = asyncio.create_task(self._loop(), name="market-loop")
         return (
-            f"▶️ Парсинг Telegram Market (только Stars)\n"
-            f"Диапазон: {int(self.min_stars)}–{int(self.max_stars)} ⭐\n"
-            f"Кидаю самые свежие лоты…"
+            "▶️ Telegram Market · только ⭐\n"
+            f"Диапазон: <b>{int(self.min_stars)}–{int(self.max_stars)} ⭐</b>\n"
+            "Ищу лоты, выставленные только что (окно ~1 час).\n"
+            "Старый инвентарь не спамлю — только свежие выставления."
         )
 
     async def stop_monitor(self) -> str:
@@ -141,62 +144,106 @@ class App:
             self._task = None
         return "⏹ Стоп."
 
+    def _in_price(self, lot: Lot) -> bool:
+        return self.min_stars <= lot.stars <= self.max_stars
+
+    def _purge_old_seen(self) -> None:
+        now = time.monotonic()
+        old = [k for k, ts in self._seen.items() if now - ts > FRESH_WINDOW_SEC]
+        for k in old:
+            del self._seen[k]
+
     async def _loop(self) -> None:
         primed = False
+        ticks = 0
         while self.running:
+            started = time.monotonic()
             try:
-                lots = await self.market.fetch_latest(limit=50)
-                in_range = [
-                    lot
-                    for lot in lots
-                    if self.min_stars <= lot.stars <= self.max_stars
-                ]
+                lots = await self.market.fetch_newest(per_collection=creds.PER_COLLECTION)
+                in_range = [lot for lot in lots if self._in_price(lot)]
+                self._purge_old_seen()
 
                 if not primed:
-                    self._seen = {lot.id for lot in lots}
+                    # Seed current market silently — это «уже висит», не «только что выставили»
+                    now = time.monotonic()
+                    for lot in lots:
+                        self._seen[lot.id] = now
                     primed = True
+
+                    # Показать срез самых свежих в диапазоне (верх выдачи API = newest)
                     preview = in_range[: creds.PREVIEW_LOTS]
                     if self.owner_id and self.bot:
                         await self.bot.send_message(
                             self.owner_id,
-                            f"📡 Живой парсер Telegram Market\n"
-                            f"Сейчас в диапазоне: <b>{len(in_range)}</b> лотов за Stars\n"
-                            f"Показываю {len(preview)} свежих, дальше только новые:",
+                            "📡 Живой парсер · Telegram Market (Stars)\n"
+                            f"Сканирую все коллекции. В диапазоне сейчас: <b>{len(in_range)}</b>\n"
+                            f"Показываю топ-{len(preview)} самых свежих, "
+                            "дальше кидаю только новые выставления (~1 час):",
                         )
                     for lot in preview:
-                        self._seen.add(lot.id)
                         await self._notify(lot)
-                    await asyncio.sleep(creds.POLL_INTERVAL)
-                    continue
+                    logger.info(
+                        "primed seen=%s in_range=%s preview=%s",
+                        len(self._seen),
+                        len(in_range),
+                        len(preview),
+                    )
+                else:
+                    fresh = [lot for lot in in_range if lot.id not in self._seen]
+                    now = time.monotonic()
+                    # Also mark out-of-range as seen so we don't later notify on price drift spam
+                    for lot in lots:
+                        if lot.id not in self._seen:
+                            if self._in_price(lot):
+                                continue  # handled below
+                            self._seen[lot.id] = now
 
-                fresh = [lot for lot in in_range if lot.id not in self._seen]
-                for lot in fresh:
-                    self._seen.add(lot.id)
-                    logger.info("NEW %.0f⭐ %s", lot.stars, lot.display)
-                    await self._notify(lot)
+                    for lot in fresh:
+                        self._seen[lot.id] = now
+                        logger.info(
+                            "NEW %.0f⭐ [%s] %s @%s",
+                            lot.stars,
+                            lot.category,
+                            lot.display,
+                            lot.seller or "—",
+                        )
+                        await self._notify(lot)
 
+                    if ticks % 20 == 0:
+                        logger.info(
+                            "tick#%s lots=%s in_range=%s fresh=%s seen=%s",
+                            ticks,
+                            len(lots),
+                            len(in_range),
+                            len(fresh),
+                            len(self._seen),
+                        )
+
+                ticks += 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("poll failed: %s", exc)
 
-            await asyncio.sleep(creds.POLL_INTERVAL)
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.05, creds.POLL_INTERVAL - elapsed))
 
     async def _notify(self, lot: Lot) -> None:
         if not self.bot or not self.owner_id:
             return
         seller = f"@{lot.seller}" if lot.seller else "—"
         text = (
-            "🆕 <b>Новый лот · Telegram Market</b>\n\n"
+            "🆕 <b>Свежий лот · Telegram Market</b>\n\n"
             f"🎁 <b>{_esc(lot.display)}</b>\n"
             f"💰 <b>{_fmt(lot.stars)} ⭐</b>\n"
+            f"📈 {_esc(lot.category)}\n"
             f"👤 {seller}\n"
             f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
         )
         rows: list[list[InlineKeyboardButton]] = [
             [InlineKeyboardButton(text="🖼 NFT", url=lot.nft_url)]
         ]
-        if lot.seller:
+        if lot.seller and re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
             rows.append(
                 [InlineKeyboardButton(text="✍️ Написать", url=f"https://t.me/{lot.seller}")]
             )
@@ -258,9 +305,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     await state.set_state(AuthStates.phone)
     await message.answer(
-        "🎁 <b>Только Telegram Market · лоты за ⭐</b>\n"
-        "Tonnel / MRKT / Portal — выключены, БД старого бота стёрта.\n\n"
-        "Нужен вход в Telegram.\n"
+        "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
+        "⚠️ Для парсинга официального маркета <b>нужен вход</b> "
+        "(Telegram API не отдаёт маркет ботам без юзер-сессии).\n"
+        "Один раз: номер → код. Потом сессия сохраняется.\n\n"
         "📱 Номер: <code>+79991234567</code>",
         reply_markup=_phone_kb(),
     )
@@ -341,33 +389,23 @@ async def got_password(message: Message, state: FSMContext) -> None:
 
 
 def wipe_old_data() -> None:
-    """Удаляет старую SQLite БД и мусор от Tonnel/MRKT/Portal."""
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
-
-    targets = [
-        data / "bot.db",
-        data / "bot.db-journal",
-        data / "bot.db-wal",
-        data / "bot.db-shm",
-        root / "bot.db",
-    ]
-    # любые старые sqlite в data/
-    if data.exists():
-        targets.extend(data.glob("*.db"))
-        targets.extend(data.glob("*.db-*"))
-
     removed: list[str] = []
-    for path in targets:
+    for path in [
+        data / "bot.db",
+        root / "bot.db",
+        *data.glob("*.db"),
+        *data.glob("*.db-*"),
+    ]:
         try:
-            if path.is_file():
+            if path.is_file() and "market_session" not in path.name:
                 path.unlink()
                 removed.append(str(path))
         except OSError as exc:
             logger.warning("cannot delete %s: %s", path, exc)
 
-    # старый пакет bot/ если вдруг остался локально
     old_pkg = root / "bot"
     if old_pkg.is_dir():
         import shutil
@@ -377,13 +415,10 @@ def wipe_old_data() -> None:
 
     if removed:
         logger.info("Wiped old data: %s", removed)
-    else:
-        logger.info("No old DB to wipe")
 
 
 async def main() -> None:
     wipe_old_data()
-
     bot = Bot(
         token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -391,7 +426,7 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт · Telegram Market Stars"),
+            BotCommand(command="start", description="Старт · свежие Stars-лоты"),
             BotCommand(command="stop", description="Стоп"),
         ]
     )
@@ -400,7 +435,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Telegram Market Stars-only parser ready (no Tonnel/MRKT/Portal)")
+    logger.info("Telegram Market Stars parser ready | need user login | fresh≤1h")
     try:
         await dp.start_polling(bot)
     finally:

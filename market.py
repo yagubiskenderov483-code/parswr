@@ -144,9 +144,18 @@ class TelegramMarket:
                 ids.append(int(gift_id))
         if not ids:
             ids = [int(g.id) for g in gifts if getattr(g, "id", None) is not None]
+        random.shuffle(ids)
         self._gift_ids = ids
-        logger.info("collections=%s", len(ids))
+        self._cursor = random.randrange(len(ids)) if ids else 0
+        logger.info("collections=%s cursor=%s", len(ids), self._cursor)
         return ids
+
+    def reshuffle_collections(self) -> None:
+        """Случайный порядок коллекций + курсор — чтобы выдача не повторялась."""
+        if not self._gift_ids:
+            return
+        random.shuffle(self._gift_ids)
+        self._cursor = random.randrange(len(self._gift_ids))
 
     async def burst_search(
         self,
@@ -179,7 +188,11 @@ class TelegramMarket:
                 error=str(exc),
             )
 
-        batch = gift_ids[:max_collections]
+        # каждый burst — новый рандомный старт
+        self.reshuffle_collections()
+        gift_ids = self._gift_ids
+        batch = list(gift_ids[:max_collections])
+        random.shuffle(batch)
         sem = asyncio.Semaphore(parallel)
         lots: list[Lot] = []
 
@@ -209,6 +222,7 @@ class TelegramMarket:
 
         unique = _dedupe(lots)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
+        random.shuffle(matched)
         matched = matched[:limit_results]
 
         return CheckResult(

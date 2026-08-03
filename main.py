@@ -208,6 +208,7 @@ class App:
         self.last_check_lots = 0
         self.last_error = ""
         self._status_msg_id = None
+        self.market.reshuffle_collections()
         self._task = asyncio.create_task(self._loop(), name="monitor")
 
     async def stop_monitor(self) -> str:
@@ -231,7 +232,9 @@ class App:
         return bool(blob and _AD_RE.search(blob))
 
     def _pick_clean(self, lots: list[Lot], *, limit: int | None = None) -> list[Lot]:
-        """Без рекламы, без повторных продавцов и моделей; модели вразнобой."""
+        """Без рекламы, без повторных продавцов и моделей; старт с рандома."""
+        lots = list(lots)
+        random.shuffle(lots)
         buckets: dict[str, list[Lot]] = {}
         keys: list[str] = []
         for lot in lots:
@@ -404,7 +407,10 @@ class App:
             self.afk_running = False
             return
 
+        self.market.reshuffle_collections()
+        gift_ids = list(self.market._gift_ids or gift_ids)
         self.afk_collections_total = len(gift_ids)
+        self.afk_cursor = random.randrange(len(gift_ids)) if gift_ids else 0
         # зарегистрируем все ~149 коллекций
         for gid in gift_ids:
             self.db.touch_collection(gid, title="", last_offset=self.db.get_collection_offset(gid))
@@ -412,7 +418,7 @@ class App:
         await self._say(
             f"🌙 AFK: коллекций <b>{len(gift_ids)}</b> · "
             f"цель <b>{creds.AFK_USER_CAP:,}</b> юзов\n"
-            f"Сейчас: <b>{self.db.count_users():,}</b>"
+            f"Сейчас: <b>{self.db.count_users():,}</b> · старт random"
         )
 
         last_status = 0.0

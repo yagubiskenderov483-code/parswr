@@ -281,7 +281,7 @@ class App:
                 max_collections=creds.BURST_MAX_COLLECTIONS,
                 gap=creds.BURST_GAP,
                 timeout=creds.API_TIMEOUT,
-                limit_results=max(creds.PREVIEW_COUNT * 3, 40),
+                limit_results=max(creds.PREVIEW_COUNT * 4, 60),
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -291,17 +291,24 @@ class App:
         now = time.monotonic()
         shown: list[Lot] = []
         if burst and burst.lots:
-            await self.market.resolve_owners(burst.lots, timeout=creds.OWNER_TIMEOUT)
-            shown = self._prepare_lots(burst.lots, limit=creds.PREVIEW_COUNT)
-            for lot in burst.lots:
+            # 1) Сначала сохраняем ВСЕ модели из поиска
+            saved = list(burst.lots)
+            for lot in saved:
                 self._seen.setdefault(lot.id, now)
+            await self._say(
+                f"💾 Сохранено моделей: <b>{len(saved)}</b> "
+                f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})\n"
+                f"Резолвлю юзы и фильтрую…"
+            )
+
+            # 2) Потом юзы + Settings, и сразу выдача
+            await self.market.resolve_owners(saved, timeout=creds.OWNER_TIMEOUT)
+            shown = self._prepare_lots(saved, limit=creds.PREVIEW_COUNT)
             for lot in shown:
                 self._seen[lot.id] = now
 
             await self._say(
-                f"🔍 Найдено подходящих: <b>{len(shown)}</b> "
-                f"(сырых {len(burst.lots)}) · ~{burst.elapsed:.1f}с · "
-                f"коллекции {burst.scanned}/{burst.collections_total}"
+                f"🔍 К выдаче: <b>{len(shown)}</b> из <b>{len(saved)}</b> моделей"
             )
             if shown:
                 lines = []
@@ -312,13 +319,14 @@ class App:
                         if lot.floor_stars is not None
                         else ""
                     )
+                    model = lot.model or lot.title
                     lines.append(
-                        f'🔍 <a href="{lot.nft_url}">NFT</a> | {user} | '
+                        f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | {user} | '
                         f"{_fmt(lot.stars)}⭐{floor}"
                     )
                 for i in range(0, len(lines), 10):
                     await self._say("\n".join(lines[i : i + 10]))
-                for lot in shown[:5]:
+                for lot in shown[:8]:
                     await self._notify_lot(lot, count_as_new=False)
             else:
                 await self._say(

@@ -1,9 +1,8 @@
 """
-Бот: Telegram Market · только лоты за Stars.
+Telegram Market bot · Stars gifts.
 
-- Без файла сессии на диске (RAM StringSession)
-- Если НЕ вошёл → /start просит номер+код
-- Если УЖЕ вошёл → /start сразу жжёт парсинг
+После входа — меню: Парсинг | Настройки.
+В парсинге выбираешь цену → кидает только НОВЫЕ лоты.
 """
 
 from __future__ import annotations
@@ -51,14 +50,28 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("bot")
-
 router = Router()
+
+PRICE_RANGES: list[tuple[str, int, int]] = [
+    ("Easy 2k–5k", 2000, 5000),
+    ("Medium 5k–10k", 5000, 10000),
+    ("Hard 15k–30k", 15000, 30000),
+    ("Impossible 30k–65k", 30000, 65000),
+    ("Unreal 65k–100k", 65000, 100000),
+    ("Все 2k–100k", 2000, 100000),
+]
 
 
 class AuthStates(StatesGroup):
     phone = State()
     code = State()
     password = State()
+
+
+class MenuStates(StatesGroup):
+    main = State()
+    pick_price = State()
+    settings = State()
 
 
 class App:
@@ -75,8 +88,10 @@ class App:
         self.phone_code_hash: str | None = None
         self.min_stars = float(creds.MIN_STARS)
         self.max_stars = float(creds.MAX_STARS)
+        self.range_label = "Все 2k–100k"
         self.logged_in = False
         self.account_name = ""
+        self.lots_notified = 0
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -146,25 +161,30 @@ class App:
         self.market = TelegramMarket(self.client, concurrency=creds.CONCURRENCY)
         wipe_disk_junk()
 
+    def set_range(self, label: str, min_s: int, max_s: int) -> None:
+        self.range_label = label
+        self.min_stars = float(min_s)
+        self.max_stars = float(max_s)
+
     async def start_monitor(self, user_id: int) -> str:
         if not self.logged_in:
-            raise RuntimeError("Сначала авторизация (номер + код).")
+            raise RuntimeError("Сначала авторизация.")
         if self.running:
             await self.stop_monitor()
         self.owner_id = user_id
         self.running = True
         self._seen.clear()
+        self.lots_notified = 0
         self._task = asyncio.create_task(self._loop(), name="market-loop")
         return (
-            "▶️ <b>Парсинг запущен</b>\n"
-            f"Акк: <b>{self.account_name}</b>\n"
-            f"Диапазон: <b>{int(self.min_stars)}–{int(self.max_stars)} ⭐</b>\n"
-            "Жгу свежие лоты Telegram Market (~1 час)…"
+            f"▶️ Парсинг · <b>{self.range_label}</b>\n"
+            f"{int(self.min_stars)}–{int(self.max_stars)} ⭐\n"
+            "Запоминаю рынок, дальше кидаю только <b>НОВЫЕ</b> лоты…"
         )
 
     async def stop_monitor(self) -> str:
         if not self.running and self._task is None:
-            return "⏹ Уже остановлено."
+            return "⏹ Парсинг уже выключен."
         self.running = False
         if self._task:
             self._task.cancel()
@@ -173,7 +193,7 @@ class App:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        return "⏹ Стоп."
+        return f"⏹ Стоп. Новых лотов за сессию: {self.lots_notified}"
 
     def _in_price(self, lot: Lot) -> bool:
         return self.min_stars <= lot.stars <= self.max_stars
@@ -186,39 +206,51 @@ class App:
     async def _loop(self) -> None:
         primed = False
         ticks = 0
-        # First tick: full market snapshot (seed), then hot waves forever
         while self.running:
             started = time.monotonic()
             try:
                 if not primed:
-                    lots = await self.market.fetch_newest(per_collection=creds.PER_COLLECTION)
+                    if self.owner_id and self.bot:
+                        await self.bot.send_message(
+                            self.owner_id,
+                            "⏳ Сканирую Telegram Market…",
+                        )
+                    lots = await self.market.fetch_newest(
+                        per_collection=creds.PER_COLLECTION
+                    )
                     now = time.monotonic()
                     for lot in lots:
                         self._seen[lot.id] = now
                     primed = True
                     in_range = [lot for lot in lots if self._in_price(lot)]
-                    preview = in_range[: creds.PREVIEW_LOTS]
+                    stats = self.market.last_stats
                     if self.owner_id and self.bot:
                         await self.bot.send_message(
                             self.owner_id,
-                            "📡 Парсер живой · Telegram Market (Stars)\n"
-                            f"Коллекций просканировано, в диапазоне: <b>{len(in_range)}</b>\n"
-                            f"Кидаю топ-{len(preview)}, дальше только новые выставления:",
+                            "✅ Рынок зафиксирован\n"
+                            f"Коллекций: <b>{stats.get('collections', 0)}</b>\n"
+                            f"Лотов Stars всего: <b>{len(lots)}</b>\n"
+                            f"В твоём диапазоне: <b>{len(in_range)}</b>\n"
+                            f"API ok/empty/err: {stats.get('ok', 0)}/"
+                            f"{stats.get('empty', 0)}/{stats.get('errors', 0)}\n\n"
+                            "Дальше шлю только <b>новые</b> выставления.\n"
+                            "Стоп — в Настройках или /stop",
                         )
-                    for lot in preview:
-                        await self._notify(lot)
-                    logger.info("primed lots=%s in_range=%s", len(lots), len(in_range))
+                    logger.info(
+                        "primed total=%s in_range=%s stats=%s",
+                        len(lots),
+                        len(in_range),
+                        stats,
+                    )
                 else:
                     self._purge_old_seen()
-                    fresh_total = 0
-                    scanned = 0
+                    fresh_n = 0
                     async for chunk in self.market.iter_wave(
                         per_collection=creds.PER_COLLECTION,
                         batch_size=creds.WAVE_BATCH,
                     ):
                         if not self.running:
                             break
-                        scanned += len(chunk)
                         now = time.monotonic()
                         for lot in chunk:
                             if lot.id in self._seen:
@@ -226,7 +258,8 @@ class App:
                             self._seen[lot.id] = now
                             if not self._in_price(lot):
                                 continue
-                            fresh_total += 1
+                            fresh_n += 1
+                            self.lots_notified += 1
                             logger.info(
                                 "NEW %.0f⭐ [%s] %s",
                                 lot.stars,
@@ -234,33 +267,40 @@ class App:
                                 lot.display,
                             )
                             await self._notify(lot)
-
-                    if ticks % 10 == 0:
+                    if ticks % 15 == 0:
                         logger.info(
-                            "wave#%s scanned=%s fresh=%s seen=%s",
+                            "wave#%s fresh=%s seen=%s notified=%s",
                             ticks,
-                            scanned,
-                            fresh_total,
+                            fresh_n,
                             len(self._seen),
+                            self.lots_notified,
                         )
                 ticks += 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("poll failed: %s", exc)
+                if self.owner_id and self.bot and ticks % 20 == 0:
+                    try:
+                        await self.bot.send_message(
+                            self.owner_id,
+                            f"⚠️ Ошибка парсера: {_esc(str(exc)[:200])}",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
 
             elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.02, creds.POLL_INTERVAL - elapsed))
+            await asyncio.sleep(max(0.05, creds.POLL_INTERVAL - elapsed))
 
     async def _notify(self, lot: Lot) -> None:
         if not self.bot or not self.owner_id:
             return
         seller = f"@{lot.seller}" if lot.seller else "—"
         text = (
-            "🆕 <b>Свежий лот · Telegram Market</b>\n\n"
+            "🆕 <b>НОВЫЙ лот</b>\n\n"
             f"🎁 <b>{_esc(lot.display)}</b>\n"
             f"💰 <b>{_fmt(lot.stars)} ⭐</b>\n"
-            f"📈 {_esc(lot.category)}\n"
+            f"📈 {lot.category}\n"
             f"👤 {seller}\n"
             f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
         )
@@ -269,7 +309,11 @@ class App:
         ]
         if lot.seller and re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
             rows.append(
-                [InlineKeyboardButton(text="✍️ Написать", url=f"https://t.me/{lot.seller}")]
+                [
+                    InlineKeyboardButton(
+                        text="✍️ Написать", url=f"https://t.me/{lot.seller}"
+                    )
+                ]
             )
         try:
             await self.bot.send_message(
@@ -285,7 +329,39 @@ class App:
 app = App()
 
 
-def _phone_kb() -> ReplyKeyboardMarkup:
+# ----- keyboards -----
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Парсинг")],
+            [KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def price_menu_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text=label)] for label, _, _ in PRICE_RANGES]
+    rows.append([KeyboardButton(text="⬅️ Назад")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def settings_kb(running: bool) -> ReplyKeyboardMarkup:
+    stop_or_status = "⏹ Стоп парсинг" if running else "▶️ Парсинг выключен"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=stop_or_status)],
+            [KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="🔄 Сменить аккаунт")],
+            [KeyboardButton(text="⬅️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def phone_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
@@ -315,76 +391,67 @@ def _fmt(value: float) -> str:
 
 
 def wipe_disk_junk() -> None:
-    """Сносит старые .session/.db с диска — автоподхвата акка нет."""
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
-    removed: list[str] = []
     for folder in (data, root):
         for pattern in ("*session*", "*.db", "*.db-*", "*.sqlite*"):
             for path in folder.glob(pattern):
                 if path.is_file():
                     try:
                         path.unlink()
-                        removed.append(str(path))
                     except OSError:
                         pass
     old_pkg = root / "bot"
     if old_pkg.is_dir():
         shutil.rmtree(old_pkg, ignore_errors=True)
-        removed.append(str(old_pkg))
-    if removed:
-        logger.info("Wiped disk junk: %s", removed)
 
 
-async def _ask_phone(message: Message, state: FSMContext) -> None:
-    await state.set_state(AuthStates.phone)
-    await message.answer(
-        "🎁 <b>Telegram Market · лоты за ⭐</b>\n\n"
-        "Нужен вход (номер → код), потом /start сразу парсит.\n\n"
-        "📱 Номер: <code>+79991234567</code>",
-        reply_markup=_phone_kb(),
+async def _show_main_menu(message: Message, state: FSMContext, prefix: str = "") -> None:
+    await state.set_state(MenuStates.main)
+    text = prefix + (
+        f"✅ Акк: <b>{app.account_name}</b>\n\n"
+        "Выбери:"
     )
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+# ----- auth -----
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-
-    # Уже авторизован в этой сессии процесса → сразу парсинг
     if app.logged_in:
-        try:
-            text = await app.start_monitor(message.from_user.id)
-        except RuntimeError as exc:
-            await message.answer(f"⚠️ {exc}")
-            await _ask_phone(message, state)
-            return
-        await message.answer(
-            f"{text}\n\nСтоп — /stop · сменить акк — /logout",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        await _show_main_menu(message, state)
         return
-
-    # Не вошёл — просим номер (старый диск-акк не подтягиваем)
     wipe_disk_junk()
-    await _ask_phone(message, state)
+    await state.set_state(AuthStates.phone)
+    await message.answer(
+        "🎁 <b>Telegram Market · Stars</b>\n\n"
+        "Сначала вход (номер → код).\n"
+        "Потом меню: Парсинг / Настройки.\n\n"
+        "📱 Номер: <code>+79991234567</code>",
+        reply_markup=phone_kb(),
+    )
 
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message, state: FSMContext) -> None:
-    await state.clear()
     text = await app.stop_monitor()
-    await message.answer(
-        f"{text}\n/start — снова парсить (если уже вошёл).",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if app.logged_in:
+        await state.set_state(MenuStates.main)
+        await message.answer(text, reply_markup=main_menu_kb())
+    else:
+        await state.clear()
+        await message.answer(text, reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Command("logout"))
 async def cmd_logout(message: Message, state: FSMContext) -> None:
-    await state.clear()
     await app.reset_auth()
-    await _ask_phone(message, state)
+    await state.set_state(AuthStates.phone)
+    await message.answer("Аккаунт сброшен. Пришли номер:", reply_markup=phone_kb())
 
 
 @router.message(StateFilter(AuthStates.phone), F.text == "❌ Отмена")
@@ -393,10 +460,7 @@ async def cmd_logout(message: Message, state: FSMContext) -> None:
 async def cancel_auth(message: Message, state: FSMContext) -> None:
     await state.clear()
     await app.reset_auth()
-    await message.answer(
-        "Отменено. Без входа парсинг не стартует.\n/start — заново.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer("Отменено. /start — заново.", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(StateFilter(AuthStates.phone))
@@ -413,7 +477,7 @@ async def got_phone(message: Message, state: FSMContext) -> None:
         await message.answer(f"⚠️ Не удалось отправить код: {exc}")
         return
     await state.set_state(AuthStates.code)
-    await message.answer(f"{reply}\nПришли код:", reply_markup=_phone_kb())
+    await message.answer(f"{reply}\nПришли код:", reply_markup=phone_kb())
 
 
 @router.message(StateFilter(AuthStates.code))
@@ -426,19 +490,11 @@ async def got_code(message: Message, state: FSMContext) -> None:
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"⚠️ Ошибка входа: {exc}")
         return
-
     if result == "NEED_PASSWORD":
         await state.set_state(AuthStates.password)
-        await message.answer("🔒 2FA пароль:", reply_markup=_phone_kb())
+        await message.answer("🔒 2FA пароль:", reply_markup=phone_kb())
         return
-
-    await state.clear()
-    text = await app.start_monitor(message.from_user.id)
-    await message.answer(
-        f"✅ Вошли как <b>{app.account_name}</b>\n\n{text}\n"
-        "Дальше /start сразу парсит. Стоп — /stop.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await _show_main_menu(message, state, prefix="Вход ок.\n")
 
 
 @router.message(StateFilter(AuthStates.password))
@@ -448,13 +504,113 @@ async def got_password(message: Message, state: FSMContext) -> None:
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"⚠️ Пароль не принят: {exc}")
         return
-    await state.clear()
-    text = await app.start_monitor(message.from_user.id)
+    await _show_main_menu(message, state, prefix="Вход ок.\n")
+
+
+# ----- main menu -----
+
+
+@router.message(MenuStates.main, F.text == "🔍 Парсинг")
+async def menu_parsing(message: Message, state: FSMContext) -> None:
+    await state.set_state(MenuStates.pick_price)
     await message.answer(
-        f"✅ Вошли как <b>{app.account_name}</b>\n\n{text}\n"
-        "Дальше /start сразу парсит. Стоп — /stop.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Выбери диапазон цены (Stars).\n"
+        "После выбора запомню рынок и буду кидать только <b>новые</b> лоты.",
+        reply_markup=price_menu_kb(),
     )
+
+
+@router.message(MenuStates.main, F.text == "⚙️ Настройки")
+async def menu_settings(message: Message, state: FSMContext) -> None:
+    await state.set_state(MenuStates.settings)
+    await message.answer(
+        "⚙️ Настройки\n"
+        f"Акк: <b>{app.account_name}</b>\n"
+        f"Диапазон: <b>{app.range_label}</b> "
+        f"({int(app.min_stars)}–{int(app.max_stars)} ⭐)\n"
+        f"Парсинг: <b>{'▶️ идёт' if app.running else '⏹ выкл'}</b>\n"
+        f"Новых лотов: <b>{app.lots_notified}</b>",
+        reply_markup=settings_kb(app.running),
+    )
+
+
+@router.message(MenuStates.pick_price, F.text == "⬅️ Назад")
+@router.message(MenuStates.settings, F.text == "⬅️ Назад")
+async def back_to_main(message: Message, state: FSMContext) -> None:
+    await _show_main_menu(message, state)
+
+
+@router.message(MenuStates.pick_price)
+async def pick_price(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    chosen = next((r for r in PRICE_RANGES if r[0] == text), None)
+    if not chosen:
+        await message.answer("Выбери диапазон кнопкой ниже.", reply_markup=price_menu_kb())
+        return
+
+    label, min_s, max_s = chosen
+    app.set_range(label, min_s, max_s)
+    try:
+        status = await app.start_monitor(message.from_user.id)
+    except RuntimeError as exc:
+        await message.answer(f"⚠️ {exc}")
+        await state.set_state(AuthStates.phone)
+        await message.answer("Пришли номер:", reply_markup=phone_kb())
+        return
+
+    await state.set_state(MenuStates.main)
+    await message.answer(status, reply_markup=main_menu_kb())
+
+
+@router.message(MenuStates.settings, F.text == "⏹ Стоп парсинг")
+async def settings_stop(message: Message, state: FSMContext) -> None:
+    text = await app.stop_monitor()
+    await message.answer(text, reply_markup=settings_kb(app.running))
+
+
+@router.message(MenuStates.settings, F.text == "▶️ Парсинг выключен")
+async def settings_already_off(message: Message) -> None:
+    await message.answer(
+        "Парсинг выключен. Запуск — через «🔍 Парсинг» и выбор цены.",
+        reply_markup=settings_kb(False),
+    )
+
+
+@router.message(MenuStates.settings, F.text == "📊 Статус")
+async def settings_status(message: Message) -> None:
+    stats = app.market.last_stats
+    await message.answer(
+        "📊 Статус\n"
+        f"Акк: <b>{app.account_name}</b>\n"
+        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
+        f"Диапазон: <b>{app.range_label}</b>\n"
+        f"Новых за сессию: <b>{app.lots_notified}</b>\n"
+        f"В памяти seen: <b>{len(app._seen)}</b>\n"
+        f"Последний скан: lots={stats.get('lots', 0)} "
+        f"ok={stats.get('ok', 0)} empty={stats.get('empty', 0)} "
+        f"err={stats.get('errors', 0)}",
+        reply_markup=settings_kb(app.running),
+    )
+
+
+@router.message(MenuStates.settings, F.text == "🔄 Сменить аккаунт")
+async def settings_relogin(message: Message, state: FSMContext) -> None:
+    await app.reset_auth()
+    await state.set_state(AuthStates.phone)
+    await message.answer("Пришли новый номер:", reply_markup=phone_kb())
+
+
+@router.message(MenuStates.main)
+@router.message(MenuStates.settings)
+@router.message(MenuStates.pick_price)
+async def menu_fallback(message: Message, state: FSMContext) -> None:
+    st = await state.get_state()
+    if st == MenuStates.pick_price.state:
+        await message.answer("Жми кнопку с ценой.", reply_markup=price_menu_kb())
+    elif st == MenuStates.settings.state:
+        await message.answer("Жми кнопку настроек.", reply_markup=settings_kb(app.running))
+    else:
+        await message.answer("Меню:", reply_markup=main_menu_kb())
 
 
 async def main() -> None:
@@ -466,17 +622,15 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт парсинга / вход"),
-            BotCommand(command="stop", description="Стоп"),
+            BotCommand(command="start", description="Меню / вход"),
+            BotCommand(command="stop", description="Стоп парсинга"),
             BotCommand(command="logout", description="Сменить аккаунт"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    logger.info("Ready | RAM session | /start parses if logged in")
+    logger.info("Ready | menu Parsing/Settings | new lots only")
     try:
         await dp.start_polling(bot)
     finally:

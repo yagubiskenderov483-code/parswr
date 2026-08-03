@@ -8,25 +8,33 @@ MIN_STARS = 2000
 MAX_STARS = 5000
 
 # TON (nanograms) → Stars для фильтра цен
-# StarsTonAmount.amount = nanotons (1 TON = 1e9)
 STARS_PER_TON = 300.0
 
-# Быстрый первый выброс (~как FreeGiftsParser)
-# один GetResale на коллекцию (Stars+TON), без двойного запроса
-BURST_PARALLEL = 16
-BURST_PER_COLLECTION = 15
-BURST_MAX_COLLECTIONS = 120
-BURST_GAP = 0.012
-BURST_TIME_BUDGET = 6.0
-API_TIMEOUT = 7.0
+# Качество выдачи
+MAX_ACCOUNT_LEVEL = 6  # Stars Rating level ≤ 6
+MIN_RU_SCORE = 2  # кириллица в био/имени/канале/подарках
+GIFTS_PROBE_LIMIT = 15
+
+# Быстрый первый выброс
+BURST_PARALLEL = 20
+BURST_PER_COLLECTION = 12
+BURST_MAX_COLLECTIONS = 100
+BURST_GAP = 0.008
+BURST_TIME_BUDGET = 4.5
+API_TIMEOUT = 5.5
 RESULT_LIMIT = 100
 PREVIEW_COUNT = 100
 
-# Дальше чеки ~раз в секунду
-CHECK_INTERVAL = 1.0
-CHECK_PARALLEL = 8
-CHECK_PER_COLLECTION = 12
-CHECK_BATCH = 24
-CHECK_GAP = 0.05
-OWNER_TIMEOUT = 0.85
-PAID_DM_TIMEOUT = 2.5
+# Чеки
+CHECK_INTERVAL = 0.85
+CHECK_PARALLEL = 10
+CHECK_PER_COLLECTION = 10
+CHECK_BATCH = 28
+CHECK_GAP = 0.035
+
+OWNER_TIMEOUT = 0.7
+OWNER_PARALLEL = 12
+PAID_DM_TIMEOUT = 1.8
+PROFILE_TIMEOUT = 2.0
+PROFILE_PARALLEL = 8
+NOTIFY_GAP = 0.12  # пауза между карточками, чтобы не шли пачкой

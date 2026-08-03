@@ -248,30 +248,30 @@ class App:
 
         now = time.monotonic()
         if burst and burst.lots:
-            await self.market.resolve_owners(burst.lots, timeout=creds.OWNER_TIMEOUT)
-            # не выдаём юзы тех, кому в ЛС только за Stars
-            writable = await self.market.filter_paid_dms(
-                burst.lots, timeout=creds.PAID_DM_TIMEOUT
+            for lot in burst.lots:
+                self._seen.setdefault(lot.id, now)
+            writable, prep = await self.market.prepare_lots(
+                burst.lots, limit=creds.RESULT_LIMIT
             )
-            writable = writable[: creds.RESULT_LIMIT]
-            skipped_paid = sum(1 for l in burst.lots if l.paid_dm)
             await self._say(
-                f"🔍 Найдено подарков: <b>{len(writable)}</b> шт. "
-                f"(~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total})"
-                + (f"\n🚫 без платных ЛС: −{skipped_paid}" if skipped_paid else "")
+                f"🔍 Найдено: <b>{prep.kept}</b> шт. "
+                f"(~{burst.elapsed:.1f}с · {burst.scanned}/{burst.collections_total})\n"
+                f"фильтр: paid−{prep.paid_skip} · lvl−{prep.level_skip} · "
+                f"ru−{prep.ru_skip} · юзы {prep.with_user}/{prep.input}"
             )
             lines = []
             for lot in writable[: creds.PREVIEW_COUNT]:
-                self._seen[lot.id] = now
+                lvl = lot.level if lot.level is not None else "?"
                 lines.append(
                     f'🔍 <a href="{lot.nft_url}">NFT</a> | @{lot.seller} | '
-                    f"{_fmt(lot.stars)}⭐"
+                    f"{_fmt(lot.stars)}⭐ · lvl{lvl}"
                 )
             for i in range(0, len(lines), 10):
                 await self._say("\n".join(lines[i : i + 10]))
 
-            for lot in writable[:5]:
+            for lot in writable[:8]:
                 await self._notify_lot(lot, count_as_new=False)
+                await asyncio.sleep(creds.NOTIFY_GAP)
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
             samples = ""
@@ -283,8 +283,6 @@ class App:
             )
 
         if burst:
-            for lot in burst.lots:
-                self._seen.setdefault(lot.id, now)
             self.checks = burst.check_no
 
         await self._say(
@@ -317,17 +315,20 @@ class App:
                         fresh.append(lot)
 
                 if fresh:
-                    await self.market.resolve_owners(fresh, timeout=creds.OWNER_TIMEOUT)
-                    writable = await self.market.filter_paid_dms(
-                        fresh, timeout=creds.PAID_DM_TIMEOUT
-                    )
-                    paid_skip = sum(1 for l in fresh if l.paid_dm)
+                    writable, prep = await self.market.prepare_lots(fresh)
+                    paid_skip = prep.paid_skip
                     for lot in writable:
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
+                        await asyncio.sleep(creds.NOTIFY_GAP)
+                    filter_note = (
+                        f" · 🚫paid {paid_skip}"
+                        f" lvl {prep.level_skip}"
+                        f" ru {prep.ru_skip}"
+                    )
                 else:
                     writable = []
-                    paid_skip = 0
+                    filter_note = ""
 
                 # статус чека (edit одного сообщения)
                 await self._edit_status(
@@ -336,13 +337,11 @@ class App:
                     f"Обошёл коллекций: <b>{result.scanned}</b>/"
                     f"{result.collections_total}\n"
                     f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
-                    f"Новых за чек: <b>{len(writable)}</b>"
-                    + (f" · 🚫paid {paid_skip}" if paid_skip else "")
-                    + "\n"
+                    f"Новых за чек: <b>{len(writable)}</b>{filter_note}\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
                     f"Seen: <b>{len(self._seen)}</b>\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
-                    f"⏱ {result.elapsed:.2f}с"
+                    f"⏱ {result.elapsed:.2f}с · RU+lvl≤{creds.MAX_ACCOUNT_LEVEL}"
                     + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
                 )
             except asyncio.CancelledError:
@@ -360,29 +359,26 @@ class App:
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
         if not self.bot or not self.chat_id:
             return
-        # юзы платных ЛС не показываем
         if lot.paid_dm or not lot.seller:
             return
         seller = f"@{lot.seller}"
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
+        lvl = lot.level if lot.level is not None else "?"
         text = (
             f"{title}\n\n"
             f"🎁 <b>{_esc(lot.display)}</b>\n"
             f"💰 <b>{_fmt(lot.stars)} ⭐</b>\n"
-            f"👤 {seller}\n"
+            f"👤 {seller} · lvl <b>{lvl}</b> · RU {lot.ru_score}\n"
             f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
         )
         rows: list[list[InlineKeyboardButton]] = [
-            [InlineKeyboardButton(text="🖼 NFT / LINK", url=lot.nft_url)]
+            [
+                InlineKeyboardButton(text="🖼 NFT", url=lot.nft_url),
+                InlineKeyboardButton(
+                    text="✍️ Написать", url=f"https://t.me/{lot.seller}"
+                ),
+            ]
         ]
-        if re.fullmatch(r"[A-Za-z0-9_]{4,64}", lot.seller):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="✍️ Написать", url=f"https://t.me/{lot.seller}"
-                    )
-                ]
-            )
         try:
             await self.bot.send_message(
                 self.chat_id,

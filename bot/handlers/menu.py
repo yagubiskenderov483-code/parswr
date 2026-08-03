@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from bot.database import session_scope
 from bot.database.repositories import get_or_create_settings, update_settings
 from bot.keyboards import main_menu, price_presets, settings_keyboard
+from bot.services.auth import AuthService
 from bot.services.monitor import MonitorService
 from bot.services.rates import RateService
 from bot.services.stats import build_stats_text
@@ -36,24 +37,19 @@ def _settings_text(cfg) -> str:
     )
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "🎁 <b>Gift Lots Monitor</b>\n\n"
-        "Парсю новые лоты одновременно с:\n"
-        "• Telegram Market\n"
-        "• Portal\n"
-        "• MRKT\n"
-        "• Tonnel\n\n"
-        "Цены приводятся к Telegram Stars.\n"
-        "Нажми ▶️ чтобы начать.",
-        reply_markup=main_menu(),
-    )
-
-
 @router.message(F.text == "▶️ Запустить парсинг")
 @router.message(Command("start_parse"))
-async def start_parsing(message: Message, monitor: MonitorService) -> None:
+async def start_parsing(
+    message: Message,
+    monitor: MonitorService,
+    auth: AuthService,
+) -> None:
+    if not await auth.is_authorized():
+        await message.answer(
+            "⚠️ Сначала авторизуйся через /login (номер + код),\n"
+            "иначе полноценно работает только Tonnel.",
+            reply_markup=main_menu(),
+        )
     text = await monitor.start(message.from_user.id)
     await message.answer(text, reply_markup=main_menu())
 

@@ -8,6 +8,7 @@ from fake_useragent import UserAgent
 
 from bot.models import Currency, MarketName, RawLot
 from bot.parsers.base import BaseMarketParser
+from bot.utils.links import nft_url
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,15 @@ class PortalParser(BaseMarketParser):
             )
             attrs = item.get("attributes") or {}
             number = item.get("external_collection_number") or item.get("number")
+            number_i = int(number) if number is not None else None
+            owner = item.get("owner") or item.get("seller") or {}
+            if isinstance(owner, dict):
+                seller = owner.get("username") or owner.get("name") or ""
+                seller_id = owner.get("id") or owner.get("telegram_id")
+            else:
+                seller = item.get("owner_username") or item.get("seller_username") or ""
+                seller_id = item.get("owner_id") or item.get("seller_id")
+            explicit_nft = item.get("tg_url") or item.get("nft_url") or item.get("url")
             lots.append(
                 RawLot(
                     market=self.name,
@@ -71,7 +81,10 @@ class PortalParser(BaseMarketParser):
                     model=str(item.get("model") or attrs.get("model") or ""),
                     backdrop=str(item.get("backdrop") or attrs.get("backdrop") or ""),
                     symbol=str(item.get("symbol") or attrs.get("symbol") or ""),
-                    number=int(number) if number is not None else None,
+                    number=number_i,
+                    seller_username=str(seller).lstrip("@") if seller else "",
+                    seller_id=int(seller_id) if seller_id else None,
+                    nft_url=str(explicit_nft) if explicit_nft and "t.me/nft" in str(explicit_nft) else nft_url(name, number_i),
                 )
             )
         return lots

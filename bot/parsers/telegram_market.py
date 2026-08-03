@@ -5,6 +5,7 @@ from typing import Any
 
 from bot.models import Currency, MarketName, RawLot
 from bot.parsers.base import BaseMarketParser
+from bot.utils.links import nft_url
 
 logger = logging.getLogger(__name__)
 
@@ -134,15 +135,28 @@ def _parse_resale_gift(gift: Any) -> RawLot | None:
         elif "pattern" in cls or "symbol" in cls:
             symbol = str(name)
 
+    owner = getattr(gift, "owner", None) or getattr(gift, "from_id", None)
+    seller_username = ""
+    seller_id = None
+    if owner is not None:
+        seller_username = str(getattr(owner, "username", "") or "")
+        seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
+
+    number_i = int(number) if number is not None else None
+    nft = f"https://t.me/nft/{slug}" if slug else nft_url(str(title), number_i)
+
     return RawLot(
         market=MarketName.TELEGRAM,
         external_id=external,
         title=str(title),
         price=float(price),
         currency=Currency.STARS,
-        url=url,
+        url=nft,
         model=model,
         backdrop=backdrop,
         symbol=symbol,
-        number=int(number) if number is not None else None,
+        number=number_i,
+        seller_username=seller_username.lstrip("@") if seller_username else "",
+        seller_id=int(seller_id) if seller_id else None,
+        nft_url=nft,
     )

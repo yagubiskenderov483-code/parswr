@@ -23,7 +23,7 @@ from bot.database.repositories import (
 from bot.models import MarketName, UnifiedLot
 from bot.parsers.base import BaseMarketParser
 from bot.services.converter import PriceConverter
-from bot.services.notifier import format_lot_message
+from bot.services.notifier import format_lot_message, lot_keyboard
 from bot.services.rates import RateService
 
 logger = logging.getLogger(__name__)
@@ -169,15 +169,24 @@ class MonitorService:
                 lot.difficulty.value,
             )
             if cfg.notifications_enabled and self.state.owner_id:
-                await self._notify(self.state.owner_id, format_lot_message(lot))
+                await self._notify(
+                    self.state.owner_id,
+                    format_lot_message(lot),
+                    reply_markup=lot_keyboard(lot),
+                )
             self.state.lots_found += 1
 
-    async def _notify(self, user_id: int, text: str) -> None:
+    async def reload_parsers(self, parsers: list[BaseMarketParser]) -> None:
+        self.parsers = parsers
+        logger.info("Parsers reloaded: %s", ", ".join(p.title for p in parsers))
+
+    async def _notify(self, user_id: int, text: str, reply_markup=None) -> None:
         try:
             await self.bot.send_message(
                 user_id,
                 text,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
+                reply_markup=reply_markup,
             )
         except TelegramRetryAfter as exc:
             await asyncio.sleep(exc.retry_after + 0.5)
@@ -185,6 +194,7 @@ class MonitorService:
                 user_id,
                 text,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
+                reply_markup=reply_markup,
             )
         except TelegramForbiddenError:
             logger.warning("User %s blocked the bot", user_id)

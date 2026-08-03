@@ -9,6 +9,7 @@ from fake_useragent import UserAgent
 
 from bot.models import Currency, MarketName, RawLot
 from bot.parsers.base import BaseMarketParser
+from bot.utils.links import nft_url
 
 logger = logging.getLogger(__name__)
 
@@ -73,18 +74,31 @@ class TonnelParser(BaseMarketParser):
             if not gift_id or price <= 0:
                 continue
             number = item.get("gift_num")
+            number_i = int(number) if number is not None else None
+            title = str(item.get("name") or item.get("gift_name") or "Gift")
+            seller = (
+                item.get("sellerUsername")
+                or item.get("seller_username")
+                or item.get("username")
+                or item.get("ownerUsername")
+                or ""
+            )
+            seller_id = item.get("seller_id") or item.get("owner_id") or item.get("user_id")
             lots.append(
                 RawLot(
                     market=self.name,
                     external_id=gift_id,
-                    title=str(item.get("name") or item.get("gift_name") or "Gift"),
+                    title=title,
                     price=price,
                     currency=Currency.TON,
                     url="https://t.me/tonnel_network_bot/gifts",
                     model=str(item.get("model") or ""),
                     backdrop=str(item.get("backdrop") or ""),
                     symbol=str(item.get("symbol") or ""),
-                    number=int(number) if number is not None else None,
+                    number=number_i,
+                    seller_username=str(seller).lstrip("@") if seller else "",
+                    seller_id=int(seller_id) if seller_id else None,
+                    nft_url=nft_url(title, number_i),
                     extra={"status": item.get("status")},
                 )
             )

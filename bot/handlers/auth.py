@@ -103,7 +103,7 @@ async def cmd_login(message: Message, state: FSMContext, monitor: MonitorService
     await cmd_start(message, state, monitor)
 
 
-@router.callback_query(AuthStates.choosing_markets, F.data.startswith("marketpick:"))
+@router.callback_query(F.data.startswith("marketpick:"))
 async def on_market_pick(
     callback: CallbackQuery,
     state: FSMContext,

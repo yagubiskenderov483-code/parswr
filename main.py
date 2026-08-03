@@ -258,9 +258,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     await state.set_state(AuthStates.phone)
     await message.answer(
-        "🎁 <b>Telegram Market · только Stars</b>\n\n"
-        "Чтобы парсить официальный маркет, нужен вход в Telegram.\n"
-        "📱 Пришли номер в формате <code>+79991234567</code>",
+        "🎁 <b>Только Telegram Market · лоты за ⭐</b>\n"
+        "Tonnel / MRKT / Portal — выключены, БД старого бота стёрта.\n\n"
+        "Нужен вход в Telegram.\n"
+        "📱 Номер: <code>+79991234567</code>",
         reply_markup=_phone_kb(),
     )
 
@@ -339,7 +340,50 @@ async def got_password(message: Message, state: FSMContext) -> None:
     )
 
 
+def wipe_old_data() -> None:
+    """Удаляет старую SQLite БД и мусор от Tonnel/MRKT/Portal."""
+    root = Path(__file__).resolve().parent
+    data = root / "data"
+    data.mkdir(exist_ok=True)
+
+    targets = [
+        data / "bot.db",
+        data / "bot.db-journal",
+        data / "bot.db-wal",
+        data / "bot.db-shm",
+        root / "bot.db",
+    ]
+    # любые старые sqlite в data/
+    if data.exists():
+        targets.extend(data.glob("*.db"))
+        targets.extend(data.glob("*.db-*"))
+
+    removed: list[str] = []
+    for path in targets:
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as exc:
+            logger.warning("cannot delete %s: %s", path, exc)
+
+    # старый пакет bot/ если вдруг остался локально
+    old_pkg = root / "bot"
+    if old_pkg.is_dir():
+        import shutil
+
+        shutil.rmtree(old_pkg, ignore_errors=True)
+        removed.append(str(old_pkg))
+
+    if removed:
+        logger.info("Wiped old data: %s", removed)
+    else:
+        logger.info("No old DB to wipe")
+
+
 async def main() -> None:
+    wipe_old_data()
+
     bot = Bot(
         token=creds.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -347,7 +391,7 @@ async def main() -> None:
     app.bot = bot
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Старт"),
+            BotCommand(command="start", description="Старт · Telegram Market Stars"),
             BotCommand(command="stop", description="Стоп"),
         ]
     )
@@ -356,7 +400,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Telegram Market Stars parser ready")
+    logger.info("Telegram Market Stars-only parser ready (no Tonnel/MRKT/Portal)")
     try:
         await dp.start_polling(bot)
     finally:

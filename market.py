@@ -102,7 +102,7 @@ class Lot:
     def seller_label(self) -> str:
         if self.seller and USERNAME_RE.fullmatch(self.seller):
             return f"@{self.seller}"
-        return "скрыт"
+        return ""
 
     @property
     def write_url(self) -> str | None:
@@ -112,10 +112,8 @@ class Lot:
 
     @property
     def writable(self) -> bool:
-        """Только реальный @username. Скрытых / id-only не выдаём."""
+        """Только реальный @username. Без юза — не выдаём (и не пишем «скрыт»)."""
         if self.paid_dm:
-            return False
-        if self.owner_hidden:
             return False
         return bool(self.seller and USERNAME_RE.fullmatch(self.seller))
 
@@ -205,6 +203,50 @@ class TelegramMarket:
                 return delta
         return None
 
+    def pick_collections(
+        self,
+        min_stars: float,
+        max_stars: float,
+        *,
+        max_collections: int,
+    ) -> list[int]:
+        """Коллекции, у которых floor реально может дать лоты в диапазоне.
+
+        Дешёвые (floor+Δ < min) и заведомо дорогие (floor > max) отсекаем —
+        иначе в 60–100k сыпятся 3k-коллекции.
+        """
+        ids = list(self._gift_ids)
+        if not ids:
+            return []
+        delta = self.floor_delta()
+        matched: list[int] = []
+        unknown: list[int] = []
+        for gid in ids:
+            floor = self._floor_by_id.get(gid)
+            if floor is None or floor <= 0:
+                unknown.append(gid)
+                continue
+            if floor > max_stars:
+                continue
+            if delta is not None and floor + float(delta) < min_stars:
+                continue
+            matched.append(gid)
+        random.shuffle(matched)
+        random.shuffle(unknown)
+        # сначала подходящие по floor, потом неизвестные (чтобы узнать floor)
+        ordered = matched + unknown
+        if max_collections > 0:
+            ordered = ordered[:max_collections]
+        logger.info(
+            "pick collections: match=%s unknown=%s take=%s range=%.0f-%.0f Δ=%s",
+            len(matched),
+            len(unknown),
+            len(ordered),
+            min_stars,
+            max_stars,
+            delta,
+        )
+        return ordered
 
     def _hydrate_profiles(self) -> None:
         for key, val in store.profiles.items():
@@ -270,15 +312,20 @@ class TelegramMarket:
                     pass
             resale = getattr(gift, "availability_resale", None)
             if resale is None:
-                ids.append(gid)
                 continue
             try:
                 if int(resale) > 0:
                     ids.append(gid)
             except (TypeError, ValueError):
-                ids.append(gid)
+                continue
         if not ids:
-            ids = [int(g.id) for g in gifts if getattr(g, "id", None) is not None]
+            # fallback: всё, у чего есть floor/resell_min
+            ids = [
+                int(g.id)
+                for g in gifts
+                if getattr(g, "id", None) is not None
+                and getattr(g, "resell_min_stars", None)
+            ]
         random.shuffle(ids)
         self._gift_ids = ids
         self._cursor = 0
@@ -314,9 +361,12 @@ class TelegramMarket:
             self.last_error = str(exc)
             return
 
-        batch = list(gift_ids)
-        random.shuffle(batch)
-        batch = batch[:max_collections]
+        batch = self.pick_collections(
+            min_stars, max_stars, max_collections=max_collections
+        )
+        if not batch:
+            batch = list(gift_ids)[:max_collections]
+            random.shuffle(batch)
 
         raw: asyncio.Queue[Lot | None] = asyncio.Queue()
         ready: asyncio.Queue[Lot | None] = asyncio.Queue()
@@ -336,6 +386,7 @@ class TelegramMarket:
                         gid, per_collection, scan_stats, gap=gap, timeout=req_timeout
                     )
 
+            # волны: не стопаемся после 1-й пачки из ~15
             for i in range(0, len(batch), parallel):
                 if time.monotonic() >= hard_deadline:
                     break
@@ -355,6 +406,13 @@ class TelegramMarket:
                         stats.input += 1
                         if min_stars <= lot.stars <= max_stars:
                             await raw.put(lot)
+            logger.info(
+                "live scan done scanned=%s/%s matched_raw=%s t=%.1fs",
+                scan_stats["scanned"],
+                len(batch),
+                stats.input,
+                time.monotonic() - started,
+            )
             for _ in range(workers_n):
                 await raw.put(None)
 
@@ -379,7 +437,7 @@ class TelegramMarket:
         scan_task = asyncio.create_task(scan())
         worker_tasks = [asyncio.create_task(worker()) for _ in range(workers_n)]
 
-        mixer = EmitMixer(gap=3)  # минимум 3 других коллекции между одинаковыми
+        mixer = EmitMixer(gap=int(getattr(creds, "EMIT_GAP", 5)))  # title+seller gap
         finished = 0
         emitted = 0
 
@@ -459,10 +517,13 @@ class TelegramMarket:
                 error=str(exc),
             )
 
-        # каждый burst — свежий срез коллекций
-        batch = list(gift_ids)
-        random.shuffle(batch)
-        batch = batch[:max_collections]
+        # каждый burst — коллекции, у которых floor в зоне диапазона
+        batch = self.pick_collections(
+            min_stars, max_stars, max_collections=max_collections
+        )
+        if not batch:
+            batch = list(gift_ids)[:max_collections]
+            random.shuffle(batch)
         sem = asyncio.Semaphore(parallel)
         lots: list[Lot] = []
 
@@ -558,9 +619,18 @@ class TelegramMarket:
             )
 
         n = len(gift_ids)
-        take = min(n, batch_size)
-        batch = [gift_ids[(self._cursor + i) % n] for i in range(take)]
-        self._cursor = (self._cursor + take) % n
+        # чек тоже по диапазону: не крутим 3k-коллекции в режиме 60–100k
+        pool = self.pick_collections(
+            self.search_min,
+            self.search_max,
+            max_collections=0,  # все подходящие
+        )
+        if not pool:
+            pool = list(gift_ids)
+        pn = len(pool)
+        take = min(pn, max(1, batch_size))
+        batch = [pool[(self._cursor + i) % pn] for i in range(take)]
+        self._cursor = (self._cursor + take) % max(pn, 1)
 
         sem = asyncio.Semaphore(parallel)
 
@@ -656,7 +726,7 @@ class TelegramMarket:
         done = 0
         emitted = 0
         total = len(tasks)
-        mixer = EmitMixer(gap=3)
+        mixer = EmitMixer(gap=int(getattr(creds, "EMIT_GAP", 5)))
 
         while done < total and emitted < cap:
             item = await queue.get()
@@ -705,19 +775,28 @@ class TelegramMarket:
         require_fresh: bool,
         check_rank: bool = True,
     ) -> bool:
+        # жёсткий диапазон режима поиска
+        if not (self.search_min <= lot.stars <= self.search_max):
+            stats.price_skip += 1
+            lot.skip_reason = (
+                f"price {lot.stars:.0f}∉[{self.search_min:.0f},{self.search_max:.0f}]"
+            )
+            return False
+
         # адекватная цена vs floor коллекции
         floor = self._fair_floor(lot)
         lot.floor_stars = floor
         delta = self.floor_delta()
-        if (
-            delta is not None
-            and floor is not None
-            and floor > 0
-            and lot.stars - floor > float(delta) + 1e-6
-        ):
-            stats.price_skip += 1
-            lot.skip_reason = f"floor+{lot.stars - floor:.0f}>{delta}"
-            return False
+        if floor is not None and floor > 0 and delta is not None:
+            # коллекция слишком дешёвая для этого режима — даже floor+Δ < min
+            if floor + float(delta) < self.search_min:
+                stats.price_skip += 1
+                lot.skip_reason = f"cheap_col fl{floor:.0f}+{delta}<{self.search_min:.0f}"
+                return False
+            if lot.stars - floor > float(delta) + 1e-6:
+                stats.price_skip += 1
+                lot.skip_reason = f"floor+{lot.stars - floor:.0f}>{delta}"
+                return False
         # ниже флора — ок (редкий дамп), но вдруг floor устарел — подтянем
         if floor is not None and lot.stars > 0 and lot.stars < floor:
             self._note_price(lot)
@@ -740,11 +819,7 @@ class TelegramMarket:
 
         if lot.paid_dm or not lot.writable:
             stats.paid_skip += 1
-            lot.skip_reason = (
-                "no_username"
-                if (not lot.seller or lot.owner_hidden)
-                else "paid_or_no_user"
-            )
+            lot.skip_reason = "no_username" if not lot.seller else "paid_dm"
             return False
 
         stats.with_user += 1
@@ -758,7 +833,7 @@ class TelegramMarket:
 
         if lot.paid_dm or not lot.writable:
             stats.paid_skip += 1
-            lot.skip_reason = "paid_dm"
+            lot.skip_reason = "paid_dm" if lot.paid_dm else "no_username"
             return False
         if store.is_blocked(lot.seller, lot.seller_id):
             stats.black_skip += 1
@@ -1253,49 +1328,47 @@ class TelegramMarket:
                     lot.seller = ""
 
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
-        """Достаёт владельца даже если в маркете профиль скрыт.
+        """Достаёт @username. Если гифт открыт (есть owner_id) — дожимаем FullUser.
 
-        Цепочка: cache → GetUniqueStarGift(slug) → users в ответе →
-        GetFullUser / get_entity → seller_id для tg://user?id=
+        Без реального @username лот не writable → не выдаём. «Скрыт» больше не пишем.
         """
         if lot.paid_dm:
             lot.seller = ""
             return
 
+        # уже есть валидный юз
         if lot.seller and USERNAME_RE.fullmatch(lot.seller):
+            lot.owner_hidden = False
             if self._paid_cache.get(lot.seller.lower()) is True:
                 lot.paid_dm = True
                 lot.seller = ""
             return
 
+        # кэш юзов (не кэшируем id-only как финал — всегда пробуем ещё раз)
         if lot.slug and lot.slug in self._owner_cache:
             cached = self._owner_cache[lot.slug]
-            if cached.startswith("id:"):
-                try:
-                    lot.seller_id = int(cached.split(":", 1)[1])
-                    lot.owner_hidden = True
-                except ValueError:
-                    pass
-            elif self._paid_cache.get(cached.lower()) is True:
-                lot.paid_dm = True
-                lot.seller = ""
-            else:
-                lot.seller = cached
-            if lot.seller:
-                return
+            if not cached.startswith("id:"):
+                if self._paid_cache.get(cached.lower()) is True:
+                    lot.paid_dm = True
+                    lot.seller = ""
+                    return
+                if USERNAME_RE.fullmatch(cached):
+                    lot.seller = cached
+                    lot.owner_hidden = False
+                    return
 
         if lot.seller_id and self._paid_cache.get(lot.seller_id) is True:
             lot.paid_dm = True
+            lot.seller = ""
             return
 
-        # 1) Всегда тянем unique gift по slug — owner есть даже при Hidden
-        gift = None
+        # 1) Unique gift по slug — owner есть даже при Hidden в ленте
         if lot.slug:
             try:
                 await self._wait_flood()
                 result = await asyncio.wait_for(
                     self.client(GetUniqueStarGiftRequest(slug=lot.slug)),
-                    timeout=max(timeout, 1.2),
+                    timeout=max(timeout, 1.6),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("unique gift %s: %s", lot.slug, exc)
@@ -1308,33 +1381,23 @@ class TelegramMarket:
                     for u in (getattr(result, "users", None) or [])
                     if getattr(u, "id", None) is not None
                 }
-                owner = getattr(gift, "owner_id", None) if gift else None
-                seller_id = None
-                if owner is not None:
-                    seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-                    try:
-                        seller_id = int(seller_id) if seller_id is not None else None
-                    except (TypeError, ValueError):
-                        seller_id = None
+                seller_id = _peer_user_id(getattr(gift, "owner_id", None) if gift else None)
                 if seller_id is None and gift is not None:
-                    host = getattr(gift, "host_id", None)
-                    if host is not None:
-                        seller_id = getattr(host, "user_id", None) or getattr(host, "id", None)
-                        try:
-                            seller_id = int(seller_id) if seller_id is not None else None
-                        except (TypeError, ValueError):
-                            seller_id = None
+                    seller_id = _peer_user_id(getattr(gift, "host_id", None))
                 if seller_id:
                     lot.seller_id = seller_id
-                    if seller_id in users:
-                        user = users[seller_id]
+                    user = users.get(seller_id)
+                    if user is None and len(users) == 1:
+                        user = next(iter(users.values()))
+                    if user is not None:
                         _apply_status(lot, user)
                         if _user_paid_dm(user):
                             lot.paid_dm = True
                             self._paid_cache[seller_id] = True
+                            lot.seller = ""
                             return
                         username = _best_username(user)
-                        if username:
+                        if username and USERNAME_RE.fullmatch(username):
                             lot.seller = username
                             lot.owner_hidden = False
                             self._owner_cache[lot.slug] = username
@@ -1347,31 +1410,36 @@ class TelegramMarket:
                         and USERNAME_RE.fullmatch(raw)
                     ):
                         lot.seller = raw
+                        lot.owner_hidden = False
                         self._owner_cache[lot.slug] = raw
                         return
 
-        # 2) По user_id: FullUser / entity
+        # 2) По user_id: FullUser / entity (открытый гифт почти всегда здесь)
         if lot.seller_id and not lot.seller:
-            username = await self._username_from_peer(lot.seller_id, timeout)
-            if username:
+            username = await self._username_from_peer(
+                lot.seller_id, max(timeout, 1.4)
+            )
+            if username and USERNAME_RE.fullmatch(username):
                 if self._paid_cache.get(username.lower()) is True:
                     lot.paid_dm = True
+                    lot.seller = ""
                     return
                 lot.seller = username
                 lot.owner_hidden = False
                 if lot.slug:
                     self._owner_cache[lot.slug] = username
                 return
+            # юза нет — реально скрыт / без username. Не выдаём.
             lot.owner_hidden = True
-            if lot.slug:
-                self._owner_cache[lot.slug] = f"id:{lot.seller_id}"
+            lot.seller = ""
             return
 
-        if lot.seller_id and not lot.seller:
+        if not lot.seller:
             lot.owner_hidden = True
+            lot.seller = ""
 
     async def _username_from_peer(self, peer: Any, timeout: float) -> str:
-        """Достаёт @username даже если в листинге профиль скрыт."""
+        """Достаёт @username по peer/id."""
         try:
             await self._wait_flood()
             full = await asyncio.wait_for(
@@ -1380,7 +1448,7 @@ class TelegramMarket:
             )
             for u in getattr(full, "users", None) or []:
                 username = _best_username(u)
-                if username:
+                if username and USERNAME_RE.fullmatch(username):
                     return username
         except Exception as exc:  # noqa: BLE001
             logger.debug("fulluser %s: %s", peer, exc)
@@ -1394,10 +1462,12 @@ class TelegramMarket:
                 if isinstance(peer, int):
                     self._paid_cache[peer] = True
                 return ""
-            return _best_username(ent)
+            username = _best_username(ent)
+            if username and USERNAME_RE.fullmatch(username):
+                return username
         except Exception as exc:  # noqa: BLE001
             logger.debug("entity %s: %s", peer, exc)
-            return ""
+        return ""
 
     async def _fetch_one(
         self,
@@ -1441,7 +1511,8 @@ class TelegramMarket:
                             gift_id=gift_id,
                             offset="",
                             limit=min(limit, 50),
-                            stars_only=None,
+                            sort_by_price=True,
+                            stars_only=True,
                         )
                     ),
                     timeout=timeout,
@@ -1464,9 +1535,9 @@ class TelegramMarket:
 
 
 def diversify_lots(lots: list[Lot]) -> list[Lot]:
-    """Жёстко перемешать: round-robin по коллекциям, без подряд."""
-    mixer = EmitMixer(gap=3)
-    # сначала раскидать по бакетам в случайном порядке
+    """Жёстко перемешать: round-robin по коллекциям и владельцам, без подряд."""
+    gap = int(getattr(creds, "EMIT_GAP", 5))
+    mixer = EmitMixer(gap=gap)
     shuffled = list(lots)
     random.shuffle(shuffled)
     out: list[Lot] = []
@@ -1477,45 +1548,50 @@ def diversify_lots(lots: list[Lot]) -> list[Lot]:
         if nxt is None:
             break
         out.append(nxt)
-    # хвост одной коллекции не дописываем подряд
     mixer.drop_rest()
     return out
 
 
 class EmitMixer:
-    """Буфер выдачи: одна и та же коллекция не чаще чем раз в `gap` лотов."""
+    """Не выдаёт подряд одинаковый title ИЛИ одинакового владельца."""
 
-    def __init__(self, gap: int = 3) -> None:
-        self.gap = max(2, int(gap))
+    def __init__(self, gap: int = 5) -> None:
+        self.gap = max(3, int(gap))
         self.buckets: dict[str, deque[Lot]] = defaultdict(deque)
         self.recent_titles: deque[str] = deque(maxlen=self.gap)
         self.recent_sellers: deque[str] = deque(maxlen=self.gap)
+        self.last_title = ""
+        self.last_seller = ""
 
     def _key(self, lot: Lot) -> str:
-        return (lot.title or "?").strip() or "?"
+        return (lot.title or "?").strip().lower() or "?"
+
+    def _seller_key(self, lot: Lot) -> str:
+        return (lot.seller or "").strip().lower()
 
     def _allowed(self, lot: Lot) -> bool:
         title = self._key(lot)
-        if title in self.recent_titles:
+        seller = self._seller_key(lot)
+        if title == self.last_title or title in self.recent_titles:
             return False
-        seller = (lot.seller or "").lower()
-        if seller and seller in self.recent_sellers:
+        if seller and (seller == self.last_seller or seller in self.recent_sellers):
             return False
         return True
 
     def _emit(self, lot: Lot) -> Lot:
         title = self._key(lot)
+        seller = self._seller_key(lot)
         self.recent_titles.append(title)
-        if lot.seller:
-            self.recent_sellers.append(lot.seller.lower())
+        self.last_title = title
+        if seller:
+            self.recent_sellers.append(seller)
+            self.last_seller = seller
         return lot
 
     def push(self, lot: Lot) -> list[Lot]:
-        """Кладёт лот в бакет; возвращает то, что можно выдать сейчас."""
         self.buckets[self._key(lot)].append(lot)
         out: list[Lot] = []
-        # несколько попыток вытолкнуть разные
-        for _ in range(len(self.buckets) + 2):
+        for _ in range(len(self.buckets) + 4):
             nxt = self.pop()
             if nxt is None:
                 break
@@ -1525,9 +1601,9 @@ class EmitMixer:
     def pop(self) -> Lot | None:
         if not self.buckets:
             return None
-        # предпочитаем ключ, которого нет в recent
         keys = list(self.buckets.keys())
         random.shuffle(keys)
+        # сначала те, кого точно можно
         for key in keys:
             bucket = self.buckets.get(key)
             if not bucket:
@@ -1543,10 +1619,21 @@ class EmitMixer:
         return None
 
     def drop_rest(self) -> int:
-        """Выбросить остаток (чтобы не слать одну коллекцию пачкой)."""
         n = sum(len(b) for b in self.buckets.values())
         self.buckets.clear()
         return n
+
+
+def _peer_user_id(peer: Any) -> int | None:
+    if peer is None:
+        return None
+    uid = getattr(peer, "user_id", None)
+    if uid is None:
+        uid = getattr(peer, "id", None)
+    try:
+        return int(uid) if uid is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _has_cyrillic(text: str) -> bool:
@@ -1642,13 +1729,12 @@ def _ton_nano_to_stars(nano: float) -> float:
 
 
 def _extract_stars(gift: Any) -> float | None:
+    """Только StarsAmount. TON-only лоты не берём (рынок Stars)."""
     amounts = getattr(gift, "resell_amount", None)
     stars_val: float | None = None
-    ton_val: float | None = None
 
     if isinstance(amounts, list):
         for item in amounts:
-            name = item.__class__.__name__
             amount = getattr(item, "amount", None)
             if amount is None:
                 continue
@@ -1658,21 +1744,43 @@ def _extract_stars(gift: Any) -> float | None:
                 continue
             if val <= 0:
                 continue
-            if name == "StarsTonAmount" or isinstance(item, StarsTonAmount):
-                ton_val = val
-            elif name == "StarsAmount" or isinstance(item, StarsAmount):
+            # TON / nanotons — пропускаем
+            if isinstance(item, StarsTonAmount) or item.__class__.__name__ == "StarsTonAmount":
+                continue
+            if isinstance(item, StarsAmount) or item.__class__.__name__ == "StarsAmount":
+                # amount = целые Stars, nanos — дробная часть
+                nanos = getattr(item, "nanos", 0) or 0
+                try:
+                    stars_val = val + float(nanos) / NANOTON
+                except (TypeError, ValueError):
+                    stars_val = val
+                break
+            if stars_val is None:
                 stars_val = val
-            elif stars_val is None:
-                stars_val = val
-        if stars_val is not None:
-            return stars_val
-        if ton_val is not None:
-            return _ton_nano_to_stars(ton_val)
+        return stars_val
+
+    # одиночное поле
+    if isinstance(amounts, StarsTonAmount) or (
+        amounts is not None and amounts.__class__.__name__ == "StarsTonAmount"
+    ):
         return None
+    if isinstance(amounts, StarsAmount) or (
+        amounts is not None and amounts.__class__.__name__ == "StarsAmount"
+    ):
+        try:
+            base = float(amounts.amount)
+            nanos = float(getattr(amounts, "nanos", 0) or 0)
+            return base + nanos / NANOTON
+        except (TypeError, ValueError):
+            return None
 
     for attr in ("resell_stars", "stars", "price"):
         val = getattr(gift, attr, None)
         if val is None:
+            continue
+        if isinstance(val, StarsTonAmount) or (
+            hasattr(val, "__class__") and val.__class__.__name__ == "StarsTonAmount"
+        ):
             continue
         if hasattr(val, "amount"):
             try:
@@ -1682,8 +1790,12 @@ def _extract_stars(gift: Any) -> float | None:
             if val.__class__.__name__ == "StarsTonAmount" or isinstance(
                 val, StarsTonAmount
             ):
-                return _ton_nano_to_stars(raw)
-            return raw
+                continue
+            nanos = getattr(val, "nanos", 0) or 0
+            try:
+                return raw + float(nanos) / NANOTON
+            except (TypeError, ValueError):
+                return raw
         try:
             return float(val)
         except (TypeError, ValueError):
@@ -1714,15 +1826,14 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
     seller = ""
     seller_id: int | None = None
     paid_dm = False
-    owner = getattr(gift, "owner_id", None)
-    if owner is not None:
-        seller_id = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-        try:
-            seller_id = int(seller_id) if seller_id is not None else None
-        except (TypeError, ValueError):
-            seller_id = None
-        if seller_id and users and seller_id in users:
-            user = users[seller_id]
+    seller_id = _peer_user_id(getattr(gift, "owner_id", None))
+    if seller_id is None:
+        seller_id = _peer_user_id(getattr(gift, "host_id", None))
+    if seller_id and users:
+        user = users.get(seller_id)
+        if user is None and len(users) == 1:
+            user = next(iter(users.values()))
+        if user is not None:
             if _user_paid_dm(user):
                 paid_dm = True
             else:

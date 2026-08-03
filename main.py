@@ -102,6 +102,8 @@ class App:
         self._notify_times: list[float] = []
         self.session_users: list[str] = []
         self._last_titles: list[str] = []
+        self._last_sellers: list[str] = []
+        self._emit_gap = int(getattr(creds, "EMIT_GAP", 5))
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -206,6 +208,8 @@ class App:
         self._notify_times.clear()
         self.session_users.clear()
         self._last_titles.clear()
+        self._last_sellers.clear()
+        self._emit_gap = int(getattr(creds, "EMIT_GAP", 5))
         self.apply_filters_to_market()
         self._task = asyncio.create_task(self._loop(), name="monitor")
 
@@ -293,6 +297,8 @@ class App:
                 stats=prep,
             ):
                 self._seen.setdefault(lot.id, now)
+                if not await self._notify_lot(lot, count_as_new=False):
+                    continue
                 emitted += 1
                 self.lots_notified += 1
                 lvl = lot.level if lot.level is not None else "?"
@@ -300,15 +306,13 @@ class App:
                 floor = (
                     f"{lot.floor_stars:.0f}" if lot.floor_stars is not None else "?"
                 )
-                hide = " · hidden" if lot.owner_hidden else ""
                 lines_buf.append(
-                    f'🔍 <a href="{lot.nft_url}">NFT</a> | {lot.seller_label} | '
-                    f"{_fmt(lot.stars)}⭐ · fl{floor} · lvl{lvl} · g{gifts}{hide}"
+                    f'🔍 <a href="{lot.nft_url}">NFT</a> | @{lot.seller} | '
+                    f"{_fmt(lot.stars)}⭐ · fl{floor} · lvl{lvl} · g{gifts}"
                 )
                 if len(lines_buf) >= 8:
                     await self._say("\n".join(lines_buf))
                     lines_buf.clear()
-                await self._notify_lot(lot, count_as_new=False)
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             await self._say(f"⚠️ Ошибка поиска: {_esc(str(exc)[:200])}")
@@ -361,9 +365,9 @@ class App:
                         check_rank=False,
                         stats=prep,
                     ):
-                        writable_n += 1
-                        self.lots_notified += 1
-                        await self._notify_lot(lot, count_as_new=True)
+                        if await self._notify_lot(lot, count_as_new=True):
+                            writable_n += 1
+                            self.lots_notified += 1
 
                 filter_note = ""
                 if fresh:
@@ -402,17 +406,32 @@ class App:
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.05, creds.CHECK_INTERVAL - elapsed))
 
-    async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
+    def _too_similar_recent(self, lot: Lot) -> bool:
+        """True если такой же гифт или владелец был в последних EMIT_GAP выдачах."""
+        gap = max(3, int(self._emit_gap))
+        title = (lot.title or "").strip().lower()
+        seller = (lot.seller or "").strip().lower()
+        recent_t = self._last_titles[-gap:]
+        recent_s = self._last_sellers[-gap:]
+        if title and (title in recent_t or (recent_t and title == recent_t[-1])):
+            return True
+        if seller and (seller in recent_s or (recent_s and seller == recent_s[-1])):
+            return True
+        return False
+
+    async def _notify_lot(self, lot: Lot, count_as_new: bool) -> bool:
         if not self.bot or not self.chat_id:
-            return
-        # только реальный @username
+            return False
+        # только реальный @username — никаких «скрыт»
         if lot.paid_dm or not lot.writable or not lot.seller:
-            return
-        # страховка: не слать одну коллекцию подряд даже если mixer пропустил
-        title_key = (lot.title or "").strip().lower()
-        if title_key and title_key in self._last_titles[-3:]:
-            logger.info("skip consecutive title=%s", lot.title)
-            return
+            return False
+        if not self._in_price(lot):
+            return False
+        if self._too_similar_recent(lot):
+            logger.info(
+                "skip consecutive title=%s seller=%s", lot.title, lot.seller
+            )
+            return False
         await self._throttle_notify()
         title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
         lvl = lot.level if lot.level is not None else "?"
@@ -448,9 +467,17 @@ class App:
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
-            self._last_titles.append(title_key)
-            if len(self._last_titles) > 30:
-                self._last_titles = self._last_titles[-20:]
+            title_key = (lot.title or "").strip().lower()
+            seller_key = (lot.seller or "").strip().lower()
+            if title_key:
+                self._last_titles.append(title_key)
+            if seller_key:
+                self._last_sellers.append(seller_key)
+            keep = max(20, self._emit_gap * 4)
+            if len(self._last_titles) > keep:
+                self._last_titles = self._last_titles[-keep:]
+            if len(self._last_sellers) > keep:
+                self._last_sellers = self._last_sellers[-keep:]
             store.add_found(
                 lot.seller,
                 {
@@ -465,8 +492,10 @@ class App:
             if creds.AUTO_BLACKLIST:
                 store.block(lot.seller, lot.seller_id, reason="shown")
             store.save_users()
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.error("notify: %s", exc)
+            return False
 
 
 app = App()
@@ -648,6 +677,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not app.logged_in:
+        await message.answer("Сначала /start и вход.")
+        return
+    await message.answer(_filters_text(), reply_markup=filters_inline())
+
+
 @router.message(Command("stop"))
 async def cmd_stop(message: Message) -> None:
     text = await app.stop_monitor()
@@ -677,8 +715,11 @@ async def got_phone(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(AuthStates.code))
 async def got_code(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        return
     try:
-        result = await app.confirm_code(message.text or "")
+        result = await app.confirm_code(text)
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"⚠️ {exc}")
         return
@@ -692,8 +733,11 @@ async def got_code(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(AuthStates.password))
 async def got_password(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        return
     try:
-        await app.confirm_password(message.text or "")
+        await app.confirm_password(text)
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"⚠️ {exc}")
         return
@@ -728,17 +772,8 @@ async def cb_parse(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:settings")
 async def cb_settings(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n"
-        f"Цена: <b>{app.range_label}</b>\n"
-        f"Свежесть: ≤<b>{int(creds.FRESH_MAX_AGE_SEC)}с</b>\n"
-        f"lvl≤{creds.MAX_ACCOUNT_LEVEL} · gifts≤{creds.MAX_PROFILE_GIFTS} · "
-        f"RU≥{creds.MIN_RU_SCORE}\n"
-        f"Чеков: <b>{app.checks}</b> · новых: <b>{app.lots_notified}</b>\n"
-        f"Юзов в сессии: <b>{len(app.session_users)}</b>\n"
-        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>",
-        reply_markup=settings_inline(),
-    )
+    # сразу фильтры — то же, что /settings
+    await callback.message.edit_text(_filters_text(), reply_markup=filters_inline())
     await callback.answer()
 
 

@@ -900,6 +900,52 @@ class TelegramMarket:
                     lots = _parse_result(result2)
                     self._remember_users(_extract_users(result2))
                     result = result2
+            # вторая страница — новые продавцы (иначе Заново пустое)
+            next_off = str(getattr(result, "next_offset", "") or "") if result else ""
+            if lots and next_off:
+                try:
+                    more = await self._request(
+                        gift_id,
+                        limit,
+                        True,
+                        stats,
+                        gap,
+                        timeout,
+                        offset=next_off,
+                    )
+                    if more is None:
+                        more = await self._request(
+                            gift_id,
+                            limit,
+                            False,
+                            stats,
+                            gap,
+                            timeout,
+                            offset=next_off,
+                        )
+                    if more is not None:
+                        extra = _parse_result(more)
+                        self._remember_users(_extract_users(more))
+                        if extra:
+                            lots.extend(extra)
+                            next2 = str(getattr(more, "next_offset", "") or "")
+                            # иногда третья страница для разброса
+                            if next2 and random.random() < 0.55:
+                                more2 = await self._request(
+                                    gift_id,
+                                    limit,
+                                    True,
+                                    stats,
+                                    gap,
+                                    timeout,
+                                    offset=next2,
+                                )
+                                if more2 is not None:
+                                    extra2 = _parse_result(more2)
+                                    self._remember_users(_extract_users(more2))
+                                    lots.extend(extra2)
+                except Exception:  # noqa: BLE001
+                    pass
             if lots:
                 stats["ok"] += 1
                 self._remember_users(

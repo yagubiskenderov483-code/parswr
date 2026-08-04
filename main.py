@@ -1063,25 +1063,25 @@ class App:
         )
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
+        """Строго по включённым тумблерам — без данных не проходит."""
         f = self.filters
         if f.few_gifts:
-            # нет данных — не режем
-            if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
+            if lot.gifts_count is None or lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is not None and lot.account_level > f.max_level:
+            if lot.account_level is None or lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
             if n < 6 or n > f.short_user_max:
                 return False
         if f.no_premium:
-            # только явный premium режем; None = ок
-            if lot.is_premium is True:
+            # нужен явный non-premium; unknown / TGP — мимо
+            if lot.is_premium is not False:
                 return False
         if f.online_only:
-            # режем только явно оффлайн; None = не проверили → ок
-            if lot.is_online is False:
+            # только кто реально в сети сейчас
+            if lot.is_online is not True:
                 return False
         return True
 
@@ -1379,13 +1379,24 @@ class App:
             attempts = [
                 (True, True, True, False),
             ]
+        elif channel == "filter":
+            # фильтры: НЕ скатываемся в «кого попало»
+            # RU + free DM всегда; extra только если тумблеры включены
+            extra = bool(apply_extra and self._filters_active())
+            attempts = [
+                (True, True, False, extra),
+                (True, True, True, extra),  # soft models only
+            ]
+            if not extra:
+                # тумблеры выкл — всё равно только RU + free
+                attempts = [
+                    (True, True, False, False),
+                    (True, True, True, False),
+                ]
         else:
-            # фильтры: тоже только free DM; RU сначала, потом any
             attempts = [
                 (True, True, False, apply_extra),
                 (True, True, True, apply_extra),
-                (False, True, True, apply_extra),
-                (False, True, True, False),
             ]
         best: list[Lot] = []
         for want_ru, _want_free, ign_seen, extra in attempts:
@@ -1551,13 +1562,20 @@ class App:
             candidates = [lot for lot in enriched if lot.free_dm is True]
             self._ingest_always(candidates)
         elif channel == "filter" and candidates:
-            sample_n = min(len(candidates), max(250, lim * 10, 200))
+            # цена фильтра + без уже выданных юзов
+            mn_f, mx_f = self.filter_min_stars, self.filter_max_stars
+            candidates = [
+                lot
+                for lot in candidates
+                if mn_f <= lot.stars <= mx_f and not self._is_seen_username(lot)
+            ]
             random.shuffle(candidates)
-            # сначала с кириллицей
-            candidates.sort(
-                key=lambda lot: (0 if self._is_russian(lot) else 1, random.random())
-            )
-            sample = candidates[:sample_n]
+            # приоритет уже-RU, потом разные типы
+            already_ru = [lot for lot in candidates if self._is_russian(lot)]
+            need_bio = [lot for lot in candidates if not self._is_russian(lot)]
+            random.shuffle(already_ru)
+            sample = already_ru[:200] + self._sample_diverse_titles(need_bio, 400)
+            sample = _dedupe_lots(sample)[: max(250, lim * 10, 200)]
             await self.market.enrich_profiles(
                 sample,
                 timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.1),
@@ -1575,8 +1593,43 @@ class App:
                 )
                 self.parse_acc_checks += len(sample)
             self._ingest_always(sample)
-            # фильтры тоже только free DM
-            candidates = [lot for lot in sample if lot.free_dm is True]
+            # только RU + подтверждённый free DM
+            candidates = [
+                lot
+                for lot in sample
+                if lot.free_dm is True and self._is_russian(lot)
+            ]
+            # мало RU free — ещё волна био
+            if len(candidates) < max(20, lim):
+                used = {lot.id for lot in sample}
+                left = [lot for lot in need_bio if lot.id not in used]
+                wave2 = self._sample_diverse_titles(left, 300)
+                if wave2:
+                    await self.market.enrich_profiles(
+                        wave2,
+                        timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.1),
+                        parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                    )
+                    await self.market.check_free_dm(
+                        wave2,
+                        timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                    )
+                    self.parse_acc_checks += len(wave2)
+                    if self.filters.online_only:
+                        await self.market.refresh_online(
+                            wave2,
+                            timeout=max(creds.OWNER_TIMEOUT, 1.2),
+                        )
+                        self.parse_acc_checks += len(wave2)
+                    self._ingest_always(wave2)
+                    candidates = _dedupe_lots(
+                        candidates
+                        + [
+                            lot
+                            for lot in wave2
+                            if lot.free_dm is True and self._is_russian(lot)
+                        ]
+                    )
         elif candidates:
             sample_n = min(
                 len(candidates),
@@ -1606,7 +1659,8 @@ class App:
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
-            strict_russian=want_ru if channel == "parser" else False,
+            # фильтры тоже только RU
+            strict_russian=True if channel in ("parser", "filter") else False,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
@@ -1653,6 +1707,10 @@ class App:
                 )
 
             merged = _dedupe_lots(old + live)
+            # строго цена фильтра
+            merged = [
+                lot for lot in merged if mn <= lot.stars <= mx
+            ]
             random.shuffle(merged)
             self._ingest_always(merged)
             shown = await self._prepare_show(
@@ -1662,28 +1720,43 @@ class App:
                 track_seen=False,
                 need_full=True,
                 channel="filter",
+                strict_russian=True,
             )
-            # пусто — ещё один live без лишних фильтров-extra
-            if not shown and merged:
+            # пусто и тумблеры включены — один добор live, но фильтры не снимаем
+            if not shown and self._filters_active():
+                try:
+                    burst2 = await self.multi_burst(
+                        mn, mx, progress_cb=None, early_show_at=0
+                    )
+                    extra = [
+                        lot
+                        for lot in (burst2.all_lots or burst2.lots or [])
+                        if mn <= lot.stars <= mx
+                    ]
+                    merged = _dedupe_lots(merged + extra)
+                    self._ingest_always(extra)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("filter retry burst: %s", exc)
                 shown = await self._prepare_show(
                     merged,
                     limit=max(30, int(creds.SHOW_LIMIT)),
-                    apply_extra=False,
+                    apply_extra=True,
                     track_seen=False,
                     need_full=True,
                     channel="filter",
+                    strict_russian=True,
                 )
             if not shown:
                 await self._say_to(
                     chat_id,
-                    f"{screen('Фильтры')}\nпусто",
+                    f"{screen('Фильтры')}\nпусто · нет RU/free под условия",
                     reply_markup=filters_inline(),
                 )
                 return
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nготово · {len(shown)}",
+                f"{screen('Фильтры')}\nготово · {len(shown)} · RU · free DM",
                 reply_markup=filters_inline(),
             )
         finally:

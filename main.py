@@ -490,17 +490,16 @@ class App:
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
         random.shuffle(candidates)
-        # био/имя/ник — для анти-рекламы и простой RU-проверки (кириллица)
+        # био/имя — RU/анти-реклама; меньше запросов = быстрее выдача
         if candidates:
             lim = limit or creds.SHOW_LIMIT
-            # берём запас: много отсеется по RU / рекламе / повторам
-            sample_n = min(len(candidates), max(lim * 8, 80))
+            sample_n = min(len(candidates), max(lim * 4, 50))
             if need_full or apply_extra:
-                sample_n = min(len(candidates), max(sample_n, lim * 10))
+                sample_n = min(len(candidates), max(sample_n, lim * 5))
             await self.market.enrich_profiles(
                 candidates[:sample_n],
-                timeout=min(creds.OWNER_TIMEOUT, 1.0),
-                parallel=12,
+                timeout=min(creds.OWNER_TIMEOUT, 0.7),
+                parallel=16,
             )
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],
@@ -554,7 +553,8 @@ class App:
                     limit_results=creds.FILTER_LIMIT,
                     bump_check=False,
                     touch_cursor=False,
-                    time_budget=0,  # полный 149/149, парсер не трогаем
+                    time_budget=0,
+                    early_show_at=creds.FILTER_EARLY_SHOW_AT,
                 )
                 if burst:
                     if burst.all_lots:
@@ -866,24 +866,55 @@ class App:
         self._afk_task = None
 
     async def _loop(self) -> None:
-        # 1) Полный проход 149/149 (без фильтр-поиска)
+        # 1) Скан 149/149, но выдача СРАЗУ как набрали пул (не ждать конца)
         await self._say(
             f"⚡ Ищу свежие лоты · <b>{self.range_label}</b>\n"
-            f"Коллекции: <b>все / 149</b> · идёт скан…"
+            f"Коллекции: <b>149/149</b> · первая выдача сразу, как наберётся"
         )
         last_prog = 0.0
+        early_shown = False
 
         async def _burst_progress(done: int, total: int, lots_n: int) -> None:
             nonlocal last_prog
             nowp = time.monotonic()
-            if nowp - last_prog < 2.5 and done < total:
+            if nowp - last_prog < 1.8 and done < total:
                 return
             last_prog = nowp
             await self._edit_status(
-                f"⚡ Скан коллекций: <b>{done}/{total}</b>\n"
-                f"Лотов сырых: <b>{lots_n}</b>\n"
-                f"Режим: <b>{self.range_label}</b>"
+                f"⚡ Скан: <b>{done}/{total}</b>"
+                f"{' · выдача уже ушла' if early_shown else ' · жду пул…'}\n"
+                f"Лотов сырых: <b>{lots_n}</b> · <b>{self.range_label}</b>"
             )
+
+        async def _on_early(matched: list[Lot], done: int, total: int) -> None:
+            nonlocal early_shown
+            if early_shown or not self.running:
+                return
+            early_shown = True
+            await self._say(
+                f"⚡ Быстрая выдача · скан <b>{done}/{total}</b> ещё идёт в фоне…"
+            )
+            # сохранить что уже есть
+            self._save_models(matched)
+            self._flush_market_users()
+            pool = [lot for lot in matched if self._in_price(lot)]
+            random.shuffle(pool)
+            shown = await self._prepare_show(
+                pool, limit=creds.SHOW_LIMIT, apply_extra=False
+            )
+            await self._say(
+                f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
+                f"(быстрый режим · RU · без повторов)"
+            )
+            if shown:
+                now_e = time.monotonic()
+                for lot in shown:
+                    self._seen[lot.id] = now_e
+                await self._say_lot_list(shown)
+                for lot in shown[: creds.NOTIFY_CARDS]:
+                    await self._notify_lot(lot, count_as_new=False)
+            else:
+                await self._say("Пока пусто по фильтрам — добьём круг 149…")
 
         self.market._progress_cb = _burst_progress
         try:
@@ -898,7 +929,9 @@ class App:
                 limit_results=creds.SHOW_LIMIT,
                 bump_check=True,
                 touch_cursor=True,
-                time_budget=0,  # без раннего стопа — весь круг
+                time_budget=0,
+                early_show_at=creds.BURST_EARLY_SHOW_AT,
+                on_early_lots=_on_early,
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -924,7 +957,7 @@ class App:
                 and burst.collections_total > 0
             )
             await self._say(
-                f"💾 Моделей: <b>{len(to_save)}</b> (+{ins}/{upd})\n"
+                f"💾 Круг готов · моделей: <b>{len(to_save)}</b> (+{ins}/{upd})\n"
                 f"👤 Юзов +{ins_u} / upd {upd_u} · всего <b>{total_u:,}</b>\n"
                 f"🗄 В БД: <b>{self.db_total}</b> · уник. моделей: <b>{uniq_models}</b>\n"
                 f"Коллекции: <b>{burst.scanned}/{burst.collections_total}</b>"
@@ -932,33 +965,33 @@ class App:
                 f"~{burst.elapsed:.1f}с"
             )
 
-            # в выдачу — весь ценовой пул (не только 30 сырых)
-            price_pool = [
-                lot
-                for lot in (burst.all_lots or burst.lots)
-                if self._in_price(lot)
-            ]
-            random.shuffle(price_pool)
-            shown = await self._prepare_show(
-                price_pool or list(burst.lots),
-                limit=creds.SHOW_LIMIT,
-                apply_extra=False,
-            )
-            await self._say(
-                f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                f"(кириллица в имени/био · без рекламы · без 4–5 · без повторов)"
-            )
-            if shown:
-                for lot in shown:
-                    self._seen[lot.id] = now
-                await self._say_lot_list(shown)
-                for lot in shown[: creds.NOTIFY_CARDS]:
-                    await self._notify_lot(lot, count_as_new=False)
-            else:
-                await self._say(
-                    "После фильтров пусто (мало RU-профилей в этом круге) — "
-                    "мониторю дальше…"
+            # если ранняя выдача не сработала — покажем сейчас
+            if not early_shown:
+                price_pool = [
+                    lot
+                    for lot in (burst.all_lots or burst.lots)
+                    if self._in_price(lot)
+                ]
+                random.shuffle(price_pool)
+                shown = await self._prepare_show(
+                    price_pool or list(burst.lots),
+                    limit=creds.SHOW_LIMIT,
+                    apply_extra=False,
                 )
+                await self._say(
+                    f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
+                    f"(кириллица в имени/био · без повторов)"
+                )
+                if shown:
+                    for lot in shown:
+                        self._seen[lot.id] = now
+                    await self._say_lot_list(shown)
+                    for lot in shown[: creds.NOTIFY_CARDS]:
+                        await self._notify_lot(lot, count_as_new=False)
+                else:
+                    await self._say(
+                        "После фильтров пусто — мониторю дальше…"
+                    )
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
             await self._say(
@@ -970,7 +1003,7 @@ class App:
             self.checks = burst.check_no
 
         await self._say(
-            "📡 Мониторю · каждый чек <b>149/149</b> коллекций.",
+            "📡 Мониторю · чек = <b>149/149</b> (ускоренный).",
             reply_markup=main_inline(),
         )
 

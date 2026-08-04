@@ -191,11 +191,10 @@ class TelegramMarket:
         bump_check: bool = True,
         touch_cursor: bool = True,
         time_budget: float = 3.5,
+        early_show_at: int = 0,
+        on_early_lots: Any | None = None,
     ) -> CheckResult:
-        """Быстрый поиск свежих лотов в диапазоне.
-
-        bump_check/touch_cursor=False — для фильтр-поиска, чтобы не трогать парсер.
-        """
+        """Поиск лотов. Может отдать early-пул для быстрой выдачи, потом добить 149."""
         started = time.monotonic()
         if bump_check:
             self.check_no += 1
@@ -231,6 +230,7 @@ class TelegramMarket:
             random.shuffle(batch)
         sem = asyncio.Semaphore(parallel)
         lots: list[Lot] = []
+        early_fired = False
 
         async def one(gid: int) -> list[Lot]:
             async with sem:
@@ -238,7 +238,6 @@ class TelegramMarket:
                     gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
                 )
 
-        # кусками по всем коллекциям; early-stop только если time_budget > 0
         progress_cb = getattr(self, "_progress_cb", None)
         for i in range(0, len(batch), parallel):
             if 0 < time_budget < 1e8 and time.monotonic() - started > time_budget:
@@ -252,23 +251,37 @@ class TelegramMarket:
                 else:
                     stats["errors"] += 1
             if callable(progress_cb) and (
-                stats["scanned"] % max(parallel * 2, 20) == 0
+                stats["scanned"] % max(parallel, 15) == 0
                 or stats["scanned"] >= len(batch)
             ):
                 try:
                     await progress_cb(stats["scanned"], len(batch), len(lots))
                 except Exception:  # noqa: BLE001
                     pass
-            # early-stop по лимиту лотов — только для «быстрого» режима с бюджетом
-            if 0 < time_budget < 1e8:
-                matched_now = sum(
-                    1 for lot in _dedupe(lots) if min_stars <= lot.stars <= max_stars
-                )
-                if matched_now >= max(limit_results * 3, limit_results):
-                    break
+
+            matched_now = [
+                lot for lot in _dedupe(lots) if min_stars <= lot.stars <= max_stars
+            ]
+            # ранняя выдача — не ждём конец 149
+            if (
+                not early_fired
+                and early_show_at > 0
+                and callable(on_early_lots)
+                and len(matched_now) >= early_show_at
+            ):
+                early_fired = True
+                try:
+                    await on_early_lots(list(matched_now), stats["scanned"], len(batch))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # time_budget>0 — можно рано выйти полностью
+            if 0 < time_budget < 1e8 and len(matched_now) >= max(
+                limit_results * 3, limit_results
+            ):
+                break
 
         if not touch_cursor:
-            # вернуть курсор/порядок парсера как был
             self._gift_ids = saved_ids
             self._cursor = saved_cursor
 
@@ -276,7 +289,6 @@ class TelegramMarket:
         random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
         random.shuffle(matched)
-        # большой пул на выдачу — дальше отфильтруют RU/рекламу/повторы
         pool_n = max(limit_results * 12, 120)
         matched = matched[:pool_n]
 

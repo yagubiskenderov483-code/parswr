@@ -811,6 +811,54 @@ class GiftDB:
         )
         self._conn.commit()
 
+    def purge_delivered_seller(
+        self, *, username: str = "", user_id: int | None = None
+    ) -> tuple[int, int]:
+        """После выдачи: навсегда в seen + удалить юзера и его лоты из БД."""
+        self.mark_seen_seller(username=username, user_id=user_id)
+        u = (username or "").lstrip("@").strip().lower()
+        deleted_users = 0
+        deleted_gifts = 0
+        if user_id is not None:
+            cur = self._conn.execute(
+                "DELETE FROM users WHERE user_id = ?", (int(user_id),)
+            )
+            deleted_users += int(cur.rowcount or 0)
+            cur = self._conn.execute(
+                "DELETE FROM gifts WHERE seller_id = ?", (int(user_id),)
+            )
+            deleted_gifts += int(cur.rowcount or 0)
+        if u:
+            cur = self._conn.execute(
+                "DELETE FROM users WHERE lower(username) = ?", (u,)
+            )
+            deleted_users += int(cur.rowcount or 0)
+            cur = self._conn.execute(
+                "DELETE FROM gifts WHERE lower(seller) = ?", (u,)
+            )
+            deleted_gifts += int(cur.rowcount or 0)
+        self._conn.commit()
+        return deleted_users, deleted_gifts
+
+    def purge_delivered_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
+        """Пакетно стереть выданных продавцов из users+gifts."""
+        users_n = gifts_n = 0
+        seen_local: set[str] = set()
+        for lot in lots:
+            key = (lot.seller or "").lower() or (
+                f"id:{lot.seller_id}" if lot.seller_id is not None else ""
+            )
+            if not key or key in seen_local:
+                continue
+            seen_local.add(key)
+            du, dg = self.purge_delivered_seller(
+                username=lot.seller or "",
+                user_id=lot.seller_id,
+            )
+            users_n += du
+            gifts_n += dg
+        return users_n, gifts_n
+
     def mark_seen_model(self, model_key: str, title: str = "") -> None:
         mk = (model_key or "").strip()
         if not mk:

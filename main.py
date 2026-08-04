@@ -196,6 +196,7 @@ class App:
         self._seen_sellers: set[str] = set()
         self._seen_models: set[str] = set()
         self._seen_titles: set[str] = set()  # уже выданные типы NFT (парсер)
+        self._delivered_sellers: set[str] = set()  # юзы после выдачи — навсегда
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = 2000.0
@@ -257,6 +258,9 @@ class App:
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
         self._reload_persist_seen(blocklist_only=True)
+        self._delivered_sellers = self._load_delivered_sellers()
+        self._seen_sellers |= set(self._delivered_sellers)
+        self._filter_seen_sellers |= set(self._delivered_sellers)
 
     def _wire_market(self) -> None:
         """Кэш коллекций в БД + хуки на текущий market."""
@@ -670,36 +674,77 @@ class App:
         return out
 
     def _mark_delivered(self, lots: list[Lot], *, channel: str) -> None:
-        """Юзы + типы — без повторов в своём канале."""
+        """После выдачи: юзы навсегда, стереть из БД, больше не показывать."""
+        if not lots:
+            return
         for lot in lots:
             tk = self._title_key(lot)
-            if channel == "filter":
-                self._filter_seen_sellers.add(lot.owner_key)
-                self._filter_seen_models.add(lot.model_key)
-                if tk:
+            self._seen_sellers.add(lot.owner_key)
+            self._filter_seen_sellers.add(lot.owner_key)
+            self._delivered_sellers.add(lot.owner_key)
+            if lot.seller:
+                self._delivered_sellers.add(lot.seller.lower())
+            if lot.seller_id is not None:
+                self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+            if tk:
+                self._seen_titles.add(tk)
+                self._recent_titles.append(tk)
+                if channel == "filter":
                     self._filter_recent_titles.append(tk)
+                    self._filter_seen_models.add(lot.model_key)
                 try:
-                    if lot.title or tk:
-                        self.db.bump_collection_shown(lot.title or tk or "")
+                    self.db.bump_collection_shown(lot.title or tk or "")
                 except Exception:  # noqa: BLE001
                     pass
-            else:
-                self._seen_sellers.add(lot.owner_key)
-                if tk:
-                    self._seen_titles.add(tk)
-                    self._recent_titles.append(tk)
+        try:
+            self.db.purge_delivered_lots(lots)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("purge delivered: %s", exc)
+            for lot in lots:
                 try:
                     self.db.mark_seen_seller(
                         username=lot.seller, user_id=lot.seller_id
                     )
-                    if lot.title or tk:
-                        self.db.bump_collection_shown(lot.title or tk or "")
                 except Exception:  # noqa: BLE001
                     pass
+        self.db_total = self.db.count()
         if len(self._recent_titles) > 400:
             del self._recent_titles[:-400]
         if len(self._filter_recent_titles) > 400:
             del self._filter_recent_titles[:-400]
+
+    def _load_delivered_sellers(self) -> set[str]:
+        """Ключи юзов, которых уже выдавали (из БД seen)."""
+        out: set[str] = set()
+        try:
+            for k in self.db.load_seen_seller_keys():
+                if not k:
+                    continue
+                if k.startswith("u:"):
+                    out.add(k[2:].lower())
+                elif k.startswith("id:"):
+                    out.add(k)
+                else:
+                    out.add(str(k).lower().lstrip("@"))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    def _is_delivered_seller(self, lot: Lot) -> bool:
+        if lot.owner_key in self._delivered_sellers:
+            return True
+        if lot.seller and lot.seller.lower() in self._delivered_sellers:
+            return True
+        if lot.seller_id is not None and (
+            f"id:{int(lot.seller_id)}" in self._delivered_sellers
+        ):
+            return True
+        try:
+            return self.db.is_seen_seller(
+                username=lot.seller or "", user_id=lot.seller_id
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     def _reload_persist_seen(self, *, blocklist_only: bool = False) -> None:
         """Подтянуть блоклист (+ опционально seen). Парсер не грузит вечный seen —
@@ -1219,6 +1264,8 @@ class App:
         always_block_sellers = (
             set(self._filter_seen_sellers) if is_filter else set(self._seen_sellers)
         )
+        # выданные юзы — никогда снова (парсер и фильтры)
+        always_block_sellers |= set(self._delivered_sellers)
 
         lots = list(lots)
         random.shuffle(lots)
@@ -1555,6 +1602,7 @@ class App:
             lot
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
+            and not self._is_delivered_seller(lot)
         ]
         # без уже выданных юзов/типов — каналы раздельно
         if channel == "parser":
@@ -1563,6 +1611,7 @@ class App:
                 lot
                 for lot in candidates
                 if lot.owner_key not in self._seen_sellers
+                and lot.owner_key not in self._delivered_sellers
                 and self._title_key(lot) not in blocked_t
             ]
         elif channel == "filter":
@@ -1571,6 +1620,7 @@ class App:
                 lot
                 for lot in candidates
                 if lot.owner_key not in self._filter_seen_sellers
+                and lot.owner_key not in self._delivered_sellers
                 and self._title_key(lot) not in blocked_t
             ]
 
@@ -1847,10 +1897,12 @@ class App:
         label = self.filter_range_label
         spice_note = self._roll_random_spice()
         target_n = max(30, int(creds.SHOW_LIMIT))
-        # каждый поиск — свежий seen (из 12k БД всегда новые)
-        self._filter_seen_sellers.clear()
-        self._filter_seen_models.clear()
+        # каждый поиск — новые типы; выданные юзы навсегда (из БД)
         self._filter_recent_titles.clear()
+        self._filter_seen_models.clear()
+        self._delivered_sellers |= self._load_delivered_sellers()
+        self._filter_seen_sellers = set(self._delivered_sellers)
+        self._seen_sellers |= set(self._delivered_sellers)
         try:
             db_n = 0
             try:
@@ -1896,7 +1948,7 @@ class App:
                         hours=hours if hours > 0 else 168.0,
                         require_seller=True,
                         prefer_rare=bool(f.rare_types or f.random_mix),
-                        exclude_sellers=set(),
+                        exclude_sellers=set(self._delivered_sellers),
                         exclude_titles=set(),
                     )
                 except Exception:  # noqa: BLE001
@@ -1992,10 +2044,8 @@ class App:
                 f.spice_mid_user = False
                 f.spice_has_bio = False
                 f.spice_low_stars = False
-                self._filter_seen_sellers.clear()
+                self._filter_seen_sellers = set(self._delivered_sellers)
                 self._filter_seen_models.clear()
-                # не чистим titles уже показанных в этом запуске —
-                # только sellers, titles оставим в recent чтобы не дублировать в merge
                 old3 = _db_pool()
                 more = await self._prepare_show(
                     old3,
@@ -2142,13 +2192,19 @@ class App:
         )
         if not batch:
             return
+        # стереть юзов из БД после выдачи (если ещё не)
+        todo = [
+            lot for lot in batch if lot.owner_key not in self._delivered_sellers
+        ]
+        if todo:
+            try:
+                self._mark_delivered(todo, channel=channel)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mark on say: %s", exc)
         lines = [self._format_lot_line(lot) for lot in batch]
         for i in range(0, len(lines), 10):
             await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
-        # счётчик коллекций / дневная стата — только парсер-монитор
         if channel == "parser":
-            for lot in batch:
-                self.db.bump_collection_shown(lot.title or lot.model or "")
             try:
                 self.db.bump_daily(lots_shown=len(batch))
             except Exception:  # noqa: BLE001
@@ -2218,7 +2274,25 @@ class App:
                 pass
         if not found:
             return 0, 0, self.db.count_users()
-        ins, upd, total = self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
+        # не возвращаем в БД уже выданных
+        clean: list[dict] = []
+        for u in found:
+            uid = u.get("user_id")
+            uname = str(u.get("username") or "").lstrip("@").strip().lower()
+            if uname and uname in self._delivered_sellers:
+                continue
+            if uid is not None and f"id:{int(uid)}" in self._delivered_sellers:
+                continue
+            if self.db.is_seen_seller(username=uname, user_id=uid):
+                if uname:
+                    self._delivered_sellers.add(uname)
+                if uid is not None:
+                    self._delivered_sellers.add(f"id:{int(uid)}")
+                continue
+            clean.append(u)
+        if not clean:
+            return 0, 0, self.db.count_users()
+        ins, upd, total = self.db.upsert_users(clean, cap=creds.AFK_USER_CAP)
         if ins:
             try:
                 self.db.bump_daily(users_new=ins)
@@ -2227,8 +2301,12 @@ class App:
         return ins, upd, total
 
     def _ingest_always(self, lots: list[Lot] | None = None) -> None:
-        """Всегда копить gifts+users в БД — даже если в выдачу не попали."""
-        batch = list(lots or [])
+        """Копить gifts+users в БД — кроме уже выданных юзов."""
+        batch = [
+            lot
+            for lot in (lots or [])
+            if not self._is_delivered_seller(lot)
+        ]
         if batch:
             try:
                 self._save_models(batch)
@@ -2236,7 +2314,11 @@ class App:
                 logger.warning("ingest gifts: %s", exc)
             try:
                 self.db.upsert_users_from_lots(
-                    [lot for lot in batch if lot.seller_id is not None or lot.seller],
+                    [
+                        lot
+                        for lot in batch
+                        if lot.seller_id is not None or lot.seller
+                    ],
                     cap=creds.AFK_USER_CAP,
                 )
             except Exception as exc:  # noqa: BLE001

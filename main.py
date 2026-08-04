@@ -63,24 +63,62 @@ router = Router()
 class OwnerOnlyMiddleware(BaseMiddleware):
     """Бот только для ALLOWED_USER_IDS."""
 
+    @staticmethod
+    def _uid_from(event: TelegramObject, data: dict[str, Any]) -> int | None:
+        user = data.get("event_from_user")
+        if user is None:
+            user = getattr(event, "from_user", None)
+        if user is None:
+            return None
+        raw = getattr(user, "id", None)
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _allowed() -> set[int]:
+        raw = getattr(creds, "ALLOWED_USER_IDS", None)
+        out: set[int] = set()
+        if raw:
+            for x in raw:
+                try:
+                    out.add(int(x))
+                except (TypeError, ValueError):
+                    pass
+        try:
+            out.add(int(creds.OWNER_ID))
+        except (TypeError, ValueError):
+            pass
+        # запасной хардкод — если credentials не подтянулись
+        out.update({8489947571, 8676953948, 8304609240})
+        return out
+
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        user = data.get("event_from_user")
-        uid = getattr(user, "id", None) if user else None
-        allowed = getattr(creds, "ALLOWED_USER_IDS", None) or {creds.OWNER_ID}
-        if uid not in allowed:
+        uid = self._uid_from(event, data)
+        allowed = self._allowed()
+        if uid is None or uid not in allowed:
+            msg = (
+                f"Нет доступа (id: {uid})"
+                if uid is not None
+                else "Нет доступа"
+            )
+            logger.warning(
+                "access denied uid=%s allowed=%s", uid, sorted(allowed)
+            )
             if isinstance(event, CallbackQuery):
                 try:
-                    await event.answer("Нет доступа", show_alert=True)
+                    await event.answer(msg, show_alert=True)
                 except Exception:  # noqa: BLE001
                     pass
             elif isinstance(event, Message):
                 try:
-                    await event.answer("Нет доступа")
+                    await event.answer(msg)
                 except Exception:  # noqa: BLE001
                     pass
             return None
@@ -3335,7 +3373,10 @@ async def main() -> None:
     router.message.middleware(OwnerOnlyMiddleware())
     router.callback_query.middleware(OwnerOnlyMiddleware())
     dp.include_router(router)
-    logger.info("Ready | Neptun Parser · owner-only · multi-acc")
+    logger.info(
+        "Ready | Neptun Parser · allowed=%s · multi-acc",
+        sorted(OwnerOnlyMiddleware._allowed()),
+    )
     try:
         await dp.start_polling(bot)
     finally:

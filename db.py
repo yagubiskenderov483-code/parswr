@@ -399,8 +399,21 @@ class GiftDB:
                 gifts_count=r["u_gifts_count"],
             )
             lots.append(lot)
-        random.shuffle(lots)
-        return lots
+        # разнообразие NFT: не отдавать пачку из одной коллекции подряд
+        by_title: dict[str, list[Lot]] = {}
+        for lot in lots:
+            tk = (lot.title or lot.model or lot.id).strip().lower()
+            by_title.setdefault(tk, []).append(lot)
+        titles = list(by_title.keys())
+        random.shuffle(titles)
+        mixed: list[Lot] = []
+        while any(by_title.values()):
+            random.shuffle(titles)
+            for tk in titles:
+                bucket = by_title.get(tk) or []
+                if bucket:
+                    mixed.append(bucket.pop(random.randrange(len(bucket))))
+        return mixed
 
     def touch_collection(
         self,

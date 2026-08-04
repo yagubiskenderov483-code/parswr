@@ -152,7 +152,25 @@ class App:
         self._filter_task: asyncio.Task | None = None
         self.require_russian = True
         self._blocked_keys: set[str] = set()
+        self.speed_mode = creds.DEFAULT_SPEED
+        self.speed_label = creds.apply_speed(self.speed_mode)
+        # недавние NFT-коллекции — чтобы в mid/hard не сыпалось одно и то же
+        self._recent_titles: list[str] = []
         self._reload_persist_seen()
+
+    def cycle_speed(self) -> str:
+        order = ["quiet", "norm", "fast"]
+        try:
+            i = order.index(self.speed_mode)
+        except ValueError:
+            i = 0
+        self.speed_mode = order[(i + 1) % len(order)]
+        self.speed_label = creds.apply_speed(self.speed_mode)
+        return self.speed_label
+
+    @staticmethod
+    def _title_key(lot: Lot) -> str:
+        return (lot.title or lot.model or lot.id or "").strip().lower()
 
     def _reload_persist_seen(self) -> None:
         """Подтянуть блоклист + уже показанных — без повторов после рестарта."""
@@ -368,13 +386,15 @@ class App:
         apply_extra: bool = False,
         track_seen: bool = True,
     ) -> list[Lot]:
-        """Без рекламы/4–5 юзов/повторов; сильный рандом порядка."""
+        """Разнообразие NFT-коллекций + без повторов продавцов/моделей."""
         lots = list(lots)
         random.shuffle(lots)
+        # ведро по НАЗВАНИЮ NFT (Perfume Bottle), не по модели
         buckets: dict[str, list[Lot]] = {}
         keys: list[str] = []
         local_sellers: set[str] = set()
         local_models: set[str] = set()
+        recent = set(self._recent_titles[-80:])
 
         for lot in lots:
             if not lot.seller:
@@ -389,7 +409,6 @@ class App:
                 continue
             if apply_extra and not self._passes_extra_filters(lot):
                 continue
-            # без повторов продавцов/моделей всегда
             if lot.owner_key in self._seen_sellers:
                 continue
             if lot.model_key in self._seen_models:
@@ -404,68 +423,79 @@ class App:
                 continue
             if lot.model_key in local_models:
                 continue
-            mk = lot.model_key
-            if mk not in buckets:
-                buckets[mk] = []
-                keys.append(mk)
-            buckets[mk].append(lot)
+            tk = self._title_key(lot)
+            if not tk:
+                continue
+            if tk not in buckets:
+                buckets[tk] = []
+                keys.append(tk)
+            buckets[tk].append(lot)
             local_sellers.add(lot.owner_key)
             local_models.add(lot.model_key)
 
         random.shuffle(keys)
-        for mk in keys:
-            random.shuffle(buckets[mk])
+        # сначала коллекции, которых давно не было в выдаче
+        keys.sort(key=lambda k: k in recent)
+        for tk in keys:
+            random.shuffle(buckets[tk])
 
         out: list[Lot] = []
-        last = ""
-        while True:
-            progressed = False
+        # раунд-робин по разным NFT — в одной пачке макс. 1 лот на коллекцию
+        # (если уникальных мало — второй проход)
+        for pass_no in (1, 2):
             ordered = list(keys)
             random.shuffle(ordered)
-            # чуть приоритетнее не-last
-            ordered.sort(key=lambda k: k == last)
-            for mk in ordered:
-                bucket = buckets.get(mk) or []
-                while bucket:
-                    lot = bucket.pop(0)
-                    if track_seen and lot.owner_key in self._seen_sellers:
-                        continue
-                    if track_seen and lot.model_key in self._seen_models:
-                        continue
-                    if out and out[-1].model_key == mk:
-                        continue
-                    out.append(lot)
-                    # сразу помечаем — повторов больше не будет
-                    self._seen_sellers.add(lot.owner_key)
-                    self._seen_models.add(lot.model_key)
-                    self.db.mark_seen_seller(
-                        username=lot.seller, user_id=lot.seller_id
-                    )
-                    self.db.mark_seen_model(
-                        lot.model_key, title=lot.model or lot.title
-                    )
-                    last = mk
-                    progressed = True
+            if pass_no == 1:
+                ordered.sort(key=lambda k: k in recent)
+            for tk in ordered:
+                if limit is not None and len(out) >= limit:
                     break
-                if progressed:
-                    break
-            if not progressed:
-                break
+                bucket = buckets.get(tk) or []
+                if not bucket:
+                    continue
+                if pass_no == 1 and any(self._title_key(x) == tk for x in out):
+                    continue
+                if out and self._title_key(out[-1]) == tk:
+                    continue
+                lot = bucket.pop(0)
+                if lot.owner_key in self._seen_sellers:
+                    continue
+                if lot.model_key in self._seen_models:
+                    continue
+                out.append(lot)
+                self._seen_sellers.add(lot.owner_key)
+                self._seen_models.add(lot.model_key)
+                self.db.mark_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                )
+                self.db.mark_seen_model(
+                    lot.model_key, title=lot.model or lot.title
+                )
             if limit is not None and len(out) >= limit:
                 break
-        random.shuffle(out)
-        # после shuffle снова разнесём одинаковые подряд если вдруг
+
+        # финальный разнос одинаковых названий подряд
         fixed: list[Lot] = []
         rest = list(out)
+        random.shuffle(rest)
         while rest:
             pick_i = 0
             if fixed:
+                last = self._title_key(fixed[-1])
                 for i, lot in enumerate(rest):
-                    if lot.model_key != fixed[-1].model_key:
+                    if self._title_key(lot) != last:
                         pick_i = i
                         break
             fixed.append(rest.pop(pick_i))
-        return fixed[:limit] if limit is not None else fixed
+
+        result = fixed[:limit] if limit is not None else fixed
+        for lot in result:
+            tk = self._title_key(lot)
+            if tk:
+                self._recent_titles.append(tk)
+        if len(self._recent_titles) > 200:
+            self._recent_titles = self._recent_titles[-200:]
+        return result
 
     async def _prepare_show(
         self,
@@ -1004,7 +1034,8 @@ class App:
             self.checks = burst.check_no
 
         await self._say(
-            "📡 Мониторю · чек = <b>149/149</b> (ускоренный).",
+            "📡 Мониторю <b>тихо</b> · по ~12 коллекций за чек, "
+            "полный круг 149 без гонки · сессию бережём.",
             reply_markup=main_inline(),
         )
 
@@ -1056,18 +1087,14 @@ class App:
                         await self._notify_lot(lot, count_as_new=True)
                     self.lots_notified += max(0, len(fresh) - creds.NOTIFY_CARDS)
 
-                full = (
-                    result.scanned >= result.collections_total
-                    and result.collections_total > 0
-                )
                 if self.checks % 3 == 0:
                     self.db.checkpoint()
                 await self._edit_status(
-                    f"💓 <b>Чек #{self.checks}</b>\n"
+                    f"💓 <b>Чек #{self.checks}</b> · тихо\n"
                     f"Режим: <b>{self.range_label}</b>\n"
-                    f"Обошёл коллекций: <b>{result.scanned}</b>/"
-                    f"<b>{result.collections_total}</b>"
-                    f"{' ✅ все' if full else ''}\n"
+                    f"За чек: <b>{result.scanned}</b>/"
+                    f"<b>{result.collections_total}</b> "
+                    f"(кусок, без гонки)\n"
                     f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
                     f"Новых за чек: <b>{len(fresh)}</b>\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
@@ -1283,10 +1310,12 @@ def _filters_menu_text() -> str:
 def settings_inline() -> InlineKeyboardMarkup:
     stop = "⏹ Стоп парсинг" if app.running else "▶️ Парсинг выкл"
     afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK старт"
+    speed = f"Скорость: {app.speed_label}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Сложность парсера", callback_data="menu:parse")],
             [InlineKeyboardButton(text="🧩 Фильтр-поиск", callback_data="menu:filters")],
+            [InlineKeyboardButton(text=speed, callback_data="menu:speed")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="📊 Статус", callback_data="menu:status")],
@@ -1368,10 +1397,11 @@ async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
         f"Акк: <b>{app.account_name}</b>\n"
         f"Парсер: <b>{app.range_label}</b>\n"
         f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
+        f"Скорость: <b>{app.speed_label}</b>\n"
         f"Фильтры: {_filters_label(app.filters)}\n"
         f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b> · "
         f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
-        f"🚫 4–5 значные юзы скрыты · фильтры ≠ парсер"
+        f"🎲 Разные NFT в выдаче · 🚫 бан 4–5 юзов"
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_inline())
@@ -1548,6 +1578,8 @@ async def cb_settings(callback: CallbackQuery) -> None:
         "⚙️ <b>Настройки</b>\n"
         f"Парсер: <b>{app.range_label}</b>\n"
         f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
+        f"Скорость: <b>{app.speed_label}</b>\n"
+        f"<i>🐢 тихо · ⚖️ норм · ⚡ быстро (жми кнопку чтобы сменить)</i>\n"
         f"Фильтры: {_filters_label(app.filters)}\n"
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
@@ -1556,6 +1588,25 @@ async def cb_settings(callback: CallbackQuery) -> None:
         reply_markup=settings_inline(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu:speed")
+async def cb_speed(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    label = app.cycle_speed()
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки</b>\n"
+        f"Скорость: <b>{label}</b>\n"
+        f"<i>🐢 тихо — бережёт сессию\n"
+        f"⚖️ норм — баланс (по умолчанию)\n"
+        f"⚡ быстро — шустрее, но аккуратно</i>\n\n"
+        f"Парсер: <b>{app.range_label}</b>\n"
+        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>",
+        reply_markup=settings_inline(),
+    )
+    await callback.answer(f"Скорость: {label}")
 
 
 @router.callback_query(F.data == "menu:stop")

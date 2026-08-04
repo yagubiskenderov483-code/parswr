@@ -4,6 +4,9 @@ BOT_TOKEN = "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
+# только этот Telegram user_id может пользоваться ботом
+OWNER_ID = 8489947571
+
 MIN_STARS = 2000
 MAX_STARS = 5000
 
@@ -12,8 +15,13 @@ SHOW_LIMIT = 30
 # 0 = только списком (как в примере), без карточек по одной
 NOTIFY_CARDS = 0
 
+# параллельный парсинг сразу с нескольких Telethon-акков
+PARSE_ACCOUNTS = 3
+
 AFK_USER_CAP = 5_000_000
 AFK_STATUS_EVERY = 25.0
+
+BRAND = "Neptun Parser"
 
 # Профили скорости: тихо бережёт сессию, норм — баланс, быстро — шустрее но аккуратно
 SPEED_PROFILES: dict[str, dict] = {
@@ -71,28 +79,28 @@ SPEED_PROFILES: dict[str, dict] = {
     },
     "fast": {
         "label": "⚡ Быстро",
-        "BURST_PARALLEL": 24,
-        "BURST_PER_COLLECTION": 10,
+        "BURST_PARALLEL": 28,
+        "BURST_PER_COLLECTION": 12,
         "BURST_MAX_COLLECTIONS": 0,
-        "BURST_GAP": 0.02,
-        "API_TIMEOUT": 3.8,
-        "BURST_EARLY_SHOW_AT": 16,
-        "CHECK_INTERVAL": 0.35,
-        "CHECK_PARALLEL": 16,
-        "CHECK_PER_COLLECTION": 8,
-        "CHECK_BATCH": 40,
-        "CHECK_GAP": 0.03,
-        "OWNER_TIMEOUT": 0.45,
-        "ENRICH_PARALLEL": 12,
-        "FILTER_BURST_PARALLEL": 18,
-        "FILTER_BURST_PER_COLLECTION": 10,
+        "BURST_GAP": 0.012,
+        "API_TIMEOUT": 3.2,
+        "BURST_EARLY_SHOW_AT": 12,
+        "CHECK_INTERVAL": 0.25,
+        "CHECK_PARALLEL": 20,
+        "CHECK_PER_COLLECTION": 10,
+        "CHECK_BATCH": 50,
+        "CHECK_GAP": 0.02,
+        "OWNER_TIMEOUT": 0.4,
+        "ENRICH_PARALLEL": 16,
+        "FILTER_BURST_PARALLEL": 22,
+        "FILTER_BURST_PER_COLLECTION": 12,
         "FILTER_BURST_MAX_COLLECTIONS": 0,
-        "FILTER_BURST_GAP": 0.025,
+        "FILTER_BURST_GAP": 0.015,
         "FILTER_LIMIT": 30,
         "FILTER_DB_LIMIT": 30,
-        "FILTER_EARLY_SHOW_AT": 16,
+        "FILTER_EARLY_SHOW_AT": 12,
         "AFK_PAGE_LIMIT": 50,
-        "AFK_GAP": 0.1,
+        "AFK_GAP": 0.08,
         "AFK_PARALLEL": 4,
     },
 }

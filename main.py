@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -35,7 +35,9 @@ from aiogram.types import (
     MenuButtonCommands,
     Message,
     ReplyKeyboardRemove,
+    TelegramObject,
 )
+from typing import Any, Awaitable, Callable
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -56,6 +58,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 router = Router()
+
+
+class OwnerOnlyMiddleware(BaseMiddleware):
+    """Бот только для OWNER_ID."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        uid = getattr(user, "id", None) if user else None
+        if uid != creds.OWNER_ID:
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("Нет доступа", show_alert=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            elif isinstance(event, Message):
+                try:
+                    await event.answer("Нет доступа")
+                except Exception:  # noqa: BLE001
+                    pass
+            return None
+        return await handler(event, data)
+
+
+def screen(where: str) -> str:
+    """Короткий заголовок экрана — без статусов."""
+    return f"{creds.BRAND} • {where}"
+
 
 # Сложности парсинга
 DIFFICULTIES: list[tuple[str, str, int, int]] = [
@@ -163,6 +197,15 @@ class App:
         self._filter_recent_titles: list[str] = []
         self.active_account_id: int | None = None
         self._adding_account = False
+        # выбор сложности до старта
+        self.pending_range_label = self.range_label
+        self.pending_min_stars = self.min_stars
+        self.pending_max_stars = self.max_stars
+        self.parse_checked = 0
+        self.parse_ready = 0
+        self._last_pool: list[Lot] = []
+        self._extra_clients: list[TelegramClient] = []
+        self._extra_markets: list[TelegramMarket] = []
         self._reload_persist_seen()
 
     def _wire_market(self) -> None:
@@ -189,6 +232,203 @@ class App:
             logger.info("collections ready: %s", n)
         except Exception as exc:  # noqa: BLE001
             logger.warning("preload collections: %s", exc)
+
+    async def _close_extra_clients(self) -> None:
+        for client in self._extra_clients:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self._extra_clients.clear()
+        self._extra_markets.clear()
+
+    async def _build_parse_markets(self) -> list[TelegramMarket]:
+        """До PARSE_ACCOUNTS Telethon-рынков сразу (основной + доп. акки)."""
+        markets: list[TelegramMarket] = [self.market]
+        await self.market.ensure_connected()
+        await self.market.load_collections(force=False)
+        # шарим кэш коллекций
+        gift_ids = list(self.market._gift_ids)
+        gift_hash = int(getattr(self.market, "_gifts_hash", 0) or 0)
+
+        await self._close_extra_clients()
+        accs = [
+            a
+            for a in self.db.list_accounts()
+            if a.get("session")
+            and int(a["id"]) != (self.active_account_id or -1)
+        ]
+        need = max(0, int(getattr(creds, "PARSE_ACCOUNTS", 3)) - 1)
+        for acc in accs[:need]:
+            try:
+                client = TelegramClient(
+                    StringSession(acc["session"]), creds.API_ID, creds.API_HASH
+                )
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    continue
+                m = TelegramMarket(client)
+                m.set_catalog_hooks(
+                    load_cb=self.db.load_gift_catalog,
+                    save_cb=self.db.save_gift_catalog,
+                )
+                if gift_ids:
+                    m._gift_ids = list(gift_ids)
+                    m._gifts_hash = gift_hash
+                    m._cursor = random.randrange(len(gift_ids))
+                else:
+                    await m.load_collections(force=False)
+                self._extra_clients.append(client)
+                self._extra_markets.append(m)
+                markets.append(m)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("parse pool acc %s: %s", acc.get("id"), exc)
+        logger.info("parse markets: %s", len(markets))
+        return markets
+
+    @staticmethod
+    def _split_ids(ids: list[int], n: int) -> list[list[int]]:
+        if n <= 1:
+            return [list(ids)]
+        chunks: list[list[int]] = [[] for _ in range(n)]
+        for i, gid in enumerate(ids):
+            chunks[i % n].append(gid)
+        return [c for c in chunks if c]
+
+    async def multi_burst(
+        self,
+        min_stars: float,
+        max_stars: float,
+        *,
+        progress_cb: Any | None = None,
+        early_show_at: int = 0,
+        on_early_lots: Any | None = None,
+    ):
+        """Параллельный burst сразу с нескольких аккаунтов."""
+        markets = await self._build_parse_markets()
+        base = markets[0]
+        all_ids = list(await base.load_collections(force=False))
+        random.shuffle(all_ids)
+        chunks = self._split_ids(all_ids, len(markets))
+        # меньше параллели на акк, зато акков несколько
+        per_parallel = max(
+            8, int(creds.BURST_PARALLEL // max(1, len(markets)))
+        )
+
+        early_lock = asyncio.Lock()
+        early_fired = False
+        scanned_total = 0
+        scanned_lock = asyncio.Lock()
+
+        async def _prog(done: int, total: int, lots_n: int) -> None:
+            nonlocal scanned_total
+            async with scanned_lock:
+                # приблизительный общий прогресс
+                pass
+            if callable(progress_cb):
+                try:
+                    await progress_cb(done, total, lots_n)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        async def _early(matched: list[Lot], done: int, total: int) -> None:
+            nonlocal early_fired
+            async with early_lock:
+                if early_fired:
+                    return
+                early_fired = True
+            if callable(on_early_lots):
+                await on_early_lots(matched, done, total)
+
+        async def run_one(m: TelegramMarket, ids: list[int], bump: bool):
+            m._progress_cb = _prog if bump else None
+            try:
+                return await m.burst_search(
+                    min_stars,
+                    max_stars,
+                    parallel=per_parallel,
+                    per_collection=creds.BURST_PER_COLLECTION,
+                    max_collections=0,
+                    gap=creds.BURST_GAP,
+                    timeout=creds.API_TIMEOUT,
+                    limit_results=creds.SHOW_LIMIT,
+                    bump_check=bump,
+                    touch_cursor=False,
+                    time_budget=0,
+                    early_show_at=early_show_at if bump else 0,
+                    on_early_lots=_early if bump else None,
+                    collection_ids=ids,
+                )
+            finally:
+                m._progress_cb = None
+
+        tasks = [
+            run_one(m, chunk, bump=(i == 0))
+            for i, (m, chunk) in enumerate(zip(markets, chunks))
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ok_results = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("multi burst part: %s", r)
+                continue
+            ok_results.append(r)
+        if not ok_results:
+            from market import CheckResult
+
+            return CheckResult(
+                check_no=0,
+                scanned=0,
+                lots=[],
+                collections_total=len(all_ids),
+                errors=1,
+                error="all accounts failed",
+            )
+
+        # merge
+        all_lots: list[Lot] = []
+        matched: list[Lot] = []
+        scanned = 0
+        floods = 0
+        errors = 0
+        elapsed = 0.0
+        for r in ok_results:
+            scanned += int(r.scanned or 0)
+            floods += int(r.floods or 0)
+            errors += int(r.errors or 0)
+            elapsed = max(elapsed, float(r.elapsed or 0))
+            if r.all_lots:
+                all_lots.extend(r.all_lots)
+            matched.extend(r.lots or [])
+
+        def _dedupe(lots: list[Lot]) -> list[Lot]:
+            seen: set[str] = set()
+            out: list[Lot] = []
+            for lot in lots:
+                if lot.id in seen:
+                    continue
+                seen.add(lot.id)
+                out.append(lot)
+            return out
+
+        all_lots = _dedupe(all_lots)
+        matched = _dedupe(matched)
+        random.shuffle(matched)
+        from market import CheckResult
+
+        return CheckResult(
+            check_no=ok_results[0].check_no,
+            scanned=scanned,
+            lots=matched,
+            collections_total=len(all_ids),
+            ok=sum(int(r.ok or 0) for r in ok_results),
+            errors=errors,
+            floods=floods,
+            elapsed=elapsed,
+            all_lots=all_lots,
+        )
 
     def cycle_speed(self) -> str:
         order = ["quiet", "norm", "fast"]
@@ -496,7 +736,7 @@ class App:
 
     async def stop_monitor(self) -> str:
         if not self.running and self._task is None:
-            return "⏹ Уже стоп."
+            return f"{screen('Парсинг')}\nУже стоп"
         self.running = False
         if self._task:
             self._task.cancel()
@@ -505,7 +745,8 @@ class App:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        return f"⏹ Стоп. Чеков: {self.checks}. Новых: {self.lots_notified}"
+        await self._close_extra_clients()
+        return f"{screen('Парсинг')}\nСтоп · выдано {self.lots_notified}"
 
     def _in_price(self, lot: Lot) -> bool:
         return self.min_stars <= lot.stars <= self.max_stars
@@ -579,6 +820,11 @@ class App:
             if self._is_ad(lot):
                 continue
             if self.require_russian and not self._is_russian(lot):
+                continue
+            # только бесплатные ЛС (не за Stars)
+            if lot.free_dm is False:
+                continue
+            if lot.free_dm is None:
                 continue
             # тумблеры SearchFilters — ТОЛЬКО filter-канал
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
@@ -751,6 +997,11 @@ class App:
                     timeout=min(creds.OWNER_TIMEOUT, 0.7),
                     parallel=getattr(creds, "ENRICH_PARALLEL", 8),
                 )
+            # проверка: можно ли писать бесплатно (не за Stars)
+            await self.market.check_free_dm(
+                candidates[:sample_n],
+                timeout=max(creds.OWNER_TIMEOUT, 1.2),
+            )
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],
                 cap=creds.AFK_USER_CAP,
@@ -768,19 +1019,14 @@ class App:
     async def run_filter_search(self, chat_id: int) -> None:
         """Отдельный поиск по фильтрам — НЕ связан с парсером/монитором."""
         if self.filter_search_running:
-            await self._say_to(
-                chat_id, "🔎 Фильтр-поиск уже идёт. Подожди…"
-            )
+            await self._say_to(chat_id, f"{screen('Фильтры')}\nуже идёт")
             return
         self.filter_search_running = True
         f = self.filters
         mn, mx = self.filter_min_stars, self.filter_max_stars
         label = self.filter_range_label
         try:
-            await self._say_to(
-                chat_id,
-                f"🔎 <b>{label}</b>\n{_filters_label(f)}",
-            )
+            await self._say_to(chat_id, f"{screen('Фильтры')}\n{label}")
             old = self.db.fetch_random_lots(
                 min_stars=mn,
                 max_stars=mx,
@@ -789,49 +1035,24 @@ class App:
             )
             live: list[Lot] = []
             try:
-                burst = await self.market.burst_search(
+                burst = await self.multi_burst(
                     mn,
                     mx,
-                    parallel=creds.FILTER_BURST_PARALLEL,
-                    per_collection=creds.FILTER_BURST_PER_COLLECTION,
-                    max_collections=creds.FILTER_BURST_MAX_COLLECTIONS,
-                    gap=creds.FILTER_BURST_GAP,
-                    timeout=creds.API_TIMEOUT,
-                    limit_results=creds.FILTER_LIMIT,
-                    bump_check=False,
-                    touch_cursor=False,
-                    time_budget=0,
-                    early_show_at=creds.FILTER_EARLY_SHOW_AT,
+                    progress_cb=None,
+                    early_show_at=0,
                 )
                 if burst:
                     if burst.all_lots:
                         self._save_models(burst.all_lots)
                     self._flush_market_users()
                     live = list(burst.lots)
-                    full = (
-                        burst.scanned >= burst.collections_total
-                        and burst.collections_total > 0
-                    )
-                    await self._say_to(
-                        chat_id,
-                        f"📡 Лайв: <b>{burst.scanned}</b>/"
-                        f"<b>{burst.collections_total}</b>"
-                        f"{' ✅' if full else ''} · "
-                        f"в диапазоне {len(live)} · ~{burst.elapsed:.1f}с",
-                    )
             except Exception as exc:  # noqa: BLE001
                 await self._say_to(
-                    chat_id, f"⚠️ Лайв-поиск: {_esc(str(exc)[:160])}"
+                    chat_id, f"{screen('Фильтры')}\n⚠️ {_esc(str(exc)[:120])}"
                 )
 
             merged = _dedupe_lots(old + live)
             random.shuffle(merged)
-            await self._say_to(
-                chat_id,
-                f"📦 Кандидатов: <b>{len(merged)}</b> "
-                f"(БД {len(old)} · лайв {len(live)})",
-            )
-            # channel=filter — свой seen, парсер не затрагивает
             shown = await self._prepare_show(
                 merged,
                 limit=creds.SHOW_LIMIT,
@@ -843,24 +1064,19 @@ class App:
             if not shown:
                 await self._say_to(
                     chat_id,
-                    "Пусто в фильтр-поиске. Ослабь тумблеры или смени сложность.",
+                    f"{screen('Фильтры')}\nпусто",
                     reply_markup=filters_inline(),
                 )
                 return
-            await self._say_to(
-                chat_id,
-                f"✅ Фильтр-парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} · "
-                f"<b>{label}</b>\n"
-                f"<i>отдельный канал · монитор не тронут</i>",
-            )
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                "Готово · фильтр-парсер. Блок: <code>/block username</code>",
+                f"{screen('Фильтры')}\nготово · {len(shown)}",
                 reply_markup=filters_inline(),
             )
         finally:
             self.filter_search_running = False
+            await self._close_extra_clients()
 
     @staticmethod
     def _format_lot_line(lot: Lot) -> str:
@@ -1155,29 +1371,128 @@ class App:
         self._afk_task = None
 
     async def _loop(self) -> None:
-        # 1) Быстрый скан: сразу выдача, без простыней в чат
+        """Один круг: скан → прогресс → выдача 30 → стоп (есть кнопка Заново)."""
+        self.parse_checked = 0
+        self.parse_ready = 0
+        self._last_pool = []
+        n_acc = max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))
+        await self._edit_status(
+            f"{screen('Парсинг')}\n"
+            f"Сканирую · акков: <b>{n_acc}</b>\n"
+            f"Проверено: <b>0</b> · Готово: <b>0</b>/{creds.SHOW_LIMIT}"
+        )
+
         last_prog = 0.0
-        early_shown = False
 
         async def _burst_progress(done: int, total: int, lots_n: int) -> None:
             nonlocal last_prog
             nowp = time.monotonic()
-            if nowp - last_prog < 2.5 and done < total:
+            if nowp - last_prog < 1.2 and done < total:
                 return
             last_prog = nowp
+            self.parse_checked = max(self.parse_checked, lots_n)
             await self._edit_status(
-                f"⚡ <b>{self.range_label}</b> · {done}/{total} · лотов {lots_n}"
-                f"{' · выдача ✅' if early_shown else ''}"
+                f"{screen('Парсинг')}\n"
+                f"Коллекции: <b>{done}</b>/{total}\n"
+                f"Проверено: <b>{self.parse_checked}</b> · "
+                f"Готово: <b>{self.parse_ready}</b>/{creds.SHOW_LIMIT}"
             )
 
-        async def _on_early(matched: list[Lot], done: int, total: int) -> None:
-            nonlocal early_shown
-            if early_shown or not self.running:
-                return
-            early_shown = True
-            self._save_models(matched)
+        try:
+            burst = await self.multi_burst(
+                self.min_stars,
+                self.max_stars,
+                progress_cb=_burst_progress,
+                early_show_at=0,
+                on_early_lots=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            self.running = False
+            await self._say(
+                f"{screen('Парсинг')}\n⚠️ {_esc(str(exc)[:200])}",
+                reply_markup=parse_done_inline(),
+            )
+            return
+
+        if not self.running:
+            return
+
+        now = time.monotonic()
+        to_save = (burst.all_lots or burst.lots) if burst else []
+        if to_save:
+            for lot in to_save:
+                self._seen.setdefault(lot.id, now)
+            self._save_models(to_save)
             self._flush_market_users()
-            pool = [lot for lot in matched if self._in_price(lot)]
+            self.db.upsert_users_from_lots(
+                [lot for lot in to_save if lot.seller_id is not None],
+                cap=creds.AFK_USER_CAP,
+            )
+
+        price_pool = [lot for lot in to_save if self._in_price(lot)]
+        random.shuffle(price_pool)
+        self._last_pool = list(price_pool)
+        self.parse_checked = len(
+            {lot.owner_key for lot in price_pool if lot.seller or lot.seller_id}
+        ) or len(price_pool)
+
+        await self._edit_status(
+            f"{screen('Парсинг')}\n"
+            f"Проверено: <b>{self.parse_checked}</b>\n"
+            f"Готовлю выдачу…"
+        )
+
+        shown = await self._prepare_show(
+            price_pool,
+            limit=creds.SHOW_LIMIT,
+            apply_extra=False,
+            channel="parser",
+        )
+        self.parse_ready = len(shown)
+        if burst:
+            self.checks = burst.check_no
+
+        if shown:
+            for lot in shown:
+                self._seen[lot.id] = now
+            await self._edit_status(
+                f"{screen('Парсинг')}\n"
+                f"Проверено: <b>{self.parse_checked}</b> · "
+                f"Готово: <b>{len(shown)}</b>/{creds.SHOW_LIMIT}"
+            )
+            await self._say_lot_list(shown, channel="parser")
+            self.lots_notified += len(shown)
+            await self._say(
+                f"{screen('Парсинг')}\n"
+                f"Выдал <b>{len(shown)}</b> · только free DM",
+                reply_markup=parse_done_inline(),
+            )
+        else:
+            await self._say(
+                f"{screen('Парсинг')}\n"
+                f"Проверено: <b>{self.parse_checked}</b> · готово 0\n"
+                f"Не набрал free DM. Жми Заново / смени сложность.",
+                reply_markup=parse_done_inline(),
+            )
+
+        self.running = False
+        self._task = None
+        await self._close_extra_clients()
+
+    async def deliver_again(self) -> None:
+        """Ещё одна выдача других лотов из пула / быстрый добор."""
+        if self.running:
+            raise RuntimeError("Уже парсит — сначала стоп.")
+        if not self.logged_in:
+            raise RuntimeError("Сначала вход.")
+        self.running = True
+        self._task = asyncio.create_task(self._again_loop(), name="again")
+
+    async def _again_loop(self) -> None:
+        try:
+            await self._edit_status(f"{screen('Парсинг')}\nЗаново · готовлю…")
+            pool = [lot for lot in self._last_pool if self._in_price(lot)]
             random.shuffle(pool)
             shown = await self._prepare_show(
                 pool,
@@ -1185,165 +1500,53 @@ class App:
                 apply_extra=False,
                 channel="parser",
             )
-            if shown:
-                now_e = time.monotonic()
-                for lot in shown:
-                    self._seen[lot.id] = now_e
-                await self._say_lot_list(shown, channel="parser")
-
-        self.market._progress_cb = _burst_progress
-        try:
-            burst = await self.market.burst_search(
-                self.min_stars,
-                self.max_stars,
-                parallel=creds.BURST_PARALLEL,
-                per_collection=creds.BURST_PER_COLLECTION,
-                max_collections=creds.BURST_MAX_COLLECTIONS,
-                gap=creds.BURST_GAP,
-                timeout=creds.API_TIMEOUT,
-                limit_results=creds.SHOW_LIMIT,
-                bump_check=True,
-                touch_cursor=True,
-                time_budget=0,
-                early_show_at=creds.BURST_EARLY_SHOW_AT,
-                on_early_lots=_on_early,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = str(exc)
-            await self._say(f"⚠️ Ошибка поиска: {_esc(str(exc)[:200])}")
-            burst = None
-        finally:
-            self.market._progress_cb = None
-
-        now = time.monotonic()
-        if burst and (burst.all_lots or burst.lots):
-            to_save = burst.all_lots or burst.lots
-            for lot in to_save:
-                self._seen.setdefault(lot.id, now)
-            ins, upd = self._save_models(to_save)
-            ins_u, upd_u, total_u = self._flush_market_users()
-            self.db.upsert_users_from_lots(
-                [lot for lot in to_save if lot.seller_id is not None],
-                cap=creds.AFK_USER_CAP,
-            )
-            uniq_models = self.db.count_models()
-            full = (
-                burst.scanned >= burst.collections_total
-                and burst.collections_total > 0
-            )
-            if not early_shown:
-                price_pool = [
+            if len(shown) < creds.SHOW_LIMIT:
+                # добор лайвом с 3 акков
+                burst = await self.multi_burst(
+                    self.min_stars,
+                    self.max_stars,
+                    progress_cb=None,
+                    early_show_at=0,
+                )
+                extra = [
                     lot
-                    for lot in (burst.all_lots or burst.lots)
+                    for lot in (burst.all_lots or burst.lots or [])
                     if self._in_price(lot)
                 ]
-                random.shuffle(price_pool)
+                self._last_pool = _dedupe_lots(pool + extra)
+                self._save_models(extra)
                 shown = await self._prepare_show(
-                    price_pool or list(burst.lots),
+                    self._last_pool,
                     limit=creds.SHOW_LIMIT,
                     apply_extra=False,
                     channel="parser",
                 )
-                if shown:
-                    for lot in shown:
-                        self._seen[lot.id] = now
-                    await self._say_lot_list(shown, channel="parser")
-            await self._edit_status(
-                f"✅ Круг <b>{burst.scanned}/{burst.collections_total}</b> · "
-                f"~{burst.elapsed:.1f}с · моделей {len(to_save)} · "
-                f"юзов {total_u:,} (+{ins_u})"
-            )
-        else:
-            err = (burst.error if burst else self.last_error) or "пусто"
-            await self._say(f"Пусто · {_esc(err)[:120]}")
-
-        if burst:
-            self.checks = burst.check_no
-
-        await self._edit_status(
-            f"📡 Парсер · <b>{self.range_label}</b> · {self.speed_label}\n"
-            f"мониторю…"
-        )
-
-        # 2) Чеки — полный круг коллекций каждый раз
-        while self.running:
-            started = time.monotonic()
-            try:
-                result = await self.market.run_check(
-                    parallel=creds.CHECK_PARALLEL,
-                    per_collection=creds.CHECK_PER_COLLECTION,
-                    batch_size=creds.CHECK_BATCH,
-                    gap=creds.CHECK_GAP,
-                    timeout=creds.API_TIMEOUT,
-                )
-                self.checks = result.check_no
-                self.last_check_lots = len(result.lots)
-                self.last_error = result.error
-                try:
-                    self.db.bump_daily(checks=1)
-                except Exception:  # noqa: BLE001
-                    pass
-
-                # авто-ротация акка при сильном flood
-                if result.floods >= 3 and len(self.db.list_accounts()) > 1:
-                    try:
-                        msg = await self.rotate_account()
-                        await self._say(f"🛟 Flood → ротация\n{msg}")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("rotate: %s", exc)
-
-                if result.lots:
-                    self._save_models(result.lots)
-                ins_u, _upd_u, total_u = self._flush_market_users()
-                if result.lots:
-                    self.db.upsert_users_from_lots(
-                        [lot for lot in result.lots if lot.seller_id is not None],
-                        cap=creds.AFK_USER_CAP,
-                    )
-                    total_u = self.db.count_users()
-
+            self.parse_ready = len(shown)
+            if shown:
                 now = time.monotonic()
-                candidates = []
-                for lot in result.lots:
-                    if lot.id in self._seen:
-                        continue
+                for lot in shown:
                     self._seen[lot.id] = now
-                    if self._in_price(lot):
-                        candidates.append(lot)
-
-                fresh: list[Lot] = []
-                if candidates:
-                    fresh = await self._prepare_show(
-                        candidates,
-                        limit=creds.SHOW_LIMIT,
-                        apply_extra=False,
-                        channel="parser",
-                    )
-                    if fresh:
-                        await self._say_lot_list(
-                            fresh[: creds.SHOW_LIMIT], channel="parser"
-                        )
-                        self.lots_notified += len(fresh)
-
-                if self.checks % 3 == 0:
-                    self.db.checkpoint()
-                await self._edit_status(
-                    f"💓 #{self.checks} · <b>{self.range_label}</b>\n"
-                    f"{result.scanned}/{result.collections_total} · "
-                    f"+{len(fresh)} · {result.elapsed:.1f}с"
-                    + (f"\n⚠️ {_esc(result.error[:80])}" if result.error else "")
+                await self._say_lot_list(shown, channel="parser")
+                self.lots_notified += len(shown)
+                await self._say(
+                    f"{screen('Парсинг')}\nВыдал <b>{len(shown)}</b>",
+                    reply_markup=parse_done_inline(),
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self.last_error = str(exc)
-                logger.exception("check failed")
-                await self._edit_status(
-                    f"💓 Чек ошибка\n<code>{_esc(str(exc)[:180])}</code>\nПродолжаю…"
+            else:
+                await self._say(
+                    f"{screen('Парсинг')}\nПока пусто · free DM",
+                    reply_markup=parse_done_inline(),
                 )
-
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.05, creds.CHECK_INTERVAL - elapsed))
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            await self._say(
+                f"{screen('Парсинг')}\n⚠️ {_esc(str(exc)[:180])}",
+                reply_markup=parse_done_inline(),
+            )
+        finally:
+            self.running = False
+            self._task = None
+            await self._close_extra_clients()
 
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
         if not self.chat_id:
@@ -1422,17 +1625,15 @@ def _filters_label(f: SearchFilters) -> str:
 
 
 def main_inline() -> InlineKeyboardMarkup:
-    afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK фарм юзов"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Парсер", callback_data="menu:parse")],
+            [InlineKeyboardButton(text="1️⃣ Парсинг", callback_data="menu:parse")],
             [
                 InlineKeyboardButton(
-                    text="🧩 Фильтр-парсер", callback_data="menu:filters"
+                    text="2️⃣ Парсер по фильтрам", callback_data="menu:filters"
                 )
             ],
-            [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+            [InlineKeyboardButton(text="3️⃣ Настройки", callback_data="menu:settings")],
         ]
     )
 
@@ -1442,10 +1643,38 @@ def difficulty_inline(prefix: str = "diff") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=label, callback_data=f"{prefix}:{rid}")]
         for rid, label, _, _ in DIFFICULTIES
     ]
-    rows.append(
-        [InlineKeyboardButton(text="🧩 Сначала фильтры", callback_data="menu:filters")]
-    )
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parse_ready_inline() -> InlineKeyboardMarkup:
+    """После выбора сложности — старт / стоп."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="▶️ Начать парсить", callback_data="parse:go")],
+    ]
+    if app.running:
+        rows.append(
+            [InlineKeyboardButton(text="⏹ Стоп", callback_data="menu:stop")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:parse")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parse_done_inline() -> InlineKeyboardMarkup:
+    """После листинга — заново / стоп / меню."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔄 Заново", callback_data="parse:again")],
+    ]
+    if app.running:
+        rows.append(
+            [InlineKeyboardButton(text="⏹ Стоп", callback_data="menu:stop")]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="🎯 Сложность", callback_data="menu:parse")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")],
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1474,7 +1703,6 @@ def filters_inline() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎯 Сложность фильтр-поиска:", callback_data="fdiff:noop")],
             diff_row,
             [
                 InlineKeyboardButton(
@@ -1490,7 +1718,7 @@ def filters_inline() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅" if f.short_username else "⬜️") + " Короткий юз (6–8)",
+                    text=("✅" if f.short_username else "⬜️") + " Короткий юз",
                     callback_data="flt:short",
                 )
             ],
@@ -1502,7 +1730,7 @@ def filters_inline() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🔎 Искать (БД+лайв)", callback_data="flt:run"
+                    text="🔎 Искать", callback_data="flt:run"
                 )
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
@@ -1522,44 +1750,28 @@ def _current_filter_diff_id() -> str:
 
 def _filters_menu_text() -> str:
     return (
-        "🧩 <b>Фильтр-парсер</b>\n"
-        "<i>Отдельный канал ≠ монитор/парсинг</i>\n"
-        "• своя сложность 🟢🟡🔴💀\n"
-        "• свои тумблеры\n"
-        "• свой seen (парсер не портит и наоборот)\n\n"
-        f"Сложность: <b>{app.filter_range_label}</b>\n"
-        f"{_filters_label(app.filters)}\n\n"
-        "• Мало гифтов — gifts ≤ 5\n"
-        "• Мелкий lvl — rating ≤ 5\n"
-        "• Короткий юз — длина 6–8 (4–5 всегда бан)\n"
-        "• Без TGP — не Premium\n\n"
-        "Искать = БД + лайв · монитор можно не останавливать"
+        f"{screen('Фильтры')}\n"
+        f"{app.filter_range_label}\n"
+        f"{_filters_label(app.filters)}"
     )
 
 
 def settings_inline() -> InlineKeyboardMarkup:
-    stop = "⏹ Стоп парсинг" if app.running else "▶️ Парсинг выкл"
-    afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK старт"
-    speed = f"Скорость: {app.speed_label}"
+    stop = "⏹ Стоп" if app.running else "▶️ Парсинг выкл"
+    afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK"
+    speed = f"Скорость · {app.speed_label}"
     nacc = len(app.db.list_accounts())
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎯 Сложность парсера", callback_data="menu:parse")],
-            [
-                InlineKeyboardButton(
-                    text="🧩 Фильтр-парсер", callback_data="menu:filters"
-                )
-            ],
             [InlineKeyboardButton(text=speed, callback_data="menu:speed")],
             [
                 InlineKeyboardButton(
                     text=f"👤 Аккаунты ({nacc})", callback_data="menu:accounts"
                 )
             ],
-            [InlineKeyboardButton(text="📅 Стата за день", callback_data="menu:daily")],
-            [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
+            [InlineKeyboardButton(text="📅 /daily", callback_data="menu:daily")],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
-            [InlineKeyboardButton(text="📊 Статус", callback_data="menu:status")],
+            [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
     )
@@ -1661,21 +1873,12 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
 
 
 async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
-    # только статус + кнопки, без преамбулы сверху
-    text = (
-        f"{app.account_name or '—'}\n"
-        f"{app.range_label} · {app.speed_label}\n"
-        f"{'▶️' if app.running else '⏹'} парсер · "
-        f"{'🌙' if app.afk_running else '⏹'} afk"
-    )
+    text = screen("Меню")
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_inline())
         await target.answer()
     else:
-        await target.answer(
-            text,
-            reply_markup=main_inline(),
-        )
+        await target.answer(text, reply_markup=main_inline())
 
 
 @router.message(CommandStart())
@@ -1690,7 +1893,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     wipe_disk_junk()
     await state.set_state(AuthStates.phone)
     await message.answer(
-        "📱 <code>+79991234567</code>",
+        f"{screen('Вход')}\n📱 <code>+79991234567</code>",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -1762,13 +1965,7 @@ async def cb_parse(callback: CallbackQuery) -> None:
         await callback.answer("Сначала вход", show_alert=True)
         return
     await callback.message.edit_text(
-        "🎯 <b>Выбери сложность:</b>\n\n"
-        "🟢 <b>Лёгкий</b> — 2k–5k\n"
-        "🟡 <b>Средний</b> — 5k–15k\n"
-        "🔴 <b>Сложный</b> — 15k–30k\n"
-        "💀 <b>Impossible</b> — 30k–60k\n\n"
-        f"Фильтры сейчас: {_filters_label(app.filters)}\n"
-        "Выдача random · без 4–5 значных юзов",
+        screen("Парсинг"),
         reply_markup=difficulty_inline("diff"),
     )
     await callback.answer()
@@ -1825,7 +2022,7 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
     elif key == "run":
         await callback.answer("Ищу…")
         await callback.message.edit_text(
-            f"🔎 <b>{app.filter_range_label}</b>\n{_filters_label(app.filters)}",
+            screen("Фильтры"),
             reply_markup=main_inline(),
         )
         await app.run_filter_search(callback.from_user.id)
@@ -1843,16 +2040,7 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:settings")
 async def cb_settings(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n"
-        f"Парсер: <b>{app.range_label}</b>\n"
-        f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
-        f"Скорость: <b>{app.speed_label}</b>\n"
-        f"<i>🐢 тихо · ⚖️ норм · ⚡ быстро (жми кнопку чтобы сменить)</i>\n"
-        f"Фильтры: {_filters_label(app.filters)}\n"
-        f"Чеков: <b>{app.checks}</b>\n"
-        f"Новых: <b>{app.lots_notified}</b>\n"
-        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
-        f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>",
+        screen("Настройки"),
         reply_markup=settings_inline(),
     )
     await callback.answer()
@@ -1865,16 +2053,10 @@ async def cb_speed(callback: CallbackQuery) -> None:
         return
     label = app.cycle_speed()
     await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n"
-        f"Скорость: <b>{label}</b>\n"
-        f"<i>🐢 тихо — бережёт сессию\n"
-        f"⚖️ норм — баланс (по умолчанию)\n"
-        f"⚡ быстро — шустрее, но аккуратно</i>\n\n"
-        f"Парсер: <b>{app.range_label}</b>\n"
-        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>",
+        screen("Настройки"),
         reply_markup=settings_inline(),
     )
-    await callback.answer(f"Скорость: {label}")
+    await callback.answer(label)
 
 
 @router.callback_query(F.data == "menu:accounts")
@@ -1882,19 +2064,14 @@ async def cb_accounts(callback: CallbackQuery) -> None:
     if not app.logged_in and not app.db.list_accounts():
         await callback.answer("Сначала вход", show_alert=True)
         return
-    lines = [
-        "👤 <b>Аккаунты Telethon</b>",
-        f"Сейчас: <b>{app.account_name or '—'}</b>",
-        "Ротация при flood / кнопка 🔀",
-        "",
-    ]
+    lines = [screen("Аккаунты")]
     for acc in app.db.list_accounts():
-        mark = "✅" if acc.get("is_active") else "▫️"
+        mark = "✅" if acc.get("is_active") else "·"
         lines.append(
-            f"{mark} <b>{_esc(str(acc.get('label') or acc.get('phone') or acc['id']))}</b>"
+            f"{mark} {_esc(str(acc.get('label') or acc.get('phone') or acc['id']))}"
         )
     await callback.message.edit_text(
-        "\n".join(lines) or "Пусто",
+        "\n".join(lines),
         reply_markup=accounts_inline(),
     )
     await callback.answer()
@@ -1963,15 +2140,9 @@ async def cb_acc_action(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_daily(callback: CallbackQuery) -> None:
     st = app.db.get_daily_stats()
     text = (
-        f"📅 <b>Стата за {st['day']}</b>\n\n"
-        f"🎁 Новых лотов в БД: <b>{st['lots_new']:,}</b>\n"
-        f"📤 Выдано в чат: <b>{st['lots_shown']:,}</b>\n"
-        f"👤 Новых юзов: <b>{st['users_new']:,}</b>\n"
-        f"🎲 Уник. NFT сегодня: <b>{st['unique_titles']:,}</b>\n"
-        f"💓 Чеков: <b>{st['checks']:,}</b>\n\n"
-        f"Всего в БД: лотов <b>{st['lots_total']:,}</b> · "
-        f"юзов <b>{st['users_total']:,}</b> · "
-        f"акков <b>{st['accounts']}</b>"
+        f"{screen('Daily')}\n"
+        f"лотов +{st['lots_new']:,} · выдано {st['lots_shown']:,}\n"
+        f"юзов +{st['users_new']:,} · NFT {st['unique_titles']:,}"
     )
     await callback.message.edit_text(text, reply_markup=settings_inline())
     await callback.answer()
@@ -1981,19 +2152,16 @@ async def cb_daily(callback: CallbackQuery) -> None:
 async def cmd_daily(message: Message) -> None:
     st = app.db.get_daily_stats()
     await message.answer(
-        f"📅 <b>Стата за {st['day']}</b>\n"
-        f"🎁 новых лотов: <b>{st['lots_new']:,}</b>\n"
-        f"📤 выдано: <b>{st['lots_shown']:,}</b>\n"
-        f"👤 новых юзов: <b>{st['users_new']:,}</b>\n"
-        f"🎲 уник. NFT: <b>{st['unique_titles']:,}</b>\n"
-        f"💓 чеков: <b>{st['checks']:,}</b>"
+        f"{screen('Daily')}\n"
+        f"лотов +{st['lots_new']:,} · выдано {st['lots_shown']:,}\n"
+        f"юзов +{st['users_new']:,} · NFT {st['unique_titles']:,}"
     )
 
 
 @router.callback_query(F.data == "menu:stop")
 async def cb_stop(callback: CallbackQuery) -> None:
     text = await app.stop_monitor()
-    await callback.message.edit_text(text, reply_markup=settings_inline())
+    await callback.message.edit_text(text, reply_markup=parse_done_inline())
     await callback.answer("Стоп")
 
 
@@ -2003,55 +2171,30 @@ async def cb_afk(callback: CallbackQuery) -> None:
         await callback.answer("Сначала вход", show_alert=True)
         return
     if app.afk_running:
-        text = await app.stop_afk()
-        await callback.message.edit_text(text, reply_markup=main_inline())
+        await app.stop_afk()
+        await callback.message.edit_text(
+            screen("Настройки"), reply_markup=settings_inline()
+        )
         await callback.answer("AFK стоп")
         return
     try:
-        text = await app.start_afk(callback.from_user.id)
+        await app.start_afk(callback.from_user.id)
     except RuntimeError as exc:
         await callback.answer(str(exc), show_alert=True)
         return
-    await callback.message.edit_text(text, reply_markup=main_inline())
-    await callback.answer("AFK старт")
+    await callback.message.edit_text(
+        screen("Настройки"), reply_markup=settings_inline()
+    )
+    await callback.answer("AFK")
 
 
 @router.callback_query(F.data == "menu:status")
 async def cb_status(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "📊 <b>Статус</b>\n"
-        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
-        f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
-        f"Фильтр-поиск: <b>{'🔎' if app.filter_search_running else '⏹'}</b>\n"
-        f"Парсер: <b>{app.range_label}</b>\n"
-        f"Фильтр-поиск цена: <b>{app.filter_range_label}</b>\n"
-        f"Чеков: <b>{app.checks}</b>\n"
-        f"Новых: <b>{app.lots_notified}</b>\n"
-        f"Seen: <b>{len(app._seen)}</b>\n"
-        f"🗄 Моделей: <b>{app.db.count()}</b> "
-        f"(уник. {app.db.count_models()})\n"
-        f"👤 Юзов: <b>{app.db.count_users():,}</b> / {creds.AFK_USER_CAP:,}\n"
-        f"🎁 Коллекций: <b>{app.db.count_collections()}</b>"
-        f"/{app.afk_collections_total or len(app.market._gift_ids) or '?'}\n"
-        f"Err: {_esc(app.last_error[:120]) if app.last_error else '—'}",
+        screen("Настройки"),
         reply_markup=settings_inline(),
     )
     await callback.answer()
-
-
-async def _start_with_range(
-    callback: CallbackQuery, label: str, mn: int, mx: int
-) -> None:
-    app.set_range(label, mn, mx)
-    await callback.message.edit_text(
-        f"▶️ <b>{label}</b> · {app.speed_label}",
-        reply_markup=main_inline(),
-    )
-    await callback.answer("Старт")
-    try:
-        await app.start_monitor(callback.from_user.id)
-    except RuntimeError as exc:
-        await callback.message.answer(f"⚠️ {exc}")
 
 
 @router.callback_query(F.data.startswith("block:"))
@@ -2139,7 +2282,8 @@ async def cmd_blocked(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("diff:"))
-async def cb_diff_start(callback: CallbackQuery) -> None:
+async def cb_diff_pick(callback: CallbackQuery) -> None:
+    """Сложность → экран с кнопкой Начать парсить (не старт сразу)."""
     if not app.logged_in:
         await callback.answer("Сначала вход", show_alert=True)
         return
@@ -2149,7 +2293,58 @@ async def cb_diff_start(callback: CallbackQuery) -> None:
         await callback.answer("?", show_alert=True)
         return
     label, mn, mx = chosen
-    await _start_with_range(callback, label, mn, mx)
+    app.pending_range_label = label
+    app.pending_min_stars = float(mn)
+    app.pending_max_stars = float(mx)
+    state = "▶️ идёт" if app.running else "⏹ стоп"
+    await callback.message.edit_text(
+        f"{screen('Парсинг')}\n{label}\n{state}",
+        reply_markup=parse_ready_inline(),
+    )
+    await callback.answer(label)
+
+
+@router.callback_query(F.data == "parse:go")
+async def cb_parse_go(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    if app.running:
+        await callback.answer("Уже парсит", show_alert=True)
+        return
+    app.set_range(
+        app.pending_range_label,
+        int(app.pending_min_stars),
+        int(app.pending_max_stars),
+    )
+    await callback.message.edit_text(
+        f"{screen('Парсинг')}\n{app.range_label}\n▶️ старт…",
+        reply_markup=parse_done_inline(),
+    )
+    await callback.answer("Старт")
+    try:
+        await app.start_monitor(callback.from_user.id)
+    except RuntimeError as exc:
+        await callback.message.answer(f"⚠️ {exc}")
+
+
+@router.callback_query(F.data == "parse:again")
+async def cb_parse_again(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    if app.running:
+        await callback.answer("Уже парсит", show_alert=True)
+        return
+    await callback.answer("Заново")
+    await callback.message.edit_text(
+        f"{screen('Парсинг')}\n🔄 …",
+        reply_markup=parse_done_inline(),
+    )
+    try:
+        await app.deliver_again()
+    except RuntimeError as exc:
+        await callback.message.answer(f"⚠️ {exc}")
 
 
 @router.callback_query(F.data.startswith("price:"))
@@ -2163,26 +2358,14 @@ async def cb_price_start(callback: CallbackQuery) -> None:
         await callback.answer("?", show_alert=True)
         return
     label, mn, mx = chosen
-    await _start_with_range(callback, label, mn, mx)
-
-
-@router.callback_query(F.data.startswith("search:"))
-async def cb_price_search(callback: CallbackQuery) -> None:
-    """Legacy: цена только для парсера (фильтр-поиск — через fdiff)."""
-    rid = (callback.data or "").split(":", 1)[-1]
-    chosen = _range_by_id(rid)
-    if not chosen:
-        await callback.answer("?", show_alert=True)
-        return
-    label, mn, mx = chosen
-    app.set_range(label, mn, mx)
-    if app.running:
-        await app.start_monitor(callback.from_user.id)
-        text = f"▶️ Парсер: <b>{label}</b>, перезапустил."
-    else:
-        text = f"▶️ Парсер: <b>{label}</b>. Жми Парсинг."
-    await callback.message.edit_text(text, reply_markup=main_inline())
-    await callback.answer("Ок")
+    app.pending_range_label = label
+    app.pending_min_stars = float(mn)
+    app.pending_max_stars = float(mx)
+    await callback.message.edit_text(
+        f"{screen('Парсинг')}\n{label}",
+        reply_markup=parse_ready_inline(),
+    )
+    await callback.answer()
 
 
 async def main() -> None:
@@ -2192,7 +2375,6 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     app.bot = bot
-    # подтянуть сохранённый акк если есть
     try:
         await app.try_restore_account()
     except Exception:  # noqa: BLE001
@@ -2202,21 +2384,20 @@ async def main() -> None:
             BotCommand(command="start", description="Меню"),
             BotCommand(command="stop", description="Стоп"),
             BotCommand(command="daily", description="Стата за день"),
-            BotCommand(command="block", description="Блок @user"),
-            BotCommand(command="unblock", description="Разблок @user"),
-            BotCommand(command="blocked", description="Список блоклиста"),
-            BotCommand(command="logout", description="Сброс акка"),
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     dp = Dispatcher(storage=MemoryStorage())
+    router.message.middleware(OwnerOnlyMiddleware())
+    router.callback_query.middleware(OwnerOnlyMiddleware())
     dp.include_router(router)
-    logger.info("Ready | burst search + per-second checks")
+    logger.info("Ready | Neptun Parser · owner-only · multi-acc")
     try:
         await dp.start_polling(bot)
     finally:
         await app.stop_monitor()
         await app.stop_afk()
+        await app._close_extra_clients()
         if app.client.is_connected():
             await app.client.disconnect()
         app.db.close()

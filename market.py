@@ -21,8 +21,13 @@ from telethon.tl.functions.payments import (
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import StarsAmount, StarsTonAmount
+from telethon.tl.functions.users import GetFullUserRequest, GetRequirementsToContactRequest
+from telethon.tl.types import (
+    StarsAmount,
+    StarsTonAmount,
+    RequirementToContactPaidMessages,
+    RequirementToContactPremium,
+)
 from telethon.tl.types.payments import StarGiftsNotModified
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,9 @@ class Lot:
     is_premium: bool | None = None
     account_level: int | None = None
     gifts_count: int | None = None
+    # None=неизвестно, True=можно писать бесплатно, False=нужны Stars/Premium
+    free_dm: bool | None = None
+    paid_dm_stars: int | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -305,6 +313,7 @@ class TelegramMarket:
         time_budget: float = 3.5,
         early_show_at: int = 0,
         on_early_lots: Any | None = None,
+        collection_ids: list[int] | None = None,
     ) -> CheckResult:
         """Поиск лотов. Может отдать early-пул для быстрой выдачи, потом добить 149."""
         started = time.monotonic()
@@ -329,7 +338,10 @@ class TelegramMarket:
 
         saved_ids = list(self._gift_ids)
         saved_cursor = self._cursor
-        if touch_cursor:
+        if collection_ids is not None:
+            ids = list(collection_ids)
+            random.shuffle(ids)
+        elif touch_cursor:
             self.reshuffle_collections()
             ids = list(self._gift_ids)
         else:
@@ -393,7 +405,7 @@ class TelegramMarket:
             ):
                 break
 
-        if not touch_cursor:
+        if not touch_cursor or collection_ids is not None:
             self._gift_ids = saved_ids
             self._cursor = saved_cursor
 
@@ -606,6 +618,8 @@ class TelegramMarket:
                 about = str(getattr(uf, "about", "") or "") if uf else ""
                 level = None
                 gifts = None
+                paid_stars: int | None = None
+                free_dm: bool | None = None
                 if uf is not None:
                     raw_gifts = getattr(uf, "stargifts_count", None)
                     if raw_gifts is not None:
@@ -619,11 +633,27 @@ class TelegramMarket:
                             level = int(getattr(rating, "level", 0))
                         except (TypeError, ValueError):
                             level = None
+                    # флаг не выставлен → бесплатно; >0 → платно Stars
+                    if hasattr(uf, "send_paid_messages_stars"):
+                        raw_paid = getattr(uf, "send_paid_messages_stars", None)
+                        if raw_paid is None:
+                            free_dm = True
+                            paid_stars = None
+                        else:
+                            try:
+                                paid_stars = int(raw_paid)
+                            except (TypeError, ValueError):
+                                paid_stars = None
+                            free_dm = paid_stars is None or paid_stars <= 0
                 lot.about = about
                 if level is not None:
                     lot.account_level = level
                 if gifts is not None:
                     lot.gifts_count = gifts
+                if free_dm is not None:
+                    lot.free_dm = free_dm
+                if paid_stars is not None:
+                    lot.paid_dm_stars = paid_stars
                 info = {
                     "username": lot.seller,
                     "first_name": lot.first_name,
@@ -632,10 +662,89 @@ class TelegramMarket:
                     "is_premium": lot.is_premium,
                     "account_level": level,
                     "gifts_count": gifts,
+                    "free_dm": free_dm,
+                    "paid_dm_stars": paid_stars,
                 }
                 self._profile_cache[lot.seller_id] = info
 
         await asyncio.gather(*[one(lot) for lot in lots])
+
+    async def check_free_dm(
+        self, lots: list[Lot], *, timeout: float = 2.5
+    ) -> None:
+        """Пометить lot.free_dm: True только если можно писать без Stars."""
+        need = [lot for lot in lots if lot.seller_id is not None]
+        if not need:
+            return
+        # сброс — решает только GetRequirementsToContact
+        for lot in need:
+            lot.free_dm = None
+        # сгруппируем по id
+        by_id: dict[int, list[Lot]] = {}
+        for lot in need:
+            by_id.setdefault(int(lot.seller_id), []).append(lot)
+
+        inputs = []
+        id_order: list[int] = []
+        for uid in list(by_id.keys()):
+            try:
+                ent = await asyncio.wait_for(
+                    self.client.get_input_entity(uid), timeout=timeout
+                )
+                inputs.append(ent)
+                id_order.append(uid)
+            except Exception:  # noqa: BLE001
+                for lot in by_id[uid]:
+                    # не смогли проверить — не выдаём
+                    lot.free_dm = False
+
+        for i in range(0, len(inputs), 40):
+            chunk = inputs[i : i + 40]
+            ids_chunk = id_order[i : i + 40]
+            try:
+                await self._wait_flood()
+                result = await asyncio.wait_for(
+                    self.client(GetRequirementsToContactRequest(id=chunk)),
+                    timeout=timeout,
+                )
+            except Exception:  # noqa: BLE001
+                for uid in ids_chunk:
+                    for lot in by_id[uid]:
+                        if lot.free_dm is None:
+                            lot.free_dm = False
+                continue
+            reqs = list(result or [])
+            for uid, req in zip(ids_chunk, reqs):
+                free = True
+                paid = None
+                name = req.__class__.__name__
+                if isinstance(req, RequirementToContactPaidMessages) or name == (
+                    "RequirementToContactPaidMessages"
+                ):
+                    try:
+                        paid = int(getattr(req, "stars_amount", 0) or 0)
+                    except (TypeError, ValueError):
+                        paid = 1
+                    free = paid <= 0
+                elif isinstance(req, RequirementToContactPremium) or name == (
+                    "RequirementToContactPremium"
+                ):
+                    # без Premium писать нельзя — для нас не бесплатно
+                    free = False
+                for lot in by_id[uid]:
+                    lot.free_dm = free
+                    if paid is not None:
+                        lot.paid_dm_stars = paid
+            # если API вернул меньше ответов
+            if len(reqs) < len(ids_chunk):
+                for uid in ids_chunk[len(reqs) :]:
+                    for lot in by_id[uid]:
+                        if lot.free_dm is None:
+                            lot.free_dm = False
+
+        for lot in need:
+            if lot.free_dm is None:
+                lot.free_dm = False
 
     async def afk_fetch_page(
         self,
@@ -847,6 +956,19 @@ def _fill_user(lot: Lot, user: Any) -> None:
         lot.last_name = ln
     if getattr(user, "premium", None) is not None:
         lot.is_premium = bool(user.premium)
+    if hasattr(user, "send_paid_messages_stars"):
+        raw = getattr(user, "send_paid_messages_stars", None)
+        if raw is None:
+            # флаг не выставлен на User — ещё не знаем точно (нужен UserFull/requirements)
+            pass
+        else:
+            try:
+                paid = int(raw)
+            except (TypeError, ValueError):
+                paid = None
+            if paid is not None:
+                lot.paid_dm_stars = paid
+                lot.free_dm = paid <= 0
 
 
 def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
@@ -864,6 +986,13 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
         lot.account_level = int(info["account_level"])
     if info.get("gifts_count") is not None:
         lot.gifts_count = int(info["gifts_count"])
+    if info.get("free_dm") is not None:
+        lot.free_dm = bool(info["free_dm"])
+    if info.get("paid_dm_stars") is not None:
+        try:
+            lot.paid_dm_stars = int(info["paid_dm_stars"])
+        except (TypeError, ValueError):
+            pass
 
 
 def _parse_result(result: Any) -> list[Lot]:

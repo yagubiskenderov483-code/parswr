@@ -157,6 +157,10 @@ class SearchFilters:
     fresh_only: bool = False  # только свежие из БД (48ч)
     rare_types: bool = False  # редкие/мало показанные типы
     random_mix: bool = True  # каждый поиск — рандомные мягкие предпочтения
+    with_bio: bool = False  # есть имя или био
+    with_model: bool = False  # у NFT заполнена модель
+    no_digits_user: bool = False  # юз без цифр
+    strict_free: bool = False  # только free_dm=True (не unknown)
     max_gifts: int = 5
     max_level: int = 5
     short_user_max: int = 8
@@ -1085,6 +1089,10 @@ class App:
             or f.online_only
             or f.fresh_only
             or f.rare_types
+            or f.with_bio
+            or f.with_model
+            or f.no_digits_user
+            or f.strict_free
         )
 
     def _roll_random_spice(self) -> str:
@@ -1135,6 +1143,19 @@ class App:
                 return False
         if f.online_only:
             if lot.is_online is False:
+                return False
+        if f.with_bio:
+            if not (lot.first_name or lot.last_name or lot.about):
+                return False
+        if f.with_model:
+            if not (lot.model or "").strip():
+                return False
+        if f.no_digits_user:
+            u = lot.seller or ""
+            if any(ch.isdigit() for ch in u):
+                return False
+        if f.strict_free:
+            if lot.free_dm is not True:
                 return False
         return True
 
@@ -1579,6 +1600,12 @@ class App:
                             continue
                     if self.filters.no_premium and lot.is_premium is True:
                         continue
+                    if self.filters.with_model and not (lot.model or "").strip():
+                        continue
+                    if self.filters.no_digits_user and any(
+                        ch.isdigit() for ch in (lot.seller or "")
+                    ):
+                        continue
                     pre.append(lot)
                 candidates = pre or candidates
             # сортируем по spice — сначала «вкусные», но всех оставляем
@@ -1734,8 +1761,8 @@ class App:
         elif channel == "parser" and candidates:
             already_ru = [lot for lot in candidates if self._is_russian(lot)]
             need_bio = [lot for lot in candidates if not self._is_russian(lot)]
-            # меньше чеков: ~80 разных типов уже-RU
-            check_ru = self._sample_diverse_titles(already_ru, 80)
+            # ~100 разных типов уже-RU + добор
+            check_ru = self._sample_diverse_titles(already_ru, 100)
             if check_ru:
                 await self.market.check_free_dm(
                     check_ru,
@@ -1750,14 +1777,14 @@ class App:
             titles_ready = {
                 self._title_key(lot) for lot in ready if self._title_key(lot)
             }
-            if len(titles_ready) < 30:
+            if len(titles_ready) < 35:
                 wave = self._sample_diverse_titles(
                     [
                         lot
                         for lot in need_bio
                         if self._title_key(lot) not in titles_ready
                     ],
-                    90,
+                    120,
                 )
                 if wave:
                     await self.market.enrich_profiles(
@@ -1837,11 +1864,20 @@ class App:
                 notes.append("🆕 48ч")
             if f.rare_types:
                 notes.append("💎 редкие")
+            if f.with_bio:
+                notes.append("био")
+            if f.with_model:
+                notes.append("модель")
+            if f.no_digits_user:
+                notes.append("без цифр")
+            if f.strict_free:
+                notes.append("free✓")
             extra = (" · " + " · ".join(notes)) if notes else ""
+            total_db = self.db.count()
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n{label}{extra}{spice_note}\n"
-                f"БД в диапазоне: <b>{db_n}</b> · тяну максимум…",
+                f"БД всего: <b>{total_db}</b> · в диапазоне: <b>{db_n}</b>",
             )
 
             def _db_pool() -> list[Lot]:
@@ -2214,12 +2250,15 @@ class App:
         except Exception:  # noqa: BLE001
             pass
 
+    async def pause_db_farm(self) -> None:
+        """Мягкая пауза — задачу НЕ убиваем, БД продолжает копиться после."""
+        self._afk_paused = True
+
     async def ensure_db_farm(self) -> None:
         """Тихий непрерывный скан юзов+моделей в БД (без кнопки AFK)."""
         if not self.logged_in:
             return
-        if self.running:
-            # парсер занят — фарм после
+        if self.running or self.filter_search_running or self.old_parse_running:
             return
         if self.afk_running and self._afk_task and not self._afk_task.done():
             self._afk_paused = False
@@ -2234,20 +2273,6 @@ class App:
             self.db.count_users(),
             self.db.count(),
         )
-
-    async def pause_db_farm(self) -> None:
-        """Пауза фарма на время парсинга (клиент занят)."""
-        self._afk_paused = True
-        if not self.afk_running and self._afk_task is None:
-            return
-        self.afk_running = False
-        if self._afk_task:
-            self._afk_task.cancel()
-            try:
-                await self._afk_task
-            except asyncio.CancelledError:
-                pass
-            self._afk_task = None
 
     async def start_afk(self, chat_id: int) -> str:
         if not self.logged_in:
@@ -2825,6 +2850,10 @@ def _filters_label(f: SearchFilters) -> str:
     parts.append("🟢 в сети" if f.online_only else "сеть:any")
     parts.append("🆕 48ч" if f.fresh_only else "возраст:any")
     parts.append("💎 редкие" if f.rare_types else "типы:any")
+    parts.append("био" if f.with_bio else "био:any")
+    parts.append("модель" if f.with_model else "модель:any")
+    parts.append("юз без цифр" if f.no_digits_user else "цифры:ok")
+    parts.append("free✓" if f.strict_free else "free±")
     parts.append("🎲 микс" if f.random_mix else "микс:off")
     return " · ".join(parts)
 
@@ -2957,15 +2986,33 @@ def filters_inline() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅" if f.fresh_only else "⬜️") + " Свежие 48ч (БД)",
+                    text=("✅" if f.fresh_only else "⬜️") + " Свежие 48ч",
                     callback_data="flt:fresh",
-                )
+                ),
+                InlineKeyboardButton(
+                    text=("✅" if f.rare_types else "⬜️") + " Редкие",
+                    callback_data="flt:rare",
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅" if f.rare_types else "⬜️") + " Редкие типы",
-                    callback_data="flt:rare",
-                )
+                    text=("✅" if f.with_bio else "⬜️") + " С био",
+                    callback_data="flt:bio",
+                ),
+                InlineKeyboardButton(
+                    text=("✅" if f.with_model else "⬜️") + " С моделью",
+                    callback_data="flt:model",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.no_digits_user else "⬜️") + " Юз без цифр",
+                    callback_data="flt:nodigit",
+                ),
+                InlineKeyboardButton(
+                    text=("✅" if f.strict_free else "⬜️") + " Строго free",
+                    callback_data="flt:frestrict",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -3328,6 +3375,14 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
         app.filters.rare_types = not app.filters.rare_types
     elif key == "mix":
         app.filters.random_mix = not app.filters.random_mix
+    elif key == "bio":
+        app.filters.with_bio = not app.filters.with_bio
+    elif key == "model":
+        app.filters.with_model = not app.filters.with_model
+    elif key == "nodigit":
+        app.filters.no_digits_user = not app.filters.no_digits_user
+    elif key == "frestrict":
+        app.filters.strict_free = not app.filters.strict_free
     elif key == "run":
         if app.filter_search_running:
             await callback.answer("Уже идёт", show_alert=True)

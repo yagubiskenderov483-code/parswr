@@ -215,19 +215,23 @@ class GiftDB:
         self._conn.commit()
 
     def upsert_models(self, lots: Iterable[Lot]) -> tuple[int, int]:
+        """Только рост/обогащение: строки не удаляем, пустые поля не затираем."""
         now = time.time()
         inserted = updated = 0
         cur = self._conn.cursor()
         for lot in lots:
+            if not lot.id:
+                continue
             mk = _model_key(lot)
             model = _model_name(lot)
             row = cur.execute(
-                "SELECT id, seller, seller_id FROM gifts WHERE id = ?", (lot.id,)
+                "SELECT id, seller, seller_id, title, stars, slug, model, "
+                "model_key, backdrop, symbol, nft_url FROM gifts WHERE id = ?",
+                (lot.id,),
             ).fetchone()
-            seller = lot.seller or (row["seller"] if row else "") or ""
+            seller = (lot.seller or "").strip()
             seller_id = lot.seller_id
-            if seller_id is None and row is not None:
-                seller_id = row["seller_id"]
+            new_stars = float(lot.stars) if lot.stars is not None else 0.0
             if row is None:
                 cur.execute(
                     """
@@ -239,15 +243,15 @@ class GiftDB:
                     """,
                     (
                         lot.id,
-                        lot.title,
+                        lot.title or "Gift",
                         lot.number,
-                        float(lot.stars),
-                        lot.slug,
+                        new_stars,
+                        lot.slug or "",
                         model,
                         mk,
-                        lot.backdrop,
-                        lot.symbol,
-                        lot.nft_url,
+                        lot.backdrop or "",
+                        lot.symbol or "",
+                        lot.nft_url or "",
                         seller,
                         seller_id,
                         now,
@@ -257,27 +261,39 @@ class GiftDB:
                 )
                 inserted += 1
             else:
+                # не затираем старое пустым / нулевой ценой
+                title = (lot.title or "").strip() or str(row["title"] or "Gift")
+                stars = new_stars if new_stars > 0 else float(row["stars"] or 0)
+                slug = (lot.slug or "").strip() or str(row["slug"] or "")
+                keep_model = model or str(row["model"] or "")
+                keep_mk = mk if (lot.model or lot.title) else str(row["model_key"] or mk)
+                backdrop = (lot.backdrop or "").strip() or str(row["backdrop"] or "")
+                symbol = (lot.symbol or "").strip() or str(row["symbol"] or "")
+                nft_url = (lot.nft_url or "").strip() or str(row["nft_url"] or "")
+                if not seller:
+                    seller = str(row["seller"] or "")
+                if seller_id is None:
+                    seller_id = row["seller_id"]
                 cur.execute(
                     """
                     UPDATE gifts SET
-                        title=?, number=?, stars=?, slug=?, model=?, model_key=?,
+                        title=?, number=COALESCE(?, number), stars=?, slug=?,
+                        model=?, model_key=?,
                         backdrop=?, symbol=?, nft_url=?,
-                        seller=CASE WHEN ? != '' THEN ? ELSE seller END,
-                        seller_id=COALESCE(?, seller_id),
+                        seller=?, seller_id=COALESCE(?, seller_id),
                         last_seen=?, updated_at=?
                     WHERE id=?
                     """,
                     (
-                        lot.title,
+                        title,
                         lot.number,
-                        float(lot.stars),
-                        lot.slug,
-                        model,
-                        mk,
-                        lot.backdrop,
-                        lot.symbol,
-                        lot.nft_url,
-                        seller,
+                        stars,
+                        slug,
+                        keep_model,
+                        keep_mk,
+                        backdrop,
+                        symbol,
+                        nft_url,
                         seller,
                         seller_id,
                         now,

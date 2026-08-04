@@ -167,13 +167,15 @@ class SearchFilters:
     """Фильтры выдачи / поиска по БД+лайву."""
 
     few_gifts: bool = False  # мало гифтов у акка (<=5)
-    low_level: bool = False  # мелкий lvl (<=5)
+    low_level: bool = False  # мелкий lvl (<=5) — строго, нужен известный lvl
     short_username: bool = False  # короткий юз 6–8 (4–5 всегда бан)
+    long_username: bool = False  # длинный юз (9+)
     no_premium: bool = False  # без TGP
     online_only: bool = False  # только кто сейчас в сети
     max_gifts: int = 5
     max_level: int = 5
     short_user_max: int = 8
+    long_user_min: int = 9
 
 
 class AuthStates(StatesGroup):
@@ -231,6 +233,7 @@ class App:
         self.filter_search_running = False
         self._filter_task: asyncio.Task | None = None
         self.old_parse_running = False
+        self._old_task: asyncio.Task | None = None
         self.require_russian = True
         self._blocked_keys: set[str] = set()
         self.speed_mode = creds.DEFAULT_SPEED
@@ -1039,6 +1042,57 @@ class App:
         await self.ensure_db_farm()
         return f"{screen('Парсинг')}\nСтоп · выдано {self.lots_notified}"
 
+    async def stop_all_jobs(self) -> str:
+        """Стоп парсера + фильтров + старого парса."""
+        stopped: list[str] = []
+
+        if self.running or self._task is not None:
+            self.running = False
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+                self._task = None
+            stopped.append("парсер")
+
+        if self.filter_search_running or self._filter_task is not None:
+            self.filter_search_running = False
+            t = self._filter_task
+            self._filter_task = None
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            stopped.append("фильтры")
+
+        if self.old_parse_running or self._old_task is not None:
+            self.old_parse_running = False
+            t = self._old_task
+            self._old_task = None
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            stopped.append("старый парс")
+
+        await self._close_extra_clients()
+        await self.ensure_db_farm()
+        if not stopped:
+            return f"{screen('Стоп')}\nУже стоп"
+        return f"{screen('Стоп')}\nостановлено: {', '.join(stopped)}"
+
     def _in_price(self, lot: Lot) -> bool:
         return self.min_stars <= lot.stars <= self.max_stars
 
@@ -1058,29 +1112,33 @@ class App:
             f.few_gifts
             or f.low_level
             or f.short_username
+            or f.long_username
             or f.no_premium
             or f.online_only
         )
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
-        """Тумблеры: режем только явное несоответствие; нет данных — ок."""
+        """Включённые тумблеры. TGP/lvl/длинный юз — без проскока."""
         f = self.filters
         if f.few_gifts:
-            if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
+            if lot.gifts_count is None or lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is not None and lot.account_level > f.max_level:
+            if lot.account_level is None or lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
             if n < 6 or n > f.short_user_max:
                 return False
+        if f.long_username:
+            n = len(lot.seller or "")
+            if n < f.long_user_min:
+                return False
         if f.no_premium:
             if lot.is_premium is True:
                 return False
         if f.online_only:
-            # явный оффлайн режем; не проверили (None) — ок
-            if lot.is_online is False:
+            if lot.is_online is not True:
                 return False
         return True
 
@@ -1159,7 +1217,8 @@ class App:
                 lot, require=require_free_dm, strict=strict_free_dm
             ):
                 continue
-            if is_filter and apply_extra and not self._passes_extra_filters(lot):
+            # включённые тумблеры (TGP/lvl/длинный юз/…) — всегда
+            if is_filter and self._filters_active() and not self._passes_extra_filters(lot):
                 continue
             # повторные юзы — парсер/фильтры (старый парс не душит вечным seen)
             if (not is_old) and (
@@ -1396,12 +1455,12 @@ class App:
                 (True, False, True, False),
             ]
         elif channel == "filter":
-            # RU + условия; не скатываемся в non-RU «кого попало»
+            # тумблеры (TGP/lvl/юзы) никогда не снимаем в fallback
+            keep_extra = bool(apply_extra or self._filters_active())
             attempts = [
-                (True, True, False, apply_extra),
-                (True, True, True, apply_extra),
-                (True, False, True, apply_extra),
-                (True, False, True, False),
+                (True, True, False, keep_extra),
+                (True, True, True, keep_extra),
+                (True, False, True, keep_extra),
             ]
         else:
             attempts = [
@@ -1764,6 +1823,7 @@ class App:
             )
         finally:
             self.filter_search_running = False
+            self._filter_task = None
             await self._close_extra_clients()
             await self.ensure_db_farm()
 
@@ -1836,6 +1896,7 @@ class App:
             )
         finally:
             self.old_parse_running = False
+            self._old_task = None
             await self.ensure_db_farm()
 
     @staticmethod
@@ -2613,9 +2674,12 @@ def _filters_label(f: SearchFilters) -> str:
     parts = ["бан юз 4–5"]
     parts.append(f"мало gifts≤{f.max_gifts}" if f.few_gifts else "gifts:any")
     parts.append(f"lvl≤{f.max_level}" if f.low_level else "lvl:any")
-    parts.append(
-        f"юз 6–{f.short_user_max}" if f.short_username else "юз:any (кроме 4–5)"
-    )
+    if f.short_username:
+        parts.append(f"юз 6–{f.short_user_max}")
+    elif f.long_username:
+        parts.append(f"юз ≥{f.long_user_min}")
+    else:
+        parts.append("юз:any (кроме 4–5)")
     parts.append("no TGP" if f.no_premium else "TGP:any")
     parts.append("🟢 в сети" if f.online_only else "сеть:any")
     return " · ".join(parts)
@@ -2727,6 +2791,12 @@ def filters_inline() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=("✅" if f.short_username else "⬜️") + " Короткий юз",
                     callback_data="flt:short",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.long_username else "⬜️") + " Длинный юз",
+                    callback_data="flt:long",
                 )
             ],
             [
@@ -2925,7 +2995,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message) -> None:
-    text = await app.stop_monitor()
+    text = await app.stop_all_jobs()
     await message.answer(text, reply_markup=main_inline() if app.logged_in else None)
 
 
@@ -3028,7 +3098,10 @@ async def cb_old_start(callback: CallbackQuery) -> None:
         reply_markup=main_inline(),
     )
     await callback.answer("Старый парс")
-    await app.run_old_parse(callback.from_user.id, hours=24.0)
+    app._old_task = asyncio.create_task(
+        app.run_old_parse(callback.from_user.id, hours=24.0),
+        name="old-parse",
+    )
 
 
 @router.callback_query(F.data == "menu:filters")
@@ -3077,17 +3150,29 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
         app.filters.low_level = not app.filters.low_level
     elif key == "short":
         app.filters.short_username = not app.filters.short_username
+        if app.filters.short_username:
+            app.filters.long_username = False
+    elif key == "long":
+        app.filters.long_username = not app.filters.long_username
+        if app.filters.long_username:
+            app.filters.short_username = False
     elif key == "tgp":
         app.filters.no_premium = not app.filters.no_premium
     elif key == "online":
         app.filters.online_only = not app.filters.online_only
     elif key == "run":
+        if app.filter_search_running:
+            await callback.answer("Уже идёт", show_alert=True)
+            return
         await callback.answer("Ищу…")
         await callback.message.edit_text(
             screen("Фильтры"),
             reply_markup=main_inline(),
         )
-        await app.run_filter_search(callback.from_user.id)
+        app._filter_task = asyncio.create_task(
+            app.run_filter_search(callback.from_user.id),
+            name="filter-search",
+        )
         return
     else:
         await callback.answer("?")
@@ -3239,7 +3324,7 @@ async def cmd_daily(message: Message) -> None:
 
 @router.callback_query(F.data == "menu:stop")
 async def cb_stop(callback: CallbackQuery) -> None:
-    text = await app.stop_monitor()
+    text = await app.stop_all_jobs()
     await callback.message.edit_text(text, reply_markup=parse_done_inline())
     await callback.answer("Стоп")
 

@@ -464,6 +464,72 @@ class GiftDB:
                     mixed.append(bucket.pop(random.randrange(len(bucket))))
         return mixed
 
+    def fetch_lots_last_hours(
+        self,
+        *,
+        min_stars: float,
+        max_stars: float,
+        hours: float = 24.0,
+        require_seller: bool = True,
+        limit: int = 0,
+    ) -> list[Lot]:
+        """Все лоты в диапазоне цены, которые видели/выставляли за последние N часов."""
+        cutoff = time.time() - max(0.1, float(hours)) * 3600.0
+        sql = """
+            SELECT
+                g.id, g.title, g.number, g.stars, g.slug, g.model,
+                g.backdrop, g.symbol, g.nft_url, g.seller, g.seller_id,
+                g.first_seen, g.last_seen,
+                u.username AS u_username,
+                u.first_name AS u_first_name,
+                u.last_name AS u_last_name,
+                u.is_premium AS u_is_premium,
+                u.account_level AS u_account_level,
+                u.gifts_count AS u_gifts_count
+            FROM gifts g
+            LEFT JOIN users u ON u.user_id = g.seller_id
+            WHERE g.stars >= ? AND g.stars <= ?
+              AND (g.last_seen >= ? OR g.first_seen >= ?)
+        """
+        params: list[Any] = [
+            float(min_stars),
+            float(max_stars),
+            cutoff,
+            cutoff,
+        ]
+        if require_seller:
+            sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+        sql += " ORDER BY g.last_seen DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        lots: list[Lot] = []
+        for r in rows:
+            seller = str(r["seller"] or "").lstrip("@").strip()
+            if not seller:
+                seller = str(r["u_username"] or "").lstrip("@").strip()
+            premium = r["u_is_premium"]
+            lot = Lot(
+                id=str(r["id"]),
+                title=str(r["title"] or "Gift"),
+                number=r["number"],
+                stars=float(r["stars"]),
+                slug=str(r["slug"] or ""),
+                model=str(r["model"] or ""),
+                backdrop=str(r["backdrop"] or ""),
+                symbol=str(r["symbol"] or ""),
+                seller=seller,
+                seller_id=r["seller_id"],
+                first_name=str(r["u_first_name"] or ""),
+                last_name=str(r["u_last_name"] or ""),
+                is_premium=None if premium is None else bool(premium),
+                account_level=r["u_account_level"],
+                gifts_count=r["u_gifts_count"],
+            )
+            lots.append(lot)
+        return lots
+
     def touch_collection(
         self,
         gift_id: int,

@@ -185,6 +185,7 @@ class App:
         self.filters = SearchFilters()
         self.filter_search_running = False
         self._filter_task: asyncio.Task | None = None
+        self.old_parse_running = False
         self.require_russian = True
         self._blocked_keys: set[str] = set()
         self.speed_mode = creds.DEFAULT_SPEED
@@ -453,6 +454,8 @@ class App:
         a = "🌙" if self.afk_running else "⏹"
         lines.append(f"{p} Парсер · {self.range_label}")
         lines.append(f"{f} Фильтры · {self.filter_range_label}")
+        o = "▶️" if self.old_parse_running else "⏹"
+        lines.append(f"{o} Старый парс · 24ч")
         lines.append(f"{a} AFK")
         lines.append("")
         lines.append(f"Обход: <b>#{self.parse_rounds}</b>")
@@ -842,15 +845,24 @@ class App:
         track_seen: bool = True,
         channel: str = "parser",
     ) -> list[Lot]:
-        """Разнообразие NFT. channel=parser|filter — РАЗНЫЕ seen, не мешаются."""
+        """Разнообразие NFT. channel=parser|filter|old — разные режимы."""
         is_filter = channel == "filter"
-        seen_sellers = (
-            self._filter_seen_sellers if is_filter else self._seen_sellers
-        )
-        seen_models = self._filter_seen_models if is_filter else self._seen_models
-        recent_list = (
-            self._filter_recent_titles if is_filter else self._recent_titles
-        )
+        is_old = channel == "old"
+        if is_old:
+            # старый парс: не трогаем seen парсера, только уникальность в выдаче
+            seen_sellers: set[str] = set()
+            seen_models: set[str] = set()
+            recent_list: list[str] = []
+        else:
+            seen_sellers = (
+                self._filter_seen_sellers if is_filter else self._seen_sellers
+            )
+            seen_models = (
+                self._filter_seen_models if is_filter else self._seen_models
+            )
+            recent_list = (
+                self._filter_recent_titles if is_filter else self._recent_titles
+            )
 
         lots = list(lots)
         random.shuffle(lots)
@@ -950,7 +962,11 @@ class App:
         per_type = max(1, int(getattr(creds, "PER_TYPE", 1)))
         max_types = int(getattr(creds, "MAX_TYPES", 0) or 0)
         # parser: по типам (1 с каждого), не фикс 30
-        by_types = (not is_filter) and (limit is None or limit <= 0)
+        # old: все лоты (уник. продавцы), не по одному типу
+        by_types = (not is_filter) and channel == "parser" and (
+            limit is None or limit <= 0
+        )
+        take_all = channel == "old"
 
         if by_types:
             types_taken = 0
@@ -967,6 +983,20 @@ class App:
                     got += 1
                 if got:
                     types_taken += 1
+            result = list(primary)
+        elif take_all:
+            # старый парс: все подходящие лоты за 24ч
+            for tk in ordered:
+                while True:
+                    lot = _take(tk)
+                    if lot is None:
+                        break
+                    primary.append(lot)
+                    _mark(lot)
+                    if limit is not None and limit > 0 and len(primary) >= limit:
+                        break
+                if limit is not None and limit > 0 and len(primary) >= limit:
+                    break
             result = list(primary)
         else:
             for tk in ordered:
@@ -1026,17 +1056,22 @@ class App:
         channel: str = "parser",
     ) -> list[Lot]:
         # parser: limit=None → выдача по типам (все)
+        # old: все лоты за 24ч
         by_types = channel == "parser" and (limit is None or limit <= 0)
+        take_all = channel == "old"
         lim = (
             10_000
-            if by_types
+            if (by_types or take_all)
             else (limit or creds.SHOW_LIMIT)
         )
         pre = list(lots)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
         without = [lot for lot in pre if not lot.seller]
-        resolve_n = min(len(without), max(lim if not by_types else 120, 60))
+        resolve_n = min(
+            len(without),
+            max(lim if not (by_types or take_all) else 200, 60),
+        )
         if resolve_n:
             await self.market.resolve_owners(
                 without[:resolve_n],
@@ -1060,7 +1095,9 @@ class App:
         if candidates:
             sample_n = min(
                 len(candidates),
-                max(lim * 3, 80) if not by_types else min(len(candidates), 220),
+                max(lim * 3, 80)
+                if not (by_types or take_all)
+                else min(len(candidates), 500 if take_all else 220),
             )
             if need_full or apply_extra or channel == "filter":
                 sample_n = min(len(candidates), max(sample_n, lim * 5))
@@ -1092,7 +1129,7 @@ class App:
             candidates = candidates[:sample_n]
         return self._pick_clean(
             candidates,
-            limit=None if by_types else lim,
+            limit=None if (by_types or take_all) else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
@@ -1160,6 +1197,74 @@ class App:
             self.filter_search_running = False
             await self._close_extra_clients()
 
+    async def run_old_parse(self, chat_id: int, *, hours: float = 24.0) -> None:
+        """Все лоты из БД за 24ч в выбранном ценовом диапазоне."""
+        if self.old_parse_running:
+            await self._say_to(chat_id, f"{screen('Старый парс')}\nуже идёт")
+            return
+        self.old_parse_running = True
+        mn, mx = self.min_stars, self.max_stars
+        label = self.range_label
+        try:
+            await self._say_to(
+                chat_id,
+                f"{screen('Старый парс')}\n{label} · за {int(hours)}ч",
+            )
+            lots = self.db.fetch_lots_last_hours(
+                min_stars=mn,
+                max_stars=mx,
+                hours=hours,
+                require_seller=True,
+                limit=0,
+            )
+            self.parse_checked = len(lots)
+            await self._say_to(
+                chat_id,
+                f"{screen('Старый парс')}\n"
+                f"В БД за {int(hours)}ч: <b>{len(lots)}</b>",
+            )
+            if not lots:
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Старый парс')}\nпусто · нет лотов за 24ч",
+                    reply_markup=main_inline(),
+                )
+                return
+            shown = await self._prepare_show(
+                lots,
+                limit=None,
+                apply_extra=False,
+                track_seen=False,
+                need_full=False,
+                channel="old",
+            )
+            self.parse_ready = len(shown)
+            if not shown:
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Старый парс')}\n"
+                    f"нашёл {len(lots)}, после фильтров 0",
+                    reply_markup=main_inline(),
+                )
+                return
+            await self._say_lot_list_to(chat_id, shown, channel="old")
+            await self._say_to(
+                chat_id,
+                f"{screen('Старый парс')}\n"
+                f"выдал <b>{len(shown)}</b> / {len(lots)}\n"
+                f"проверок акка: {self.parse_acc_checks}",
+                reply_markup=main_inline(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            await self._say_to(
+                chat_id,
+                f"{screen('Старый парс')}\n⚠️ {_esc(str(exc)[:180])}",
+                reply_markup=main_inline(),
+            )
+        finally:
+            self.old_parse_running = False
+
     @staticmethod
     def _format_lot_line(lot: Lot) -> str:
         # Название NFT/коллекции (Plush Pepe), не модель (Glow Verde)
@@ -1189,7 +1294,11 @@ class App:
         self, chat_id: int, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
         """Выдача СПИСКОМ. channel=parser|filter — раздельный учёт."""
-        batch = lots if channel == "parser" else lots[: creds.SHOW_LIMIT]
+        batch = (
+            lots
+            if channel in ("parser", "old")
+            else lots[: creds.SHOW_LIMIT]
+        )
         if not batch:
             return
         lines = [self._format_lot_line(lot) for lot in batch]
@@ -1759,6 +1868,11 @@ def main_inline() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🗄 Старый парс", callback_data="menu:old"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📡 Парсинги", callback_data="menu:jobs"
                 )
             ],
@@ -2112,6 +2226,41 @@ async def cb_parse(callback: CallbackQuery) -> None:
         reply_markup=difficulty_inline("diff"),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu:old")
+async def cb_old_menu(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{screen('Старый парс')}\nлоты за 24ч · выбери цену",
+        reply_markup=difficulty_inline("old"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("old:"))
+async def cb_old_start(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    if app.old_parse_running:
+        await callback.answer("Уже идёт", show_alert=True)
+        return
+    rid = (callback.data or "").split(":", 1)[-1]
+    chosen = _diff_by_id(rid)
+    if not chosen:
+        await callback.answer("?", show_alert=True)
+        return
+    label, mn, mx = chosen
+    app.set_range(label, mn, mx)
+    await callback.message.edit_text(
+        f"{screen('Старый парс')}\n{label}\nищу за 24ч…",
+        reply_markup=main_inline(),
+    )
+    await callback.answer("Старый парс")
+    await app.run_old_parse(callback.from_user.id, hours=24.0)
 
 
 @router.callback_query(F.data == "menu:filters")

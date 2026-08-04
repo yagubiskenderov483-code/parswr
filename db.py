@@ -143,6 +143,44 @@ class GiftDB:
             """
         )
         self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                tg_user_id INTEGER,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                last_used REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                day TEXT PRIMARY KEY,
+                lots_new INTEGER NOT NULL DEFAULT 0,
+                lots_shown INTEGER NOT NULL DEFAULT 0,
+                users_new INTEGER NOT NULL DEFAULT 0,
+                unique_titles INTEGER NOT NULL DEFAULT 0,
+                checks INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        # сколько раз коллекцию уже выдавали — для разнообразия (меньше = приоритет)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shown_collections (
+                title_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                shown_count INTEGER NOT NULL DEFAULT 0,
+                last_shown REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gifts_stars ON gifts(stars)"
         )
         self._conn.execute(
@@ -649,6 +687,261 @@ class GiftDB:
             if r["user_id"] is not None:
                 out.add(f"id:{int(r['user_id'])}")
         return out
+
+    # ----- multi-account -----
+    def upsert_account(
+        self,
+        *,
+        phone: str,
+        session: str,
+        label: str = "",
+        tg_user_id: int | None = None,
+        make_active: bool = True,
+    ) -> int:
+        now = time.time()
+        phone = (phone or "").strip()
+        session = session or ""
+        label = (label or phone or "acc").strip()
+        row = None
+        if phone:
+            row = self._conn.execute(
+                "SELECT id FROM accounts WHERE phone = ?", (phone,)
+            ).fetchone()
+        if row is None and tg_user_id is not None:
+            row = self._conn.execute(
+                "SELECT id FROM accounts WHERE tg_user_id = ?", (int(tg_user_id),)
+            ).fetchone()
+        if make_active:
+            self._conn.execute("UPDATE accounts SET is_active = 0")
+        if row is None:
+            cur = self._conn.execute(
+                """
+                INSERT INTO accounts (
+                    phone, session, label, tg_user_id, is_active, last_used, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    phone,
+                    session,
+                    label,
+                    tg_user_id,
+                    1 if make_active else 0,
+                    now,
+                    now,
+                ),
+            )
+            acc_id = int(cur.lastrowid)
+        else:
+            acc_id = int(row["id"])
+            self._conn.execute(
+                """
+                UPDATE accounts SET
+                    phone = CASE WHEN ? != '' THEN ? ELSE phone END,
+                    session = CASE WHEN ? != '' THEN ? ELSE session END,
+                    label = CASE WHEN ? != '' THEN ? ELSE label END,
+                    tg_user_id = COALESCE(?, tg_user_id),
+                    is_active = ?,
+                    last_used = ?
+                WHERE id = ?
+                """,
+                (
+                    phone,
+                    phone,
+                    session,
+                    session,
+                    label,
+                    label,
+                    tg_user_id,
+                    1 if make_active else 0,
+                    now,
+                    acc_id,
+                ),
+            )
+        self._conn.commit()
+        return acc_id
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT id, phone, session, label, tg_user_id, is_active, last_used, created_at
+            FROM accounts
+            ORDER BY is_active DESC, last_used DESC, id ASC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_account(self, acc_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (int(acc_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_active_account(self) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM accounts WHERE is_active = 1 ORDER BY last_used DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return dict(row)
+        row = self._conn.execute(
+            "SELECT * FROM accounts ORDER BY last_used DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_active_account(self, acc_id: int) -> bool:
+        row = self.get_account(acc_id)
+        if not row:
+            return False
+        self._conn.execute("UPDATE accounts SET is_active = 0")
+        self._conn.execute(
+            "UPDATE accounts SET is_active = 1, last_used = ? WHERE id = ?",
+            (time.time(), int(acc_id)),
+        )
+        self._conn.commit()
+        return True
+
+    def delete_account(self, acc_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM accounts WHERE id = ?", (int(acc_id),)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def next_account_id(self, current_id: int | None) -> int | None:
+        rows = self.list_accounts()
+        ready = [r for r in rows if r.get("session")]
+        if not ready:
+            return None
+        if current_id is None:
+            return int(ready[0]["id"])
+        ids = [int(r["id"]) for r in ready]
+        if current_id not in ids:
+            return ids[0]
+        return ids[(ids.index(current_id) + 1) % len(ids)]
+
+    # ----- daily stats -----
+    @staticmethod
+    def _today_key() -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+    @staticmethod
+    def _day_start_ts(day: str | None = None) -> float:
+        day = day or time.strftime("%Y-%m-%d", time.localtime())
+        return time.mktime(time.strptime(day + " 00:00:00", "%Y-%m-%d %H:%M:%S"))
+
+    def bump_daily(
+        self,
+        *,
+        lots_new: int = 0,
+        lots_shown: int = 0,
+        users_new: int = 0,
+        checks: int = 0,
+    ) -> None:
+        day = self._today_key()
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO daily_stats (
+                day, lots_new, lots_shown, users_new, unique_titles, checks, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET
+                lots_new = lots_new + excluded.lots_new,
+                lots_shown = lots_shown + excluded.lots_shown,
+                users_new = users_new + excluded.users_new,
+                checks = checks + excluded.checks,
+                updated_at = excluded.updated_at
+            """,
+            (day, int(lots_new), int(lots_shown), int(users_new), int(checks), now),
+        )
+        self._conn.commit()
+
+    def refresh_daily_unique_titles(self, day: str | None = None) -> int:
+        day = day or self._today_key()
+        start = self._day_start_ts(day)
+        end = start + 86400
+        row = self._conn.execute(
+            """
+            SELECT COUNT(DISTINCT lower(title)) AS c
+            FROM gifts
+            WHERE title != '' AND last_seen >= ? AND last_seen < ?
+            """,
+            (start, end),
+        ).fetchone()
+        n = int(row["c"] if row else 0)
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO daily_stats (
+                day, lots_new, lots_shown, users_new, unique_titles, checks, updated_at
+            ) VALUES (?, 0, 0, 0, ?, 0, ?)
+            ON CONFLICT(day) DO UPDATE SET
+                unique_titles = excluded.unique_titles,
+                updated_at = excluded.updated_at
+            """,
+            (day, n, now),
+        )
+        self._conn.commit()
+        return n
+
+    def bump_collection_shown(self, title: str, *, n: int = 1) -> None:
+        tk = (title or "").strip().lower()
+        if not tk:
+            return
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO shown_collections (title_key, title, shown_count, last_shown)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(title_key) DO UPDATE SET
+                title = CASE WHEN excluded.title != '' THEN excluded.title ELSE shown_collections.title END,
+                shown_count = shown_collections.shown_count + excluded.shown_count,
+                last_shown = excluded.last_shown
+            """,
+            (tk, (title or "").strip(), int(n), now),
+        )
+        self._conn.commit()
+
+    def get_collection_show_counts(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT title_key, shown_count FROM shown_collections"
+        ).fetchall()
+        return {str(r["title_key"]): int(r["shown_count"] or 0) for r in rows}
+
+    def get_daily_stats(self, day: str | None = None) -> dict[str, Any]:
+        day = day or self._today_key()
+        start = self._day_start_ts(day)
+        end = start + 86400
+        # живые цифры из таблиц + счётчики shown/checks
+        lots_new = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM gifts WHERE first_seen >= ? AND first_seen < ?",
+            (start, end),
+        ).fetchone()["c"]
+        users_new = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE first_seen >= ? AND first_seen < ?",
+            (start, end),
+        ).fetchone()["c"]
+        unique_titles = self._conn.execute(
+            """
+            SELECT COUNT(DISTINCT lower(title)) AS c FROM gifts
+            WHERE title != '' AND last_seen >= ? AND last_seen < ?
+            """,
+            (start, end),
+        ).fetchone()["c"]
+        row = self._conn.execute(
+            "SELECT lots_shown, checks FROM daily_stats WHERE day = ?", (day,)
+        ).fetchone()
+        lots_shown = int(row["lots_shown"]) if row else 0
+        checks = int(row["checks"]) if row else 0
+        return {
+            "day": day,
+            "lots_new": int(lots_new),
+            "lots_shown": lots_shown,
+            "users_new": int(users_new),
+            "unique_titles": int(unique_titles),
+            "checks": checks,
+            "users_total": self.count_users(),
+            "lots_total": self.count(),
+            "accounts": len(self.list_accounts()),
+        }
 
     def checkpoint(self) -> None:
         """Слить WAL на диск — чтобы БД переживала рестарт/деплой."""

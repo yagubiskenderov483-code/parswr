@@ -156,6 +156,8 @@ class App:
         self.speed_label = creds.apply_speed(self.speed_mode)
         # недавние NFT-коллекции — чтобы в mid/hard не сыпалось одно и то же
         self._recent_titles: list[str] = []
+        self.active_account_id: int | None = None
+        self._adding_account = False
         self._reload_persist_seen()
 
     def cycle_speed(self) -> str:
@@ -243,10 +245,134 @@ class App:
             f"@{me.username}" if me.username else (me.first_name or str(me.id))
         )
         self.market.set_client(self.client)
+        # сохранить сессию для мультиакка / ротации
+        try:
+            session = StringSession.save(self.client.session)
+            self.active_account_id = self.db.upsert_account(
+                phone=self.phone or "",
+                session=session,
+                label=self.account_name,
+                tg_user_id=int(me.id) if me and me.id else None,
+                make_active=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("save account session: %s", exc)
+        self._adding_account = False
+
+    async def try_restore_account(self) -> bool:
+        """Поднять активный акк из БД при старте бота."""
+        acc = self.db.get_active_account()
+        if not acc or not acc.get("session"):
+            return False
+        try:
+            client = TelegramClient(
+                StringSession(acc["session"]), creds.API_ID, creds.API_HASH
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                return False
+            try:
+                if self.client.is_connected():
+                    await self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self.client = client
+            self.market = TelegramMarket(self.client)
+            me = await client.get_me()
+            self.logged_in = True
+            self.account_name = (
+                f"@{me.username}" if me.username else (me.first_name or str(me.id))
+            )
+            self.phone = str(acc.get("phone") or "")
+            self.active_account_id = int(acc["id"])
+            self.db.set_active_account(self.active_account_id)
+            self.market.set_client(self.client)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("restore account: %s", exc)
+            return False
+
+    async def switch_account(self, acc_id: int) -> str:
+        acc = self.db.get_account(acc_id)
+        if not acc or not acc.get("session"):
+            raise ValueError("Аккаунт не найден / нет сессии.")
+        was_running = self.running
+        was_afk = self.afk_running
+        chat = self.chat_id
+        await self.stop_monitor()
+        await self.stop_afk()
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        client = TelegramClient(
+            StringSession(acc["session"]), creds.API_ID, creds.API_HASH
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise ValueError("Сессия мертва — залогинь акк заново.")
+        self.client = client
+        self.market = TelegramMarket(self.client)
+        me = await client.get_me()
+        self.logged_in = True
+        self.account_name = (
+            f"@{me.username}" if me.username else (me.first_name or str(me.id))
+        )
+        self.phone = str(acc.get("phone") or "")
+        self.active_account_id = int(acc["id"])
+        self.db.set_active_account(self.active_account_id)
+        # обновим session string
+        try:
+            self.db.upsert_account(
+                phone=self.phone,
+                session=StringSession.save(client.session),
+                label=self.account_name,
+                tg_user_id=int(me.id) if me and me.id else None,
+                make_active=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if was_running and chat:
+            await self.start_monitor(chat)
+        if was_afk and chat:
+            await self.start_afk(chat)
+        return f"🔀 Акк: <b>{self.account_name}</b>"
+
+    async def rotate_account(self) -> str:
+        nxt = self.db.next_account_id(self.active_account_id)
+        if nxt is None or nxt == self.active_account_id:
+            raise ValueError("Нет другого аккаунта для ротации. Добавь через Аккаунты.")
+        return await self.switch_account(nxt)
+
+    async def start_add_account(self) -> None:
+        """Начать логин доп. акка — текущий не трогаем в БД."""
+        self._adding_account = True
+        await self.stop_monitor()
+        await self.stop_afk()
+        try:
+            if self.client.is_connected():
+                await self.client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self.client = self._new_client()
+        self.market = TelegramMarket(self.client)
+        self.phone = None
+        self.phone_code_hash = None
+        self.logged_in = False
+        self.account_name = ""
 
     async def reset_auth(self) -> None:
         await self.stop_monitor()
         await self.stop_afk()
+        # удалить только активный акк из БД, остальные оставить
+        if self.active_account_id is not None:
+            try:
+                self.db.delete_account(self.active_account_id)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             if self.client.is_connected():
                 await self.client.disconnect()
@@ -256,9 +382,19 @@ class App:
         self.phone_code_hash = None
         self.logged_in = False
         self.account_name = ""
+        self.active_account_id = None
         self.client = self._new_client()
         self.market = TelegramMarket(self.client)
         wipe_disk_junk()
+        # если есть другой акк — поднять его
+        other = self.db.get_active_account() or (
+            self.db.list_accounts()[0] if self.db.list_accounts() else None
+        )
+        if other and other.get("session"):
+            try:
+                await self.switch_account(int(other["id"]))
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_range(self, label: str, mn: int, mx: int) -> None:
         """Сложность/цена парсера (монитор)."""
@@ -289,13 +425,6 @@ class App:
         self._status_msg_id = None
         self.market.reshuffle_collections()
         self._task = asyncio.create_task(self._loop(), name="monitor")
-
-    def _flush_market_users(self) -> tuple[int, int, int]:
-        """Слить юзеров из ответов маркета в БД."""
-        found = self.market.drain_users()
-        if not found:
-            return 0, 0, self.db.count_users()
-        return self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
 
     def _is_blocked_lot(self, lot: Lot) -> bool:
         u = (lot.seller or "").lower()
@@ -388,13 +517,15 @@ class App:
     ) -> list[Lot]:
         """Разнообразие NFT-коллекций + без повторов продавцов/моделей."""
         lots = list(lots)
+        lots = list(lots)
         random.shuffle(lots)
-        # ведро по НАЗВАНИЮ NFT (Perfume Bottle), не по модели
+        # ведро по коллекции NFT; приоритет — кто МЕНЬШЕ всего выдавался
         buckets: dict[str, list[Lot]] = {}
         keys: list[str] = []
         local_sellers: set[str] = set()
         local_models: set[str] = set()
-        recent = set(self._recent_titles[-80:])
+        show_counts = self.db.get_collection_show_counts()
+        recent = set(self._recent_titles[-100:])
 
         for lot in lots:
             if not lot.seller:
@@ -433,11 +564,16 @@ class App:
             local_sellers.add(lot.owner_key)
             local_models.add(lot.model_key)
 
-        random.shuffle(keys)
-        # сначала коллекции, которых давно не было в выдаче
-        keys.sort(key=lambda k: k in recent)
         for tk in keys:
             random.shuffle(buckets[tk])
+
+        def _rank(tk: str) -> tuple:
+            # меньше показов → раньше; недавние в хвост; лёгкий random
+            return (
+                show_counts.get(tk, 0),
+                1 if tk in recent else 0,
+                random.random(),
+            )
 
         def _take(tk: str) -> Lot | None:
             bucket = buckets.get(tk) or []
@@ -450,10 +586,15 @@ class App:
                 return lot
             return None
 
+        def _mark(lot: Lot) -> None:
+            self._seen_sellers.add(lot.owner_key)
+            self._seen_models.add(lot.model_key)
+            self.db.mark_seen_seller(username=lot.seller, user_id=lot.seller_id)
+            self.db.mark_seen_model(lot.model_key, title=lot.model or lot.title)
+
+        # 1 лот на коллекцию, сначала самые «недовыданные»
         primary: list[Lot] = []
-        ordered = list(keys)
-        random.shuffle(ordered)
-        ordered.sort(key=lambda k: k in recent)
+        ordered = sorted(keys, key=_rank)
         for tk in ordered:
             if limit is not None and len(primary) >= limit:
                 break
@@ -461,16 +602,12 @@ class App:
             if lot is None:
                 continue
             primary.append(lot)
-            self._seen_sellers.add(lot.owner_key)
-            self._seen_models.add(lot.model_key)
-            self.db.mark_seen_seller(username=lot.seller, user_id=lot.seller_id)
-            self.db.mark_seen_model(lot.model_key, title=lot.model or lot.title)
+            _mark(lot)
 
-        # добор, если уникальных NFT не хватило до лимита
+        # добор только если уникальных коллекций не хватило
         extra: list[Lot] = []
         if limit is not None and len(primary) < limit:
-            again = list(keys)
-            random.shuffle(again)
+            again = sorted(keys, key=_rank)
             for tk in again:
                 if len(primary) + len(extra) >= limit:
                     break
@@ -478,23 +615,12 @@ class App:
                 if lot is None:
                     continue
                 extra.append(lot)
-                self._seen_sellers.add(lot.owner_key)
-                self._seen_models.add(lot.model_key)
-                self.db.mark_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                )
-                self.db.mark_seen_model(
-                    lot.model_key, title=lot.model or lot.title
-                )
+                _mark(lot)
 
-        # сначала ВСЕ разные NFT, добор только в хвост
-        random.shuffle(primary)
-        random.shuffle(extra)
+        # уникальные коллекции сверху, добор в хвост; разнос одинаковых
         result = list(primary) + list(extra)
         if limit is not None:
             result = result[:limit]
-
-        # разнести одинаковые названия, не ломая приоритет уникальных
         spread: list[Lot] = []
         rest = list(result)
         while rest:
@@ -512,8 +638,8 @@ class App:
             tk = self._title_key(lot)
             if tk:
                 self._recent_titles.append(tk)
-        if len(self._recent_titles) > 200:
-            self._recent_titles = self._recent_titles[-200:]
+        if len(self._recent_titles) > 250:
+            self._recent_titles = self._recent_titles[-250:]
         return result
 
     async def _prepare_show(
@@ -653,10 +779,10 @@ class App:
                 f"фильтр-поиск (не парсер) · <b>{label}</b>",
             )
             await self._say_lot_list_to(chat_id, shown)
-            for lot in shown[: creds.NOTIFY_CARDS]:
-                await self._notify_lot_to(chat_id, lot, count_as_new=False)
             await self._say_to(
-                chat_id, "Готово · фильтр-поиск.", reply_markup=filters_inline()
+                chat_id,
+                "Готово · списком. Блок юза: <code>/block username</code>",
+                reply_markup=filters_inline(),
             )
         finally:
             self.filter_search_running = False
@@ -685,9 +811,21 @@ class App:
             await self._say_lot_list_to(self.chat_id, lots)
 
     async def _say_lot_list_to(self, chat_id: int, lots: list[Lot]) -> None:
-        lines = [self._format_lot_line(lot) for lot in lots[: creds.SHOW_LIMIT]]
+        """Выдача СПИСКОМ (как в примере), не карточками по одной."""
+        batch = lots[: creds.SHOW_LIMIT]
+        if not batch:
+            return
+        lines = [self._format_lot_line(lot) for lot in batch]
+        # одним/несколькими сообщениями по 10 строк — без очереди карточек
         for i in range(0, len(lines), 10):
             await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
+        # учёт разнообразия + дневная стата
+        for lot in batch:
+            self.db.bump_collection_shown(lot.title or lot.model or "")
+        try:
+            self.db.bump_daily(lots_shown=len(batch))
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _say(self, text: str, reply_markup=None) -> Message | None:
         if not self.chat_id:
@@ -732,7 +870,24 @@ class App:
         inserted, updated = self.db.upsert_models(lots)
         self.db_last_saved = inserted + updated
         self.db_total = self.db.count()
+        if inserted:
+            try:
+                self.db.bump_daily(lots_new=inserted)
+            except Exception:  # noqa: BLE001
+                pass
         return inserted, updated
+
+    def _flush_market_users(self) -> tuple[int, int, int]:
+        found = self.market.drain_users()
+        if not found:
+            return 0, 0, self.db.count_users()
+        ins, upd, total = self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
+        if ins:
+            try:
+                self.db.bump_daily(users_new=ins)
+            except Exception:  # noqa: BLE001
+                pass
+        return ins, upd, total
 
     async def start_afk(self, chat_id: int) -> str:
         if not self.logged_in:
@@ -877,6 +1032,11 @@ class App:
                 batch_users, cap=creds.AFK_USER_CAP
             )
             self.afk_users_added += ins_u
+            if ins_u:
+                try:
+                    self.db.bump_daily(users_new=ins_u)
+                except Exception:  # noqa: BLE001
+                    pass
             self.afk_pages += 1
             if self.afk_pages % 5 == 0:
                 self.db.checkpoint()
@@ -961,8 +1121,6 @@ class App:
                 for lot in shown:
                     self._seen[lot.id] = now_e
                 await self._say_lot_list(shown)
-                for lot in shown[: creds.NOTIFY_CARDS]:
-                    await self._notify_lot(lot, count_as_new=False)
             else:
                 await self._say("Пока пусто по фильтрам — добьём круг 149…")
 
@@ -1036,8 +1194,6 @@ class App:
                     for lot in shown:
                         self._seen[lot.id] = now
                     await self._say_lot_list(shown)
-                    for lot in shown[: creds.NOTIFY_CARDS]:
-                        await self._notify_lot(lot, count_as_new=False)
                 else:
                     await self._say(
                         "После фильтров пусто — мониторю дальше…"
@@ -1072,6 +1228,18 @@ class App:
                 self.checks = result.check_no
                 self.last_check_lots = len(result.lots)
                 self.last_error = result.error
+                try:
+                    self.db.bump_daily(checks=1)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # авто-ротация акка при сильном flood
+                if result.floods >= 3 and len(self.db.list_accounts()) > 1:
+                    try:
+                        msg = await self.rotate_account()
+                        await self._say(f"🛟 Flood → ротация\n{msg}")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("rotate: %s", exc)
 
                 if result.lots:
                     self._save_models(result.lots)
@@ -1101,10 +1269,7 @@ class App:
                     )
                     if fresh:
                         await self._say_lot_list(fresh[: creds.SHOW_LIMIT])
-                    for lot in fresh[: creds.NOTIFY_CARDS]:
-                        self.lots_notified += 1
-                        await self._notify_lot(lot, count_as_new=True)
-                    self.lots_notified += max(0, len(fresh) - creds.NOTIFY_CARDS)
+                        self.lots_notified += len(fresh)
 
                 if self.checks % 3 == 0:
                     self.db.checkpoint()
@@ -1330,17 +1495,52 @@ def settings_inline() -> InlineKeyboardMarkup:
     stop = "⏹ Стоп парсинг" if app.running else "▶️ Парсинг выкл"
     afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK старт"
     speed = f"Скорость: {app.speed_label}"
+    nacc = len(app.db.list_accounts())
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Сложность парсера", callback_data="menu:parse")],
             [InlineKeyboardButton(text="🧩 Фильтр-поиск", callback_data="menu:filters")],
             [InlineKeyboardButton(text=speed, callback_data="menu:speed")],
+            [
+                InlineKeyboardButton(
+                    text=f"👤 Аккаунты ({nacc})", callback_data="menu:accounts"
+                )
+            ],
+            [InlineKeyboardButton(text="📅 Стата за день", callback_data="menu:daily")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="📊 Статус", callback_data="menu:status")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
     )
+
+
+def accounts_inline() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for acc in app.db.list_accounts():
+        mark = "✅ " if acc.get("is_active") else ""
+        label = acc.get("label") or acc.get("phone") or f"#{acc['id']}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{label}",
+                    callback_data=f"acc:use:{acc['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=f"acc:del:{acc['id']}",
+                ),
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="➕ Добавить акк", callback_data="acc:add")]
+    )
+    if len(app.db.list_accounts()) > 1:
+        rows.append(
+            [InlineKeyboardButton(text="🔀 Ротация", callback_data="acc:rotate")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _normalize_phone(phone: str) -> str:
@@ -1413,7 +1613,8 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
 async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
     text = prefix + (
         "💡 <b>Меню</b>\n\n"
-        f"Акк: <b>{app.account_name}</b>\n"
+        f"Акк: <b>{app.account_name}</b> "
+        f"({len(app.db.list_accounts())} шт)\n"
         f"Парсер: <b>{app.range_label}</b>\n"
         f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
         f"Скорость: <b>{app.speed_label}</b>\n"
@@ -1435,6 +1636,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(".", reply_markup=ReplyKeyboardRemove())
     if app.logged_in:
         await _send_menu(message)
+        return
+    if await app.try_restore_account():
+        await _send_menu(message, "Сессия восстановлена.\n")
         return
     wipe_disk_junk()
     await state.set_state(AuthStates.phone)
@@ -1626,6 +1830,119 @@ async def cb_speed(callback: CallbackQuery) -> None:
         reply_markup=settings_inline(),
     )
     await callback.answer(f"Скорость: {label}")
+
+
+@router.callback_query(F.data == "menu:accounts")
+async def cb_accounts(callback: CallbackQuery) -> None:
+    if not app.logged_in and not app.db.list_accounts():
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    lines = [
+        "👤 <b>Аккаунты Telethon</b>",
+        f"Сейчас: <b>{app.account_name or '—'}</b>",
+        "Ротация при flood / кнопка 🔀",
+        "",
+    ]
+    for acc in app.db.list_accounts():
+        mark = "✅" if acc.get("is_active") else "▫️"
+        lines.append(
+            f"{mark} <b>{_esc(str(acc.get('label') or acc.get('phone') or acc['id']))}</b>"
+        )
+    await callback.message.edit_text(
+        "\n".join(lines) or "Пусто",
+        reply_markup=accounts_inline(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("acc:"))
+async def cb_acc_action(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "add":
+        await app.start_add_account()
+        await state.set_state(AuthStates.phone)
+        await callback.message.edit_text(
+            "➕ Новый акк для ротации.\n"
+            "Старый останется в списке.\n"
+            "📱 Пришли номер: <code>+79991234567</code>"
+        )
+        await callback.answer("Жду номер")
+        return
+    if action == "rotate":
+        try:
+            text = await app.rotate_account()
+        except Exception as exc:  # noqa: BLE001
+            await callback.answer(str(exc)[:180], show_alert=True)
+            return
+        await callback.message.edit_text(text, reply_markup=accounts_inline())
+        await callback.answer("Ротация")
+        return
+    if action in ("use", "del") and len(parts) > 2:
+        try:
+            acc_id = int(parts[2])
+        except ValueError:
+            await callback.answer("?", show_alert=True)
+            return
+        if action == "del":
+            if app.active_account_id == acc_id and len(app.db.list_accounts()) <= 1:
+                await callback.answer("Нельзя удалить единственный акк", show_alert=True)
+                return
+            app.db.delete_account(acc_id)
+            if app.active_account_id == acc_id:
+                nxt = app.db.next_account_id(None)
+                if nxt:
+                    try:
+                        await app.switch_account(nxt)
+                    except Exception:  # noqa: BLE001
+                        pass
+            await callback.message.edit_text(
+                "🗑 Удалил.\n"
+                f"Сейчас: <b>{app.account_name or '—'}</b>",
+                reply_markup=accounts_inline(),
+            )
+            await callback.answer("Удалено")
+            return
+        try:
+            text = await app.switch_account(acc_id)
+        except Exception as exc:  # noqa: BLE001
+            await callback.answer(str(exc)[:180], show_alert=True)
+            return
+        await callback.message.edit_text(text, reply_markup=accounts_inline())
+        await callback.answer("Переключил")
+        return
+    await callback.answer("?")
+
+
+@router.callback_query(F.data == "menu:daily")
+async def cb_daily(callback: CallbackQuery) -> None:
+    st = app.db.get_daily_stats()
+    text = (
+        f"📅 <b>Стата за {st['day']}</b>\n\n"
+        f"🎁 Новых лотов в БД: <b>{st['lots_new']:,}</b>\n"
+        f"📤 Выдано в чат: <b>{st['lots_shown']:,}</b>\n"
+        f"👤 Новых юзов: <b>{st['users_new']:,}</b>\n"
+        f"🎲 Уник. NFT сегодня: <b>{st['unique_titles']:,}</b>\n"
+        f"💓 Чеков: <b>{st['checks']:,}</b>\n\n"
+        f"Всего в БД: лотов <b>{st['lots_total']:,}</b> · "
+        f"юзов <b>{st['users_total']:,}</b> · "
+        f"акков <b>{st['accounts']}</b>"
+    )
+    await callback.message.edit_text(text, reply_markup=settings_inline())
+    await callback.answer()
+
+
+@router.message(Command("daily"))
+async def cmd_daily(message: Message) -> None:
+    st = app.db.get_daily_stats()
+    await message.answer(
+        f"📅 <b>Стата за {st['day']}</b>\n"
+        f"🎁 новых лотов: <b>{st['lots_new']:,}</b>\n"
+        f"📤 выдано: <b>{st['lots_shown']:,}</b>\n"
+        f"👤 новых юзов: <b>{st['users_new']:,}</b>\n"
+        f"🎲 уник. NFT: <b>{st['unique_titles']:,}</b>\n"
+        f"💓 чеков: <b>{st['checks']:,}</b>"
+    )
 
 
 @router.callback_query(F.data == "menu:stop")
@@ -1835,10 +2152,16 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     app.bot = bot
+    # подтянуть сохранённый акк если есть
+    try:
+        await app.try_restore_account()
+    except Exception:  # noqa: BLE001
+        pass
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Меню"),
             BotCommand(command="stop", description="Стоп"),
+            BotCommand(command="daily", description="Стата за день"),
             BotCommand(command="block", description="Блок @user"),
             BotCommand(command="unblock", description="Разблок @user"),
             BotCommand(command="blocked", description="Список блоклиста"),

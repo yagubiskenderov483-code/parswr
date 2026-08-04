@@ -9,7 +9,8 @@ MAX_STARS = 5000
 
 PREVIEW_COUNT = 30
 SHOW_LIMIT = 30
-NOTIFY_CARDS = 5
+# 0 = только списком (как в примере), без карточек по одной
+NOTIFY_CARDS = 0
 
 AFK_USER_CAP = 5_000_000
 AFK_STATUS_EVERY = 25.0

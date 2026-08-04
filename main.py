@@ -360,7 +360,7 @@ class App:
         async def run_one(m: TelegramMarket, ids: list[int], bump: bool):
             m._progress_cb = _prog
             try:
-                return await m.burst_search(
+                result = await m.burst_search(
                     min_stars,
                     max_stars,
                     parallel=per_parallel,
@@ -377,8 +377,22 @@ class App:
                     collection_ids=ids,
                     stop_event=stop_event,
                 )
+                # копим БД сразу с каждого акка — даже при ошибках выдачи
+                try:
+                    self._ingest_always(
+                        list(result.all_lots or result.lots or [])
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ingest after burst: %s", exc)
+                return result
             finally:
                 m._progress_cb = None
+                try:
+                    found = m.drain_users()
+                    if found:
+                        self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
+                except Exception:  # noqa: BLE001
+                    pass
 
         tasks = [
             asyncio.create_task(run_one(m, chunk, bump=(i == 0)))
@@ -434,6 +448,11 @@ class App:
         from market import CheckResult
 
         self.parse_coll_checks = scanned
+        # финальный слив всего найденного в БД
+        try:
+            self._ingest_always(all_lots or matched)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ingest merge: %s", exc)
         return CheckResult(
             check_no=ok_results[0].check_no,
             scanned=scanned,
@@ -1148,6 +1167,8 @@ class App:
             if (by_types or take_all)
             else (limit or max(30, creds.SHOW_LIMIT))
         )
+        # всегда сначала в БД — до любых фильтров выдачи
+        self._ingest_always(list(lots))
         pre = list(lots)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
@@ -1195,6 +1216,8 @@ class App:
                 cap=creds.AFK_USER_CAP,
             )
             self._flush_market_users()
+            # профили тоже в БД
+            self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
         return self._pick_with_fallback(
             candidates,
@@ -1423,7 +1446,7 @@ class App:
             self._status_msg_id = msg.message_id
 
     def _save_models(self, lots: list[Lot]) -> tuple[int, int]:
-        """Сохраняет модели в БД."""
+        """Сохраняет модели в БД (всегда, без условий выдачи)."""
         if not lots:
             return 0, 0
         inserted, updated = self.db.upsert_models(lots)
@@ -1437,7 +1460,17 @@ class App:
         return inserted, updated
 
     def _flush_market_users(self) -> tuple[int, int, int]:
-        found = self.market.drain_users()
+        """Слить юзов со ВСЕХ Telethon-рынков в БД."""
+        found: list[dict] = []
+        try:
+            found.extend(self.market.drain_users() or [])
+        except Exception:  # noqa: BLE001
+            pass
+        for m in list(self._extra_markets):
+            try:
+                found.extend(m.drain_users() or [])
+            except Exception:  # noqa: BLE001
+                pass
         if not found:
             return 0, 0, self.db.count_users()
         ins, upd, total = self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
@@ -1447,6 +1480,30 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
         return ins, upd, total
+
+    def _ingest_always(self, lots: list[Lot] | None = None) -> None:
+        """Всегда копить gifts+users в БД — даже если в выдачу не попали."""
+        batch = list(lots or [])
+        if batch:
+            try:
+                self._save_models(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ingest gifts: %s", exc)
+            try:
+                self.db.upsert_users_from_lots(
+                    [lot for lot in batch if lot.seller_id is not None or lot.seller],
+                    cap=creds.AFK_USER_CAP,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ingest users from lots: %s", exc)
+        try:
+            self._flush_market_users()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ingest drain users: %s", exc)
+        try:
+            self.db.checkpoint()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def start_afk(self, chat_id: int) -> str:
         if not self.logged_in:

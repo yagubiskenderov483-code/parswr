@@ -203,6 +203,11 @@ class App:
         self.pending_max_stars = self.max_stars
         self.parse_checked = 0
         self.parse_ready = 0
+        self.parse_rounds = 0  # обходы
+        self.parse_coll_checks = 0  # чеки коллекций
+        self.parse_acc_checks = 0  # проверки акка (owner/bio/free_dm)
+        self.parse_types = 0  # уникальные типы NFT
+        self.parse_models = 0  # уникальные модели
         self._last_pool: list[Lot] = []
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
@@ -305,6 +310,7 @@ class App:
         progress_cb: Any | None = None,
         early_show_at: int = 0,
         on_early_lots: Any | None = None,
+        stop_event: Any | None = None,
     ):
         """Параллельный burst сразу с нескольких аккаунтов."""
         markets = await self._build_parse_markets()
@@ -312,24 +318,32 @@ class App:
         all_ids = list(await base.load_collections(force=False))
         random.shuffle(all_ids)
         chunks = self._split_ids(all_ids, len(markets))
-        # меньше параллели на акк, зато акков несколько
-        per_parallel = max(
-            8, int(creds.BURST_PARALLEL // max(1, len(markets)))
-        )
+        # полная параллель на КАЖДЫЙ акк — максимальная скорость
+        per_parallel = max(12, int(creds.BURST_PARALLEL))
 
         early_lock = asyncio.Lock()
         early_fired = False
-        scanned_total = 0
-        scanned_lock = asyncio.Lock()
+        stop_event = stop_event or asyncio.Event()
 
-        async def _prog(done: int, total: int, lots_n: int) -> None:
-            nonlocal scanned_total
-            async with scanned_lock:
-                # приблизительный общий прогресс
-                pass
+        async def _prog(
+            done: int,
+            total: int,
+            lots_n: int,
+            types_n: int = 0,
+            models_n: int = 0,
+        ) -> None:
+            self.parse_coll_checks = max(self.parse_coll_checks, done)
+            self.parse_checked = max(self.parse_checked, lots_n)
+            self.parse_types = max(self.parse_types, types_n)
+            self.parse_models = max(self.parse_models, models_n)
             if callable(progress_cb):
                 try:
-                    await progress_cb(done, total, lots_n)
+                    await progress_cb(done, total, lots_n, types_n, models_n)
+                except TypeError:
+                    try:
+                        await progress_cb(done, total, lots_n)
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -343,7 +357,7 @@ class App:
                 await on_early_lots(matched, done, total)
 
         async def run_one(m: TelegramMarket, ids: list[int], bump: bool):
-            m._progress_cb = _prog if bump else None
+            m._progress_cb = _prog
             try:
                 return await m.burst_search(
                     min_stars,
@@ -353,19 +367,20 @@ class App:
                     max_collections=0,
                     gap=creds.BURST_GAP,
                     timeout=creds.API_TIMEOUT,
-                    limit_results=creds.SHOW_LIMIT,
+                    limit_results=max(creds.SHOW_LIMIT, 80),
                     bump_check=bump,
                     touch_cursor=False,
                     time_budget=0,
-                    early_show_at=early_show_at if bump else 0,
-                    on_early_lots=_early if bump else None,
+                    early_show_at=early_show_at,
+                    on_early_lots=_early,
                     collection_ids=ids,
+                    stop_event=stop_event,
                 )
             finally:
                 m._progress_cb = None
 
         tasks = [
-            run_one(m, chunk, bump=(i == 0))
+            asyncio.create_task(run_one(m, chunk, bump=(i == 0)))
             for i, (m, chunk) in enumerate(zip(markets, chunks))
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -387,7 +402,6 @@ class App:
                 error="all accounts failed",
             )
 
-        # merge
         all_lots: list[Lot] = []
         matched: list[Lot] = []
         scanned = 0
@@ -418,6 +432,7 @@ class App:
         random.shuffle(matched)
         from market import CheckResult
 
+        self.parse_coll_checks = scanned
         return CheckResult(
             check_no=ok_results[0].check_no,
             scanned=scanned,
@@ -429,6 +444,35 @@ class App:
             elapsed=elapsed,
             all_lots=all_lots,
         )
+
+    def parse_status_text(self) -> str:
+        """Активные парсинги + счётчики обходов/чеков/проверок."""
+        lines = [screen("Парсинги")]
+        p = "▶️" if self.running else "⏹"
+        f = "▶️" if self.filter_search_running else "⏹"
+        a = "🌙" if self.afk_running else "⏹"
+        lines.append(f"{p} Парсер · {self.range_label}")
+        lines.append(f"{f} Фильтры · {self.filter_range_label}")
+        lines.append(f"{a} AFK")
+        lines.append("")
+        lines.append(f"Обход: <b>#{self.parse_rounds}</b>")
+        lines.append(f"Чеков коллекций: <b>{self.parse_coll_checks}</b>")
+        lines.append(f"Проверок акка: <b>{self.parse_acc_checks}</b>")
+        lines.append(f"Типов NFT: <b>{self.parse_types}</b>")
+        lines.append(f"Моделей: <b>{self.parse_models}</b>")
+        lines.append(f"Готово к выдаче: <b>{self.parse_ready}</b>")
+        lines.append("")
+        st = self.db.get_daily_stats()
+        lines.append(
+            f"Юзов: <b>{st['users_total']:,}</b> · "
+            f"лотов: <b>{st['lots_total']:,}</b>"
+        )
+        lines.append(
+            f"Сегодня: юзов +{st['users_new']:,} · "
+            f"лотов +{st['lots_new']:,} · NFT {st['unique_titles']:,}"
+        )
+        lines.append(f"Акков Telethon: <b>{st['accounts']}</b>")
+        return "\n".join(lines)
 
     def cycle_speed(self) -> str:
         order = ["quiet", "norm", "fast"]
@@ -697,6 +741,13 @@ class App:
         self.last_check_lots = 0
         self.last_error = ""
         self._status_msg_id = None
+        self.parse_rounds += 1
+        self.parse_coll_checks = 0
+        self.parse_acc_checks = 0
+        self.parse_checked = 0
+        self.parse_ready = 0
+        self.parse_types = 0
+        self.parse_models = 0
         self.market.reshuffle_collections()
         self._task = asyncio.create_task(self._loop(), name="monitor")
 
@@ -896,30 +947,53 @@ class App:
 
         primary: list[Lot] = []
         ordered = sorted(keys, key=_rank)
-        for tk in ordered:
-            if limit is not None and len(primary) >= limit:
-                break
-            lot = _take(tk)
-            if lot is None:
-                continue
-            primary.append(lot)
-            _mark(lot)
+        per_type = max(1, int(getattr(creds, "PER_TYPE", 1)))
+        max_types = int(getattr(creds, "MAX_TYPES", 0) or 0)
+        # parser: по типам (1 с каждого), не фикс 30
+        by_types = (not is_filter) and (limit is None or limit <= 0)
 
-        extra: list[Lot] = []
-        if limit is not None and len(primary) < limit:
-            again = sorted(keys, key=_rank)
-            for tk in again:
-                if len(primary) + len(extra) >= limit:
+        if by_types:
+            types_taken = 0
+            for tk in ordered:
+                if max_types > 0 and types_taken >= max_types:
+                    break
+                got = 0
+                while got < per_type:
+                    lot = _take(tk)
+                    if lot is None:
+                        break
+                    primary.append(lot)
+                    _mark(lot)
+                    got += 1
+                if got:
+                    types_taken += 1
+            result = list(primary)
+        else:
+            for tk in ordered:
+                if limit is not None and len(primary) >= limit:
                     break
                 lot = _take(tk)
                 if lot is None:
                     continue
-                extra.append(lot)
+                primary.append(lot)
                 _mark(lot)
 
-        result = list(primary) + list(extra)
-        if limit is not None:
-            result = result[:limit]
+            extra: list[Lot] = []
+            if limit is not None and len(primary) < limit:
+                again = sorted(keys, key=_rank)
+                for tk in again:
+                    if len(primary) + len(extra) >= limit:
+                        break
+                    lot = _take(tk)
+                    if lot is None:
+                        continue
+                    extra.append(lot)
+                    _mark(lot)
+
+            result = list(primary) + list(extra)
+            if limit is not None:
+                result = result[:limit]
+
         spread: list[Lot] = []
         rest = list(result)
         while rest:
@@ -951,20 +1025,25 @@ class App:
         need_full: bool | None = None,
         channel: str = "parser",
     ) -> list[Lot]:
-        lim = limit or creds.SHOW_LIMIT
-        # сначала те, у кого уже есть seller из маркета — меньше API
+        # parser: limit=None → выдача по типам (все)
+        by_types = channel == "parser" and (limit is None or limit <= 0)
+        lim = (
+            10_000
+            if by_types
+            else (limit or creds.SHOW_LIMIT)
+        )
         pre = list(lots)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
         without = [lot for lot in pre if not lot.seller]
-        # резолвим только недостающих, и не всех подряд
-        resolve_n = min(len(without), max(lim * 3, 40))
+        resolve_n = min(len(without), max(lim if not by_types else 120, 60))
         if resolve_n:
             await self.market.resolve_owners(
                 without[:resolve_n],
                 timeout=creds.OWNER_TIMEOUT,
                 parallel=getattr(creds, "ENRICH_PARALLEL", 8),
             )
+            self.parse_acc_checks += resolve_n
         pool = with_seller + without[:resolve_n]
         self.db.upsert_users_from_lots(
             [lot for lot in pool if lot.seller_id is not None],
@@ -979,10 +1058,12 @@ class App:
         ]
         random.shuffle(candidates)
         if candidates:
-            sample_n = min(len(candidates), max(lim * 3, 36))
+            sample_n = min(
+                len(candidates),
+                max(lim * 3, 80) if not by_types else min(len(candidates), 220),
+            )
             if need_full or apply_extra or channel == "filter":
                 sample_n = min(len(candidates), max(sample_n, lim * 5))
-            # кто уже RU по имени — био можно не тянуть
             need_bio = [
                 lot
                 for lot in candidates[:sample_n]
@@ -997,11 +1078,12 @@ class App:
                     timeout=min(creds.OWNER_TIMEOUT, 0.7),
                     parallel=getattr(creds, "ENRICH_PARALLEL", 8),
                 )
-            # проверка: можно ли писать бесплатно (не за Stars)
+                self.parse_acc_checks += len(need_bio)
             await self.market.check_free_dm(
                 candidates[:sample_n],
-                timeout=max(creds.OWNER_TIMEOUT, 1.2),
+                timeout=max(creds.OWNER_TIMEOUT, 1.0),
             )
+            self.parse_acc_checks += len(candidates[:sample_n])
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],
                 cap=creds.AFK_USER_CAP,
@@ -1010,7 +1092,7 @@ class App:
             candidates = candidates[:sample_n]
         return self._pick_clean(
             candidates,
-            limit=lim,
+            limit=None if by_types else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
@@ -1107,7 +1189,7 @@ class App:
         self, chat_id: int, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
         """Выдача СПИСКОМ. channel=parser|filter — раздельный учёт."""
-        batch = lots[: creds.SHOW_LIMIT]
+        batch = lots if channel == "parser" else lots[: creds.SHOW_LIMIT]
         if not batch:
             return
         lines = [self._format_lot_line(lot) for lot in batch]
@@ -1371,40 +1453,83 @@ class App:
         self._afk_task = None
 
     async def _loop(self) -> None:
-        """Один круг: скан → прогресс → выдача 30 → стоп (есть кнопка Заново)."""
+        """Один обход: скан → прогресс (чеки/проверки) → выдача по типам."""
         self.parse_checked = 0
         self.parse_ready = 0
         self._last_pool = []
         n_acc = max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))
-        await self._edit_status(
-            f"{screen('Парсинг')}\n"
-            f"Сканирую · акков: <b>{n_acc}</b>\n"
-            f"Проверено: <b>0</b> · Готово: <b>0</b>/{creds.SHOW_LIMIT}"
-        )
+        stop_event = asyncio.Event()
+        delivered = False
 
-        last_prog = 0.0
-
-        async def _burst_progress(done: int, total: int, lots_n: int) -> None:
-            nonlocal last_prog
-            nowp = time.monotonic()
-            if nowp - last_prog < 1.2 and done < total:
-                return
-            last_prog = nowp
-            self.parse_checked = max(self.parse_checked, lots_n)
+        async def _status() -> None:
             await self._edit_status(
                 f"{screen('Парсинг')}\n"
-                f"Коллекции: <b>{done}</b>/{total}\n"
-                f"Проверено: <b>{self.parse_checked}</b> · "
-                f"Готово: <b>{self.parse_ready}</b>/{creds.SHOW_LIMIT}"
+                f"Обход <b>#{self.parse_rounds}</b> · акков {n_acc}\n"
+                f"Чеков коллекций: <b>{self.parse_coll_checks}</b>\n"
+                f"Проверок акка: <b>{self.parse_acc_checks}</b>\n"
+                f"Типов: <b>{self.parse_types}</b> · "
+                f"моделей: <b>{self.parse_models}</b>\n"
+                f"Готово: <b>{self.parse_ready}</b> (по типам)"
             )
+
+        await _status()
+        last_prog = 0.0
+
+        async def _burst_progress(
+            done: int,
+            total: int,
+            lots_n: int,
+            types_n: int = 0,
+            models_n: int = 0,
+        ) -> None:
+            nonlocal last_prog
+            nowp = time.monotonic()
+            if nowp - last_prog < 0.7 and done < total:
+                return
+            last_prog = nowp
+            self.parse_coll_checks = done
+            self.parse_checked = lots_n
+            self.parse_types = types_n
+            self.parse_models = models_n
+            await _status()
+
+        async def _on_early(matched: list[Lot], done: int, total: int) -> None:
+            nonlocal delivered
+            if delivered or not self.running:
+                return
+            pool = [lot for lot in matched if self._in_price(lot)]
+            shown = await self._prepare_show(
+                pool, limit=None, apply_extra=False, channel="parser"
+            )
+            self.parse_ready = len(shown)
+            # достаточно типов → сразу выдача и стоп скана
+            min_types = max(8, int(creds.SHOW_LIMIT // 2))
+            if len(shown) >= min_types:
+                delivered = True
+                stop_event.set()
+                now_e = time.monotonic()
+                for lot in shown:
+                    self._seen[lot.id] = now_e
+                await self._say_lot_list(shown, channel="parser")
+                self.lots_notified += len(shown)
+                self._last_pool = list(pool)
+                await self._say(
+                    f"{screen('Парсинг')}\n"
+                    f"Обход #{self.parse_rounds} · выдал "
+                    f"<b>{len(shown)}</b> типов\n"
+                    f"Чеков: {self.parse_coll_checks} · "
+                    f"проверок акка: {self.parse_acc_checks}",
+                    reply_markup=parse_done_inline(),
+                )
 
         try:
             burst = await self.multi_burst(
                 self.min_stars,
                 self.max_stars,
                 progress_cb=_burst_progress,
-                early_show_at=0,
-                on_early_lots=None,
+                early_show_at=max(10, creds.BURST_EARLY_SHOW_AT),
+                on_early_lots=_on_early,
+                stop_event=stop_event,
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -1430,51 +1555,46 @@ class App:
                 cap=creds.AFK_USER_CAP,
             )
 
-        price_pool = [lot for lot in to_save if self._in_price(lot)]
-        random.shuffle(price_pool)
-        self._last_pool = list(price_pool)
-        self.parse_checked = len(
-            {lot.owner_key for lot in price_pool if lot.seller or lot.seller_id}
-        ) or len(price_pool)
-
-        await self._edit_status(
-            f"{screen('Парсинг')}\n"
-            f"Проверено: <b>{self.parse_checked}</b>\n"
-            f"Готовлю выдачу…"
-        )
-
-        shown = await self._prepare_show(
-            price_pool,
-            limit=creds.SHOW_LIMIT,
-            apply_extra=False,
-            channel="parser",
-        )
-        self.parse_ready = len(shown)
-        if burst:
+        if not delivered:
+            price_pool = [lot for lot in to_save if self._in_price(lot)]
+            random.shuffle(price_pool)
+            self._last_pool = list(price_pool)
+            self.parse_checked = len(
+                {lot.owner_key for lot in price_pool if lot.seller or lot.seller_id}
+            ) or len(price_pool)
+            await _status()
+            shown = await self._prepare_show(
+                price_pool,
+                limit=None,
+                apply_extra=False,
+                channel="parser",
+            )
+            self.parse_ready = len(shown)
+            if burst:
+                self.checks = burst.check_no
+            if shown:
+                for lot in shown:
+                    self._seen[lot.id] = now
+                await self._say_lot_list(shown, channel="parser")
+                self.lots_notified += len(shown)
+                await self._say(
+                    f"{screen('Парсинг')}\n"
+                    f"Обход #{self.parse_rounds} · выдал "
+                    f"<b>{len(shown)}</b> типов\n"
+                    f"Чеков: {self.parse_coll_checks} · "
+                    f"проверок акка: {self.parse_acc_checks}",
+                    reply_markup=parse_done_inline(),
+                )
+            else:
+                await self._say(
+                    f"{screen('Парсинг')}\n"
+                    f"Обход #{self.parse_rounds} · типов 0\n"
+                    f"Чеков: {self.parse_coll_checks} · "
+                    f"проверок акка: {self.parse_acc_checks}",
+                    reply_markup=parse_done_inline(),
+                )
+        elif burst:
             self.checks = burst.check_no
-
-        if shown:
-            for lot in shown:
-                self._seen[lot.id] = now
-            await self._edit_status(
-                f"{screen('Парсинг')}\n"
-                f"Проверено: <b>{self.parse_checked}</b> · "
-                f"Готово: <b>{len(shown)}</b>/{creds.SHOW_LIMIT}"
-            )
-            await self._say_lot_list(shown, channel="parser")
-            self.lots_notified += len(shown)
-            await self._say(
-                f"{screen('Парсинг')}\n"
-                f"Выдал <b>{len(shown)}</b> · только free DM",
-                reply_markup=parse_done_inline(),
-            )
-        else:
-            await self._say(
-                f"{screen('Парсинг')}\n"
-                f"Проверено: <b>{self.parse_checked}</b> · готово 0\n"
-                f"Не набрал free DM. Жми Заново / смени сложность.",
-                reply_markup=parse_done_inline(),
-            )
 
         self.running = False
         self._task = None
@@ -1487,6 +1607,7 @@ class App:
         if not self.logged_in:
             raise RuntimeError("Сначала вход.")
         self.running = True
+        self.parse_rounds += 1
         self._task = asyncio.create_task(self._again_loop(), name="again")
 
     async def _again_loop(self) -> None:
@@ -1496,11 +1617,11 @@ class App:
             random.shuffle(pool)
             shown = await self._prepare_show(
                 pool,
-                limit=creds.SHOW_LIMIT,
+                limit=None,
                 apply_extra=False,
                 channel="parser",
             )
-            if len(shown) < creds.SHOW_LIMIT:
+            if len(shown) < max(5, int(getattr(creds, "SHOW_LIMIT", 20) // 2)):
                 # добор лайвом с 3 акков
                 burst = await self.multi_burst(
                     self.min_stars,
@@ -1517,7 +1638,7 @@ class App:
                 self._save_models(extra)
                 shown = await self._prepare_show(
                     self._last_pool,
-                    limit=creds.SHOW_LIMIT,
+                    limit=None,
                     apply_extra=False,
                     channel="parser",
                 )
@@ -1529,7 +1650,10 @@ class App:
                 await self._say_lot_list(shown, channel="parser")
                 self.lots_notified += len(shown)
                 await self._say(
-                    f"{screen('Парсинг')}\nВыдал <b>{len(shown)}</b>",
+                    f"{screen('Парсинг')}\n"
+                    f"Заново · <b>{len(shown)}</b> типов\n"
+                    f"Чеков: {self.parse_coll_checks} · "
+                    f"проверок акка: {self.parse_acc_checks}",
                     reply_markup=parse_done_inline(),
                 )
             else:
@@ -1631,6 +1755,11 @@ def main_inline() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="2️⃣ Парсер по фильтрам", callback_data="menu:filters"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📡 Парсинги", callback_data="menu:jobs"
                 )
             ],
             [InlineKeyboardButton(text="3️⃣ Настройки", callback_data="menu:settings")],
@@ -1769,12 +1898,26 @@ def settings_inline() -> InlineKeyboardMarkup:
                     text=f"👤 Аккаунты ({nacc})", callback_data="menu:accounts"
                 )
             ],
+            [InlineKeyboardButton(text="📡 Парсинги", callback_data="menu:jobs")],
             [InlineKeyboardButton(text="📅 /daily", callback_data="menu:daily")],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
     )
+
+
+def jobs_inline() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if app.running:
+        rows.append(
+            [InlineKeyboardButton(text="⏹ Стоп парсер", callback_data="menu:stop")]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu:jobs")]
+    )
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def accounts_inline() -> InlineKeyboardMarkup:
@@ -2046,6 +2189,15 @@ async def cb_settings(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "menu:jobs")
+async def cb_jobs(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        app.parse_status_text(),
+        reply_markup=jobs_inline(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "menu:speed")
 async def cb_speed(callback: CallbackQuery) -> None:
     if not app.logged_in:
@@ -2141,8 +2293,13 @@ async def cb_daily(callback: CallbackQuery) -> None:
     st = app.db.get_daily_stats()
     text = (
         f"{screen('Daily')}\n"
-        f"лотов +{st['lots_new']:,} · выдано {st['lots_shown']:,}\n"
-        f"юзов +{st['users_new']:,} · NFT {st['unique_titles']:,}"
+        f"Юзов всего: <b>{st['users_total']:,}</b> · "
+        f"сегодня +{st['users_new']:,}\n"
+        f"Лотов всего: <b>{st['lots_total']:,}</b> · "
+        f"сегодня +{st['lots_new']:,}\n"
+        f"Выдано: {st['lots_shown']:,} · NFT {st['unique_titles']:,}\n"
+        f"Обход #{app.parse_rounds} · чеков {app.parse_coll_checks} · "
+        f"проверок акка {app.parse_acc_checks}"
     )
     await callback.message.edit_text(text, reply_markup=settings_inline())
     await callback.answer()
@@ -2153,8 +2310,11 @@ async def cmd_daily(message: Message) -> None:
     st = app.db.get_daily_stats()
     await message.answer(
         f"{screen('Daily')}\n"
-        f"лотов +{st['lots_new']:,} · выдано {st['lots_shown']:,}\n"
-        f"юзов +{st['users_new']:,} · NFT {st['unique_titles']:,}"
+        f"Юзов: <b>{st['users_total']:,}</b> (+{st['users_new']:,})\n"
+        f"Лотов: <b>{st['lots_total']:,}</b> (+{st['lots_new']:,})\n"
+        f"Выдано {st['lots_shown']:,} · NFT {st['unique_titles']:,}\n"
+        f"Обход #{app.parse_rounds} · чеков {app.parse_coll_checks} · "
+        f"проверок акка {app.parse_acc_checks}"
     )
 
 

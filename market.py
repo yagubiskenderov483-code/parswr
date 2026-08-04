@@ -314,6 +314,7 @@ class TelegramMarket:
         early_show_at: int = 0,
         on_early_lots: Any | None = None,
         collection_ids: list[int] | None = None,
+        stop_event: Any | None = None,
     ) -> CheckResult:
         """Поиск лотов. Может отдать early-пул для быстрой выдачи, потом добить 149."""
         started = time.monotonic()
@@ -364,6 +365,8 @@ class TelegramMarket:
 
         progress_cb = getattr(self, "_progress_cb", None)
         for i in range(0, len(batch), parallel):
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                break
             if 0 < time_budget < 1e8 and time.monotonic() - started > time_budget:
                 break
             group = batch[i : i + parallel]
@@ -374,12 +377,29 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
-            if callable(progress_cb) and (
-                stats["scanned"] % max(parallel, 15) == 0
-                or stats["scanned"] >= len(batch)
-            ):
+            # уникальные модели/типы в сыром пуле
+            titles = {
+                (lot.title or lot.model or "").strip().lower()
+                for lot in lots
+                if (lot.title or lot.model)
+            }
+            models = {
+                lot.model_key for lot in lots if getattr(lot, "model_key", None)
+            }
+            if callable(progress_cb):
                 try:
-                    await progress_cb(stats["scanned"], len(batch), len(lots))
+                    await progress_cb(
+                        stats["scanned"],
+                        len(batch),
+                        len(lots),
+                        len(titles),
+                        len(models),
+                    )
+                except TypeError:
+                    try:
+                        await progress_cb(stats["scanned"], len(batch), len(lots))
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -399,6 +419,9 @@ class TelegramMarket:
                 except Exception:  # noqa: BLE001
                     pass
 
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                break
+
             # time_budget>0 — можно рано выйти полностью
             if 0 < time_budget < 1e8 and len(matched_now) >= max(
                 limit_results * 3, limit_results
@@ -413,7 +436,7 @@ class TelegramMarket:
         random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
         random.shuffle(matched)
-        pool_n = max(limit_results * 12, 120)
+        pool_n = max(limit_results * 20, 300)
         matched = matched[:pool_n]
 
         return CheckResult(

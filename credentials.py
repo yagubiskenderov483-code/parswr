@@ -10,9 +10,14 @@ OWNER_ID = 8489947571
 MIN_STARS = 2000
 MAX_STARS = 5000
 
-PREVIEW_COUNT = 30
-SHOW_LIMIT = 30
-# 0 = только списком (как в примере), без карточек по одной
+# выдача ПО ТИПАМ (коллекциям), не фикс 30 лотов
+PER_TYPE = 1  # по одному с каждого типа NFT
+MAX_TYPES = 0  # 0 = все найденные типы (без потолка)
+# совместимость: сколько типов достаточно для ранней выдачи
+SHOW_LIMIT = 20
+PREVIEW_COUNT = 20
+
+# 0 = только списком, без карточек по одной
 NOTIFY_CARDS = 0
 
 # параллельный парсинг сразу с нескольких Telethon-акков
@@ -23,7 +28,7 @@ AFK_STATUS_EVERY = 25.0
 
 BRAND = "Neptun Parser"
 
-# Профили скорости: тихо бережёт сессию, норм — баланс, быстро — шустрее но аккуратно
+# Профили: quietly / norm / turbo
 SPEED_PROFILES: dict[str, dict] = {
     "quiet": {
         "label": "🐢 Тихо",
@@ -53,59 +58,58 @@ SPEED_PROFILES: dict[str, dict] = {
     },
     "norm": {
         "label": "⚖️ Норм",
-        "BURST_PARALLEL": 8,
-        "BURST_PER_COLLECTION": 8,
-        "BURST_MAX_COLLECTIONS": 0,
-        "BURST_GAP": 0.12,
-        "API_TIMEOUT": 6.0,
-        "BURST_EARLY_SHOW_AT": 30,
-        "CHECK_INTERVAL": 1.2,
-        "CHECK_PARALLEL": 6,
-        "CHECK_PER_COLLECTION": 6,
-        "CHECK_BATCH": 20,
-        "CHECK_GAP": 0.14,
-        "OWNER_TIMEOUT": 0.75,
-        "ENRICH_PARALLEL": 5,
-        "FILTER_BURST_PARALLEL": 8,
-        "FILTER_BURST_PER_COLLECTION": 8,
-        "FILTER_BURST_MAX_COLLECTIONS": 0,
-        "FILTER_BURST_GAP": 0.12,
-        "FILTER_LIMIT": 30,
-        "FILTER_DB_LIMIT": 30,
-        "FILTER_EARLY_SHOW_AT": 30,
-        "AFK_PAGE_LIMIT": 40,
-        "AFK_GAP": 0.22,
-        "AFK_PARALLEL": 2,
-    },
-    "fast": {
-        "label": "⚡ Быстро",
-        "BURST_PARALLEL": 28,
+        "BURST_PARALLEL": 16,
         "BURST_PER_COLLECTION": 12,
         "BURST_MAX_COLLECTIONS": 0,
-        "BURST_GAP": 0.012,
-        "API_TIMEOUT": 3.2,
-        "BURST_EARLY_SHOW_AT": 12,
-        "CHECK_INTERVAL": 0.25,
-        "CHECK_PARALLEL": 20,
+        "BURST_GAP": 0.03,
+        "API_TIMEOUT": 4.5,
+        "BURST_EARLY_SHOW_AT": 18,
+        "CHECK_INTERVAL": 0.6,
+        "CHECK_PARALLEL": 12,
         "CHECK_PER_COLLECTION": 10,
-        "CHECK_BATCH": 50,
-        "CHECK_GAP": 0.02,
-        "OWNER_TIMEOUT": 0.4,
-        "ENRICH_PARALLEL": 16,
-        "FILTER_BURST_PARALLEL": 22,
+        "CHECK_BATCH": 40,
+        "CHECK_GAP": 0.04,
+        "OWNER_TIMEOUT": 0.5,
+        "ENRICH_PARALLEL": 12,
+        "FILTER_BURST_PARALLEL": 16,
         "FILTER_BURST_PER_COLLECTION": 12,
         "FILTER_BURST_MAX_COLLECTIONS": 0,
-        "FILTER_BURST_GAP": 0.015,
-        "FILTER_LIMIT": 30,
-        "FILTER_DB_LIMIT": 30,
-        "FILTER_EARLY_SHOW_AT": 12,
+        "FILTER_BURST_GAP": 0.03,
+        "FILTER_LIMIT": 40,
+        "FILTER_DB_LIMIT": 40,
+        "FILTER_EARLY_SHOW_AT": 18,
+        "AFK_PAGE_LIMIT": 40,
+        "AFK_GAP": 0.12,
+        "AFK_PARALLEL": 3,
+    },
+    "fast": {
+        "label": "⚡ Turbo",
+        "BURST_PARALLEL": 56,
+        "BURST_PER_COLLECTION": 25,
+        "BURST_MAX_COLLECTIONS": 0,
+        "BURST_GAP": 0.0,
+        "API_TIMEOUT": 2.5,
+        "BURST_EARLY_SHOW_AT": 14,
+        "CHECK_INTERVAL": 0.1,
+        "CHECK_PARALLEL": 40,
+        "CHECK_PER_COLLECTION": 20,
+        "CHECK_BATCH": 100,
+        "CHECK_GAP": 0.0,
+        "OWNER_TIMEOUT": 0.3,
+        "ENRICH_PARALLEL": 32,
+        "FILTER_BURST_PARALLEL": 48,
+        "FILTER_BURST_PER_COLLECTION": 25,
+        "FILTER_BURST_MAX_COLLECTIONS": 0,
+        "FILTER_BURST_GAP": 0.0,
+        "FILTER_LIMIT": 80,
+        "FILTER_DB_LIMIT": 80,
+        "FILTER_EARLY_SHOW_AT": 14,
         "AFK_PAGE_LIMIT": 50,
-        "AFK_GAP": 0.08,
-        "AFK_PARALLEL": 4,
+        "AFK_GAP": 0.04,
+        "AFK_PARALLEL": 6,
     },
 }
 
-# парсер по умолчанию быстрее (тихо/норм — в Настройках)
 DEFAULT_SPEED = "fast"
 
 

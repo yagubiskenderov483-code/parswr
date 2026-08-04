@@ -1,7 +1,8 @@
-"""SQLite: модели гифтов + юзеры (AFK до 5M) + коллекции."""
+"""SQLite: модели гифтов + юзеры (AFK до 5M) + коллекции + блоклист."""
 
 from __future__ import annotations
 
+import os
 import random
 import sqlite3
 import time
@@ -10,7 +11,8 @@ from typing import Any, Iterable
 
 from market import Lot
 
-DB_PATH = Path("data") / "gifts.db"
+# GIFTS_DB_PATH — для persistent volume на деплое
+DB_PATH = Path(os.environ.get("GIFTS_DB_PATH") or (Path("data") / "gifts.db"))
 USER_CAP = 5_000_000
 
 
@@ -108,6 +110,39 @@ class GiftDB:
             """
         )
         self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blocklist (
+                key TEXT PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                user_id INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        # уже показанные продавцы/модели — без повторов между рестартами
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_sellers (
+                key TEXT PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                user_id INTEGER,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_models (
+                model_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gifts_stars ON gifts(stars)"
         )
         self._conn.execute(
@@ -121,6 +156,12 @@ class GiftDB:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_blocklist_username ON blocklist(username)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_blocklist_user_id ON blocklist(user_id)"
         )
         self._conn.commit()
 
@@ -423,8 +464,190 @@ class GiftDB:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM collections").fetchone()
         return int(row["c"] if row else 0)
 
+    @staticmethod
+    def _block_key(username: str = "", user_id: int | None = None) -> str:
+        u = (username or "").lstrip("@").strip().lower()
+        if u:
+            return f"u:{u}"
+        if user_id is not None:
+            return f"id:{int(user_id)}"
+        return ""
+
+    def block_user(
+        self,
+        *,
+        username: str = "",
+        user_id: int | None = None,
+        reason: str = "",
+    ) -> bool:
+        key = self._block_key(username, user_id)
+        if not key:
+            return False
+        now = time.time()
+        u = (username or "").lstrip("@").strip().lower()
+        self._conn.execute(
+            """
+            INSERT INTO blocklist (key, username, user_id, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE blocklist.username END,
+                user_id = COALESCE(excluded.user_id, blocklist.user_id),
+                reason = CASE WHEN excluded.reason != '' THEN excluded.reason ELSE blocklist.reason END
+            """,
+            (key, u, user_id, reason or "", now),
+        )
+        self._conn.commit()
+        return True
+
+    def unblock_user(self, *, username: str = "", user_id: int | None = None) -> bool:
+        key = self._block_key(username, user_id)
+        if not key:
+            return False
+        cur = self._conn.execute("DELETE FROM blocklist WHERE key = ?", (key,))
+        if u := (username or "").lstrip("@").strip().lower():
+            self._conn.execute(
+                "DELETE FROM blocklist WHERE lower(username) = ?", (u,)
+            )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def is_blocked(self, *, username: str = "", user_id: int | None = None) -> bool:
+        u = (username or "").lstrip("@").strip().lower()
+        if u:
+            row = self._conn.execute(
+                "SELECT 1 FROM blocklist WHERE key = ? OR lower(username) = ? LIMIT 1",
+                (f"u:{u}", u),
+            ).fetchone()
+            if row:
+                return True
+        if user_id is not None:
+            row = self._conn.execute(
+                "SELECT 1 FROM blocklist WHERE user_id = ? OR key = ? LIMIT 1",
+                (int(user_id), f"id:{int(user_id)}"),
+            ).fetchone()
+            if row:
+                return True
+        return False
+
+    def list_blocked(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT username, user_id, reason, created_at
+            FROM blocklist
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_blocked(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM blocklist").fetchone()
+        return int(row["c"] if row else 0)
+
+    def mark_seen_seller(
+        self, *, username: str = "", user_id: int | None = None
+    ) -> None:
+        key = self._block_key(username, user_id)
+        if not key:
+            return
+        now = time.time()
+        u = (username or "").lstrip("@").strip().lower()
+        self._conn.execute(
+            """
+            INSERT INTO seen_sellers (key, username, user_id, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE seen_sellers.username END,
+                user_id = COALESCE(excluded.user_id, seen_sellers.user_id),
+                last_seen = excluded.last_seen
+            """,
+            (key, u, user_id, now, now),
+        )
+        self._conn.commit()
+
+    def mark_seen_model(self, model_key: str, title: str = "") -> None:
+        mk = (model_key or "").strip()
+        if not mk:
+            return
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO seen_models (model_key, title, first_seen, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(model_key) DO UPDATE SET last_seen = excluded.last_seen
+            """,
+            (mk, title or "", now, now),
+        )
+        self._conn.commit()
+
+    def is_seen_seller(self, *, username: str = "", user_id: int | None = None) -> bool:
+        key = self._block_key(username, user_id)
+        if not key:
+            return False
+        u = (username or "").lstrip("@").strip().lower()
+        row = self._conn.execute(
+            "SELECT 1 FROM seen_sellers WHERE key = ? OR (? != '' AND username = ?) LIMIT 1",
+            (key, u, u),
+        ).fetchone()
+        return row is not None
+
+    def is_seen_model(self, model_key: str) -> bool:
+        mk = (model_key or "").strip()
+        if not mk:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM seen_models WHERE model_key = ? LIMIT 1", (mk,)
+        ).fetchone()
+        return row is not None
+
+    def load_seen_seller_keys(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT key, username, user_id FROM seen_sellers"
+        ).fetchall()
+        out: set[str] = set()
+        for r in rows:
+            if r["key"]:
+                out.add(str(r["key"]))
+            u = str(r["username"] or "").lower()
+            if u:
+                out.add(u)
+                out.add(f"u:{u}")
+            if r["user_id"] is not None:
+                out.add(f"id:{int(r['user_id'])}")
+        return out
+
+    def load_seen_model_keys(self) -> set[str]:
+        rows = self._conn.execute("SELECT model_key FROM seen_models").fetchall()
+        return {str(r["model_key"]) for r in rows if r["model_key"]}
+
+    def load_block_keys(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT key, username, user_id FROM blocklist"
+        ).fetchall()
+        out: set[str] = set()
+        for r in rows:
+            if r["key"]:
+                out.add(str(r["key"]))
+            u = str(r["username"] or "").lower()
+            if u:
+                out.add(u)
+                out.add(f"u:{u}")
+            if r["user_id"] is not None:
+                out.add(f"id:{int(r['user_id'])}")
+        return out
+
+    def checkpoint(self) -> None:
+        """Слить WAL на диск — чтобы БД переживала рестарт/деплой."""
+        try:
+            self._conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:  # noqa: BLE001
+            pass
+
     def close(self) -> None:
         try:
+            self.checkpoint()
             self._conn.close()
         except Exception:  # noqa: BLE001
             pass

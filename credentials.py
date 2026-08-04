@@ -7,21 +7,32 @@ API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 MIN_STARS = 2000
 MAX_STARS = 5000
 
-# Быстрый первый выброс
-BURST_PARALLEL = 20
+# Быстрый первый выброс — тоже все коллекции 149/149
+BURST_PARALLEL = 25
 BURST_PER_COLLECTION = 12
-BURST_MAX_COLLECTIONS = 60
+BURST_MAX_COLLECTIONS = 0  # 0 = все (149/149)
 BURST_GAP = 0.01
 API_TIMEOUT = 5.0
 
-# Чеки ~раз в секунду
-CHECK_INTERVAL = 1.0
-CHECK_PARALLEL = 10
-CHECK_PER_COLLECTION = 10
-CHECK_BATCH = 25
-CHECK_GAP = 0.03
+# Чеки: каждый чек = ВСЕ коллекции (149/149)
+CHECK_INTERVAL = 0.15
+CHECK_PARALLEL = 25
+CHECK_PER_COLLECTION = 12
+CHECK_BATCH = 0  # 0 = все коллекции за один чек
+CHECK_GAP = 0.015
 OWNER_TIMEOUT = 0.7
+# Лимит выдачи в чат — чтобы не жечь API/БД впустую
 PREVIEW_COUNT = 30
+SHOW_LIMIT = 30
+NOTIFY_CARDS = 10  # карточек с кнопкой «Блок»
+
+# Отдельный фильтр-поиск (не трогает парсер)
+FILTER_BURST_PARALLEL = 25
+FILTER_BURST_PER_COLLECTION = 12
+FILTER_BURST_MAX_COLLECTIONS = 0  # 0 = все 149/149
+FILTER_BURST_GAP = 0.01
+FILTER_LIMIT = 30
+FILTER_DB_LIMIT = 30
 
 # AFK фарм юзов по всем коллекциям
 AFK_USER_CAP = 5_000_000

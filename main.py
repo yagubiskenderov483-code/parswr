@@ -85,6 +85,9 @@ _AD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Русские: кириллица в имени/био
+_CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
+
 
 @dataclass
 class SearchFilters:
@@ -124,6 +127,10 @@ class App:
         self.min_stars = 2000.0
         self.max_stars = 5000.0
         self.range_label = "2k–5k ⭐"
+        # Отдельная сложность ТОЛЬКО для фильтр-поиска (парсер не трогает)
+        self.filter_min_stars = 2000.0
+        self.filter_max_stars = 5000.0
+        self.filter_range_label = "🟢 Лёгкий · 2k–5k"
         self.logged_in = False
         self.account_name = ""
         self.lots_notified = 0
@@ -141,6 +148,30 @@ class App:
         self.afk_collections_total = 0
         self.afk_cursor = 0
         self.filters = SearchFilters()
+        self.filter_search_running = False
+        self._filter_task: asyncio.Task | None = None
+        self.require_russian = True
+        self._blocked_keys: set[str] = set()
+        self._reload_persist_seen()
+
+    def _reload_persist_seen(self) -> None:
+        """Подтянуть блоклист + уже показанных — без повторов после рестарта."""
+        try:
+            sellers: set[str] = set()
+            for k in self.db.load_seen_seller_keys():
+                if not k:
+                    continue
+                if k.startswith("u:"):
+                    sellers.add(k[2:].lower())
+                elif k.startswith("id:"):
+                    sellers.add(k)
+                else:
+                    sellers.add(str(k).lower().lstrip("@"))
+            self._seen_sellers = sellers
+            self._seen_models = self.db.load_seen_model_keys()
+            self._blocked_keys = self.db.load_block_keys()
+        except Exception:  # noqa: BLE001
+            self._blocked_keys = set()
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -212,9 +243,16 @@ class App:
         wipe_disk_junk()
 
     def set_range(self, label: str, mn: int, mx: int) -> None:
+        """Сложность/цена парсера (монитор)."""
         self.range_label = label
         self.min_stars = float(mn)
         self.max_stars = float(mx)
+
+    def set_filter_range(self, label: str, mn: int, mx: int) -> None:
+        """Сложность ТОЛЬКО для фильтр-поиска — парсер не меняется."""
+        self.filter_range_label = label
+        self.filter_min_stars = float(mn)
+        self.filter_max_stars = float(mx)
 
     async def start_monitor(self, chat_id: int) -> None:
         if not self.logged_in:
@@ -223,9 +261,9 @@ class App:
             await self.stop_monitor()
         self.chat_id = chat_id
         self.running = True
+        # лоты-seen сбрасываем, продавцов/модели — НЕТ (без повторов юзов)
         self._seen.clear()
-        self._seen_sellers.clear()
-        self._seen_models.clear()
+        self._reload_persist_seen()
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -233,6 +271,39 @@ class App:
         self._status_msg_id = None
         self.market.reshuffle_collections()
         self._task = asyncio.create_task(self._loop(), name="monitor")
+
+    def _flush_market_users(self) -> tuple[int, int, int]:
+        """Слить юзеров из ответов маркета в БД."""
+        found = self.market.drain_users()
+        if not found:
+            return 0, 0, self.db.count_users()
+        return self.db.upsert_users(found, cap=creds.AFK_USER_CAP)
+
+    def _is_blocked_lot(self, lot: Lot) -> bool:
+        u = (lot.seller or "").lower()
+        if u and (u in self._blocked_keys or f"u:{u}" in self._blocked_keys):
+            return True
+        if lot.seller_id is not None and f"id:{lot.seller_id}" in self._blocked_keys:
+            return True
+        return self.db.is_blocked(username=lot.seller, user_id=lot.seller_id)
+
+    @staticmethod
+    def _is_russian(lot: Lot) -> bool:
+        blob = " ".join(x for x in (lot.about, lot.first_name, lot.last_name) if x)
+        return bool(blob and _CYR_RE.search(blob))
+
+    def block_seller(self, *, username: str = "", user_id: int | None = None) -> bool:
+        ok = self.db.block_user(username=username, user_id=user_id, reason="manual")
+        if ok:
+            u = (username or "").lstrip("@").strip().lower()
+            if u:
+                self._blocked_keys.add(u)
+                self._blocked_keys.add(f"u:{u}")
+                self._seen_sellers.add(u)
+            if user_id is not None:
+                self._blocked_keys.add(f"id:{int(user_id)}")
+            self.db.mark_seen_seller(username=username, user_id=user_id)
+        return ok
 
     async def stop_monitor(self) -> str:
         if not self.running and self._task is None:
@@ -302,13 +373,24 @@ class App:
                 continue
             if self._bad_username_len(lot.seller):
                 continue
+            if self._is_blocked_lot(lot):
+                continue
             if self._is_ad(lot):
+                continue
+            if self.require_russian and not self._is_russian(lot):
                 continue
             if apply_extra and not self._passes_extra_filters(lot):
                 continue
-            if track_seen and lot.owner_key in self._seen_sellers:
+            # без повторов продавцов/моделей всегда
+            if lot.owner_key in self._seen_sellers:
                 continue
-            if track_seen and lot.model_key in self._seen_models:
+            if lot.model_key in self._seen_models:
+                continue
+            if track_seen and self.db.is_seen_seller(
+                username=lot.seller, user_id=lot.seller_id
+            ):
+                continue
+            if track_seen and self.db.is_seen_model(lot.model_key):
                 continue
             if lot.owner_key in local_sellers:
                 continue
@@ -345,9 +427,15 @@ class App:
                     if out and out[-1].model_key == mk:
                         continue
                     out.append(lot)
-                    if track_seen:
-                        self._seen_sellers.add(lot.owner_key)
-                        self._seen_models.add(lot.model_key)
+                    # сразу помечаем — повторов больше не будет
+                    self._seen_sellers.add(lot.owner_key)
+                    self._seen_models.add(lot.model_key)
+                    self.db.mark_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    )
+                    self.db.mark_seen_model(
+                        lot.model_key, title=lot.model or lot.title
+                    )
                     last = mk
                     progressed = True
                     break
@@ -394,11 +482,12 @@ class App:
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
         random.shuffle(candidates)
-        # about всегда — анти-реклама; lvl/gifts/premium — если фильтры или need_full
+        # about всегда — анти-реклама / RU-проверка; не больше чем нужно для лимита
         if candidates:
-            sample_n = max((limit or 30) * 4, 48)
+            lim = limit or creds.SHOW_LIMIT
+            sample_n = min(len(candidates), max(lim * 3, 45))
             if need_full or apply_extra:
-                sample_n = max(sample_n, 80)
+                sample_n = min(len(candidates), max(sample_n, lim * 4))
             await self.market.enrich_profiles(
                 candidates[:sample_n],
                 timeout=min(creds.OWNER_TIMEOUT, 0.85),
@@ -408,97 +497,150 @@ class App:
                 [lot for lot in candidates if lot.seller_id is not None],
                 cap=creds.AFK_USER_CAP,
             )
+            self._flush_market_users()
         return self._pick_clean(
             candidates,
-            limit=limit,
+            limit=limit or creds.SHOW_LIMIT,
             apply_extra=apply_extra,
             track_seen=track_seen,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
-        """Поиск по фильтрам: старые из БД + свежие с маркета."""
-        self.chat_id = chat_id
-        f = self.filters
-        await self._say(
-            f"🔎 Фильтр-поиск · <b>{self.range_label}</b>\n"
-            f"{_filters_label(f)}\n"
-            f"Беру старые из БД + свежие с маркета…"
-        )
-        old = self.db.fetch_random_lots(
-            min_stars=self.min_stars,
-            max_stars=self.max_stars,
-            limit=50,
-            require_seller=False,
-        )
-        live: list[Lot] = []
-        try:
-            burst = await self.market.burst_search(
-                self.min_stars,
-                self.max_stars,
-                parallel=creds.BURST_PARALLEL,
-                per_collection=creds.BURST_PER_COLLECTION,
-                max_collections=min(creds.BURST_MAX_COLLECTIONS, 30),
-                gap=creds.BURST_GAP,
-                timeout=creds.API_TIMEOUT,
-                limit_results=40,
-            )
-            if burst:
-                if burst.all_lots:
-                    self._save_models(burst.all_lots)
-                live = list(burst.lots)
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = str(exc)
-            await self._say(f"⚠️ Лайв-поиск: {_esc(str(exc)[:160])}")
-
-        merged = _dedupe_lots(old + live)
-        random.shuffle(merged)
-        await self._say(
-            f"📦 Кандидатов: <b>{len(merged)}</b> "
-            f"(БД {len(old)} · лайв {len(live)})"
-        )
-        shown = await self._prepare_show(
-            merged,
-            limit=creds.PREVIEW_COUNT,
-            apply_extra=True,
-            track_seen=False,
-            need_full=True,
-        )
-        if not shown:
-            await self._say(
-                "Пусто по фильтрам. Ослабь фильтры или подожди AFK/парсинг.",
-                reply_markup=filters_inline(),
+        """Отдельный поиск по фильтрам — НЕ связан с парсером/монитором."""
+        if self.filter_search_running:
+            await self._say_to(
+                chat_id, "🔎 Фильтр-поиск уже идёт. Подожди…"
             )
             return
-        lines = []
-        for lot in shown:
-            model = lot.model or lot.title
-            meta = []
-            if lot.gifts_count is not None:
-                meta.append(f"gifts {lot.gifts_count}")
-            if lot.account_level is not None:
-                meta.append(f"lvl {lot.account_level}")
-            if lot.is_premium is False:
-                meta.append("no TGP")
-            elif lot.is_premium is True:
-                meta.append("TGP")
-            extra = f" · {', '.join(meta)}" if meta else ""
-            lines.append(
-                f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | '
-                f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
+        self.filter_search_running = True
+        f = self.filters
+        mn, mx = self.filter_min_stars, self.filter_max_stars
+        label = self.filter_range_label
+        try:
+            await self._say_to(
+                chat_id,
+                f"🔎 <b>Фильтр-поиск</b> (отдельно от парсера)\n"
+                f"Сложность: <b>{label}</b>\n"
+                f"{_filters_label(f)}\n"
+                f"БД + лайв по рынку · парсер/чеки не трогаю",
             )
-        await self._say(f"✅ Найдено: <b>{len(shown)}</b> (старые+новые, random)")
+            old = self.db.fetch_random_lots(
+                min_stars=mn,
+                max_stars=mx,
+                limit=creds.FILTER_DB_LIMIT,
+                require_seller=False,
+            )
+            live: list[Lot] = []
+            try:
+                burst = await self.market.burst_search(
+                    mn,
+                    mx,
+                    parallel=creds.FILTER_BURST_PARALLEL,
+                    per_collection=creds.FILTER_BURST_PER_COLLECTION,
+                    max_collections=creds.FILTER_BURST_MAX_COLLECTIONS,
+                    gap=creds.FILTER_BURST_GAP,
+                    timeout=creds.API_TIMEOUT,
+                    limit_results=creds.FILTER_LIMIT,
+                    bump_check=False,
+                    touch_cursor=False,
+                    time_budget=0,  # полный 149/149, парсер не трогаем
+                )
+                if burst:
+                    if burst.all_lots:
+                        self._save_models(burst.all_lots)
+                    self._flush_market_users()
+                    live = list(burst.lots)
+                    full = (
+                        burst.scanned >= burst.collections_total
+                        and burst.collections_total > 0
+                    )
+                    await self._say_to(
+                        chat_id,
+                        f"📡 Лайв: <b>{burst.scanned}</b>/"
+                        f"<b>{burst.collections_total}</b>"
+                        f"{' ✅' if full else ''} · "
+                        f"в диапазоне {len(live)} · ~{burst.elapsed:.1f}с",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                await self._say_to(
+                    chat_id, f"⚠️ Лайв-поиск: {_esc(str(exc)[:160])}"
+                )
+
+            merged = _dedupe_lots(old + live)
+            random.shuffle(merged)
+            await self._say_to(
+                chat_id,
+                f"📦 Кандидатов: <b>{len(merged)}</b> "
+                f"(БД {len(old)} · лайв {len(live)})",
+            )
+            shown = await self._prepare_show(
+                merged,
+                limit=creds.SHOW_LIMIT,
+                apply_extra=True,
+                track_seen=True,
+                need_full=True,
+            )
+            if not shown:
+                await self._say_to(
+                    chat_id,
+                    "Пусто по фильтрам. Ослабь тумблеры или смени сложность.",
+                    reply_markup=filters_inline(),
+                )
+                return
+            await self._say_to(
+                chat_id,
+                f"✅ Найдено: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} · "
+                f"фильтр-поиск (не парсер) · <b>{label}</b>",
+            )
+            await self._say_lot_list_to(chat_id, shown)
+            for lot in shown[: creds.NOTIFY_CARDS]:
+                await self._notify_lot_to(chat_id, lot, count_as_new=False)
+            await self._say_to(
+                chat_id, "Готово · фильтр-поиск.", reply_markup=filters_inline()
+            )
+        finally:
+            self.filter_search_running = False
+
+    @staticmethod
+    def _format_lot_line(lot: Lot) -> str:
+        model = lot.model or lot.title
+        meta = []
+        if lot.gifts_count is not None:
+            meta.append(f"gifts {lot.gifts_count}")
+        if lot.account_level is not None:
+            meta.append(f"lvl {lot.account_level}")
+        if lot.is_premium is False:
+            meta.append("no TGP")
+        elif lot.is_premium is True:
+            meta.append("TGP")
+        extra = f" · {', '.join(meta)}" if meta else ""
+        return (
+            f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | '
+            f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
+        )
+
+    async def _say_lot_list(self, lots: list[Lot]) -> None:
+        if self.chat_id:
+            await self._say_lot_list_to(self.chat_id, lots)
+
+    async def _say_lot_list_to(self, chat_id: int, lots: list[Lot]) -> None:
+        lines = [self._format_lot_line(lot) for lot in lots[: creds.SHOW_LIMIT]]
         for i in range(0, len(lines), 10):
-            await self._say("\n".join(lines[i : i + 10]))
-        for lot in shown[:8]:
-            await self._notify_lot(lot, count_as_new=False)
-        await self._say("Готово.", reply_markup=main_inline())
+            await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
 
     async def _say(self, text: str, reply_markup=None) -> Message | None:
-        if not self.bot or not self.chat_id:
+        if not self.chat_id:
+            return None
+        return await self._say_to(self.chat_id, text, reply_markup=reply_markup)
+
+    async def _say_to(
+        self, chat_id: int, text: str, reply_markup=None
+    ) -> Message | None:
+        if not self.bot or not chat_id:
             return None
         try:
             return await self.bot.send_message(
-                self.chat_id, text, reply_markup=reply_markup
+                chat_id, text, reply_markup=reply_markup
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("say: %s", exc)
@@ -666,11 +808,17 @@ class App:
                             "last_name": lot.last_name,
                         }
                     )
+            # юзы из страницы + всё что market накопил в drain
+            drain = self.market.drain_users()
+            if drain:
+                batch_users.extend(drain)
             ins_u, _upd_u, total_u = self.db.upsert_users(
                 batch_users, cap=creds.AFK_USER_CAP
             )
             self.afk_users_added += ins_u
             self.afk_pages += 1
+            if self.afk_pages % 5 == 0:
+                self.db.checkpoint()
 
             # если страница пустая / нет next — с начала коллекции
             new_offset = next_offset if (lots and next_offset) else ""
@@ -707,10 +855,10 @@ class App:
         self._afk_task = None
 
     async def _loop(self) -> None:
-        # 1) Быстрый выброс как FreeGiftsParser
+        # 1) Полный проход 149/149 (без фильтр-поиска)
         await self._say(
             f"⚡ Ищу свежие лоты · <b>{self.range_label}</b>\n"
-            f"Фильтры: {_filters_label(self.filters)}"
+            f"Коллекции: <b>все 149/149</b> · парсер ≠ фильтр-поиск"
         )
         try:
             burst = await self.market.burst_search(
@@ -721,7 +869,10 @@ class App:
                 max_collections=creds.BURST_MAX_COLLECTIONS,
                 gap=creds.BURST_GAP,
                 timeout=creds.API_TIMEOUT,
-                limit_results=creds.PREVIEW_COUNT,
+                limit_results=creds.SHOW_LIMIT,
+                bump_check=True,
+                touch_cursor=True,
+                time_budget=0,  # без раннего стопа — весь круг
             )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -730,43 +881,43 @@ class App:
 
         now = time.monotonic()
         if burst and (burst.all_lots or burst.lots):
-            # 1) СНАЧАЛА сохраняем все МОДЕЛИ (не юзы)
             to_save = burst.all_lots or burst.lots
             for lot in to_save:
                 self._seen.setdefault(lot.id, now)
             ins, upd = self._save_models(to_save)
+            ins_u, upd_u, total_u = self._flush_market_users()
+            self.db.upsert_users_from_lots(
+                [lot for lot in to_save if lot.seller_id is not None],
+                cap=creds.AFK_USER_CAP,
+            )
             uniq_models = self.db.count_models()
+            full = (
+                burst.scanned >= burst.collections_total
+                and burst.collections_total > 0
+            )
             await self._say(
-                f"💾 Сохранено моделей: <b>{len(to_save)}</b> "
-                f"(+{ins} новых / {upd} обновл.)\n"
-                f"🗄 В БД лотов: <b>{self.db_total}</b> · уникальных моделей: <b>{uniq_models}</b>\n"
-                f"~{burst.elapsed:.1f}с · коллекции {burst.scanned}/{burst.collections_total}"
+                f"💾 Моделей: <b>{len(to_save)}</b> (+{ins}/{upd})\n"
+                f"👤 Юзов +{ins_u} / upd {upd_u} · всего <b>{total_u:,}</b>\n"
+                f"🗄 В БД: <b>{self.db_total}</b> · уник. моделей: <b>{uniq_models}</b>\n"
+                f"Коллекции: <b>{burst.scanned}/{burst.collections_total}</b>"
+                f"{' ✅' if full else ''}\n"
+                f"~{burst.elapsed:.1f}с"
             )
 
-            # 2) Потом уже фильтр выдачи (юз/реклама/доп.фильтры)
-            use_extra = self._filters_active()
             shown = await self._prepare_show(
                 burst.lots,
-                limit=creds.PREVIEW_COUNT,
-                apply_extra=use_extra,
+                limit=creds.SHOW_LIMIT,
+                apply_extra=False,
             )
             await self._say(
-                f"🔍 К выдаче: <b>{len(shown)}</b> "
-                f"(без рекламы · без 4–5 юзов · без повторов"
-                f"{' · +фильтры' if use_extra else ''})"
+                f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
+                f"(RU · без рекламы · без 4–5 · без повторов)"
             )
             if shown:
-                lines = []
                 for lot in shown:
                     self._seen[lot.id] = now
-                    model = lot.model or lot.title
-                    lines.append(
-                        f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | '
-                        f"@{lot.seller} | {_fmt(lot.stars)}⭐"
-                    )
-                for i in range(0, len(lines), 10):
-                    await self._say("\n".join(lines[i : i + 10]))
-                for lot in shown[:5]:
+                await self._say_lot_list(shown)
+                for lot in shown[: creds.NOTIFY_CARDS]:
                     await self._notify_lot(lot, count_as_new=False)
             else:
                 await self._say("После фильтров пусто — мониторю дальше…")
@@ -781,11 +932,11 @@ class App:
             self.checks = burst.check_no
 
         await self._say(
-            "📡 Мониторю новые выставления.\nЧек ~каждую секунду.",
+            "📡 Мониторю · каждый чек <b>149/149</b> коллекций.",
             reply_markup=main_inline(),
         )
 
-        # 2) Чеки раз в секунду
+        # 2) Чеки — полный круг коллекций каждый раз
         while self.running:
             started = time.monotonic()
             try:
@@ -800,9 +951,15 @@ class App:
                 self.last_check_lots = len(result.lots)
                 self.last_error = result.error
 
-                # сразу сохраняем МОДЕЛИ из чека
                 if result.lots:
                     self._save_models(result.lots)
+                ins_u, _upd_u, total_u = self._flush_market_users()
+                if result.lots:
+                    self.db.upsert_users_from_lots(
+                        [lot for lot in result.lots if lot.seller_id is not None],
+                        cap=creds.AFK_USER_CAP,
+                    )
+                    total_u = self.db.count_users()
 
                 now = time.monotonic()
                 candidates = []
@@ -816,26 +973,39 @@ class App:
                 fresh: list[Lot] = []
                 if candidates:
                     fresh = await self._prepare_show(
-                        candidates, apply_extra=self._filters_active()
+                        candidates,
+                        limit=creds.SHOW_LIMIT,
+                        apply_extra=False,
                     )
-                    for lot in fresh:
+                    if fresh:
+                        await self._say_lot_list(fresh[: creds.SHOW_LIMIT])
+                    for lot in fresh[: creds.NOTIFY_CARDS]:
                         self.lots_notified += 1
                         await self._notify_lot(lot, count_as_new=True)
+                    self.lots_notified += max(0, len(fresh) - creds.NOTIFY_CARDS)
 
+                full = (
+                    result.scanned >= result.collections_total
+                    and result.collections_total > 0
+                )
+                if self.checks % 3 == 0:
+                    self.db.checkpoint()
                 await self._edit_status(
                     f"💓 <b>Чек #{self.checks}</b>\n"
                     f"Режим: <b>{self.range_label}</b>\n"
-                    f"Фильтры: {_filters_label(self.filters)}\n"
                     f"Обошёл коллекций: <b>{result.scanned}</b>/"
-                    f"{result.collections_total}\n"
+                    f"<b>{result.collections_total}</b>"
+                    f"{' ✅ все' if full else ''}\n"
                     f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
                     f"Новых за чек: <b>{len(fresh)}</b>\n"
                     f"Всего новых: <b>{self.lots_notified}</b>\n"
                     f"Seen: <b>{len(self._seen)}</b> · "
                     f"sellers: <b>{len(self._seen_sellers)}</b> · "
                     f"models: <b>{len(self._seen_models)}</b>\n"
+                    f"👤 Юзов в БД: <b>{total_u:,}</b> (+{ins_u})\n"
                     f"🗄 Моделей в БД: <b>{self.db_total}</b> "
                     f"(уник. {self.db.count_models()}, last {self.db_last_saved})\n"
+                    f"🚫 Блок: <b>{self.db.count_blocked()}</b>\n"
                     f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
                     f"⏱ {result.elapsed:.2f}с"
                     + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
@@ -853,41 +1023,48 @@ class App:
             await asyncio.sleep(max(0.05, creds.CHECK_INTERVAL - elapsed))
 
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
-        if not self.bot or not self.chat_id or not lot.seller:
+        if not self.chat_id:
+            return
+        await self._notify_lot_to(self.chat_id, lot, count_as_new=count_as_new)
+
+    async def _notify_lot_to(
+        self, chat_id: int, lot: Lot, count_as_new: bool
+    ) -> None:
+        if not self.bot or not chat_id or not lot.seller:
             return
         if self._bad_username_len(lot.seller):
             return
-        seller = f"@{lot.seller}"
-        title = "🆕 <b>НОВЫЙ лот</b>" if count_as_new else "🎁 <b>Лот</b>"
-        meta = []
-        if lot.gifts_count is not None:
-            meta.append(f"gifts {lot.gifts_count}")
-        if lot.account_level is not None:
-            meta.append(f"lvl {lot.account_level}")
-        if lot.is_premium is False:
-            meta.append("no TGP")
-        meta_line = f"\n📌 {_esc(', '.join(meta))}" if meta else ""
-        text = (
-            f"{title}\n\n"
-            f"🎁 <b>{_esc(lot.display)}</b>\n"
-            f"💰 <b>{_fmt(lot.stars)} ⭐</b>\n"
-            f"👤 {seller}{meta_line}\n"
-            f'🖼 <a href="{lot.nft_url}">{lot.nft_url}</a>'
-        )
+        if self._is_blocked_lot(lot):
+            return
+        text = self._format_lot_line(lot)
+        if count_as_new:
+            text = "🆕 " + text
         rows: list[list[InlineKeyboardButton]] = [
             [InlineKeyboardButton(text="🖼 NFT / LINK", url=lot.nft_url)]
         ]
+        action_row: list[InlineKeyboardButton] = []
         if re.fullmatch(r"[A-Za-z0-9_]{6,64}", lot.seller):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="✍️ Написать", url=f"https://t.me/{lot.seller}"
-                    )
-                ]
+            action_row.append(
+                InlineKeyboardButton(
+                    text="✍️ Написать", url=f"https://t.me/{lot.seller}"
+                )
             )
+            action_row.append(
+                InlineKeyboardButton(
+                    text="🚫 Блок", callback_data=f"block:{lot.seller}"
+                )
+            )
+        elif lot.seller_id is not None:
+            action_row.append(
+                InlineKeyboardButton(
+                    text="🚫 Блок", callback_data=f"blockid:{lot.seller_id}"
+                )
+            )
+        if action_row:
+            rows.append(action_row)
         try:
             await self.bot.send_message(
-                self.chat_id,
+                chat_id,
                 text,
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -956,8 +1133,22 @@ def prices_inline(prefix: str = "price") -> InlineKeyboardMarkup:
 
 def filters_inline() -> InlineKeyboardMarkup:
     f = app.filters
+    diff_row = [
+        InlineKeyboardButton(
+            text=("•" if rid == _current_filter_diff_id() else "") + short,
+            callback_data=f"fdiff:{rid}",
+        )
+        for rid, short in (
+            ("easy", "🟢"),
+            ("mid", "🟡"),
+            ("hard", "🔴"),
+            ("impos", "💀"),
+        )
+    ]
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Сложность фильтр-поиска:", callback_data="fdiff:noop")],
+            diff_row,
             [
                 InlineKeyboardButton(
                     text=("✅" if f.few_gifts else "⬜️") + " Мало гифтов",
@@ -987,13 +1178,33 @@ def filters_inline() -> InlineKeyboardMarkup:
                     text="🔎 Искать (БД+лайв)", callback_data="flt:run"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="▶️ Парсинг с этими фильтрами", callback_data="menu:parse"
-                )
-            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
+    )
+
+
+def _current_filter_diff_id() -> str:
+    for rid, _label, mn, mx in DIFFICULTIES:
+        if (
+            abs(app.filter_min_stars - mn) < 1
+            and abs(app.filter_max_stars - mx) < 1
+        ):
+            return rid
+    return ""
+
+
+def _filters_menu_text() -> str:
+    return (
+        "🧩 <b>Поиск по фильтрам</b>\n"
+        "<i>Отдельно от парсера — чеки/seen не трогает</i>\n\n"
+        f"Сложность поиска: <b>{app.filter_range_label}</b>\n"
+        f"{_filters_label(app.filters)}\n\n"
+        "🟢 лёгкий · 🟡 средний · 🔴 сложный · 💀 impossible\n"
+        "• Мало гифтов — gifts ≤ 5\n"
+        "• Мелкий lvl — rating ≤ 5\n"
+        "• Короткий юз — длина 6–8 (4–5 всегда бан)\n"
+        "• Без TGP — не Premium\n\n"
+        "Искать = старые из БД + свежие с маркета"
     )
 
 
@@ -1002,9 +1213,8 @@ def settings_inline() -> InlineKeyboardMarkup:
     afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK старт"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎯 Сложность", callback_data="menu:parse")],
-            [InlineKeyboardButton(text="🧩 Фильтры", callback_data="menu:filters")],
-            [InlineKeyboardButton(text="🔎 Цена поиска", callback_data="menu:search")],
+            [InlineKeyboardButton(text="🎯 Сложность парсера", callback_data="menu:parse")],
+            [InlineKeyboardButton(text="🧩 Фильтр-поиск", callback_data="menu:filters")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="📊 Статус", callback_data="menu:status")],
@@ -1035,23 +1245,29 @@ def _fmt(value: float) -> str:
 
 
 def wipe_disk_junk() -> None:
-    """Чистит session-мусор. gifts.db НЕ трогаем."""
+    """Чистит session-мусор. gifts.db / WAL / blocklist — НИКОГДА не трогаем."""
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
-    keep = {"gifts.db", "gifts.db-wal", "gifts.db-shm"}
+
+    def _is_gifts_db(path: Path) -> bool:
+        name = path.name.lower()
+        return name.startswith("gifts.db") or "gifts.db" in name
+
     for folder in (data, root):
         for pattern in ("*session*", "*.session*", "*.session-journal"):
             for path in folder.glob(pattern):
-                if path.is_file():
+                if path.is_file() and not _is_gifts_db(path):
                     try:
                         path.unlink()
                     except OSError:
                         pass
-        # старые telethon sqlite-сессии, но не наша БД гифтов
         for pattern in ("*.db", "*.db-*", "*.sqlite*"):
             for path in folder.glob(pattern):
-                if path.name in keep:
+                if _is_gifts_db(path):
+                    continue
+                # в data/ кроме gifts.* ничего критичного не удаляем
+                if folder == data:
                     continue
                 if path.is_file():
                     try:
@@ -1078,11 +1294,12 @@ async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
     text = prefix + (
         "💡 <b>Меню</b>\n\n"
         f"Акк: <b>{app.account_name}</b>\n"
-        f"Сложность: <b>{app.range_label}</b>\n"
+        f"Парсер: <b>{app.range_label}</b>\n"
+        f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
         f"Фильтры: {_filters_label(app.filters)}\n"
         f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b> · "
         f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
-        f"🚫 4–5 значные юзы скрыты"
+        f"🚫 4–5 значные юзы скрыты · фильтры ≠ парсер"
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_inline())
@@ -1191,17 +1408,32 @@ async def cb_filters(callback: CallbackQuery) -> None:
         await callback.answer("Сначала вход", show_alert=True)
         return
     await callback.message.edit_text(
-        "🧩 <b>Поиск по фильтрам</b>\n\n"
-        f"Цена/сложность: <b>{app.range_label}</b>\n"
-        f"{_filters_label(app.filters)}\n\n"
-        "• Мало гифтов — gifts ≤ 5\n"
-        "• Мелкий lvl — rating ≤ 5\n"
-        "• Короткий юз — длина 6–8 (4–5 всегда бан)\n"
-        "• Без TGP — не Premium\n\n"
-        "Искать = старые из БД + свежие с маркета",
+        _filters_menu_text(),
         reply_markup=filters_inline(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fdiff:"))
+async def cb_filter_diff(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    rid = (callback.data or "").split(":", 1)[-1]
+    if rid == "noop":
+        await callback.answer("Сначала выбери 🟢🟡🔴💀", show_alert=False)
+        return
+    chosen = _diff_by_id(rid)
+    if not chosen:
+        await callback.answer("?", show_alert=True)
+        return
+    label, mn, mx = chosen
+    app.set_filter_range(label, mn, mx)
+    await callback.message.edit_text(
+        _filters_menu_text(),
+        reply_markup=filters_inline(),
+    )
+    await callback.answer(f"Сложность поиска: {label}")
 
 
 @router.callback_query(F.data.startswith("flt:"))
@@ -1221,7 +1453,9 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
     elif key == "run":
         await callback.answer("Ищу…")
         await callback.message.edit_text(
-            f"🔎 Запуск фильтр-поиска…\n{_filters_label(app.filters)}",
+            f"🔎 Фильтр-поиск · <b>{app.filter_range_label}</b>\n"
+            f"{_filters_label(app.filters)}\n"
+            f"Парсер не затрагивается.",
             reply_markup=main_inline(),
         )
         await app.run_filter_search(callback.from_user.id)
@@ -1230,10 +1464,7 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
         await callback.answer("?")
         return
     await callback.message.edit_text(
-        "🧩 <b>Поиск по фильтрам</b>\n\n"
-        f"Цена/сложность: <b>{app.range_label}</b>\n"
-        f"{_filters_label(app.filters)}\n\n"
-        "Искать = старые из БД + свежие с маркета",
+        _filters_menu_text(),
         reply_markup=filters_inline(),
     )
     await callback.answer("Ок")
@@ -1243,22 +1474,14 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
 async def cb_settings(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\n"
-        f"Сложность: <b>{app.range_label}</b>\n"
+        f"Парсер: <b>{app.range_label}</b>\n"
+        f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
         f"Фильтры: {_filters_label(app.filters)}\n"
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
         f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
         f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>",
         reply_markup=settings_inline(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:search")
-async def cb_search(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "🔎 Цена поиска:",
-        reply_markup=prices_inline("search"),
     )
     await callback.answer()
 
@@ -1295,7 +1518,9 @@ async def cb_status(callback: CallbackQuery) -> None:
         "📊 <b>Статус</b>\n"
         f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b>\n"
         f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
-        f"Цена: <b>{app.range_label}</b>\n"
+        f"Фильтр-поиск: <b>{'🔎' if app.filter_search_running else '⏹'}</b>\n"
+        f"Парсер: <b>{app.range_label}</b>\n"
+        f"Фильтр-поиск цена: <b>{app.filter_range_label}</b>\n"
         f"Чеков: <b>{app.checks}</b>\n"
         f"Новых: <b>{app.lots_notified}</b>\n"
         f"Seen: <b>{len(app._seen)}</b>\n"
@@ -1303,7 +1528,7 @@ async def cb_status(callback: CallbackQuery) -> None:
         f"(уник. {app.db.count_models()})\n"
         f"👤 Юзов: <b>{app.db.count_users():,}</b> / {creds.AFK_USER_CAP:,}\n"
         f"🎁 Коллекций: <b>{app.db.count_collections()}</b>"
-        f"/{app.afk_collections_total or '?'}\n"
+        f"/{app.afk_collections_total or len(app.market._gift_ids) or '?'}\n"
         f"Err: {_esc(app.last_error[:120]) if app.last_error else '—'}",
         reply_markup=settings_inline(),
     )
@@ -1328,6 +1553,90 @@ async def _start_with_range(
         await app.start_monitor(callback.from_user.id)
     except RuntimeError as exc:
         await callback.message.answer(f"⚠️ {exc}")
+
+
+@router.callback_query(F.data.startswith("block:"))
+async def cb_block_user(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    username = (callback.data or "").split(":", 1)[-1].lstrip("@").strip()
+    if not username:
+        await callback.answer("?", show_alert=True)
+        return
+    app.block_seller(username=username)
+    await callback.answer(f"🚫 @{username} в блоклисте", show_alert=True)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@router.callback_query(F.data.startswith("blockid:"))
+async def cb_block_id(callback: CallbackQuery) -> None:
+    if not app.logged_in:
+        await callback.answer("Сначала вход", show_alert=True)
+        return
+    raw = (callback.data or "").split(":", 1)[-1]
+    try:
+        uid = int(raw)
+    except ValueError:
+        await callback.answer("?", show_alert=True)
+        return
+    app.block_seller(user_id=uid)
+    await callback.answer(f"🚫 id:{uid} в блоклисте", show_alert=True)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@router.message(Command("block"))
+async def cmd_block(message: Message) -> None:
+    if not app.logged_in:
+        await message.answer("Сначала /start")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Пример: <code>/block username</code>")
+        return
+    username = parts[1].lstrip("@").strip()
+    app.block_seller(username=username)
+    await message.answer(f"🚫 @{username} заблокирован · больше не покажу")
+
+
+@router.message(Command("unblock"))
+async def cmd_unblock(message: Message) -> None:
+    if not app.logged_in:
+        await message.answer("Сначала /start")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Пример: <code>/unblock username</code>")
+        return
+    username = parts[1].lstrip("@").strip()
+    app.db.unblock_user(username=username)
+    app._blocked_keys.discard(username.lower())
+    app._blocked_keys.discard(f"u:{username.lower()}")
+    app._seen_sellers.discard(username.lower())
+    await message.answer(f"✅ @{username} разблокирован")
+
+
+@router.message(Command("blocked"))
+async def cmd_blocked(message: Message) -> None:
+    rows = app.db.list_blocked(40)
+    if not rows:
+        await message.answer("Блоклист пуст.")
+        return
+    lines = []
+    for r in rows:
+        u = r.get("username") or ""
+        uid = r.get("user_id")
+        label = f"@{u}" if u else f"id:{uid}"
+        lines.append(f"• {label}")
+    await message.answer(
+        f"🚫 Блоклист ({app.db.count_blocked()}):\n" + "\n".join(lines)
+    )
 
 
 @router.callback_query(F.data.startswith("diff:"))
@@ -1360,6 +1669,7 @@ async def cb_price_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("search:"))
 async def cb_price_search(callback: CallbackQuery) -> None:
+    """Legacy: цена только для парсера (фильтр-поиск — через fdiff)."""
     rid = (callback.data or "").split(":", 1)[-1]
     chosen = _range_by_id(rid)
     if not chosen:
@@ -1369,16 +1679,9 @@ async def cb_price_search(callback: CallbackQuery) -> None:
     app.set_range(label, mn, mx)
     if app.running:
         await app.start_monitor(callback.from_user.id)
-        text = (
-            f"🔎 Переключил на <b>{label}</b>, перезапустил.\n"
-            f"Фильтры: {_filters_label(app.filters)}"
-        )
+        text = f"▶️ Парсер: <b>{label}</b>, перезапустил."
     else:
-        text = (
-            f"🔎 Цена/сложность: <b>{label}</b>.\n"
-            f"Фильтры: {_filters_label(app.filters)}\n"
-            f"Жми Парсинг или Искать в фильтрах."
-        )
+        text = f"▶️ Парсер: <b>{label}</b>. Жми Парсинг."
     await callback.message.edit_text(text, reply_markup=main_inline())
     await callback.answer("Ок")
 
@@ -1394,6 +1697,9 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Меню"),
             BotCommand(command="stop", description="Стоп"),
+            BotCommand(command="block", description="Блок @user"),
+            BotCommand(command="unblock", description="Разблок @user"),
+            BotCommand(command="blocked", description="Список блоклиста"),
             BotCommand(command="logout", description="Сброс акка"),
         ]
     )

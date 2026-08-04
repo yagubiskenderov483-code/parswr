@@ -158,8 +158,10 @@ env.bak/
 venv.bak/
 
 # Runtime / secrets
-data/
+data/*
+!data/gifts.db
 *.db
+!data/gifts.db
 *.db-journal
 *.session
 *.session-journal

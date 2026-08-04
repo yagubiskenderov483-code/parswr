@@ -105,6 +105,7 @@ class TelegramMarket:
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
         self._profile_cache: dict[int, dict[str, Any]] = {}
+        self._found_users: list[dict[str, Any]] = []
         self.check_no = 0
         self.last_error = ""
 
@@ -113,10 +114,24 @@ class TelegramMarket:
         self._gift_ids.clear()
         self._owner_cache.clear()
         self._profile_cache.clear()
+        self._found_users.clear()
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
         self.last_error = ""
+
+    def drain_users(self) -> list[dict[str, Any]]:
+        """Забрать юзеров, собранных из ответов маркета (для записи в БД)."""
+        out = self._found_users
+        self._found_users = []
+        return out
+
+    def _remember_users(self, users: list[dict[str, Any]] | Any) -> None:
+        if not users:
+            return
+        if not isinstance(users, list):
+            return
+        self._found_users.extend(users)
 
     async def ensure_connected(self) -> None:
         if not self.client.is_connected():
@@ -171,18 +186,26 @@ class TelegramMarket:
         gap: float = 0.02,
         timeout: float = 8.0,
         limit_results: int = 25,
+        bump_check: bool = True,
+        touch_cursor: bool = True,
+        time_budget: float = 3.5,
     ) -> CheckResult:
-        """Быстрый поиск свежих лотов в диапазоне — цель ~2–4 сек."""
+        """Быстрый поиск свежих лотов в диапазоне.
+
+        bump_check/touch_cursor=False — для фильтр-поиска, чтобы не трогать парсер.
+        """
         started = time.monotonic()
-        self.check_no += 1
+        if bump_check:
+            self.check_no += 1
         stats = {"ok": 0, "errors": 0, "floods": 0, "scanned": 0}
 
         try:
             gift_ids = await self.load_collections()
         except Exception as exc:  # noqa: BLE001
-            self.last_error = str(exc)
+            if bump_check:
+                self.last_error = str(exc)
             return CheckResult(
-                check_no=self.check_no,
+                check_no=self.check_no if bump_check else 0,
                 scanned=0,
                 lots=[],
                 collections_total=0,
@@ -191,11 +214,19 @@ class TelegramMarket:
                 error=str(exc),
             )
 
-        # каждый burst — новый рандомный старт
-        self.reshuffle_collections()
-        gift_ids = self._gift_ids
-        batch = list(gift_ids[:max_collections])
-        random.shuffle(batch)
+        saved_ids = list(self._gift_ids)
+        saved_cursor = self._cursor
+        if touch_cursor:
+            self.reshuffle_collections()
+            ids = list(self._gift_ids)
+        else:
+            ids = list(gift_ids)
+            random.shuffle(ids)
+        if max_collections <= 0 or max_collections >= len(ids):
+            batch = ids
+        else:
+            batch = list(ids[:max_collections])
+            random.shuffle(batch)
         sem = asyncio.Semaphore(parallel)
         lots: list[Lot] = []
 
@@ -205,9 +236,9 @@ class TelegramMarket:
                     gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
                 )
 
-        # кусками; стоп когда набрали preview или вышли по времени
+        # кусками по всем коллекциям; early-stop только если time_budget > 0
         for i in range(0, len(batch), parallel):
-            if time.monotonic() - started > 3.5:
+            if 0 < time_budget < 1e8 and time.monotonic() - started > time_budget:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
@@ -217,23 +248,29 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
-            matched_now = sum(
-                1 for lot in _dedupe(lots) if min_stars <= lot.stars <= max_stars
-            )
-            if matched_now >= limit_results:
-                break
+            # early-stop по лимиту лотов — только для «быстрого» режима с бюджетом
+            if 0 < time_budget < 1e8:
+                matched_now = sum(
+                    1 for lot in _dedupe(lots) if min_stars <= lot.stars <= max_stars
+                )
+                if matched_now >= max(limit_results * 3, limit_results):
+                    break
+
+        if not touch_cursor:
+            # вернуть курсор/порядок парсера как был
+            self._gift_ids = saved_ids
+            self._cursor = saved_cursor
 
         unique = _dedupe(lots)
         random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
         random.shuffle(matched)
-        # ещё раз перемешаем «окна», чтобы первые N не были из одних коллекций
         matched = matched[: max(limit_results * 2, limit_results)]
         random.shuffle(matched)
         matched = matched[:limit_results]
 
         return CheckResult(
-            check_no=self.check_no,
+            check_no=self.check_no if bump_check else 0,
             scanned=stats["scanned"],
             lots=matched,
             collections_total=len(gift_ids),
@@ -241,7 +278,7 @@ class TelegramMarket:
             errors=stats["errors"],
             floods=stats["floods"],
             elapsed=time.monotonic() - started,
-            error=self.last_error,
+            error=self.last_error if bump_check else "",
             all_lots=unique,
         )
 
@@ -283,9 +320,16 @@ class TelegramMarket:
             )
 
         n = len(gift_ids)
-        take = min(n, batch_size)
-        batch = [gift_ids[(self._cursor + i) % n] for i in range(take)]
-        self._cursor = (self._cursor + take) % n
+        # batch_size<=0 → все коллекции за один чек (149/149)
+        if batch_size <= 0 or batch_size >= n:
+            take = n
+            batch = list(gift_ids)
+            random.shuffle(batch)
+            self._cursor = 0
+        else:
+            take = min(n, batch_size)
+            batch = [gift_ids[(self._cursor + i) % n] for i in range(take)]
+            self._cursor = (self._cursor + take) % n
 
         sem = asyncio.Semaphore(parallel)
 
@@ -295,14 +339,16 @@ class TelegramMarket:
                     gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
                 )
 
-        parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
         lots: list[Lot] = []
-        for part in parts:
-            stats["scanned"] += 1
-            if isinstance(part, list):
-                lots.extend(part)
-            else:
-                stats["errors"] += 1
+        for i in range(0, len(batch), parallel):
+            group = batch[i : i + parallel]
+            parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
+            for part in parts:
+                stats["scanned"] += 1
+                if isinstance(part, list):
+                    lots.extend(part)
+                else:
+                    stats["errors"] += 1
 
         unique = _dedupe(lots)
         random.shuffle(unique)
@@ -466,6 +512,33 @@ class TelegramMarket:
 
         lots = _parse_result(result)
         users = _extract_users(result)
+        self._remember_users(users)
+        # также продавцы с лотов — чтобы юзы точно копились
+        for lot in lots:
+            if lot.seller_id is None:
+                continue
+            users.append(
+                {
+                    "user_id": lot.seller_id,
+                    "username": lot.seller,
+                    "first_name": lot.first_name,
+                    "last_name": lot.last_name,
+                    "is_premium": lot.is_premium,
+                }
+            )
+        self._remember_users(
+            [
+                {
+                    "user_id": lot.seller_id,
+                    "username": lot.seller,
+                    "first_name": lot.first_name,
+                    "last_name": lot.last_name,
+                    "is_premium": lot.is_premium,
+                }
+                for lot in lots
+                if lot.seller_id is not None
+            ]
+        )
         next_offset = str(getattr(result, "next_offset", "") or "")
         try:
             total = int(getattr(result, "count", 0) or 0)
@@ -488,15 +561,31 @@ class TelegramMarket:
         async def _do() -> list[Lot]:
             result = await self._request(gift_id, limit, True, stats, gap, timeout)
             lots = _parse_result(result) if result is not None else []
+            if result is not None:
+                self._remember_users(_extract_users(result))
             if not lots:
                 result2 = await self._request(
                     gift_id, limit, False, stats, gap, timeout
                 )
                 if result2 is not None:
                     lots = _parse_result(result2)
+                    self._remember_users(_extract_users(result2))
                     result = result2
             if lots:
                 stats["ok"] += 1
+                self._remember_users(
+                    [
+                        {
+                            "user_id": lot.seller_id,
+                            "username": lot.seller,
+                            "first_name": lot.first_name,
+                            "last_name": lot.last_name,
+                            "is_premium": lot.is_premium,
+                        }
+                        for lot in lots
+                        if lot.seller_id is not None
+                    ]
+                )
             elif result is None:
                 stats["errors"] += 1
             return lots

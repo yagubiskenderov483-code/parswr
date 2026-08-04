@@ -15,12 +15,12 @@ BURST_GAP = 0.01
 API_TIMEOUT = 5.0
 
 # Чеки: каждый чек = ВСЕ коллекции (149/149)
-CHECK_INTERVAL = 0.15
-CHECK_PARALLEL = 25
-CHECK_PER_COLLECTION = 12
+CHECK_INTERVAL = 0.2
+CHECK_PARALLEL = 18
+CHECK_PER_COLLECTION = 10
 CHECK_BATCH = 0  # 0 = все коллекции за один чек
-CHECK_GAP = 0.015
-OWNER_TIMEOUT = 0.7
+CHECK_GAP = 0.02
+OWNER_TIMEOUT = 0.9
 # Лимит выдачи в чат — чтобы не жечь API/БД впустую
 PREVIEW_COUNT = 30
 SHOW_LIMIT = 30

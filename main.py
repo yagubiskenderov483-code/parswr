@@ -85,7 +85,7 @@ _AD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Русские: кириллица в имени/био
+# Русские: кириллица в нике/имени/био/описании (просто и достаточно)
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
 
 
@@ -289,8 +289,16 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        blob = " ".join(x for x in (lot.about, lot.first_name, lot.last_name) if x)
-        return bool(blob and _CYR_RE.search(blob))
+        """Простая RU-проверка: кириллица в имени / фамилии / био (опис).
+
+        Ник (@username) почти всегда латиница — смотрим display name + about.
+        Аву/историю подарков API так не отдаёт текстом.
+        """
+        parts = [lot.first_name or "", lot.last_name or "", lot.about or ""]
+        blob = " ".join(p for p in parts if p).strip()
+        if not blob:
+            return False
+        return bool(_CYR_RE.search(blob))
 
     def block_seller(self, *, username: str = "", user_id: int | None = None) -> bool:
         ok = self.db.block_user(username=username, user_id=user_id, reason="manual")
@@ -482,22 +490,25 @@ class App:
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
         random.shuffle(candidates)
-        # about всегда — анти-реклама / RU-проверка; не больше чем нужно для лимита
+        # био/имя/ник — для анти-рекламы и простой RU-проверки (кириллица)
         if candidates:
             lim = limit or creds.SHOW_LIMIT
-            sample_n = min(len(candidates), max(lim * 3, 45))
+            # берём запас: много отсеется по RU / рекламе / повторам
+            sample_n = min(len(candidates), max(lim * 8, 80))
             if need_full or apply_extra:
-                sample_n = min(len(candidates), max(sample_n, lim * 4))
+                sample_n = min(len(candidates), max(sample_n, lim * 10))
             await self.market.enrich_profiles(
                 candidates[:sample_n],
-                timeout=min(creds.OWNER_TIMEOUT, 0.85),
-                parallel=10,
+                timeout=min(creds.OWNER_TIMEOUT, 1.0),
+                parallel=12,
             )
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],
                 cap=creds.AFK_USER_CAP,
             )
             self._flush_market_users()
+            # в пул на pick — только уже обогащённые (есть шанс пройти RU)
+            candidates = candidates[:sample_n]
         return self._pick_clean(
             candidates,
             limit=limit or creds.SHOW_LIMIT,
@@ -858,8 +869,23 @@ class App:
         # 1) Полный проход 149/149 (без фильтр-поиска)
         await self._say(
             f"⚡ Ищу свежие лоты · <b>{self.range_label}</b>\n"
-            f"Коллекции: <b>все 149/149</b> · парсер ≠ фильтр-поиск"
+            f"Коллекции: <b>все / 149</b> · идёт скан…"
         )
+        last_prog = 0.0
+
+        async def _burst_progress(done: int, total: int, lots_n: int) -> None:
+            nonlocal last_prog
+            nowp = time.monotonic()
+            if nowp - last_prog < 2.5 and done < total:
+                return
+            last_prog = nowp
+            await self._edit_status(
+                f"⚡ Скан коллекций: <b>{done}/{total}</b>\n"
+                f"Лотов сырых: <b>{lots_n}</b>\n"
+                f"Режим: <b>{self.range_label}</b>"
+            )
+
+        self.market._progress_cb = _burst_progress
         try:
             burst = await self.market.burst_search(
                 self.min_stars,
@@ -878,6 +904,8 @@ class App:
             self.last_error = str(exc)
             await self._say(f"⚠️ Ошибка поиска: {_esc(str(exc)[:200])}")
             burst = None
+        finally:
+            self.market._progress_cb = None
 
         now = time.monotonic()
         if burst and (burst.all_lots or burst.lots):
@@ -904,14 +932,21 @@ class App:
                 f"~{burst.elapsed:.1f}с"
             )
 
+            # в выдачу — весь ценовой пул (не только 30 сырых)
+            price_pool = [
+                lot
+                for lot in (burst.all_lots or burst.lots)
+                if self._in_price(lot)
+            ]
+            random.shuffle(price_pool)
             shown = await self._prepare_show(
-                burst.lots,
+                price_pool or list(burst.lots),
                 limit=creds.SHOW_LIMIT,
                 apply_extra=False,
             )
             await self._say(
                 f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                f"(RU · без рекламы · без 4–5 · без повторов)"
+                f"(кириллица в имени/био · без рекламы · без 4–5 · без повторов)"
             )
             if shown:
                 for lot in shown:
@@ -920,7 +955,10 @@ class App:
                 for lot in shown[: creds.NOTIFY_CARDS]:
                     await self._notify_lot(lot, count_as_new=False)
             else:
-                await self._say("После фильтров пусто — мониторю дальше…")
+                await self._say(
+                    "После фильтров пусто (мало RU-профилей в этом круге) — "
+                    "мониторю дальше…"
+                )
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
             await self._say(

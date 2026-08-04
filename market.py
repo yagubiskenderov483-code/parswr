@@ -106,6 +106,7 @@ class TelegramMarket:
         self._owner_cache: dict[str, str] = {}
         self._profile_cache: dict[int, dict[str, Any]] = {}
         self._found_users: list[dict[str, Any]] = []
+        self._progress_cb = None
         self.check_no = 0
         self.last_error = ""
 
@@ -115,6 +116,7 @@ class TelegramMarket:
         self._owner_cache.clear()
         self._profile_cache.clear()
         self._found_users.clear()
+        self._progress_cb = None
         self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
@@ -237,6 +239,7 @@ class TelegramMarket:
                 )
 
         # кусками по всем коллекциям; early-stop только если time_budget > 0
+        progress_cb = getattr(self, "_progress_cb", None)
         for i in range(0, len(batch), parallel):
             if 0 < time_budget < 1e8 and time.monotonic() - started > time_budget:
                 break
@@ -248,6 +251,14 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
+            if callable(progress_cb) and (
+                stats["scanned"] % max(parallel * 2, 20) == 0
+                or stats["scanned"] >= len(batch)
+            ):
+                try:
+                    await progress_cb(stats["scanned"], len(batch), len(lots))
+                except Exception:  # noqa: BLE001
+                    pass
             # early-stop по лимиту лотов — только для «быстрого» режима с бюджетом
             if 0 < time_budget < 1e8:
                 matched_now = sum(
@@ -265,9 +276,9 @@ class TelegramMarket:
         random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
         random.shuffle(matched)
-        matched = matched[: max(limit_results * 2, limit_results)]
-        random.shuffle(matched)
-        matched = matched[:limit_results]
+        # большой пул на выдачу — дальше отфильтруют RU/рекламу/повторы
+        pool_n = max(limit_results * 12, 120)
+        matched = matched[:pool_n]
 
         return CheckResult(
             check_no=self.check_no if bump_check else 0,

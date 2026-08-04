@@ -154,10 +154,20 @@ class SearchFilters:
     long_username: bool = False  # длинный юз (9+)
     no_premium: bool = False  # без TGP
     online_only: bool = False  # только кто сейчас в сети
+    fresh_only: bool = False  # только свежие из БД (48ч)
+    rare_types: bool = False  # редкие/мало показанные типы
+    random_mix: bool = True  # каждый поиск — рандомные мягкие предпочтения
     max_gifts: int = 5
     max_level: int = 5
     short_user_max: int = 8
     long_user_min: int = 9
+    # активный рандом-микс (выставляется на запуск поиска)
+    spice_no_model: bool = False  # только с заполненной моделью
+    spice_mid_user: bool = False  # юз 7–14
+    spice_has_bio: bool = False  # уже есть имя/био в БД
+    spice_fresh_boost: bool = False  # подмешать свежие 72ч сильнее
+    spice_low_stars: bool = False  # нижняя половина диапазона цены
+
 
 
 class AuthStates(StatesGroup):
@@ -656,25 +666,32 @@ class App:
         return out
 
     def _mark_delivered(self, lots: list[Lot], *, channel: str) -> None:
-        """Юзы + типы — больше не повторяем."""
+        """Юзы + типы — без повторов в своём канале."""
         for lot in lots:
-            self._seen_sellers.add(lot.owner_key)
             tk = self._title_key(lot)
-            if tk:
-                self._seen_titles.add(tk)
-                self._recent_titles.append(tk)
-                if channel == "filter":
+            if channel == "filter":
+                self._filter_seen_sellers.add(lot.owner_key)
+                self._filter_seen_models.add(lot.model_key)
+                if tk:
                     self._filter_recent_titles.append(tk)
-                    self._filter_seen_sellers.add(lot.owner_key)
-                    self._filter_seen_models.add(lot.model_key)
-            try:
-                self.db.mark_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                )
-                if lot.title or tk:
-                    self.db.bump_collection_shown(lot.title or tk or "")
-            except Exception:  # noqa: BLE001
-                pass
+                try:
+                    if lot.title or tk:
+                        self.db.bump_collection_shown(lot.title or tk or "")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                self._seen_sellers.add(lot.owner_key)
+                if tk:
+                    self._seen_titles.add(tk)
+                    self._recent_titles.append(tk)
+                try:
+                    self.db.mark_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    )
+                    if lot.title or tk:
+                        self.db.bump_collection_shown(lot.title or tk or "")
+                except Exception:  # noqa: BLE001
+                    pass
         if len(self._recent_titles) > 400:
             del self._recent_titles[:-400]
         if len(self._filter_recent_titles) > 400:
@@ -1066,10 +1083,41 @@ class App:
             or f.long_username
             or f.no_premium
             or f.online_only
+            or f.fresh_only
+            or f.rare_types
+            or f.spice_no_model
+            or f.spice_mid_user
+            or f.spice_has_bio
+            or f.spice_low_stars
         )
 
+    def _roll_random_spice(self) -> str:
+        """Рандомные мягкие предпочтения на этот поиск."""
+        f = self.filters
+        f.spice_no_model = False
+        f.spice_mid_user = False
+        f.spice_has_bio = False
+        f.spice_fresh_boost = False
+        f.spice_low_stars = False
+        if not f.random_mix:
+            return ""
+        opts = [
+            ("model", "spice_no_model"),
+            ("mid-юз", "spice_mid_user"),
+            ("bio", "spice_has_bio"),
+            ("свежие", "spice_fresh_boost"),
+            ("дешевле", "spice_low_stars"),
+        ]
+        random.shuffle(opts)
+        picked = opts[: random.randint(1, 2)]
+        labels: list[str] = []
+        for label, attr in picked:
+            setattr(f, attr, True)
+            labels.append(label)
+        return " · 🎲 " + "+".join(labels) if labels else ""
+
     def _passes_extra_filters(self, lot: Lot) -> bool:
-        """TGP/lvl/длинный юз — жёстко, без проскока в fallback."""
+        """TGP/lvl/длинный юз/рандом-spice — жёстко, без проскока в fallback."""
         f = self.filters
         if f.few_gifts:
             if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
@@ -1090,6 +1138,21 @@ class App:
                 return False
         if f.online_only:
             if lot.is_online is False:
+                return False
+        # рандом-spice (мягкие, но если включены — режем)
+        if f.spice_no_model and not (lot.model or "").strip():
+            return False
+        if f.spice_mid_user:
+            n = len(lot.seller or "")
+            if n < 7 or n > 14:
+                return False
+        if f.spice_has_bio and not (
+            lot.first_name or lot.last_name or lot.about
+        ):
+            return False
+        if f.spice_low_stars:
+            mid = (self.filter_min_stars + self.filter_max_stars) / 2.0
+            if lot.stars > mid:
                 return False
         return True
 
@@ -1112,30 +1175,27 @@ class App:
         want_ru = (
             self.require_russian if require_russian is None else bool(require_russian)
         )
-        # типы: парсер+фильтры — без повторов (сессия + уже выданные)
+        # типы: каждый канал — свой seen (фильтры ≠ парсер)
         seen_titles: set[str] = set()
-        if channel in ("parser", "filter"):
+        if channel == "parser":
             seen_titles = set(self._seen_titles) | set(self._recent_titles[-200:])
-            if is_filter:
-                seen_titles |= set(self._filter_recent_titles[-200:])
+        elif is_filter:
+            seen_titles = set(self._filter_recent_titles[-300:])
         if is_old or ignore_seen:
             seen_sellers: set[str] = set()
             seen_models: set[str] = set()
             recent_list: list[str] = []
+        elif is_filter:
+            seen_sellers = set(self._filter_seen_sellers)
+            seen_models = set(self._filter_seen_models)
+            recent_list = self._filter_recent_titles
         else:
-            # владельцы общие — не повторяем ни в парсере, ни в фильтрах
             seen_sellers = set(self._seen_sellers)
-            if is_filter:
-                seen_sellers |= set(self._filter_seen_sellers)
-            seen_models = (
-                self._filter_seen_models if is_filter else self._seen_models
-            )
-            recent_list = (
-                self._filter_recent_titles if is_filter else self._recent_titles
-            )
-        always_block_sellers = set(self._seen_sellers)
-        if is_filter:
-            always_block_sellers |= set(self._filter_seen_sellers)
+            seen_models = self._seen_models
+            recent_list = self._recent_titles
+        always_block_sellers = (
+            set(self._filter_seen_sellers) if is_filter else set(self._seen_sellers)
+        )
 
         lots = list(lots)
         random.shuffle(lots)
@@ -1450,19 +1510,21 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
-        # без уже выданных юзов/типов
-        if channel in ("parser", "filter"):
+        # без уже выданных юзов/типов — каналы раздельно
+        if channel == "parser":
             blocked_t = set(self._seen_titles) | set(self._recent_titles[-200:])
-            if channel == "filter":
-                blocked_t |= set(self._filter_recent_titles[-200:])
             candidates = [
                 lot
                 for lot in candidates
                 if lot.owner_key not in self._seen_sellers
-                and (
-                    channel != "filter"
-                    or lot.owner_key not in self._filter_seen_sellers
-                )
+                and self._title_key(lot) not in blocked_t
+            ]
+        elif channel == "filter":
+            blocked_t = set(self._filter_recent_titles[-300:])
+            candidates = [
+                lot
+                for lot in candidates
+                if lot.owner_key not in self._filter_seen_sellers
                 and self._title_key(lot) not in blocked_t
             ]
 
@@ -1475,12 +1537,12 @@ class App:
             want_ru = True
 
         if channel == "filter" and candidates:
-            # === ОСНОВА: фильтры — разнообразие типов, ~30, free DM ===
+            # === ОСНОВА: фильтры — БД+live, максимум разных типов ===
             mn_f, mx_f = self.filter_min_stars, self.filter_max_stars
             candidates = [
                 lot for lot in candidates if mn_f <= lot.stars <= mx_f
             ]
-            # дешёвые фильтры до API (юз / известный TGP)
+            # дешёвые фильтры до API (юз / TGP / spice)
             if self._filters_active():
                 pre: list[Lot] = []
                 for lot in candidates:
@@ -1493,19 +1555,37 @@ class App:
                             continue
                     if self.filters.no_premium and lot.is_premium is True:
                         continue
+                    if self.filters.spice_no_model and not (lot.model or "").strip():
+                        continue
+                    if self.filters.spice_mid_user:
+                        n = len(lot.seller or "")
+                        if n < 7 or n > 14:
+                            continue
+                    if self.filters.spice_low_stars:
+                        mid = (mn_f + mx_f) / 2.0
+                        if lot.stars > mid:
+                            continue
+                    if self.filters.spice_has_bio and not (
+                        lot.first_name or lot.last_name or lot.about
+                    ):
+                        # ещё без био — оставим, enrich доберёт
+                        pass
                     pre.append(lot)
-                candidates = pre
+                candidates = pre or candidates
             already_ru = [lot for lot in candidates if self._is_russian(lot)]
             need_bio = [lot for lot in candidates if not self._is_russian(lot)]
-            # ~100 разных типов: сначала RU, потом добор
-            sample = self._sample_diverse_titles(already_ru, 100)
-            if len({self._title_key(x) for x in sample}) < 40:
+            # большой разнообразный сэмпл: цель ≥30 типов после отсева
+            sample = self._sample_diverse_titles(already_ru, 140)
+            if len({self._title_key(x) for x in sample}) < 50:
                 sample = _dedupe_lots(
-                    sample + self._sample_diverse_titles(need_bio, 120)
+                    sample + self._sample_diverse_titles(need_bio, 160)
+                )
+            if len(sample) < 40:
+                sample = _dedupe_lots(
+                    sample + self._sample_diverse_titles(candidates, 200)
                 )
             need_lvl = bool(self.filters.low_level or self.filters.few_gifts)
             if need_lvl or self.filters.no_premium:
-                # для lvl/gifts/TGP — enrich всем в сэмпле
                 need_enr = list(sample)
             else:
                 need_enr = [
@@ -1532,7 +1612,6 @@ class App:
                 )
                 self.parse_acc_checks += len(sample)
             self._ingest_always(sample)
-            # платных Stars / premium-DM сразу выкидываем
             candidates = [lot for lot in sample if lot.free_dm is not False]
             if self._filters_active():
                 candidates = [
@@ -1540,7 +1619,6 @@ class App:
                     for lot in candidates
                     if self._passes_extra_filters(lot)
                 ]
-            # мало уникальных RU — короткая волна по новым типам
             ru_titles = {
                 self._title_key(x)
                 for x in candidates
@@ -1554,7 +1632,7 @@ class App:
                     for lot in need_bio
                     if lot.id not in used and self._title_key(lot) not in used_t
                 ]
-                wave2 = self._sample_diverse_titles(left, 80)
+                wave2 = self._sample_diverse_titles(left, 120)
                 if wave2:
                     await self.market.enrich_profiles(
                         wave2,
@@ -1661,62 +1739,123 @@ class App:
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
-        """Отдельный поиск по фильтрам — НЕ связан с парсером/монитором."""
+        """Фильтр-поиск: БД (основа) + live, максимум новых уникальных лотов."""
         if self.filter_search_running:
             await self._say_to(chat_id, f"{screen('Фильтры')}\nуже идёт")
             return
         self.filter_search_running = True
-        # типы/юзы сессии не чистим — без повторов между запусками
-        # если пул истощён — мягко освободим старую половину
-        if len(self._filter_recent_titles) > 80:
-            drop = self._filter_recent_titles[: len(self._filter_recent_titles) // 2]
-            drop_set = set(drop)
-            self._filter_recent_titles = self._filter_recent_titles[len(drop) :]
-            self._seen_titles -= drop_set
-            # часть владельцев тоже — иначе после 2–3 прогонов 0
-            if len(self._filter_seen_sellers) > 40:
-                keep = list(self._filter_seen_sellers)
-                random.shuffle(keep)
-                self._filter_seen_sellers = set(keep[len(keep) // 2 :])
-                self._seen_sellers -= set(keep[: len(keep) // 2])
-                self._filter_seen_models.clear()
         await self.pause_db_farm()
         f = self.filters
         mn, mx = self.filter_min_stars, self.filter_max_stars
         label = self.filter_range_label
+        spice_note = self._roll_random_spice()
+        target_n = max(30, int(creds.SHOW_LIMIT))
         try:
-            online_note = " · 🟢 в сети" if f.online_only else ""
-            await self._say_to(chat_id, f"{screen('Фильтры')}\n{label}{online_note}")
-            db_lim = max(800, int(getattr(creds, "FILTER_DB_LIMIT", 120)) * 6)
-            old = self.db.fetch_random_lots(
-                min_stars=mn,
-                max_stars=mx,
-                limit=db_lim,
-                require_seller=False,
-            )
-            live: list[Lot] = []
+            db_n = 0
             try:
-                burst = await self.multi_burst(
-                    mn,
-                    mx,
-                    progress_cb=None,
-                    early_show_at=0,
-                )
-                if burst:
-                    raw = list(burst.all_lots or burst.lots or [])
-                    if raw:
-                        self._save_models(raw)
-                    self._flush_market_users()
-                    live = list(burst.lots or raw)
-            except Exception as exc:  # noqa: BLE001
-                await self._say_to(
-                    chat_id, f"{screen('Фильтры')}\n⚠️ {_esc(str(exc)[:120])}"
-                )
+                db_n = self.db.count_in_range(min_stars=mn, max_stars=mx)
+            except Exception:  # noqa: BLE001
+                db_n = self.db.count()
+            notes = []
+            if f.online_only:
+                notes.append("🟢 в сети")
+            if f.fresh_only:
+                notes.append("🆕 48ч")
+            if f.rare_types:
+                notes.append("💎 редкие")
+            extra = (" · " + " · ".join(notes)) if notes else ""
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\n{label}{extra}{spice_note}\n"
+                f"БД в диапазоне: <b>{db_n}</b>",
+            )
 
+            async def _db_pool(*, clear_seen: bool = False) -> list[Lot]:
+                if clear_seen:
+                    self._filter_seen_sellers.clear()
+                    self._filter_seen_models.clear()
+                    self._filter_recent_titles.clear()
+                hours = 48.0 if (f.fresh_only or f.spice_fresh_boost) else 72.0
+                if f.fresh_only:
+                    hours = 48.0
+                lim = max(
+                    2500,
+                    int(getattr(creds, "FILTER_DB_LIMIT", 200)) * 8,
+                )
+                excl_s = set(self._filter_seen_sellers)
+                excl_t = set(self._filter_recent_titles[-300:])
+                try:
+                    return self.db.fetch_for_filters(
+                        min_stars=mn,
+                        max_stars=mx,
+                        limit=lim,
+                        hours=hours,
+                        require_seller=True,
+                        prefer_rare=bool(f.rare_types or f.random_mix),
+                        exclude_sellers=excl_s,
+                        exclude_titles=excl_t,
+                    )
+                except Exception:  # noqa: BLE001
+                    return self.db.fetch_random_lots(
+                        min_stars=mn,
+                        max_stars=mx,
+                        limit=lim,
+                        require_seller=True,
+                    )
+
+            async def _live_pool() -> list[Lot]:
+                live: list[Lot] = []
+                try:
+                    burst = await self.multi_burst(
+                        mn,
+                        mx,
+                        progress_cb=None,
+                        early_show_at=0,
+                    )
+                    if burst:
+                        raw = list(burst.all_lots or burst.lots or [])
+                        if raw:
+                            self._save_models(raw)
+                        self._flush_market_users()
+                        live = list(burst.lots or raw)
+                except Exception as exc:  # noqa: BLE001
+                    await self._say_to(
+                        chat_id,
+                        f"{screen('Фильтры')}\n⚠️ live {_esc(str(exc)[:100])}",
+                    )
+                return live
+
+            def _merge_unique(
+                base: list[Lot], more: list[Lot], *, cap: int
+            ) -> list[Lot]:
+                have_t = {self._title_key(x) for x in base}
+                have_o = {x.owner_key for x in base}
+                out = list(base)
+                for lot in more:
+                    tk = self._title_key(lot)
+                    if tk in have_t or lot.owner_key in have_o:
+                        continue
+                    if lot.free_dm is False:
+                        continue
+                    out.append(lot)
+                    have_t.add(tk)
+                    have_o.add(lot.owner_key)
+                    if len(out) >= cap:
+                        break
+                return out
+
+            shown: list[Lot] = []
+            # --- проход 1: БД + live ---
+            old = await _db_pool()
+            live = await _live_pool()
             merged = _dedupe_lots(old + live)
             random.shuffle(merged)
             self._ingest_always(merged)
-            target_n = max(30, int(creds.SHOW_LIMIT))
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\n"
+                f"пул: БД {len(old)} + live {len(live)} = {len(merged)}",
+            )
             shown = await self._prepare_show(
                 merged,
                 limit=target_n,
@@ -1725,33 +1864,67 @@ class App:
                 need_full=True,
                 channel="filter",
             )
-            # мало — ещё live-проход, тумблеры НЕ снимаем
-            if len(shown) < 20 and merged:
-                shown2 = await self._prepare_show(
-                    merged,
+
+            # --- проход 2: ещё БД рандом + live, если мало ---
+            if len(shown) < target_n:
+                old2 = await _db_pool()
+                live2 = await _live_pool()
+                merged2 = _dedupe_lots(old2 + live2 + merged)
+                random.shuffle(merged2)
+                self._ingest_always(merged2)
+                more = await self._prepare_show(
+                    merged2,
                     limit=target_n,
                     apply_extra=True,
                     track_seen=True,
                     need_full=True,
                     channel="filter",
                 )
-                if shown2:
-                    # merge unique titles/owners
-                    have_t = {self._title_key(x) for x in shown}
-                    have_o = {x.owner_key for x in shown}
-                    for lot in shown2:
-                        tk = self._title_key(lot)
-                        if tk in have_t or lot.owner_key in have_o:
-                            continue
-                        shown.append(lot)
-                        have_t.add(tk)
-                        have_o.add(lot.owner_key)
-                        if len(shown) >= target_n:
-                            break
+                shown = _merge_unique(shown, more, cap=target_n)
+
+            # --- проход 3: пусто/мало — сброс filter-seen и полный ретрай ---
+            if len(shown) < 10:
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nмало ({len(shown)}) · сброс seen · ещё раз",
+                )
+                # временно ослабить spice, чтобы не резать в ноль
+                saved_spice = (
+                    f.spice_no_model,
+                    f.spice_mid_user,
+                    f.spice_has_bio,
+                    f.spice_low_stars,
+                )
+                f.spice_no_model = False
+                f.spice_mid_user = False
+                f.spice_has_bio = False
+                f.spice_low_stars = False
+                old3 = await _db_pool(clear_seen=True)
+                live3 = await _live_pool()
+                merged3 = _dedupe_lots(old3 + live3)
+                random.shuffle(merged3)
+                self._ingest_always(merged3)
+                more = await self._prepare_show(
+                    merged3,
+                    limit=target_n,
+                    apply_extra=True,
+                    track_seen=True,
+                    need_full=True,
+                    channel="filter",
+                )
+                shown = _merge_unique(shown, more, cap=target_n)
+                (
+                    f.spice_no_model,
+                    f.spice_mid_user,
+                    f.spice_has_bio,
+                    f.spice_low_stars,
+                ) = saved_spice
+
             if not shown:
                 await self._say_to(
                     chat_id,
-                    f"{screen('Фильтры')}\nпусто",
+                    f"{screen('Фильтры')}\nпусто · БД {db_n} · "
+                    f"смени сложность / сними онлайн / TGP",
                     reply_markup=filters_inline(),
                 )
                 return
@@ -1759,12 +1932,19 @@ class App:
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nготово · {len(shown)} типов · без повторов",
+                f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> типов · "
+                f"новые · free DM",
                 reply_markup=filters_inline(),
             )
         finally:
             self.filter_search_running = False
             self._filter_task = None
+            # сбросить spice после поиска
+            f.spice_no_model = False
+            f.spice_mid_user = False
+            f.spice_has_bio = False
+            f.spice_fresh_boost = False
+            f.spice_low_stars = False
             await self._close_extra_clients()
             await self.ensure_db_farm()
 
@@ -2593,6 +2773,9 @@ def _filters_label(f: SearchFilters) -> str:
         parts.append("юз:any (кроме 4–5)")
     parts.append("no TGP" if f.no_premium else "TGP:any")
     parts.append("🟢 в сети" if f.online_only else "сеть:any")
+    parts.append("🆕 48ч" if f.fresh_only else "возраст:any")
+    parts.append("💎 редкие" if f.rare_types else "типы:any")
+    parts.append("🎲 микс" if f.random_mix else "микс:off")
     return " · ".join(parts)
 
 
@@ -2720,6 +2903,24 @@ def filters_inline() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=("✅" if f.online_only else "⬜️") + " В сети (онлайн)",
                     callback_data="flt:online",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.fresh_only else "⬜️") + " Свежие 48ч (БД)",
+                    callback_data="flt:fresh",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.rare_types else "⬜️") + " Редкие типы",
+                    callback_data="flt:rare",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.random_mix else "⬜️") + " Рандом-микс",
+                    callback_data="flt:mix",
                 )
             ],
             [
@@ -3071,6 +3272,12 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
         app.filters.no_premium = not app.filters.no_premium
     elif key == "online":
         app.filters.online_only = not app.filters.online_only
+    elif key == "fresh":
+        app.filters.fresh_only = not app.filters.fresh_only
+    elif key == "rare":
+        app.filters.rare_types = not app.filters.rare_types
+    elif key == "mix":
+        app.filters.random_mix = not app.filters.random_mix
     elif key == "run":
         if app.filter_search_running:
             await callback.answer("Уже идёт", show_alert=True)

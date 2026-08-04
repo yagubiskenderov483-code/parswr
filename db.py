@@ -395,6 +395,46 @@ class GiftDB:
             )
         return self.upsert_users(users, cap=cap)
 
+    def _lot_from_gift_row(self, r: Any) -> Lot:
+        seller = str(r["seller"] or "").lstrip("@").strip()
+        if not seller:
+            seller = str(r["u_username"] or "").lstrip("@").strip()
+        premium = r["u_is_premium"]
+        return Lot(
+            id=str(r["id"]),
+            title=str(r["title"] or "Gift"),
+            number=r["number"],
+            stars=float(r["stars"]),
+            slug=str(r["slug"] or ""),
+            model=str(r["model"] or ""),
+            backdrop=str(r["backdrop"] or ""),
+            symbol=str(r["symbol"] or ""),
+            seller=seller,
+            seller_id=r["seller_id"],
+            first_name=str(r["u_first_name"] or ""),
+            last_name=str(r["u_last_name"] or ""),
+            is_premium=None if premium is None else bool(premium),
+            account_level=r["u_account_level"],
+            gifts_count=r["u_gifts_count"],
+        )
+
+    @staticmethod
+    def _mix_by_title(lots: list[Lot]) -> list[Lot]:
+        by_title: dict[str, list[Lot]] = {}
+        for lot in lots:
+            tk = (lot.title or lot.model or lot.id).strip().lower()
+            by_title.setdefault(tk, []).append(lot)
+        titles = list(by_title.keys())
+        random.shuffle(titles)
+        mixed: list[Lot] = []
+        while any(by_title.values()):
+            random.shuffle(titles)
+            for tk in titles:
+                bucket = by_title.get(tk) or []
+                if bucket:
+                    mixed.append(bucket.pop(random.randrange(len(bucket))))
+        return mixed
+
     def fetch_random_lots(
         self,
         *,
@@ -424,45 +464,106 @@ class GiftDB:
         sql += " ORDER BY RANDOM() LIMIT ?"
         params.append(int(limit))
         rows = self._conn.execute(sql, params).fetchall()
-        lots: list[Lot] = []
-        for r in rows:
-            seller = str(r["seller"] or "").lstrip("@").strip()
-            if not seller:
-                seller = str(r["u_username"] or "").lstrip("@").strip()
-            premium = r["u_is_premium"]
-            lot = Lot(
-                id=str(r["id"]),
-                title=str(r["title"] or "Gift"),
-                number=r["number"],
-                stars=float(r["stars"]),
-                slug=str(r["slug"] or ""),
-                model=str(r["model"] or ""),
-                backdrop=str(r["backdrop"] or ""),
-                symbol=str(r["symbol"] or ""),
-                seller=seller,
-                seller_id=r["seller_id"],
-                first_name=str(r["u_first_name"] or ""),
-                last_name=str(r["u_last_name"] or ""),
-                is_premium=None if premium is None else bool(premium),
-                account_level=r["u_account_level"],
-                gifts_count=r["u_gifts_count"],
+        lots = [self._lot_from_gift_row(r) for r in rows]
+        return self._mix_by_title(lots)
+
+    def fetch_for_filters(
+        self,
+        *,
+        min_stars: float,
+        max_stars: float,
+        limit: int = 2000,
+        hours: float = 0.0,
+        require_seller: bool = True,
+        prefer_rare: bool = True,
+        exclude_sellers: set[str] | None = None,
+        exclude_titles: set[str] | None = None,
+    ) -> list[Lot]:
+        """Большой пул для фильтр-поиска: свежие + рандом + редкие типы."""
+        excl_s = {str(x).lower() for x in (exclude_sellers or set()) if x}
+        excl_t = {str(x).lower() for x in (exclude_titles or set()) if x}
+        half = max(200, int(limit) // 2)
+        pools: list[Lot] = []
+
+        # 1) свежие за N часов (если hours>0)
+        if hours and hours > 0:
+            pools.extend(
+                self.fetch_lots_last_hours(
+                    min_stars=min_stars,
+                    max_stars=max_stars,
+                    hours=hours,
+                    require_seller=require_seller,
+                    limit=max(half, 800),
+                )
             )
-            lots.append(lot)
-        # разнообразие NFT: не отдавать пачку из одной коллекции подряд
-        by_title: dict[str, list[Lot]] = {}
-        for lot in lots:
-            tk = (lot.title or lot.model or lot.id).strip().lower()
-            by_title.setdefault(tk, []).append(lot)
-        titles = list(by_title.keys())
-        random.shuffle(titles)
-        mixed: list[Lot] = []
-        while any(by_title.values()):
-            random.shuffle(titles)
-            for tk in titles:
-                bucket = by_title.get(tk) or []
-                if bucket:
-                    mixed.append(bucket.pop(random.randrange(len(bucket))))
-        return mixed
+
+        # 2) рандом по всему диапазону
+        pools.extend(
+            self.fetch_random_lots(
+                min_stars=min_stars,
+                max_stars=max_stars,
+                limit=max(half, 800),
+                require_seller=require_seller,
+            )
+        )
+
+        # 3) редкие типы (мало показов) — приоритет новизны
+        if prefer_rare:
+            sql = """
+                SELECT
+                    g.id, g.title, g.number, g.stars, g.slug, g.model,
+                    g.backdrop, g.symbol, g.nft_url, g.seller, g.seller_id,
+                    u.username AS u_username,
+                    u.first_name AS u_first_name,
+                    u.last_name AS u_last_name,
+                    u.is_premium AS u_is_premium,
+                    u.account_level AS u_account_level,
+                    u.gifts_count AS u_gifts_count,
+                    IFNULL(sc.shown_count, 0) AS shown_count
+                FROM gifts g
+                LEFT JOIN users u ON u.user_id = g.seller_id
+                LEFT JOIN shown_collections sc
+                    ON sc.title_key = lower(trim(g.title))
+                WHERE g.stars >= ? AND g.stars <= ?
+            """
+            params: list[Any] = [float(min_stars), float(max_stars)]
+            if require_seller:
+                sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+            sql += " ORDER BY IFNULL(sc.shown_count, 0) ASC, RANDOM() LIMIT ?"
+            params.append(max(half, 600))
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+                pools.extend(self._lot_from_gift_row(r) for r in rows)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # dedupe + фильтр exclude
+        seen_ids: set[str] = set()
+        out: list[Lot] = []
+        for lot in pools:
+            if lot.id in seen_ids:
+                continue
+            sk = (lot.seller or "").lower()
+            if sk and sk in excl_s:
+                continue
+            if lot.seller_id is not None and f"id:{lot.seller_id}" in excl_s:
+                continue
+            tk = (lot.title or lot.model or "").strip().lower()
+            if tk and tk in excl_t:
+                continue
+            seen_ids.add(lot.id)
+            out.append(lot)
+            if len(out) >= int(limit):
+                break
+        random.shuffle(out)
+        return self._mix_by_title(out)
+
+    def count_in_range(self, *, min_stars: float, max_stars: float) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM gifts WHERE stars >= ? AND stars <= ?",
+            (float(min_stars), float(max_stars)),
+        ).fetchone()
+        return int(row["c"] if row else 0)
 
     def fetch_lots_last_hours(
         self,

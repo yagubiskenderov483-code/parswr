@@ -21,12 +21,17 @@ from telethon.tl.functions.payments import (
     GetStarGiftsRequest,
     GetUniqueStarGiftRequest,
 )
-from telethon.tl.functions.users import GetFullUserRequest, GetRequirementsToContactRequest
+from telethon.tl.functions.users import (
+    GetFullUserRequest,
+    GetRequirementsToContactRequest,
+    GetUsersRequest,
+)
 from telethon.tl.types import (
     StarsAmount,
     StarsTonAmount,
     RequirementToContactPaidMessages,
     RequirementToContactPremium,
+    UserStatusOnline,
 )
 from telethon.tl.types.payments import StarGiftsNotModified
 
@@ -54,6 +59,8 @@ class Lot:
     # None=неизвестно, True=можно писать бесплатно, False=нужны Stars/Premium
     free_dm: bool | None = None
     paid_dm_stars: int | None = None
+    # None=неизвестно, True=сейчас в сети
+    is_online: bool | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -761,6 +768,53 @@ class TelegramMarket:
                     if paid is not None:
                         lot.paid_dm_stars = paid
 
+    async def refresh_online(
+        self, lots: list[Lot], *, timeout: float = 2.0
+    ) -> None:
+        """Обновить is_online по текущему User.status (кто в сети сейчас)."""
+        need = [lot for lot in lots if lot.seller_id is not None]
+        if not need:
+            return
+        by_id: dict[int, list[Lot]] = {}
+        for lot in need:
+            by_id.setdefault(int(lot.seller_id), []).append(lot)
+        inputs = []
+        id_order: list[int] = []
+        for uid in list(by_id.keys()):
+            try:
+                ent = await asyncio.wait_for(
+                    self.client.get_input_entity(uid), timeout=timeout
+                )
+                inputs.append(ent)
+                id_order.append(uid)
+            except Exception:  # noqa: BLE001
+                continue
+        for i in range(0, len(inputs), 50):
+            chunk = inputs[i : i + 50]
+            ids_chunk = id_order[i : i + 50]
+            try:
+                await self._wait_flood()
+                users = await asyncio.wait_for(
+                    self.client(GetUsersRequest(id=chunk)),
+                    timeout=max(timeout, 3.0),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            by_uid = {
+                int(u.id): u
+                for u in (users or [])
+                if getattr(u, "id", None) is not None
+            }
+            for uid in ids_chunk:
+                u = by_uid.get(uid)
+                if u is None:
+                    continue
+                online = _user_online_flag(u)
+                for lot in by_id[uid]:
+                    if online is not None:
+                        lot.is_online = online
+                    _fill_user(lot, u)
+
     async def afk_fetch_page(
         self,
         gift_id: int,
@@ -947,6 +1001,22 @@ def _extract_users(result: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _user_online_flag(user: Any) -> bool | None:
+    """True только если статус UserStatusOnline прямо сейчас."""
+    st = getattr(user, "status", None)
+    if st is None:
+        return None
+    if isinstance(st, UserStatusOnline):
+        return True
+    name = st.__class__.__name__
+    if name == "UserStatusOnline":
+        return True
+    # любой другой известный статус = не в сети сейчас
+    if name.startswith("UserStatus"):
+        return False
+    return None
+
+
 def _fill_user(lot: Lot, user: Any) -> None:
     username = str(getattr(user, "username", "") or "").lstrip("@").strip()
     if not username:
@@ -971,6 +1041,9 @@ def _fill_user(lot: Lot, user: Any) -> None:
         lot.last_name = ln
     if getattr(user, "premium", None) is not None:
         lot.is_premium = bool(user.premium)
+    online = _user_online_flag(user)
+    if online is not None:
+        lot.is_online = online
     if hasattr(user, "send_paid_messages_stars"):
         raw = getattr(user, "send_paid_messages_stars", None)
         if raw is None:

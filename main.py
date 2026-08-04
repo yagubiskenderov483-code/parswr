@@ -131,6 +131,7 @@ class SearchFilters:
     low_level: bool = False  # мелкий lvl (<=5)
     short_username: bool = False  # короткий юз 6–8 (4–5 всегда бан)
     no_premium: bool = False  # без TGP
+    online_only: bool = False  # только кто сейчас в сети
     max_gifts: int = 5
     max_level: int = 5
     short_user_max: int = 8
@@ -157,6 +158,7 @@ class App:
         self._seen: dict[str, float] = {}
         self._seen_sellers: set[str] = set()
         self._seen_models: set[str] = set()
+        self._seen_titles: set[str] = set()  # уже выданные типы NFT (парсер)
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = 2000.0
@@ -777,7 +779,10 @@ class App:
         self.chat_id = chat_id
         self.running = True
         # лоты-seen сбрасываем, продавцов/модели — НЕТ (без повторов юзов)
+        # типы за этот запуск обнуляем — новый обход может снова найти типы
         self._seen.clear()
+        self._seen_titles.clear()
+        self._recent_titles.clear()
         self._reload_persist_seen()
         self.lots_notified = 0
         self.checks = 0
@@ -858,7 +863,13 @@ class App:
 
     def _filters_active(self) -> bool:
         f = self.filters
-        return bool(f.few_gifts or f.low_level or f.short_username or f.no_premium)
+        return bool(
+            f.few_gifts
+            or f.low_level
+            or f.short_username
+            or f.no_premium
+            or f.online_only
+        )
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
         f = self.filters
@@ -877,6 +888,10 @@ class App:
             # только явный premium режем; None = ок
             if lot.is_premium is True:
                 return False
+        if f.online_only:
+            # только явно в сети сейчас
+            if lot.is_online is not True:
+                return False
         return True
 
     def _pick_clean(
@@ -890,6 +905,7 @@ class App:
         require_russian: bool | None = None,
         require_free_dm: bool = True,
         ignore_seen: bool = False,
+        strict_free_dm: bool = False,
     ) -> list[Lot]:
         """Разнообразие NFT. channel=parser|filter|old — разные режимы."""
         is_filter = channel == "filter"
@@ -897,6 +913,10 @@ class App:
         want_ru = (
             self.require_russian if require_russian is None else bool(require_russian)
         )
+        # парсер: типы не повторяем даже если ослабляем seen продавцов
+        seen_titles = set(self._seen_titles) if channel == "parser" else set()
+        if channel == "parser":
+            seen_titles.update(self._recent_titles[-250:])
         if is_old or ignore_seen:
             seen_sellers: set[str] = set()
             seen_models: set[str] = set()
@@ -923,7 +943,7 @@ class App:
             if (is_filter or is_old or ignore_seen)
             else self.db.get_collection_show_counts()
         )
-        recent = set(recent_list[-100:])
+        recent = set(recent_list[-100:]) | seen_titles
 
         for lot in lots:
             if not lot.seller:
@@ -936,9 +956,13 @@ class App:
                 continue
             if want_ru and not self._is_russian(lot):
                 continue
-            # режем только ЯВНО платные Stars; None = неизвестно → ок
-            if require_free_dm and lot.free_dm is False:
-                continue
+            # free DM: парсер строго True; иначе режем только явный False
+            if require_free_dm:
+                if strict_free_dm or channel == "parser":
+                    if lot.free_dm is not True:
+                        continue
+                elif lot.free_dm is False:
+                    continue
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
             if not ignore_seen:
@@ -968,6 +992,9 @@ class App:
                 continue
             tk = self._title_key(lot)
             if not tk:
+                continue
+            # повторные типы NFT не выдаём в парсере
+            if channel == "parser" and tk in seen_titles:
                 continue
             if tk not in buckets:
                 buckets[tk] = []
@@ -1090,6 +1117,8 @@ class App:
                 tk = self._title_key(lot)
                 if tk:
                     recent_list.append(tk)
+                    if channel == "parser":
+                        self._seen_titles.add(tk)
             if len(recent_list) > 250:
                 del recent_list[:-250]
             if channel == "parser":
@@ -1102,6 +1131,10 @@ class App:
                     self.db.mark_seen_model(
                         lot.model_key, title=lot.model or lot.title
                     )
+                    try:
+                        self.db.bump_collection_shown(lot.title or self._title_key(lot) or "")
+                    except Exception:  # noqa: BLE001
+                        pass
             elif channel == "filter":
                 for lot in result:
                     self._filter_seen_sellers.add(lot.owner_key)
@@ -1118,7 +1151,7 @@ class App:
         channel: str,
         strict_russian: bool | None = None,
     ) -> list[Lot]:
-        """Сначала строго, потом ослабляем — но RU для парсера не снимаем."""
+        """Сначала строго; парсер — только RU + free DM, без повторов типов."""
         target = (
             25
             if channel == "parser" and (limit is None or limit <= 0)
@@ -1129,20 +1162,18 @@ class App:
             if strict_russian is None
             else bool(strict_russian)
         )
-        # парсер / again: никогда не выдаём не-русских
+        # парсер: RU + free DM всегда; ignore_seen только для продавцов (типы всё равно блок)
         if channel == "parser" and keep_ru:
             attempts = [
                 (True, True, False, False),
-                (True, True, True, False),  # ignore seen, keep RU
-                (True, False, True, False),  # drop free_dm, keep RU
+                (True, True, True, False),  # ignore seller/model seen, keep RU+free
             ]
         elif channel == "old" and keep_ru:
             attempts = [
                 (True, True, True, False),
-                (True, False, True, False),
             ]
         else:
-            # фильтры: можно чуть мягче, но RU сначала
+            # фильтры: RU сначала; free DM желателен
             attempts = [
                 (True, True, False, apply_extra),
                 (True, True, True, apply_extra),
@@ -1165,6 +1196,7 @@ class App:
                 require_russian=want_ru,
                 require_free_dm=want_free,
                 ignore_seen=ign_seen,
+                strict_free_dm=(channel == "parser" and want_free),
             )
             if len(out) > len(best):
                 best = out
@@ -1174,6 +1206,10 @@ class App:
             for lot in best:
                 self._seen_sellers.add(lot.owner_key)
                 self._seen_models.add(lot.model_key)
+                tk = self._title_key(lot)
+                if tk:
+                    self._seen_titles.add(tk)
+                    self._recent_titles.append(tk)
                 try:
                     self.db.mark_seen_seller(
                         username=lot.seller, user_id=lot.seller_id
@@ -1181,11 +1217,12 @@ class App:
                     self.db.mark_seen_model(
                         lot.model_key, title=lot.model or lot.title
                     )
+                    if lot.title:
+                        self.db.bump_collection_shown(lot.title)
                 except Exception:  # noqa: BLE001
                     pass
-                tk = self._title_key(lot)
-                if tk:
-                    self._recent_titles.append(tk)
+            if len(self._recent_titles) > 250:
+                del self._recent_titles[:-250]
         elif best and channel == "filter":
             for lot in best:
                 self._filter_seen_sellers.add(lot.owner_key)
@@ -1257,6 +1294,13 @@ class App:
                 timeout=max(creds.OWNER_TIMEOUT, 1.0),
             )
             self.parse_acc_checks += len(candidates[:sample_n])
+            # фильтр «в сети» — обновить статус онлайн
+            if channel == "filter" and self.filters.online_only:
+                await self.market.refresh_online(
+                    candidates[:sample_n],
+                    timeout=max(creds.OWNER_TIMEOUT, 1.2),
+                )
+                self.parse_acc_checks += len(candidates[:sample_n])
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None or lot.seller],
                 cap=creds.AFK_USER_CAP,
@@ -1265,13 +1309,18 @@ class App:
             # профили тоже в БД
             self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
+            # парсер: сразу отсечь платные Stars / без free DM
+            if channel == "parser":
+                candidates = [lot for lot in candidates if lot.free_dm is True]
+                if self.require_russian:
+                    candidates = [lot for lot in candidates if self._is_russian(lot)]
         want_ru = (
             bool(self.require_russian)
             if strict_russian is None
             else bool(strict_russian)
         )
         if channel == "parser":
-            want_ru = True if self.require_russian else want_ru
+            want_ru = True
         return self._pick_with_fallback(
             candidates,
             limit=None if (by_types or take_all) else lim,
@@ -1296,7 +1345,8 @@ class App:
         mn, mx = self.filter_min_stars, self.filter_max_stars
         label = self.filter_range_label
         try:
-            await self._say_to(chat_id, f"{screen('Фильтры')}\n{label}")
+            online_note = " · 🟢 в сети" if f.online_only else ""
+            await self._say_to(chat_id, f"{screen('Фильтры')}\n{label}{online_note}")
             old = self.db.fetch_random_lots(
                 min_stars=mn,
                 max_stars=mx,
@@ -2095,6 +2145,7 @@ def _filters_label(f: SearchFilters) -> str:
         f"юз 6–{f.short_user_max}" if f.short_username else "юз:any (кроме 4–5)"
     )
     parts.append("no TGP" if f.no_premium else "TGP:any")
+    parts.append("🟢 в сети" if f.online_only else "сеть:any")
     return " · ".join(parts)
 
 
@@ -2210,6 +2261,12 @@ def filters_inline() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=("✅" if f.no_premium else "⬜️") + " Без TGP",
                     callback_data="flt:tgp",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅" if f.online_only else "⬜️") + " В сети (онлайн)",
+                    callback_data="flt:online",
                 )
             ],
             [
@@ -2550,6 +2607,8 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
         app.filters.short_username = not app.filters.short_username
     elif key == "tgp":
         app.filters.no_premium = not app.filters.no_premium
+    elif key == "online":
+        app.filters.online_only = not app.filters.online_only
     elif key == "run":
         await callback.answer("Ищу…")
         await callback.message.edit_text(

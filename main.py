@@ -218,7 +218,7 @@ class App:
         self._last_pool: list[Lot] = []
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
-        self._reload_persist_seen()
+        self._reload_persist_seen(blocklist_only=True)
 
     def _wire_market(self) -> None:
         """Кэш коллекций в БД + хуки на текущий market."""
@@ -604,8 +604,15 @@ class App:
     def _title_key(lot: Lot) -> str:
         return (lot.title or lot.model or lot.id or "").strip().lower()
 
-    def _reload_persist_seen(self) -> None:
-        """Подтянуть блоклист + уже показанных — без повторов после рестарта."""
+    def _reload_persist_seen(self, *, blocklist_only: bool = False) -> None:
+        """Подтянуть блоклист (+ опционально seen). Парсер не грузит вечный seen —
+        иначе после пары дней выдача всегда пустая."""
+        try:
+            self._blocked_keys = self.db.load_block_keys()
+        except Exception:  # noqa: BLE001
+            self._blocked_keys = set()
+        if blocklist_only:
+            return
         try:
             sellers: set[str] = set()
             for k in self.db.load_seen_seller_keys():
@@ -619,9 +626,8 @@ class App:
                     sellers.add(str(k).lower().lstrip("@"))
             self._seen_sellers = sellers
             self._seen_models = self.db.load_seen_model_keys()
-            self._blocked_keys = self.db.load_block_keys()
         except Exception:  # noqa: BLE001
-            self._blocked_keys = set()
+            pass
 
     def _new_client(self) -> TelegramClient:
         return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
@@ -851,12 +857,13 @@ class App:
         await self.pause_db_farm()
         self.chat_id = chat_id
         self.running = True
-        # лоты-seen сбрасываем, продавцов/модели — НЕТ (без повторов юзов)
-        # типы за этот запуск обнуляем — новый обход может снова найти типы
+        # новый обход: свежие seen юзов/типов (блоклист оставляем)
         self._seen.clear()
         self._seen_titles.clear()
         self._recent_titles.clear()
-        self._reload_persist_seen()
+        self._seen_sellers.clear()
+        self._seen_models.clear()
+        self._reload_persist_seen(blocklist_only=True)
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -963,8 +970,8 @@ class App:
             if lot.is_premium is True:
                 return False
         if f.online_only:
-            # только явно в сети сейчас
-            if lot.is_online is not True:
+            # режем только явно оффлайн; None = не проверили → ок
+            if lot.is_online is False:
                 return False
         return True
 
@@ -1037,13 +1044,9 @@ class App:
                 continue
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
-            # уже выданные юзы — никогда в парсере
+            # уже выданные юзы в ЭТОМ обходе — не повторяем
             if channel == "parser":
                 if lot.owner_key in always_block_sellers:
-                    continue
-                if self.db.is_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                ):
                     continue
             if not ignore_seen:
                 if lot.owner_key in seen_sellers:
@@ -1052,21 +1055,9 @@ class App:
                 if channel != "parser" and lot.model_key in seen_models:
                     continue
                 if (
-                    (not is_filter)
-                    and (not is_old)
-                    and track_seen
-                    and channel != "parser"
-                    and self.db.is_seen_seller(
-                        username=lot.seller, user_id=lot.seller_id
-                    )
-                ):
-                    continue
-                if (
-                    (not is_filter)
-                    and (not is_old)
-                    and track_seen
-                    and channel != "parser"
-                    and self.db.is_seen_model(lot.model_key)
+                    is_filter
+                    and (not ignore_seen)
+                    and lot.owner_key in self._filter_seen_sellers
                 ):
                     continue
             if lot.owner_key in local_sellers:
@@ -1258,10 +1249,10 @@ class App:
         channel: str,
         strict_russian: bool | None = None,
     ) -> list[Lot]:
-        """Сначала строго; парсер — RU, без платных DM, без повторных юзов/типов."""
+        """Сначала строго; парсер/фильтры — стабильная выдача без пустоты."""
         target = (
-            25
-            if channel == "parser" and (limit is None or limit <= 0)
+            max(30, int(creds.SHOW_LIMIT))
+            if channel in ("parser", "filter") and (limit is None or limit <= 0)
             else (limit or max(30, creds.SHOW_LIMIT))
         )
         keep_ru = (
@@ -1269,33 +1260,32 @@ class App:
             if strict_russian is None
             else bool(strict_russian)
         )
-        # парсер: юзы уже выданные НЕ возвращаем; ignore_seen только модели
-        if channel == "parser" and keep_ru:
+        if channel == "parser":
+            # RU+free → RU → RU ignore session-models; sellers сессии всегда блок
             attempts = [
                 (True, True, False, False),
-                (True, True, True, False),  # soften models, sellers still blocked
+                (True, False, False, False),
+                (True, False, True, False),
             ]
         elif channel == "old" and keep_ru:
             attempts = [
                 (True, True, True, False),
+                (True, False, True, False),
             ]
         else:
+            # фильтры: RU+extra → RU → any+extra → any (чтобы не было пусто)
             attempts = [
                 (True, True, False, apply_extra),
                 (True, True, True, apply_extra),
                 (True, False, True, apply_extra),
-                (
-                    False if not keep_ru else True,
-                    False,
-                    True,
-                    apply_extra if channel == "filter" else False,
-                ),
+                (False, False, True, apply_extra),
+                (False, False, True, False),
             ]
         best: list[Lot] = []
         for want_ru, want_free, ign_seen, extra in attempts:
             out = self._pick_clean(
                 lots,
-                limit=limit,
+                limit=None if channel == "parser" else limit,
                 apply_extra=extra,
                 track_seen=False,
                 channel=channel,
@@ -1304,10 +1294,14 @@ class App:
                 ignore_seen=ign_seen,
                 strict_free_dm=False,
             )
+            if channel == "parser" and out:
+                out = out[:target]
             if len(out) > len(best):
                 best = out
             if len(best) >= min(15, target):
                 break
+        if channel in ("parser", "filter") and best:
+            best = best[: max(30, int(creds.SHOW_LIMIT))]
         if best and track_seen and channel == "parser":
             for lot in best:
                 self._seen_sellers.add(lot.owner_key)
@@ -1348,11 +1342,12 @@ class App:
     ) -> list[Lot]:
         by_types = channel == "parser" and (limit is None or limit <= 0)
         take_all = channel == "old"
-        lim = (
-            10_000
-            if (by_types or take_all)
-            else (limit or max(30, creds.SHOW_LIMIT))
-        )
+        if by_types:
+            lim = 10_000
+        elif take_all:
+            lim = int(limit) if (limit is not None and limit > 0) else 30
+        else:
+            lim = limit or max(30, creds.SHOW_LIMIT)
         self._ingest_always(list(lots))
         pre = list(lots)
         random.shuffle(pre)
@@ -1384,20 +1379,13 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
+        # парсер: только юзы уже выданные в ЭТОМ обходе (не вечная БД seen)
         if channel == "parser":
-            fresh: list[Lot] = []
-            for lot in candidates:
-                if lot.owner_key in self._seen_sellers:
-                    continue
-                try:
-                    if self.db.is_seen_seller(
-                        username=lot.seller, user_id=lot.seller_id
-                    ):
-                        continue
-                except Exception:  # noqa: BLE001
-                    pass
-                fresh.append(lot)
-            candidates = fresh
+            candidates = [
+                lot
+                for lot in candidates
+                if lot.owner_key not in self._seen_sellers
+            ]
 
         want_ru = (
             bool(self.require_russian)
@@ -1408,12 +1396,11 @@ class App:
             want_ru = True
 
         if channel == "parser" and candidates:
-            # БЫСТРЫЙ ПУТЬ: уже RU по имени с маркета → только free DM
             already_ru = [lot for lot in candidates if self._is_russian(lot)]
             need_bio = [lot for lot in candidates if not self._is_russian(lot)]
             random.shuffle(already_ru)
             random.shuffle(need_bio)
-            check_ru = already_ru[:250]
+            check_ru = already_ru[:300]
             if check_ru:
                 await self.market.check_free_dm(
                     check_ru,
@@ -1425,36 +1412,70 @@ class App:
                 for lot in check_ru
                 if lot.free_dm is not False and self._is_russian(lot)
             ]
-            # если мало типов — точечный enrich только по need_bio
             titles_ready = {
                 self._title_key(lot) for lot in ready if self._title_key(lot)
             }
-            if len(titles_ready) < 20 and need_bio:
-                wave = need_bio[:180]
-                await self.market.enrich_profiles(
-                    wave,
-                    timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
-                    parallel=getattr(creds, "ENRICH_PARALLEL", 8),
-                )
-                await self.market.check_free_dm(
-                    wave,
-                    timeout=max(creds.OWNER_TIMEOUT, 1.0),
-                )
-                self.parse_acc_checks += len(wave)
-                self._ingest_always(wave)
-                for lot in wave:
-                    if lot.free_dm is False:
-                        continue
-                    if self._is_russian(lot):
-                        ready.append(lot)
-            candidates = ready
+            # всегда добираем био если мало типов (иначе то пусто то 1)
+            if len(titles_ready) < 25:
+                wave = need_bio[:250]
+                if wave:
+                    await self.market.enrich_profiles(
+                        wave,
+                        timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
+                        parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                    )
+                    await self.market.check_free_dm(
+                        wave,
+                        timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                    )
+                    self.parse_acc_checks += len(wave)
+                    self._ingest_always(wave)
+                    for lot in wave:
+                        if lot.free_dm is False:
+                            continue
+                        if self._is_russian(lot):
+                            ready.append(lot)
+            # если всё ещё мало — берём RU без требования free_dm True
+            if len({self._title_key(x) for x in ready}) < 8:
+                ready = [
+                    lot
+                    for lot in (check_ru + ready)
+                    if self._is_russian(lot) and lot.free_dm is not False
+                ]
+            candidates = _dedupe_lots(ready)
             self._ingest_always(candidates)
+        elif channel == "filter" and candidates:
+            sample_n = min(len(candidates), max(250, lim * 10, 200))
+            random.shuffle(candidates)
+            # сначала с кириллицей
+            candidates.sort(
+                key=lambda lot: (0 if self._is_russian(lot) else 1, random.random())
+            )
+            sample = candidates[:sample_n]
+            await self.market.enrich_profiles(
+                sample,
+                timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.1),
+                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+            )
+            await self.market.check_free_dm(
+                sample,
+                timeout=max(creds.OWNER_TIMEOUT, 1.0),
+            )
+            self.parse_acc_checks += len(sample) * 2
+            if self.filters.online_only:
+                await self.market.refresh_online(
+                    sample,
+                    timeout=max(creds.OWNER_TIMEOUT, 1.2),
+                )
+                self.parse_acc_checks += len(sample)
+            self._ingest_always(sample)
+            candidates = sample
         elif candidates:
             sample_n = min(
                 len(candidates),
                 400 if take_all else max(lim * 6, 120),
             )
-            if need_full or apply_extra or channel == "filter":
+            if need_full or apply_extra:
                 sample_n = min(len(candidates), max(sample_n, lim * 8, 150))
             need_bio = list(candidates[:sample_n])
             if need_bio:
@@ -1469,22 +1490,16 @@ class App:
                 timeout=max(creds.OWNER_TIMEOUT, 1.2),
             )
             self.parse_acc_checks += len(candidates[:sample_n])
-            if channel == "filter" and self.filters.online_only:
-                await self.market.refresh_online(
-                    candidates[:sample_n],
-                    timeout=max(creds.OWNER_TIMEOUT, 1.2),
-                )
-                self.parse_acc_checks += len(candidates[:sample_n])
             self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
 
         return self._pick_with_fallback(
             candidates,
-            limit=None if (by_types or take_all) else lim,
+            limit=None if by_types else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
-            strict_russian=want_ru,
+            strict_russian=want_ru if channel == "parser" else False,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
@@ -1504,10 +1519,11 @@ class App:
         try:
             online_note = " · 🟢 в сети" if f.online_only else ""
             await self._say_to(chat_id, f"{screen('Фильтры')}\n{label}{online_note}")
+            db_lim = max(400, int(getattr(creds, "FILTER_DB_LIMIT", 120)) * 4)
             old = self.db.fetch_random_lots(
                 min_stars=mn,
                 max_stars=mx,
-                limit=max(80, int(getattr(creds, "FILTER_DB_LIMIT", 30))),
+                limit=db_lim,
                 require_seller=False,
             )
             live: list[Lot] = []
@@ -1519,10 +1535,11 @@ class App:
                     early_show_at=0,
                 )
                 if burst:
-                    if burst.all_lots:
-                        self._save_models(burst.all_lots)
+                    raw = list(burst.all_lots or burst.lots or [])
+                    if raw:
+                        self._save_models(raw)
                     self._flush_market_users()
-                    live = list(burst.lots)
+                    live = list(burst.lots or raw)
             except Exception as exc:  # noqa: BLE001
                 await self._say_to(
                     chat_id, f"{screen('Фильтры')}\n⚠️ {_esc(str(exc)[:120])}"
@@ -1539,6 +1556,16 @@ class App:
                 need_full=True,
                 channel="filter",
             )
+            # пусто — ещё один live без лишних фильтров-extra
+            if not shown and merged:
+                shown = await self._prepare_show(
+                    merged,
+                    limit=max(30, int(creds.SHOW_LIMIT)),
+                    apply_extra=False,
+                    track_seen=False,
+                    need_full=True,
+                    channel="filter",
+                )
             if not shown:
                 await self._say_to(
                     chat_id,
@@ -1594,7 +1621,7 @@ class App:
                 return
             shown = await self._prepare_show(
                 lots,
-                limit=None,
+                limit=30,
                 apply_extra=False,
                 track_seen=False,
                 need_full=False,
@@ -1894,15 +1921,18 @@ class App:
 
         while self.afk_running and not self._afk_paused:
             # во время активного парсинга — ждём
-            if self.running:
+            if self.running or self.filter_search_running or self.old_parse_running:
                 await asyncio.sleep(0.4)
                 continue
 
-            gid = gift_ids[self.afk_cursor % n]
-            self.afk_cursor = (self.afk_cursor + 1) % n
-            offset = self.db.get_collection_offset(gid)
+            parallel = max(2, int(getattr(creds, "AFK_PARALLEL", 4)))
+            batch_gids: list[int] = []
+            for _ in range(parallel):
+                batch_gids.append(gift_ids[self.afk_cursor % n])
+                self.afk_cursor = (self.afk_cursor + 1) % n
 
-            try:
+            async def _farm_one(gid: int) -> tuple[int, list, list, str, str, int]:
+                offset = self.db.get_collection_offset(gid)
                 lots, users, next_offset, total = await self.market.afk_fetch_page(
                     gid,
                     offset=offset,
@@ -1910,55 +1940,90 @@ class App:
                     gap=creds.AFK_GAP,
                     timeout=creds.API_TIMEOUT,
                 )
+                # сразу ещё страница — БД растёт быстрее, меньше одних и тех же
+                if lots and next_offset:
+                    try:
+                        lots2, users2, next2, _t2 = await self.market.afk_fetch_page(
+                            gid,
+                            offset=next_offset,
+                            limit=creds.AFK_PAGE_LIMIT,
+                            gap=creds.AFK_GAP,
+                            timeout=creds.API_TIMEOUT,
+                        )
+                        if lots2:
+                            lots = list(lots) + list(lots2)
+                            users = list(users) + list(users2)
+                            next_offset = next2 or ""
+                    except Exception:  # noqa: BLE001
+                        pass
+                title = lots[0].title if lots else ""
+                return gid, lots, users, next_offset or "", title, int(total or 0)
+
+            try:
+                parts = await asyncio.gather(
+                    *[_farm_one(g) for g in batch_gids],
+                    return_exceptions=True,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.afk_last_error = str(exc)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.4)
                 continue
 
-            title = lots[0].title if lots else ""
-            if lots:
-                ins_m, _upd_m = self._save_models(lots)
-                self.afk_models_added += ins_m
-                # все лоты+юзы через общий ingest
-                self._ingest_always(lots)
-
-            batch_users = list(users)
-            for lot in lots:
-                if lot.seller_id is not None or lot.seller:
-                    batch_users.append(
-                        {
-                            "user_id": lot.seller_id,
-                            "username": lot.seller,
-                            "first_name": lot.first_name,
-                            "last_name": lot.last_name,
-                        }
-                    )
-            drain = self.market.drain_users()
-            if drain:
-                batch_users.extend(drain)
-            ins_u, _upd_u, total_u = self.db.upsert_users(
-                batch_users, cap=creds.AFK_USER_CAP
-            )
-            self.afk_users_added += ins_u
-            if ins_u:
+            total_u = self.db.count_users()
+            for part in parts:
+                if isinstance(part, Exception):
+                    self.afk_last_error = str(part)
+                    continue
+                gid, lots, users, next_offset, title, _total = part
+                if lots:
+                    ins_m, _upd_m = self._save_models(lots)
+                    self.afk_models_added += ins_m
+                    self._ingest_always(lots)
+                batch_users = list(users)
+                for lot in lots:
+                    if lot.seller_id is not None or lot.seller:
+                        batch_users.append(
+                            {
+                                "user_id": lot.seller_id,
+                                "username": lot.seller,
+                                "first_name": lot.first_name,
+                                "last_name": lot.last_name,
+                            }
+                        )
                 try:
-                    self.db.bump_daily(users_new=ins_u)
+                    drain = self.market.drain_users()
+                    if drain:
+                        batch_users.extend(drain)
                 except Exception:  # noqa: BLE001
                     pass
-            self.afk_pages += 1
-            if self.afk_pages % 5 == 0:
-                self.db.checkpoint()
+                ins_u, _upd_u, total_u = self.db.upsert_users(
+                    batch_users, cap=creds.AFK_USER_CAP
+                )
+                self.afk_users_added += ins_u
+                if ins_u:
+                    try:
+                        self.db.bump_daily(users_new=ins_u)
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.afk_pages += 1
+                # пустая/конец — сброс offset, чтобы снова пройти глубже с начала
+                new_offset = next_offset if (lots and next_offset) else ""
+                self.db.touch_collection(
+                    gid,
+                    title=title,
+                    last_offset=new_offset,
+                    pages_inc=1 + (1 if next_offset else 0),
+                    lots_inc=len(lots),
+                )
 
-            new_offset = next_offset if (lots and next_offset) else ""
-            self.db.touch_collection(
-                gid,
-                title=title,
-                last_offset=new_offset,
-                pages_inc=1,
-                lots_inc=len(lots),
-            )
+            if self.afk_pages % 8 == 0:
+                self.db.checkpoint()
+                # периодически мешаем порядок коллекций
+                if self.afk_pages % 40 == 0:
+                    random.shuffle(gift_ids)
+                    self.afk_cursor = random.randrange(n)
 
             now = time.monotonic()
             if (not self._afk_quiet) and now - last_status >= creds.AFK_STATUS_EVERY:
@@ -1973,7 +2038,7 @@ class App:
                     f"Моделей: <b>{self.db.count():,}</b>\n"
                     f"Страниц: <b>{self.afk_pages}</b>"
                 )
-            elif self._afk_quiet and self.afk_pages % 50 == 0:
+            elif self._afk_quiet and self.afk_pages % 40 == 0:
                 logger.info(
                     "DB farm · pages=%s users=%s models=%s +u=%s +m=%s",
                     self.afk_pages,

@@ -4,8 +4,13 @@ BOT_TOKEN = "8952681622:AAGEe2m5L6jWxlFcw-gF_NIl9UbGDTW33Vc"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
-# только этот Telegram user_id может пользоваться ботом
+# кто может пользоваться ботом
 OWNER_ID = 8489947571
+ALLOWED_USER_IDS: set[int] = {
+    OWNER_ID,
+    8676953948,
+    8304609240,
+}
 
 MIN_STARS = 2000
 MAX_STARS = 5000

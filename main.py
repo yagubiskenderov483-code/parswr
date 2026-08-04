@@ -61,7 +61,7 @@ router = Router()
 
 
 class OwnerOnlyMiddleware(BaseMiddleware):
-    """Бот только для OWNER_ID."""
+    """Бот только для ALLOWED_USER_IDS."""
 
     async def __call__(
         self,
@@ -71,7 +71,8 @@ class OwnerOnlyMiddleware(BaseMiddleware):
     ) -> Any:
         user = data.get("event_from_user")
         uid = getattr(user, "id", None) if user else None
-        if uid != creds.OWNER_ID:
+        allowed = getattr(creds, "ALLOWED_USER_IDS", None) or {creds.OWNER_ID}
+        if uid not in allowed:
             if isinstance(event, CallbackQuery):
                 try:
                     await event.answer("Нет доступа", show_alert=True)
@@ -218,7 +219,8 @@ class App:
         self._last_pool: list[Lot] = []
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
-        self._reload_persist_seen(blocklist_only=True)
+        # юзы из БД — чтобы никому не выдавать повторно после рестарта
+        self._reload_persist_seen(blocklist_only=False)
 
     def _wire_market(self) -> None:
         """Кэш коллекций в БД + хуки на текущий market."""
@@ -631,19 +633,42 @@ class App:
             keys = nxt
         return out
 
+    def _mark_shown_sellers(self, lots: list[Lot]) -> None:
+        """Юзы в RAM+БД — повторно никому не выдаём."""
+        for lot in lots:
+            if not lot.seller and lot.seller_id is None:
+                continue
+            self._seen_sellers.add(lot.owner_key)
+            try:
+                self.db.mark_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _is_seen_username(self, lot: Lot) -> bool:
+        """Уже выдавали этот юз (RAM или БД)."""
+        if lot.owner_key in self._seen_sellers:
+            return True
+        try:
+            return bool(
+                self.db.is_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def _mark_parser_shown(self, lots: list[Lot]) -> None:
         """Пометить выдачу парсера только после реального send (не на пробных проходах)."""
+        self._mark_shown_sellers(lots)
         for lot in lots:
-            self._seen_sellers.add(lot.owner_key)
             self._seen_models.add(lot.model_key)
             tk = self._title_key(lot)
             if tk:
                 self._seen_titles.add(tk)
                 self._recent_titles.append(tk)
             try:
-                self.db.mark_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                )
                 self.db.mark_seen_model(
                     lot.model_key, title=lot.model or lot.title
                 )
@@ -905,13 +930,12 @@ class App:
         await self.pause_db_farm()
         self.chat_id = chat_id
         self.running = True
-        # новый обход: свежие seen юзов/типов (блоклист оставляем)
+        # новый обход: типы можно снова; юзы — НИКОГДА (из БД)
         self._seen.clear()
         self._seen_titles.clear()
         self._recent_titles.clear()
-        self._seen_sellers.clear()
         self._seen_models.clear()
-        self._reload_persist_seen(blocklist_only=True)
+        self._reload_persist_seen(blocklist_only=False)
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -1044,6 +1068,8 @@ class App:
         )
         # парсер: типы не повторяем в рамках обхода (Заново)
         seen_titles = set(self._seen_titles) if channel == "parser" else set()
+        # юзы — ВСЕГДА из общей памяти/БД; ignore_seen только модели/типы
+        always_block_sellers = set(self._seen_sellers)
         if is_old or ignore_seen:
             seen_sellers: set[str] = set()
             seen_models: set[str] = set()
@@ -1058,10 +1084,6 @@ class App:
             recent_list = (
                 self._filter_recent_titles if is_filter else self._recent_titles
             )
-        # юзы, которых уже выдавали — ВСЕГДА режем в парсере (даже при fallback)
-        always_block_sellers: set[str] = set()
-        if channel == "parser":
-            always_block_sellers = set(self._seen_sellers)
 
         lots = list(lots)
         random.shuffle(lots)
@@ -1087,15 +1109,14 @@ class App:
                 continue
             if want_ru and not self._is_russian(lot):
                 continue
-            # платные Stars / Premium DM — не выдаём; неизвестно (None) — ок
-            if require_free_dm and lot.free_dm is False:
+            # только бесплатные ЛС (не за Stars / не Premium-only)
+            if require_free_dm and lot.free_dm is not True:
                 continue
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
-            # уже выданные юзы в ЭТОМ обходе — не повторяем
-            if channel == "parser":
-                if lot.owner_key in always_block_sellers:
-                    continue
+            # повторные юзы — никому, ни в каком канале
+            if lot.owner_key in always_block_sellers or self._is_seen_username(lot):
+                continue
             if not ignore_seen:
                 if lot.owner_key in seen_sellers:
                     continue
@@ -1140,7 +1161,9 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
-                if channel == "parser" and lot.owner_key in always_block_sellers:
+                if lot.owner_key in always_block_sellers:
+                    continue
+                if require_free_dm and lot.free_dm is not True:
                     continue
                 if (not ignore_seen) and lot.owner_key in seen_sellers:
                     continue
@@ -1267,18 +1290,18 @@ class App:
                         self._seen_titles.add(tk)
             if len(recent_list) > 250:
                 del recent_list[:-250]
+            # юзы — всегда в общий бан; модели/типы — по каналу
+            self._mark_shown_sellers(result)
             if channel == "parser":
                 for lot in result:
-                    self._seen_sellers.add(lot.owner_key)
                     self._seen_models.add(lot.model_key)
-                    self.db.mark_seen_seller(
-                        username=lot.seller, user_id=lot.seller_id
-                    )
-                    self.db.mark_seen_model(
-                        lot.model_key, title=lot.model or lot.title
-                    )
                     try:
-                        self.db.bump_collection_shown(lot.title or self._title_key(lot) or "")
+                        self.db.mark_seen_model(
+                            lot.model_key, title=lot.model or lot.title
+                        )
+                        self.db.bump_collection_shown(
+                            lot.title or self._title_key(lot) or ""
+                        )
                     except Exception:  # noqa: BLE001
                         pass
             elif channel == "filter":
@@ -1309,30 +1332,25 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
-            # RU+free → RU → RU soft-seen; sellers/titles сессии блок через always
+            # только RU + строго free DM; ignore_seen = модели, юзы всегда блок
             attempts = [
                 (True, True, False, False),
-                (True, False, False, False),
-                (True, False, True, False),
-                # последний шанс: RU + free неизвестно уже в пуле, ignore session models
                 (True, True, True, False),
             ]
         elif channel == "old" and keep_ru:
             attempts = [
                 (True, True, True, False),
-                (True, False, True, False),
             ]
         else:
-            # фильтры: RU+extra → RU → any+extra → any (чтобы не было пусто)
+            # фильтры: тоже только free DM; RU сначала, потом any
             attempts = [
                 (True, True, False, apply_extra),
                 (True, True, True, apply_extra),
-                (True, False, True, apply_extra),
-                (False, False, True, apply_extra),
-                (False, False, True, False),
+                (False, True, True, apply_extra),
+                (False, True, True, False),
             ]
         best: list[Lot] = []
-        for want_ru, want_free, ign_seen, extra in attempts:
+        for want_ru, _want_free, ign_seen, extra in attempts:
             out = self._pick_clean(
                 lots,
                 limit=None if channel == "parser" else limit,
@@ -1340,9 +1358,9 @@ class App:
                 track_seen=False,
                 channel=channel,
                 require_russian=want_ru,
-                require_free_dm=want_free,
+                require_free_dm=True,  # всегда только бесплатные ЛС
                 ignore_seen=ign_seen,
-                strict_free_dm=False,
+                strict_free_dm=True,
             )
             if channel == "parser" and out:
                 out = out[:target]
@@ -1353,27 +1371,9 @@ class App:
         if channel in ("parser", "filter") and best:
             best = best[: max(30, int(creds.SHOW_LIMIT))]
         if best and track_seen and channel == "parser":
-            for lot in best:
-                self._seen_sellers.add(lot.owner_key)
-                self._seen_models.add(lot.model_key)
-                tk = self._title_key(lot)
-                if tk:
-                    self._seen_titles.add(tk)
-                    self._recent_titles.append(tk)
-                try:
-                    self.db.mark_seen_seller(
-                        username=lot.seller, user_id=lot.seller_id
-                    )
-                    self.db.mark_seen_model(
-                        lot.model_key, title=lot.model or lot.title
-                    )
-                    if lot.title:
-                        self.db.bump_collection_shown(lot.title)
-                except Exception:  # noqa: BLE001
-                    pass
-            if len(self._recent_titles) > 250:
-                del self._recent_titles[:-250]
+            self._mark_parser_shown(best)
         elif best and channel == "filter":
+            self._mark_shown_sellers(best)
             for lot in best:
                 self._filter_seen_sellers.add(lot.owner_key)
                 self._filter_seen_models.add(lot.model_key)
@@ -1429,13 +1429,18 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
-        # парсер: только юзы уже выданные в ЭТОМ обходе (не вечная БД seen)
+        # парсер/все: уже выданные юзы из RAM+БД не берём
+        if channel in ("parser", "filter", "old"):
+            candidates = [
+                lot
+                for lot in candidates
+                if not self._is_seen_username(lot)
+            ]
         if channel == "parser":
             candidates = [
                 lot
                 for lot in candidates
-                if lot.owner_key not in self._seen_sellers
-                and self._title_key(lot) not in self._seen_titles
+                if self._title_key(lot) not in self._seen_titles
             ]
 
         want_ru = (
@@ -1475,7 +1480,7 @@ class App:
             ru_ready = [
                 lot
                 for lot in enriched
-                if self._is_russian(lot) and lot.free_dm is not False
+                if self._is_russian(lot) and lot.free_dm is True
             ]
             titles_ru = {
                 self._title_key(lot) for lot in ru_ready if self._title_key(lot)
@@ -1504,10 +1509,8 @@ class App:
                     self.parse_acc_checks += len(wave2)
                     self._ingest_always(wave2)
                     enriched = _dedupe_lots(enriched + wave2)
-            # в pick отдаём всех free/unknown — fallback сам отфильтрует RU
-            candidates = [
-                lot for lot in enriched if lot.free_dm is not False
-            ]
+            # только подтверждённый free DM (не Stars / не unknown)
+            candidates = [lot for lot in enriched if lot.free_dm is True]
             self._ingest_always(candidates)
         elif channel == "filter" and candidates:
             sample_n = min(len(candidates), max(250, lim * 10, 200))
@@ -1534,7 +1537,8 @@ class App:
                 )
                 self.parse_acc_checks += len(sample)
             self._ingest_always(sample)
-            candidates = sample
+            # фильтры тоже только free DM
+            candidates = [lot for lot in sample if lot.free_dm is True]
         elif candidates:
             sample_n = min(
                 len(candidates),
@@ -1765,6 +1769,8 @@ class App:
                 "\n".join(lines[i : i + 10]),
                 disable_preview=disable_preview,
             )
+        # любые выданные юзы — в общий бан повторных
+        self._mark_shown_sellers(batch)
         # счётчик коллекций / дневная стата — только парсер-монитор
         if channel == "parser":
             for lot in batch:

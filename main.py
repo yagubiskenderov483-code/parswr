@@ -614,7 +614,8 @@ class App:
 
     @staticmethod
     def _format_lot_line(lot: Lot) -> str:
-        model = lot.model or lot.title
+        # Название NFT/коллекции (Plush Pepe), не модель (Glow Verde)
+        nft_name = (lot.title or lot.model or "Gift").strip()
         meta = []
         if lot.gifts_count is not None:
             meta.append(f"gifts {lot.gifts_count}")
@@ -626,7 +627,7 @@ class App:
             meta.append("TGP")
         extra = f" · {', '.join(meta)}" if meta else ""
         return (
-            f'🎁 <a href="{lot.nft_url}">{_esc(model)}</a> | '
+            f'🎁 <a href="{lot.nft_url}">{_esc(nft_name)}</a> | '
             f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
         )
 

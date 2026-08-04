@@ -112,8 +112,9 @@ class App:
     def __init__(self) -> None:
         Path("data").mkdir(exist_ok=True)
         self.client = TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
-        self.market = TelegramMarket(self.client)
         self.db = GiftDB()
+        self.market = TelegramMarket(self.client)
+        self._wire_market()
         self.bot: Bot | None = None
         self.chat_id: int | None = None
         self.running = False
@@ -163,6 +164,31 @@ class App:
         self.active_account_id: int | None = None
         self._adding_account = False
         self._reload_persist_seen()
+
+    def _wire_market(self) -> None:
+        """Кэш коллекций в БД + хуки на текущий market."""
+        self.market.set_catalog_hooks(
+            load_cb=self.db.load_gift_catalog,
+            save_cb=self.db.save_gift_catalog,
+        )
+        # сразу подтянуть из БД в RAM — без сети
+        try:
+            self.market._hydrate_from_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _new_market(self) -> TelegramMarket:
+        m = TelegramMarket(self.client)
+        self.market = m
+        self._wire_market()
+        return m
+
+    async def _preload_collections(self) -> None:
+        try:
+            n = await self.market.preload_collections()
+            logger.info("collections ready: %s", n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("preload collections: %s", exc)
 
     def cycle_speed(self) -> str:
         order = ["quiet", "norm", "fast"]
@@ -249,6 +275,7 @@ class App:
             f"@{me.username}" if me.username else (me.first_name or str(me.id))
         )
         self.market.set_client(self.client)
+        self._wire_market()
         # сохранить сессию для мультиакка / ротации
         try:
             session = StringSession.save(self.client.session)
@@ -262,6 +289,7 @@ class App:
         except Exception as exc:  # noqa: BLE001
             logger.warning("save account session: %s", exc)
         self._adding_account = False
+        await self._preload_collections()
 
     async def try_restore_account(self) -> bool:
         """Поднять активный акк из БД при старте бота."""
@@ -282,7 +310,7 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
             self.client = client
-            self.market = TelegramMarket(self.client)
+            self._new_market()
             me = await client.get_me()
             self.logged_in = True
             self.account_name = (
@@ -292,6 +320,7 @@ class App:
             self.active_account_id = int(acc["id"])
             self.db.set_active_account(self.active_account_id)
             self.market.set_client(self.client)
+            await self._preload_collections()
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("restore account: %s", exc)
@@ -319,7 +348,7 @@ class App:
             await client.disconnect()
             raise ValueError("Сессия мертва — залогинь акк заново.")
         self.client = client
-        self.market = TelegramMarket(self.client)
+        self._new_market()
         me = await client.get_me()
         self.logged_in = True
         self.account_name = (
@@ -339,6 +368,7 @@ class App:
             )
         except Exception:  # noqa: BLE001
             pass
+        await self._preload_collections()
         if was_running and chat:
             await self.start_monitor(chat)
         if was_afk and chat:
@@ -362,7 +392,7 @@ class App:
         except Exception:  # noqa: BLE001
             pass
         self.client = self._new_client()
-        self.market = TelegramMarket(self.client)
+        self._new_market()
         self.phone = None
         self.phone_code_hash = None
         self.logged_in = False
@@ -388,7 +418,7 @@ class App:
         self.account_name = ""
         self.active_account_id = None
         self.client = self._new_client()
-        self.market = TelegramMarket(self.client)
+        self._new_market()
         wipe_disk_junk()
         # если есть другой акк — поднять его
         other = self.db.get_active_account() or (
@@ -675,29 +705,52 @@ class App:
         need_full: bool | None = None,
         channel: str = "parser",
     ) -> list[Lot]:
-        await self.market.resolve_owners(lots, timeout=creds.OWNER_TIMEOUT)
+        lim = limit or creds.SHOW_LIMIT
+        # сначала те, у кого уже есть seller из маркета — меньше API
+        pre = list(lots)
+        random.shuffle(pre)
+        with_seller = [lot for lot in pre if lot.seller]
+        without = [lot for lot in pre if not lot.seller]
+        # резолвим только недостающих, и не всех подряд
+        resolve_n = min(len(without), max(lim * 3, 40))
+        if resolve_n:
+            await self.market.resolve_owners(
+                without[:resolve_n],
+                timeout=creds.OWNER_TIMEOUT,
+                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+            )
+        pool = with_seller + without[:resolve_n]
         self.db.upsert_users_from_lots(
-            [lot for lot in lots if lot.seller_id is not None],
+            [lot for lot in pool if lot.seller_id is not None],
             cap=creds.AFK_USER_CAP,
         )
-        self._save_models([lot for lot in lots if lot.seller or lot.seller_id])
+        self._save_models([lot for lot in pool if lot.seller or lot.seller_id])
 
         candidates = [
             lot
-            for lot in lots
+            for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
         random.shuffle(candidates)
         if candidates:
-            lim = limit or creds.SHOW_LIMIT
-            sample_n = min(len(candidates), max(lim * 4, 50))
+            sample_n = min(len(candidates), max(lim * 3, 36))
             if need_full or apply_extra or channel == "filter":
                 sample_n = min(len(candidates), max(sample_n, lim * 5))
-            await self.market.enrich_profiles(
-                candidates[:sample_n],
-                timeout=min(creds.OWNER_TIMEOUT, 0.9),
-                parallel=getattr(creds, "ENRICH_PARALLEL", 3),
-            )
+            # кто уже RU по имени — био можно не тянуть
+            need_bio = [
+                lot
+                for lot in candidates[:sample_n]
+                if not (lot.first_name or lot.last_name)
+                or not self._is_russian(lot)
+            ]
+            if channel == "filter" or need_full or apply_extra:
+                need_bio = list(candidates[:sample_n])
+            if need_bio:
+                await self.market.enrich_profiles(
+                    need_bio,
+                    timeout=min(creds.OWNER_TIMEOUT, 0.7),
+                    parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                )
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],
                 cap=creds.AFK_USER_CAP,
@@ -706,7 +759,7 @@ class App:
             candidates = candidates[:sample_n]
         return self._pick_clean(
             candidates,
-            limit=limit or creds.SHOW_LIMIT,
+            limit=lim,
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
@@ -726,10 +779,7 @@ class App:
         try:
             await self._say_to(
                 chat_id,
-                f"🔎 <b>Фильтр-поиск</b> (отдельно от парсера)\n"
-                f"Сложность: <b>{label}</b>\n"
-                f"{_filters_label(f)}\n"
-                f"БД + лайв по рынку · парсер/чеки не трогаю",
+                f"🔎 <b>{label}</b>\n{_filters_label(f)}",
             )
             old = self.db.fetch_random_lots(
                 min_stars=mn,
@@ -1105,24 +1155,19 @@ class App:
         self._afk_task = None
 
     async def _loop(self) -> None:
-        # 1) Скан 149/149, но выдача СРАЗУ как набрали пул (не ждать конца)
-        await self._say(
-            f"⚡ Ищу свежие лоты · <b>{self.range_label}</b>\n"
-            f"Коллекции: <b>149/149</b> · первая выдача сразу, как наберётся"
-        )
+        # 1) Быстрый скан: сразу выдача, без простыней в чат
         last_prog = 0.0
         early_shown = False
 
         async def _burst_progress(done: int, total: int, lots_n: int) -> None:
             nonlocal last_prog
             nowp = time.monotonic()
-            if nowp - last_prog < 1.8 and done < total:
+            if nowp - last_prog < 2.5 and done < total:
                 return
             last_prog = nowp
             await self._edit_status(
-                f"⚡ Скан: <b>{done}/{total}</b>"
-                f"{' · выдача уже ушла' if early_shown else ' · жду пул…'}\n"
-                f"Лотов сырых: <b>{lots_n}</b> · <b>{self.range_label}</b>"
+                f"⚡ <b>{self.range_label}</b> · {done}/{total} · лотов {lots_n}"
+                f"{' · выдача ✅' if early_shown else ''}"
             )
 
         async def _on_early(matched: list[Lot], done: int, total: int) -> None:
@@ -1130,10 +1175,6 @@ class App:
             if early_shown or not self.running:
                 return
             early_shown = True
-            await self._say(
-                f"⚡ Быстрая выдача · скан <b>{done}/{total}</b> ещё идёт в фоне…"
-            )
-            # сохранить что уже есть
             self._save_models(matched)
             self._flush_market_users()
             pool = [lot for lot in matched if self._in_price(lot)]
@@ -1144,17 +1185,11 @@ class App:
                 apply_extra=False,
                 channel="parser",
             )
-            await self._say(
-                f"🔍 Парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                f"(RU · без повторов · ≠ фильтр-поиск)"
-            )
             if shown:
                 now_e = time.monotonic()
                 for lot in shown:
                     self._seen[lot.id] = now_e
                 await self._say_lot_list(shown, channel="parser")
-            else:
-                await self._say("Пока пусто в парсере — добьём круг 149…")
 
         self.market._progress_cb = _burst_progress
         try:
@@ -1196,16 +1231,6 @@ class App:
                 burst.scanned >= burst.collections_total
                 and burst.collections_total > 0
             )
-            await self._say(
-                f"💾 Круг готов · моделей: <b>{len(to_save)}</b> (+{ins}/{upd})\n"
-                f"👤 Юзов +{ins_u} / upd {upd_u} · всего <b>{total_u:,}</b>\n"
-                f"🗄 В БД: <b>{self.db_total}</b> · уник. моделей: <b>{uniq_models}</b>\n"
-                f"Коллекции: <b>{burst.scanned}/{burst.collections_total}</b>"
-                f"{' ✅' if full else ''}\n"
-                f"~{burst.elapsed:.1f}с"
-            )
-
-            # если ранняя выдача не сработала — покажем сейчас
             if not early_shown:
                 price_pool = [
                     lot
@@ -1219,30 +1244,25 @@ class App:
                     apply_extra=False,
                     channel="parser",
                 )
-                await self._say(
-                    f"🔍 Парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                    f"(кириллица · без повторов · ≠ фильтр-поиск)"
-                )
                 if shown:
                     for lot in shown:
                         self._seen[lot.id] = now
                     await self._say_lot_list(shown, channel="parser")
-                else:
-                    await self._say("В парсере пусто — мониторю дальше…")
+            await self._edit_status(
+                f"✅ Круг <b>{burst.scanned}/{burst.collections_total}</b> · "
+                f"~{burst.elapsed:.1f}с · моделей {len(to_save)} · "
+                f"юзов {total_u:,} (+{ins_u})"
+            )
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
-            await self._say(
-                f"Пока в диапазоне ничего не нашёл за {getattr(burst, 'elapsed', 0):.1f}с.\n"
-                f"({_esc(err)})\nЖду новые…"
-            )
+            await self._say(f"Пусто · {_esc(err)[:120]}")
 
         if burst:
             self.checks = burst.check_no
 
-        await self._say(
-            "📡 Мониторю <b>тихо</b> · по ~12 коллекций за чек, "
-            "полный круг 149 без гонки · сессию бережём.",
-            reply_markup=main_inline(),
+        await self._edit_status(
+            f"📡 Парсер · <b>{self.range_label}</b> · {self.speed_label}\n"
+            f"мониторю…"
         )
 
         # 2) Чеки — полный круг коллекций каждый раз
@@ -1308,24 +1328,10 @@ class App:
                 if self.checks % 3 == 0:
                     self.db.checkpoint()
                 await self._edit_status(
-                    f"💓 <b>Чек #{self.checks}</b> · тихо\n"
-                    f"Режим: <b>{self.range_label}</b>\n"
-                    f"За чек: <b>{result.scanned}</b>/"
-                    f"<b>{result.collections_total}</b> "
-                    f"(кусок, без гонки)\n"
-                    f"Лотов в ответе: <b>{len(result.lots)}</b>\n"
-                    f"Новых за чек: <b>{len(fresh)}</b>\n"
-                    f"Всего новых: <b>{self.lots_notified}</b>\n"
-                    f"Seen: <b>{len(self._seen)}</b> · "
-                    f"sellers: <b>{len(self._seen_sellers)}</b> · "
-                    f"models: <b>{len(self._seen_models)}</b>\n"
-                    f"👤 Юзов в БД: <b>{total_u:,}</b> (+{ins_u})\n"
-                    f"🗄 Моделей в БД: <b>{self.db_total}</b> "
-                    f"(уник. {self.db.count_models()}, last {self.db_last_saved})\n"
-                    f"🚫 Блок: <b>{self.db.count_blocked()}</b>\n"
-                    f"ok/err/flood: {result.ok}/{result.errors}/{result.floods}\n"
-                    f"⏱ {result.elapsed:.2f}с"
-                    + (f"\n⚠️ {_esc(result.error[:120])}" if result.error else "")
+                    f"💓 #{self.checks} · <b>{self.range_label}</b>\n"
+                    f"{result.scanned}/{result.collections_total} · "
+                    f"+{len(fresh)} · {result.elapsed:.1f}с"
+                    + (f"\n⚠️ {_esc(result.error[:80])}" if result.error else "")
                 )
             except asyncio.CancelledError:
                 raise
@@ -1539,7 +1545,11 @@ def settings_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Сложность парсера", callback_data="menu:parse")],
-            [InlineKeyboardButton(text="🧩 Фильтр-поиск", callback_data="menu:filters")],
+            [
+                InlineKeyboardButton(
+                    text="🧩 Фильтр-парсер", callback_data="menu:filters"
+                )
+            ],
             [InlineKeyboardButton(text=speed, callback_data="menu:speed")],
             [
                 InlineKeyboardButton(
@@ -1651,34 +1661,26 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
 
 
 async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
-    text = prefix + (
-        "💡 <b>Меню</b>\n\n"
-        f"Акк: <b>{app.account_name}</b> "
-        f"({len(app.db.list_accounts())} шт)\n"
-        f"Парсер: <b>{app.range_label}</b>\n"
-        f"Фильтр-поиск: <b>{app.filter_range_label}</b>\n"
-        f"Скорость: <b>{app.speed_label}</b>\n"
-        f"Фильтры: {_filters_label(app.filters)}\n"
-        f"Парсинг: <b>{'▶️' if app.running else '⏹'}</b> · "
-        f"AFK: <b>{'🌙' if app.afk_running else '⏹'}</b>\n"
-        f"🎲 Разные NFT в выдаче · 🚫 бан 4–5 юзов"
+    # только статус + кнопки, без преамбулы сверху
+    text = (
+        f"{app.account_name or '—'}\n"
+        f"{app.range_label} · {app.speed_label}\n"
+        f"{'▶️' if app.running else '⏹'} парсер · "
+        f"{'🌙' if app.afk_running else '⏹'} afk"
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_inline())
         await target.answer()
     else:
-        await target.answer(text, reply_markup=main_inline())
+        await target.answer(
+            text,
+            reply_markup=main_inline(),
+        )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    try:
-        await message.answer(
-            "\u200b", reply_markup=ReplyKeyboardRemove()
-        )  # только снять клаву, без текста в меню
-    except Exception:  # noqa: BLE001
-        pass
     if app.logged_in:
         await _send_menu(message)
         return
@@ -1688,8 +1690,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     wipe_disk_junk()
     await state.set_state(AuthStates.phone)
     await message.answer(
-        "🎁 <b>Gifts parser</b>\nВход нужен для маркета Telegram.\n"
-        "📱 <code>+79991234567</code>"
+        "📱 <code>+79991234567</code>",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -1732,7 +1734,7 @@ async def got_code(message: Message, state: FSMContext) -> None:
         await message.answer("🔒 2FA:")
         return
     await state.clear()
-    await _send_menu(message, "Вход ок.\n")
+    await _send_menu(message)
 
 
 @router.message(StateFilter(AuthStates.password))
@@ -1743,7 +1745,7 @@ async def got_password(message: Message, state: FSMContext) -> None:
         await message.answer(f"⚠️ {exc}")
         return
     await state.clear()
-    await _send_menu(message, "Вход ок.\n")
+    await _send_menu(message)
 
 
 @router.callback_query(F.data == "menu:home")
@@ -1823,9 +1825,7 @@ async def cb_filter_toggle(callback: CallbackQuery) -> None:
     elif key == "run":
         await callback.answer("Ищу…")
         await callback.message.edit_text(
-            f"🔎 Фильтр-поиск · <b>{app.filter_range_label}</b>\n"
-            f"{_filters_label(app.filters)}\n"
-            f"Парсер не затрагивается.",
+            f"🔎 <b>{app.filter_range_label}</b>\n{_filters_label(app.filters)}",
             reply_markup=main_inline(),
         )
         await app.run_filter_search(callback.from_user.id)
@@ -2044,10 +2044,7 @@ async def _start_with_range(
 ) -> None:
     app.set_range(label, mn, mx)
     await callback.message.edit_text(
-        f"▶️ Парсер · <b>{label}</b>\n"
-        f"Фильтр-поиск — отдельно, сюда не мешается.\n"
-        f"Сначала быстрый поиск…\n"
-        f"🚫 4–5 значные юзы скрыты · выдача списком",
+        f"▶️ <b>{label}</b> · {app.speed_label}",
         reply_markup=main_inline(),
     )
     await callback.answer("Старт")

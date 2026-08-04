@@ -23,6 +23,7 @@ from telethon.tl.functions.payments import (
 )
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import StarsAmount, StarsTonAmount
+from telethon.tl.types.payments import StarGiftsNotModified
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ class TelegramMarket:
     def __init__(self, client: TelegramClient) -> None:
         self.client = client
         self._gift_ids: list[int] = []
+        self._gifts_hash = 0
         self._cursor = 0
         self._flood_until = 0.0
         self._gap_lock = asyncio.Lock()
@@ -107,20 +109,34 @@ class TelegramMarket:
         self._profile_cache: dict[int, dict[str, Any]] = {}
         self._found_users: list[dict[str, Any]] = []
         self._progress_cb = None
+        self._catalog_load: Any | None = None  # () -> (ids, hash) | None
+        self._catalog_save: Any | None = None  # (ids, hash) -> None
+        self._refresh_task: asyncio.Task | None = None
         self.check_no = 0
         self.last_error = ""
 
+    def set_catalog_hooks(
+        self,
+        load_cb: Any | None = None,
+        save_cb: Any | None = None,
+    ) -> None:
+        """Подключить кэш коллекций из БД — старт без ожидания GetStarGifts."""
+        self._catalog_load = load_cb
+        self._catalog_save = save_cb
+
     def set_client(self, client: TelegramClient) -> None:
         self.client = client
-        self._gift_ids.clear()
+        # gift_ids оставляем из кэша — не сбрасываем список коллекций
         self._owner_cache.clear()
         self._profile_cache.clear()
         self._found_users.clear()
         self._progress_cb = None
-        self._cursor = 0
         self._flood_until = 0.0
         self.check_no = 0
         self.last_error = ""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = None
 
     def drain_users(self) -> list[dict[str, Any]]:
         """Забрать юзеров, собранных из ответов маркета (для записи в БД)."""
@@ -139,17 +155,39 @@ class TelegramMarket:
         if not self.client.is_connected():
             await self.client.connect()
 
-    async def load_collections(self, force: bool = False) -> list[int]:
-        if self._gift_ids and not force:
-            return self._gift_ids
-        await self.ensure_connected()
-        result = await asyncio.wait_for(
-            self.client(GetStarGiftsRequest(hash=0)),
-            timeout=12.0,
-        )
-        gifts = getattr(result, "gifts", []) or []
+    def _hydrate_from_cache(self) -> bool:
+        if self._gift_ids:
+            return True
+        if not callable(self._catalog_load):
+            return False
+        try:
+            cached = self._catalog_load()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("catalog load: %s", exc)
+            return False
+        if not cached:
+            return False
+        ids, h = cached
+        if not ids:
+            return False
+        self._gift_ids = list(ids)
+        self._gifts_hash = int(h or 0)
+        if self._gift_ids:
+            self._cursor = random.randrange(len(self._gift_ids))
+        return True
+
+    def _persist_catalog(self) -> None:
+        if not callable(self._catalog_save) or not self._gift_ids:
+            return
+        try:
+            self._catalog_save(list(self._gift_ids), int(self._gifts_hash or 0))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("catalog save: %s", exc)
+
+    @staticmethod
+    def _ids_from_gifts(gifts: Any) -> list[int]:
         ids: list[int] = []
-        for gift in gifts:
+        for gift in gifts or []:
             gift_id = getattr(gift, "id", None)
             if gift_id is None:
                 continue
@@ -163,12 +201,86 @@ class TelegramMarket:
             except (TypeError, ValueError):
                 ids.append(int(gift_id))
         if not ids:
-            ids = [int(g.id) for g in gifts if getattr(g, "id", None) is not None]
-        random.shuffle(ids)
-        self._gift_ids = ids
-        self._cursor = random.randrange(len(ids)) if ids else 0
-        logger.info("collections=%s cursor=%s", len(ids), self._cursor)
+            ids = [
+                int(g.id)
+                for g in (gifts or [])
+                if getattr(g, "id", None) is not None
+            ]
         return ids
+
+    async def _fetch_collections_remote(self, *, use_hash: bool = True) -> list[int]:
+        await self.ensure_connected()
+        req_hash = int(self._gifts_hash or 0) if use_hash else 0
+        result = await asyncio.wait_for(
+            self.client(GetStarGiftsRequest(hash=req_hash)),
+            timeout=8.0,
+        )
+        if isinstance(result, StarGiftsNotModified) or result.__class__.__name__ == (
+            "StarGiftsNotModified"
+        ):
+            if self._gift_ids:
+                return self._gift_ids
+            # hash устарел локально — тянем полный список
+            result = await asyncio.wait_for(
+                self.client(GetStarGiftsRequest(hash=0)),
+                timeout=8.0,
+            )
+        gifts = getattr(result, "gifts", []) or []
+        ids = self._ids_from_gifts(gifts)
+        try:
+            self._gifts_hash = int(getattr(result, "hash", 0) or 0)
+        except (TypeError, ValueError):
+            self._gifts_hash = 0
+        if ids:
+            # сохраняем порядок shuffle только если список реально новый
+            if set(ids) != set(self._gift_ids):
+                random.shuffle(ids)
+                self._gift_ids = ids
+                self._cursor = random.randrange(len(ids)) if ids else 0
+            elif not self._gift_ids:
+                random.shuffle(ids)
+                self._gift_ids = ids
+                self._cursor = random.randrange(len(ids)) if ids else 0
+            self._persist_catalog()
+        logger.info(
+            "collections=%s hash=%s cursor=%s",
+            len(self._gift_ids),
+            self._gifts_hash,
+            self._cursor,
+        )
+        return self._gift_ids
+
+    def _schedule_refresh(self) -> None:
+        """Фоновое обновление списка коллекций — не блокирует парсинг."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._refresh_task and not self._refresh_task.done():
+            return
+
+        async def _job() -> None:
+            try:
+                await self._fetch_collections_remote(use_hash=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("catalog refresh: %s", exc)
+
+        self._refresh_task = loop.create_task(_job())
+
+    async def load_collections(self, force: bool = False) -> list[int]:
+        """Мгновенно из RAM/БД, сеть — в фоне (или force=True)."""
+        if self._gift_ids and not force:
+            self._schedule_refresh()
+            return self._gift_ids
+        if not force and self._hydrate_from_cache():
+            self._schedule_refresh()
+            return self._gift_ids
+        return await self._fetch_collections_remote(use_hash=bool(self._gifts_hash))
+
+    async def preload_collections(self) -> int:
+        """Прогрев кэша при логине — парсер стартует без паузы."""
+        ids = await self.load_collections(force=False)
+        return len(ids)
 
     def reshuffle_collections(self) -> None:
         """Случайный порядок коллекций + курсор — чтобы выдача не повторялась."""
@@ -388,8 +500,24 @@ class TelegramMarket:
             all_lots=list(unique),
         )
 
-    async def resolve_owners(self, lots: list[Lot], timeout: float = 0.9) -> None:
-        await asyncio.gather(*[self.resolve_owner(lot, timeout=timeout) for lot in lots])
+    async def resolve_owners(
+        self,
+        lots: list[Lot],
+        timeout: float = 0.9,
+        *,
+        parallel: int = 12,
+    ) -> None:
+        # только тем, кому реально нужен owner — не гоняем лишние API
+        need = [lot for lot in lots if not lot.seller or lot.seller_id is None]
+        if not need:
+            return
+        sem = asyncio.Semaphore(max(1, int(parallel)))
+
+        async def one(lot: Lot) -> None:
+            async with sem:
+                await self.resolve_owner(lot, timeout=timeout)
+
+        await asyncio.gather(*[one(lot) for lot in need])
 
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
         if lot.seller and lot.seller_id is not None:
@@ -651,15 +779,14 @@ class TelegramMarket:
                 )
             except FloodWaitError as exc:
                 stats["floods"] += 1
-                # бережём сессию: ждём почти полностью + запас
-                wait_s = float(exc.seconds) + 1.5
-                self._flood_until = time.monotonic() + min(wait_s, 90.0)
+                wait_s = float(exc.seconds) + 0.8
+                self._flood_until = time.monotonic() + min(wait_s, 60.0)
                 self.last_error = f"FloodWait {exc.seconds}s · торможу"
-                await asyncio.sleep(min(wait_s, 45.0))
+                await asyncio.sleep(min(wait_s, 30.0))
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
                 self.last_error = str(exc)
-                await asyncio.sleep(0.4 * (attempt + 1))
+                await asyncio.sleep(0.2 * (attempt + 1))
         return None
 
     async def _wait_flood(self) -> None:

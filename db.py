@@ -180,6 +180,17 @@ class GiftDB:
             )
             """
         )
+        # кэш списка коллекций маркета (gift_id) — мгновенный старт парсера
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gift_catalog (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                hash INTEGER NOT NULL DEFAULT 0,
+                gift_ids TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gifts_stars ON gifts(stars)"
         )
@@ -905,6 +916,51 @@ class GiftDB:
             "SELECT title_key, shown_count FROM shown_collections"
         ).fetchall()
         return {str(r["title_key"]): int(r["shown_count"] or 0) for r in rows}
+
+    def load_gift_catalog(self) -> tuple[list[int], int] | None:
+        """Кэш gift_id коллекций + hash Telegram. None если пусто."""
+        row = self._conn.execute(
+            "SELECT hash, gift_ids FROM gift_catalog WHERE id = 1"
+        ).fetchone()
+        if not row:
+            return None
+        raw = str(row["gift_ids"] or "").strip()
+        if not raw:
+            return None
+        ids: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids.append(int(part))
+            except ValueError:
+                continue
+        if not ids:
+            return None
+        try:
+            h = int(row["hash"] or 0)
+        except (TypeError, ValueError):
+            h = 0
+        return ids, h
+
+    def save_gift_catalog(self, gift_ids: list[int], hash_val: int = 0) -> None:
+        if not gift_ids:
+            return
+        raw = ",".join(str(int(x)) for x in gift_ids)
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO gift_catalog (id, hash, gift_ids, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                hash = excluded.hash,
+                gift_ids = excluded.gift_ids,
+                updated_at = excluded.updated_at
+            """,
+            (int(hash_val or 0), raw, now),
+        )
+        self._conn.commit()
 
     def get_daily_stats(self, day: str | None = None) -> dict[str, Any]:
         day = day or self._today_key()

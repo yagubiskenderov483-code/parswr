@@ -71,33 +71,34 @@ SPEED_PROFILES: dict[str, dict] = {
     },
     "fast": {
         "label": "⚡ Быстро",
-        "BURST_PARALLEL": 12,
+        "BURST_PARALLEL": 16,
         "BURST_PER_COLLECTION": 8,
         "BURST_MAX_COLLECTIONS": 0,
-        "BURST_GAP": 0.08,
-        "API_TIMEOUT": 5.0,
-        "BURST_EARLY_SHOW_AT": 35,
-        "CHECK_INTERVAL": 0.8,
-        "CHECK_PARALLEL": 8,
+        "BURST_GAP": 0.05,
+        "API_TIMEOUT": 4.5,
+        "BURST_EARLY_SHOW_AT": 28,
+        "CHECK_INTERVAL": 0.5,
+        "CHECK_PARALLEL": 12,
         "CHECK_PER_COLLECTION": 6,
-        "CHECK_BATCH": 25,
-        "CHECK_GAP": 0.09,
-        "OWNER_TIMEOUT": 0.65,
-        "ENRICH_PARALLEL": 6,
+        "CHECK_BATCH": 30,
+        "CHECK_GAP": 0.06,
+        "OWNER_TIMEOUT": 0.55,
+        "ENRICH_PARALLEL": 8,
         "FILTER_BURST_PARALLEL": 12,
         "FILTER_BURST_PER_COLLECTION": 8,
         "FILTER_BURST_MAX_COLLECTIONS": 0,
-        "FILTER_BURST_GAP": 0.08,
+        "FILTER_BURST_GAP": 0.06,
         "FILTER_LIMIT": 30,
         "FILTER_DB_LIMIT": 30,
-        "FILTER_EARLY_SHOW_AT": 35,
+        "FILTER_EARLY_SHOW_AT": 28,
         "AFK_PAGE_LIMIT": 40,
-        "AFK_GAP": 0.18,
+        "AFK_GAP": 0.15,
         "AFK_PARALLEL": 3,
     },
 }
 
-DEFAULT_SPEED = "norm"
+# парсер по умолчанию быстрее (тихо/норм — в Настройках)
+DEFAULT_SPEED = "fast"
 
 
 def apply_speed(name: str) -> str:

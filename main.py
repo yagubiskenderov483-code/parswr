@@ -154,8 +154,12 @@ class App:
         self._blocked_keys: set[str] = set()
         self.speed_mode = creds.DEFAULT_SPEED
         self.speed_label = creds.apply_speed(self.speed_mode)
-        # недавние NFT-коллекции — чтобы в mid/hard не сыпалось одно и то же
+        # seen парсера (монитор) — отдельно от фильтр-поиска
         self._recent_titles: list[str] = []
+        # seen ТОЛЬКО фильтр-поиска — парсер не трогает и наоборот
+        self._filter_seen_sellers: set[str] = set()
+        self._filter_seen_models: set[str] = set()
+        self._filter_recent_titles: list[str] = []
         self.active_account_id: int | None = None
         self._adding_account = False
         self._reload_persist_seen()
@@ -514,18 +518,26 @@ class App:
         limit: int | None = None,
         apply_extra: bool = False,
         track_seen: bool = True,
+        channel: str = "parser",
     ) -> list[Lot]:
-        """Разнообразие NFT-коллекций + без повторов продавцов/моделей."""
-        lots = list(lots)
+        """Разнообразие NFT. channel=parser|filter — РАЗНЫЕ seen, не мешаются."""
+        is_filter = channel == "filter"
+        seen_sellers = (
+            self._filter_seen_sellers if is_filter else self._seen_sellers
+        )
+        seen_models = self._filter_seen_models if is_filter else self._seen_models
+        recent_list = (
+            self._filter_recent_titles if is_filter else self._recent_titles
+        )
+
         lots = list(lots)
         random.shuffle(lots)
-        # ведро по коллекции NFT; приоритет — кто МЕНЬШЕ всего выдавался
         buckets: dict[str, list[Lot]] = {}
         keys: list[str] = []
         local_sellers: set[str] = set()
         local_models: set[str] = set()
-        show_counts = self.db.get_collection_show_counts()
-        recent = set(self._recent_titles[-100:])
+        show_counts = {} if is_filter else self.db.get_collection_show_counts()
+        recent = set(recent_list[-100:])
 
         for lot in lots:
             if not lot.seller:
@@ -538,17 +550,27 @@ class App:
                 continue
             if self.require_russian and not self._is_russian(lot):
                 continue
-            if apply_extra and not self._passes_extra_filters(lot):
+            # тумблеры SearchFilters — ТОЛЬКО filter-канал
+            if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
-            if lot.owner_key in self._seen_sellers:
+            if lot.owner_key in seen_sellers:
                 continue
-            if lot.model_key in self._seen_models:
+            if lot.model_key in seen_models:
                 continue
-            if track_seen and self.db.is_seen_seller(
-                username=lot.seller, user_id=lot.seller_id
+            # DB seen — только парсер
+            if (
+                (not is_filter)
+                and track_seen
+                and self.db.is_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                )
             ):
                 continue
-            if track_seen and self.db.is_seen_model(lot.model_key):
+            if (
+                (not is_filter)
+                and track_seen
+                and self.db.is_seen_model(lot.model_key)
+            ):
                 continue
             if lot.owner_key in local_sellers:
                 continue
@@ -568,7 +590,6 @@ class App:
             random.shuffle(buckets[tk])
 
         def _rank(tk: str) -> tuple:
-            # меньше показов → раньше; недавние в хвост; лёгкий random
             return (
                 show_counts.get(tk, 0),
                 1 if tk in recent else 0,
@@ -579,20 +600,24 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
-                if lot.owner_key in self._seen_sellers:
+                if lot.owner_key in seen_sellers:
                     continue
-                if lot.model_key in self._seen_models:
+                if lot.model_key in seen_models:
                     continue
                 return lot
             return None
 
         def _mark(lot: Lot) -> None:
-            self._seen_sellers.add(lot.owner_key)
-            self._seen_models.add(lot.model_key)
-            self.db.mark_seen_seller(username=lot.seller, user_id=lot.seller_id)
-            self.db.mark_seen_model(lot.model_key, title=lot.model or lot.title)
+            seen_sellers.add(lot.owner_key)
+            seen_models.add(lot.model_key)
+            if (not is_filter) and track_seen:
+                self.db.mark_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                )
+                self.db.mark_seen_model(
+                    lot.model_key, title=lot.model or lot.title
+                )
 
-        # 1 лот на коллекцию, сначала самые «недовыданные»
         primary: list[Lot] = []
         ordered = sorted(keys, key=_rank)
         for tk in ordered:
@@ -604,7 +629,6 @@ class App:
             primary.append(lot)
             _mark(lot)
 
-        # добор только если уникальных коллекций не хватило
         extra: list[Lot] = []
         if limit is not None and len(primary) < limit:
             again = sorted(keys, key=_rank)
@@ -617,7 +641,6 @@ class App:
                 extra.append(lot)
                 _mark(lot)
 
-        # уникальные коллекции сверху, добор в хвост; разнос одинаковых
         result = list(primary) + list(extra)
         if limit is not None:
             result = result[:limit]
@@ -637,9 +660,9 @@ class App:
         for lot in result:
             tk = self._title_key(lot)
             if tk:
-                self._recent_titles.append(tk)
-        if len(self._recent_titles) > 250:
-            self._recent_titles = self._recent_titles[-250:]
+                recent_list.append(tk)
+        if len(recent_list) > 250:
+            del recent_list[:-250]
         return result
 
     async def _prepare_show(
@@ -650,13 +673,13 @@ class App:
         apply_extra: bool = False,
         track_seen: bool = True,
         need_full: bool | None = None,
+        channel: str = "parser",
     ) -> list[Lot]:
         await self.market.resolve_owners(lots, timeout=creds.OWNER_TIMEOUT)
         self.db.upsert_users_from_lots(
             [lot for lot in lots if lot.seller_id is not None],
             cap=creds.AFK_USER_CAP,
         )
-        # сохраним seller к моделям в БД
         self._save_models([lot for lot in lots if lot.seller or lot.seller_id])
 
         candidates = [
@@ -665,11 +688,10 @@ class App:
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
         random.shuffle(candidates)
-        # био/имя — RU/анти-реклама; меньше запросов = быстрее выдача
         if candidates:
             lim = limit or creds.SHOW_LIMIT
             sample_n = min(len(candidates), max(lim * 4, 50))
-            if need_full or apply_extra:
+            if need_full or apply_extra or channel == "filter":
                 sample_n = min(len(candidates), max(sample_n, lim * 5))
             await self.market.enrich_profiles(
                 candidates[:sample_n],
@@ -681,13 +703,13 @@ class App:
                 cap=creds.AFK_USER_CAP,
             )
             self._flush_market_users()
-            # в пул на pick — только уже обогащённые (есть шанс пройти RU)
             candidates = candidates[:sample_n]
         return self._pick_clean(
             candidates,
             limit=limit or creds.SHOW_LIMIT,
-            apply_extra=apply_extra,
-            track_seen=track_seen,
+            apply_extra=bool(apply_extra and channel == "filter"),
+            track_seen=bool(track_seen and channel == "parser"),
+            channel=channel,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
@@ -759,29 +781,32 @@ class App:
                 f"📦 Кандидатов: <b>{len(merged)}</b> "
                 f"(БД {len(old)} · лайв {len(live)})",
             )
+            # channel=filter — свой seen, парсер не затрагивает
             shown = await self._prepare_show(
                 merged,
                 limit=creds.SHOW_LIMIT,
                 apply_extra=True,
-                track_seen=True,
+                track_seen=False,
                 need_full=True,
+                channel="filter",
             )
             if not shown:
                 await self._say_to(
                     chat_id,
-                    "Пусто по фильтрам. Ослабь тумблеры или смени сложность.",
+                    "Пусто в фильтр-поиске. Ослабь тумблеры или смени сложность.",
                     reply_markup=filters_inline(),
                 )
                 return
             await self._say_to(
                 chat_id,
-                f"✅ Найдено: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} · "
-                f"фильтр-поиск (не парсер) · <b>{label}</b>",
+                f"✅ Фильтр-парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} · "
+                f"<b>{label}</b>\n"
+                f"<i>отдельный канал · монитор не тронут</i>",
             )
-            await self._say_lot_list_to(chat_id, shown)
+            await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                "Готово · списком. Блок юза: <code>/block username</code>",
+                "Готово · фильтр-парсер. Блок: <code>/block username</code>",
                 reply_markup=filters_inline(),
             )
         finally:
@@ -806,26 +831,30 @@ class App:
             f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
         )
 
-    async def _say_lot_list(self, lots: list[Lot]) -> None:
+    async def _say_lot_list(
+        self, lots: list[Lot], *, channel: str = "parser"
+    ) -> None:
         if self.chat_id:
-            await self._say_lot_list_to(self.chat_id, lots)
+            await self._say_lot_list_to(self.chat_id, lots, channel=channel)
 
-    async def _say_lot_list_to(self, chat_id: int, lots: list[Lot]) -> None:
-        """Выдача СПИСКОМ (как в примере), не карточками по одной."""
+    async def _say_lot_list_to(
+        self, chat_id: int, lots: list[Lot], *, channel: str = "parser"
+    ) -> None:
+        """Выдача СПИСКОМ. channel=parser|filter — раздельный учёт."""
         batch = lots[: creds.SHOW_LIMIT]
         if not batch:
             return
         lines = [self._format_lot_line(lot) for lot in batch]
-        # одним/несколькими сообщениями по 10 строк — без очереди карточек
         for i in range(0, len(lines), 10):
             await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
-        # учёт разнообразия + дневная стата
-        for lot in batch:
-            self.db.bump_collection_shown(lot.title or lot.model or "")
-        try:
-            self.db.bump_daily(lots_shown=len(batch))
-        except Exception:  # noqa: BLE001
-            pass
+        # счётчик коллекций / дневная стата — только парсер-монитор
+        if channel == "parser":
+            for lot in batch:
+                self.db.bump_collection_shown(lot.title or lot.model or "")
+            try:
+                self.db.bump_daily(lots_shown=len(batch))
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _say(self, text: str, reply_markup=None) -> Message | None:
         if not self.chat_id:
@@ -1110,19 +1139,22 @@ class App:
             pool = [lot for lot in matched if self._in_price(lot)]
             random.shuffle(pool)
             shown = await self._prepare_show(
-                pool, limit=creds.SHOW_LIMIT, apply_extra=False
+                pool,
+                limit=creds.SHOW_LIMIT,
+                apply_extra=False,
+                channel="parser",
             )
             await self._say(
-                f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                f"(быстрый режим · RU · без повторов)"
+                f"🔍 Парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
+                f"(RU · без повторов · ≠ фильтр-поиск)"
             )
             if shown:
                 now_e = time.monotonic()
                 for lot in shown:
                     self._seen[lot.id] = now_e
-                await self._say_lot_list(shown)
+                await self._say_lot_list(shown, channel="parser")
             else:
-                await self._say("Пока пусто по фильтрам — добьём круг 149…")
+                await self._say("Пока пусто в парсере — добьём круг 149…")
 
         self.market._progress_cb = _burst_progress
         try:
@@ -1185,19 +1217,18 @@ class App:
                     price_pool or list(burst.lots),
                     limit=creds.SHOW_LIMIT,
                     apply_extra=False,
+                    channel="parser",
                 )
                 await self._say(
-                    f"🔍 К выдаче: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
-                    f"(кириллица в имени/био · без повторов)"
+                    f"🔍 Парсер: <b>{len(shown)}</b>/{creds.SHOW_LIMIT} "
+                    f"(кириллица · без повторов · ≠ фильтр-поиск)"
                 )
                 if shown:
                     for lot in shown:
                         self._seen[lot.id] = now
-                    await self._say_lot_list(shown)
+                    await self._say_lot_list(shown, channel="parser")
                 else:
-                    await self._say(
-                        "После фильтров пусто — мониторю дальше…"
-                    )
+                    await self._say("В парсере пусто — мониторю дальше…")
         else:
             err = (burst.error if burst else self.last_error) or "пусто"
             await self._say(
@@ -1266,9 +1297,12 @@ class App:
                         candidates,
                         limit=creds.SHOW_LIMIT,
                         apply_extra=False,
+                        channel="parser",
                     )
                     if fresh:
-                        await self._say_lot_list(fresh[: creds.SHOW_LIMIT])
+                        await self._say_lot_list(
+                            fresh[: creds.SHOW_LIMIT], channel="parser"
+                        )
                         self.lots_notified += len(fresh)
 
                 if self.checks % 3 == 0:
@@ -1385,8 +1419,12 @@ def main_inline() -> InlineKeyboardMarkup:
     afk = "🌙 AFK стоп" if app.afk_running else "🌙 AFK фарм юзов"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Парсинг", callback_data="menu:parse")],
-            [InlineKeyboardButton(text="🧩 Фильтры", callback_data="menu:filters")],
+            [InlineKeyboardButton(text="🔍 Парсер", callback_data="menu:parse")],
+            [
+                InlineKeyboardButton(
+                    text="🧩 Фильтр-парсер", callback_data="menu:filters"
+                )
+            ],
             [InlineKeyboardButton(text=afk, callback_data="menu:afk")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
         ]
@@ -1478,16 +1516,18 @@ def _current_filter_diff_id() -> str:
 
 def _filters_menu_text() -> str:
     return (
-        "🧩 <b>Поиск по фильтрам</b>\n"
-        "<i>Отдельно от парсера — чеки/seen не трогает</i>\n\n"
-        f"Сложность поиска: <b>{app.filter_range_label}</b>\n"
+        "🧩 <b>Фильтр-парсер</b>\n"
+        "<i>Отдельный канал ≠ монитор/парсинг</i>\n"
+        "• своя сложность 🟢🟡🔴💀\n"
+        "• свои тумблеры\n"
+        "• свой seen (парсер не портит и наоборот)\n\n"
+        f"Сложность: <b>{app.filter_range_label}</b>\n"
         f"{_filters_label(app.filters)}\n\n"
-        "🟢 лёгкий · 🟡 средний · 🔴 сложный · 💀 impossible\n"
         "• Мало гифтов — gifts ≤ 5\n"
         "• Мелкий lvl — rating ≤ 5\n"
         "• Короткий юз — длина 6–8 (4–5 всегда бан)\n"
         "• Без TGP — не Premium\n\n"
-        "Искать = старые из БД + свежие с маркета"
+        "Искать = БД + лайв · монитор можно не останавливать"
     )
 
 
@@ -1633,12 +1673,17 @@ async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(".", reply_markup=ReplyKeyboardRemove())
+    try:
+        await message.answer(
+            "\u200b", reply_markup=ReplyKeyboardRemove()
+        )  # только снять клаву, без текста в меню
+    except Exception:  # noqa: BLE001
+        pass
     if app.logged_in:
         await _send_menu(message)
         return
     if await app.try_restore_account():
-        await _send_menu(message, "Сессия восстановлена.\n")
+        await _send_menu(message)
         return
     wipe_disk_junk()
     await state.set_state(AuthStates.phone)
@@ -1998,13 +2043,11 @@ async def _start_with_range(
     callback: CallbackQuery, label: str, mn: int, mx: int
 ) -> None:
     app.set_range(label, mn, mx)
-    extra = ""
-    if app._filters_active():
-        extra = f"\nФильтры: {_filters_label(app.filters)}"
     await callback.message.edit_text(
-        f"▶️ Старт · <b>{label}</b>{extra}\n"
+        f"▶️ Парсер · <b>{label}</b>\n"
+        f"Фильтр-поиск — отдельно, сюда не мешается.\n"
         f"Сначала быстрый поиск…\n"
-        f"🚫 4–5 значные юзы скрыты · выдача random",
+        f"🚫 4–5 значные юзы скрыты · выдача списком",
         reply_markup=main_inline(),
     )
     await callback.answer("Старт")

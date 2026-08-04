@@ -439,30 +439,45 @@ class App:
         for tk in keys:
             random.shuffle(buckets[tk])
 
-        out: list[Lot] = []
-        # раунд-робин по разным NFT — в одной пачке макс. 1 лот на коллекцию
-        # (если уникальных мало — второй проход)
-        for pass_no in (1, 2):
-            ordered = list(keys)
-            random.shuffle(ordered)
-            if pass_no == 1:
-                ordered.sort(key=lambda k: k in recent)
-            for tk in ordered:
-                if limit is not None and len(out) >= limit:
-                    break
-                bucket = buckets.get(tk) or []
-                if not bucket:
-                    continue
-                if pass_no == 1 and any(self._title_key(x) == tk for x in out):
-                    continue
-                if out and self._title_key(out[-1]) == tk:
-                    continue
+        def _take(tk: str) -> Lot | None:
+            bucket = buckets.get(tk) or []
+            while bucket:
                 lot = bucket.pop(0)
                 if lot.owner_key in self._seen_sellers:
                     continue
                 if lot.model_key in self._seen_models:
                     continue
-                out.append(lot)
+                return lot
+            return None
+
+        primary: list[Lot] = []
+        ordered = list(keys)
+        random.shuffle(ordered)
+        ordered.sort(key=lambda k: k in recent)
+        for tk in ordered:
+            if limit is not None and len(primary) >= limit:
+                break
+            lot = _take(tk)
+            if lot is None:
+                continue
+            primary.append(lot)
+            self._seen_sellers.add(lot.owner_key)
+            self._seen_models.add(lot.model_key)
+            self.db.mark_seen_seller(username=lot.seller, user_id=lot.seller_id)
+            self.db.mark_seen_model(lot.model_key, title=lot.model or lot.title)
+
+        # добор, если уникальных NFT не хватило до лимита
+        extra: list[Lot] = []
+        if limit is not None and len(primary) < limit:
+            again = list(keys)
+            random.shuffle(again)
+            for tk in again:
+                if len(primary) + len(extra) >= limit:
+                    break
+                lot = _take(tk)
+                if lot is None:
+                    continue
+                extra.append(lot)
                 self._seen_sellers.add(lot.owner_key)
                 self._seen_models.add(lot.model_key)
                 self.db.mark_seen_seller(
@@ -471,24 +486,27 @@ class App:
                 self.db.mark_seen_model(
                     lot.model_key, title=lot.model or lot.title
                 )
-            if limit is not None and len(out) >= limit:
+
+        # сначала все разные NFT, потом добор — с разносом подряд
+        random.shuffle(primary)
+        result = list(primary)
+        for lot in extra:
+            if limit is not None and len(result) >= limit:
                 break
+            # вставить не рядом с тем же title
+            placed = False
+            for i in range(len(result) + 1):
+                left = self._title_key(result[i - 1]) if i > 0 else ""
+                right = self._title_key(result[i]) if i < len(result) else ""
+                tk = self._title_key(lot)
+                if tk != left and tk != right:
+                    result.insert(i, lot)
+                    placed = True
+                    break
+            if not placed:
+                result.append(lot)
+        result = result[:limit] if limit is not None else result
 
-        # финальный разнос одинаковых названий подряд
-        fixed: list[Lot] = []
-        rest = list(out)
-        random.shuffle(rest)
-        while rest:
-            pick_i = 0
-            if fixed:
-                last = self._title_key(fixed[-1])
-                for i, lot in enumerate(rest):
-                    if self._title_key(lot) != last:
-                        pick_i = i
-                        break
-            fixed.append(rest.pop(pick_i))
-
-        result = fixed[:limit] if limit is not None else fixed
         for lot in result:
             tk = self._title_key(lot)
             if tk:

@@ -61,6 +61,7 @@ class Lot:
     paid_dm_stars: int | None = None
     # None=неизвестно, True=сейчас в сети
     is_online: bool | None = None
+    lang_code: str = ""
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -322,6 +323,7 @@ class TelegramMarket:
         on_early_lots: Any | None = None,
         collection_ids: list[int] | None = None,
         stop_event: Any | None = None,
+        deep: bool = False,
     ) -> CheckResult:
         """Поиск лотов. Может отдать early-пул для быстрой выдачи, потом добить 149."""
         started = time.monotonic()
@@ -367,7 +369,13 @@ class TelegramMarket:
         async def one(gid: int) -> list[Lot]:
             async with sem:
                 return await self._fetch_one(
-                    gid, per_collection, stats, gap=gap, timeout=timeout, sem=None
+                    gid,
+                    per_collection,
+                    stats,
+                    gap=gap,
+                    timeout=timeout,
+                    sem=None,
+                    deep=deep,
                 )
 
         progress_cb = getattr(self, "_progress_cb", None)
@@ -886,6 +894,7 @@ class TelegramMarket:
         gap: float,
         timeout: float,
         sem: asyncio.Semaphore | None,
+        deep: bool = False,
     ) -> list[Lot]:
         async def _do() -> list[Lot]:
             result = await self._request(gift_id, limit, True, stats, gap, timeout)
@@ -900,52 +909,26 @@ class TelegramMarket:
                     lots = _parse_result(result2)
                     self._remember_users(_extract_users(result2))
                     result = result2
-            # вторая страница — новые продавцы (иначе Заново пустое)
-            next_off = str(getattr(result, "next_offset", "") or "") if result else ""
-            if lots and next_off:
-                try:
-                    more = await self._request(
-                        gift_id,
-                        limit,
-                        True,
-                        stats,
-                        gap,
-                        timeout,
-                        offset=next_off,
-                    )
-                    if more is None:
+            # deep=True (Заново) — 2-я страница для новых юзов; обычный парс — быстро
+            if deep and lots and result is not None:
+                next_off = str(getattr(result, "next_offset", "") or "")
+                if next_off:
+                    try:
                         more = await self._request(
                             gift_id,
                             limit,
-                            False,
+                            True,
                             stats,
                             gap,
                             timeout,
                             offset=next_off,
                         )
-                    if more is not None:
-                        extra = _parse_result(more)
-                        self._remember_users(_extract_users(more))
-                        if extra:
+                        if more is not None:
+                            extra = _parse_result(more)
+                            self._remember_users(_extract_users(more))
                             lots.extend(extra)
-                            next2 = str(getattr(more, "next_offset", "") or "")
-                            # иногда третья страница для разброса
-                            if next2 and random.random() < 0.55:
-                                more2 = await self._request(
-                                    gift_id,
-                                    limit,
-                                    True,
-                                    stats,
-                                    gap,
-                                    timeout,
-                                    offset=next2,
-                                )
-                                if more2 is not None:
-                                    extra2 = _parse_result(more2)
-                                    self._remember_users(_extract_users(more2))
-                                    lots.extend(extra2)
-                except Exception:  # noqa: BLE001
-                    pass
+                    except Exception:  # noqa: BLE001
+                        pass
             if lots:
                 stats["ok"] += 1
                 self._remember_users(
@@ -1090,6 +1073,9 @@ def _fill_user(lot: Lot, user: Any) -> None:
     online = _user_online_flag(user)
     if online is not None:
         lot.is_online = online
+    lc = str(getattr(user, "lang_code", "") or "").strip().lower()
+    if lc:
+        lot.lang_code = lc
     if hasattr(user, "send_paid_messages_stars"):
         raw = getattr(user, "send_paid_messages_stars", None)
         if raw is None:

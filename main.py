@@ -187,6 +187,7 @@ class App:
         self.afk_cursor = 0
         self._afk_quiet = True  # без спама в чат — только БД
         self._afk_paused = False
+        self._burst_deep = False  # 2-я страница коллекций только при доборе
         self.filters = SearchFilters()
         self.filter_search_running = False
         self._filter_task: asyncio.Task | None = None
@@ -324,12 +325,18 @@ class App:
         all_ids = list(await base.load_collections(force=False))
         random.shuffle(all_ids)
         chunks = self._split_ids(all_ids, len(markets))
-        # полная параллель на КАЖДЫЙ акк — максимальная скорость
         per_parallel = max(12, int(creds.BURST_PARALLEL))
+        deep = bool(getattr(self, "_burst_deep", False))
 
         early_lock = asyncio.Lock()
         early_fired = False
         stop_event = stop_event or asyncio.Event()
+        # общие счётчики по всем аккам (не max по куску)
+        agg_done = 0
+        agg_titles: set[str] = set()
+        agg_models: set[str] = set()
+        agg_lots = 0
+        agg_lock = asyncio.Lock()
 
         async def _prog(
             done: int,
@@ -337,17 +344,43 @@ class App:
             lots_n: int,
             types_n: int = 0,
             models_n: int = 0,
+            *,
+            titles: set[str] | None = None,
+            models: set[str] | None = None,
+            done_delta: int = 0,
+            lots_delta: int = 0,
         ) -> None:
-            self.parse_coll_checks = max(self.parse_coll_checks, done)
-            self.parse_checked = max(self.parse_checked, lots_n)
-            self.parse_types = max(self.parse_types, types_n)
-            self.parse_models = max(self.parse_models, models_n)
+            nonlocal agg_done, agg_lots
+            async with agg_lock:
+                if done_delta:
+                    agg_done += done_delta
+                else:
+                    # fallback: грубая оценка
+                    agg_done = max(agg_done, done)
+                if lots_delta:
+                    agg_lots += lots_delta
+                else:
+                    agg_lots = max(agg_lots, lots_n)
+                if titles:
+                    agg_titles.update(titles)
+                if models:
+                    agg_models.update(models)
+                self.parse_coll_checks = agg_done
+                self.parse_checked = agg_lots
+                self.parse_types = len(agg_titles) or max(self.parse_types, types_n)
+                self.parse_models = len(agg_models) or max(self.parse_models, models_n)
+                cur_done = agg_done
+                cur_lots = agg_lots
+                cur_types = self.parse_types
+                cur_models = self.parse_models
             if callable(progress_cb):
                 try:
-                    await progress_cb(done, total, lots_n, types_n, models_n)
+                    await progress_cb(
+                        cur_done, len(all_ids), cur_lots, cur_types, cur_models
+                    )
                 except TypeError:
                     try:
-                        await progress_cb(done, total, lots_n)
+                        await progress_cb(cur_done, len(all_ids), cur_lots)
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001
@@ -363,17 +396,56 @@ class App:
                 await on_early_lots(matched, done, total)
 
         async def run_one(m: TelegramMarket, ids: list[int], bump: bool):
+            last_scanned = 0
+            last_lots = 0
+
+            async def _local_prog(
+                done: int,
+                total: int,
+                lots_n: int,
+                types_n: int = 0,
+                models_n: int = 0,
+            ) -> None:
+                nonlocal last_scanned, last_lots
+                d_delta = max(0, done - last_scanned)
+                l_delta = max(0, lots_n - last_lots)
+                last_scanned = done
+                last_lots = lots_n
+                # titles/models из прогресса burst считаем приближённо по дельте
+                await _prog(
+                    done,
+                    total,
+                    lots_n,
+                    types_n,
+                    models_n,
+                    done_delta=d_delta,
+                    lots_delta=l_delta,
+                )
+
             async def _batch_save(fresh: list[Lot]) -> None:
                 self._ingest_always(fresh)
+                titles = {
+                    (lot.title or lot.model or "").strip().lower()
+                    for lot in fresh
+                    if (lot.title or lot.model)
+                }
+                models = {
+                    lot.model_key for lot in fresh if getattr(lot, "model_key", None)
+                }
+                async with agg_lock:
+                    agg_titles.update(titles)
+                    agg_models.update(models)
+                    self.parse_types = len(agg_titles)
+                    self.parse_models = len(agg_models)
 
-            m._progress_cb = _prog
+            m._progress_cb = _local_prog
             m._batch_save_cb = _batch_save
             try:
                 result = await m.burst_search(
                     min_stars,
                     max_stars,
                     parallel=per_parallel,
-                    per_collection=min(50, max(25, int(creds.BURST_PER_COLLECTION))),
+                    per_collection=min(40, max(20, int(creds.BURST_PER_COLLECTION))),
                     max_collections=0,
                     gap=creds.BURST_GAP,
                     timeout=creds.API_TIMEOUT,
@@ -385,6 +457,7 @@ class App:
                     on_early_lots=_early,
                     collection_ids=ids,
                     stop_event=stop_event,
+                    deep=deep,
                 )
                 try:
                     self._ingest_always(
@@ -809,10 +882,10 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        """RU: кириллица в имени/фамилии/био или флаг 🇷🇺.
-
-        Ник (@username) почти всегда латиница — смотрим display name + about.
-        """
+        """RU: кириллица в имени/био, флаг, или lang_code ru/uk/be."""
+        lc = (getattr(lot, "lang_code", "") or "").lower()
+        if lc.startswith(("ru", "uk", "be")):
+            return True
         parts = [lot.first_name or "", lot.last_name or "", lot.about or ""]
         blob = " ".join(p for p in parts if p).strip()
         if not blob:
@@ -975,7 +1048,8 @@ class App:
             if not ignore_seen:
                 if lot.owner_key in seen_sellers:
                     continue
-                if lot.model_key in seen_models:
+                # модели: в парсере НЕ режем по истории БД — только юзы + типы
+                if channel != "parser" and lot.model_key in seen_models:
                     continue
                 if (
                     (not is_filter)
@@ -991,11 +1065,13 @@ class App:
                     (not is_filter)
                     and (not is_old)
                     and track_seen
+                    and channel != "parser"
                     and self.db.is_seen_model(lot.model_key)
                 ):
                     continue
             if lot.owner_key in local_sellers:
                 continue
+            # в одной выдаче — разные модели; между обходами модели можно снова
             if lot.model_key in local_models:
                 continue
             tk = self._title_key(lot)
@@ -1029,7 +1105,11 @@ class App:
                     continue
                 if (not ignore_seen) and lot.owner_key in seen_sellers:
                     continue
-                if (not ignore_seen) and lot.model_key in seen_models:
+                if (
+                    channel != "parser"
+                    and (not ignore_seen)
+                    and lot.model_key in seen_models
+                ):
                     continue
                 if lot.owner_key in marked_sellers:
                     continue
@@ -1273,13 +1353,16 @@ class App:
             if (by_types or take_all)
             else (limit or max(30, creds.SHOW_LIMIT))
         )
-        # всегда сначала в БД — до любых фильтров выдачи
         self._ingest_always(list(lots))
         pre = list(lots)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
         without = [lot for lot in pre if not lot.seller]
-        resolve_n = min(len(without), 300 if (by_types or take_all) else max(lim * 4, 80))
+        # быстрее: меньше resolve на старте
+        resolve_n = min(
+            len(without),
+            120 if by_types else (220 if take_all else max(lim * 3, 60)),
+        )
         if resolve_n:
             await self.market.resolve_owners(
                 without[:resolve_n],
@@ -1287,7 +1370,6 @@ class App:
                 parallel=getattr(creds, "ENRICH_PARALLEL", 8),
             )
             self.parse_acc_checks += resolve_n
-            # после resolve — сразу в БД
             self._ingest_always(without[:resolve_n])
         pool = with_seller + without[:resolve_n]
         self.db.upsert_users_from_lots(
@@ -1302,7 +1384,6 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
-        # парсер: сразу выкидываем уже выданные юзы — не тратим на них проверки
         if channel == "parser":
             fresh: list[Lot] = []
             for lot in candidates:
@@ -1317,22 +1398,64 @@ class App:
                     pass
                 fresh.append(lot)
             candidates = fresh
-        random.shuffle(candidates)
-        if candidates:
-            # больше проверок = больше типов в выдаче
+
+        want_ru = (
+            bool(self.require_russian)
+            if strict_russian is None
+            else bool(strict_russian)
+        )
+        if channel == "parser":
+            want_ru = True
+
+        if channel == "parser" and candidates:
+            # БЫСТРЫЙ ПУТЬ: уже RU по имени с маркета → только free DM
+            already_ru = [lot for lot in candidates if self._is_russian(lot)]
+            need_bio = [lot for lot in candidates if not self._is_russian(lot)]
+            random.shuffle(already_ru)
+            random.shuffle(need_bio)
+            check_ru = already_ru[:250]
+            if check_ru:
+                await self.market.check_free_dm(
+                    check_ru,
+                    timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                )
+                self.parse_acc_checks += len(check_ru)
+            ready = [
+                lot
+                for lot in check_ru
+                if lot.free_dm is not False and self._is_russian(lot)
+            ]
+            # если мало типов — точечный enrich только по need_bio
+            titles_ready = {
+                self._title_key(lot) for lot in ready if self._title_key(lot)
+            }
+            if len(titles_ready) < 20 and need_bio:
+                wave = need_bio[:180]
+                await self.market.enrich_profiles(
+                    wave,
+                    timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
+                    parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                )
+                await self.market.check_free_dm(
+                    wave,
+                    timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                )
+                self.parse_acc_checks += len(wave)
+                self._ingest_always(wave)
+                for lot in wave:
+                    if lot.free_dm is False:
+                        continue
+                    if self._is_russian(lot):
+                        ready.append(lot)
+            candidates = ready
+            self._ingest_always(candidates)
+        elif candidates:
             sample_n = min(
                 len(candidates),
-                900 if (by_types or take_all) else max(lim * 6, 120),
+                400 if take_all else max(lim * 6, 120),
             )
             if need_full or apply_extra or channel == "filter":
-                sample_n = min(len(candidates), max(sample_n, lim * 8, 200))
-            # сначала те, у кого уже видна кириллица в имени
-            candidates.sort(
-                key=lambda lot: (
-                    0 if self._is_russian(lot) else 1,
-                    random.random(),
-                )
-            )
+                sample_n = min(len(candidates), max(sample_n, lim * 8, 150))
             need_bio = list(candidates[:sample_n])
             if need_bio:
                 await self.market.enrich_profiles(
@@ -1346,69 +1469,15 @@ class App:
                 timeout=max(creds.OWNER_TIMEOUT, 1.2),
             )
             self.parse_acc_checks += len(candidates[:sample_n])
-            # фильтр «в сети» — обновить статус онлайн
             if channel == "filter" and self.filters.online_only:
                 await self.market.refresh_online(
                     candidates[:sample_n],
                     timeout=max(creds.OWNER_TIMEOUT, 1.2),
                 )
                 self.parse_acc_checks += len(candidates[:sample_n])
-            self.db.upsert_users_from_lots(
-                [lot for lot in candidates if lot.seller_id is not None or lot.seller],
-                cap=creds.AFK_USER_CAP,
-            )
-            self._flush_market_users()
-            # профили тоже в БД
             self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
-            # парсер: режем только ЯВНО платные Stars/Premium
-            if channel == "parser":
-                candidates = [
-                    lot for lot in candidates if lot.free_dm is not False
-                ]
-                ru = [lot for lot in candidates if self._is_russian(lot)]
-                # мало RU после первой волны — добираем био по остатку пула
-                if self.require_russian and len(ru) < 20:
-                    have_keys = {lot.owner_key for lot in candidates}
-                    extra_need = [
-                        lot
-                        for lot in pool
-                        if lot.seller
-                        and not self._bad_username_len(lot.seller)
-                        and lot.owner_key not in self._seen_sellers
-                        and lot.owner_key not in have_keys
-                    ]
-                    random.shuffle(extra_need)
-                    wave2 = extra_need[:500]
-                    if wave2:
-                        await self.market.enrich_profiles(
-                            wave2,
-                            timeout=min(max(creds.OWNER_TIMEOUT, 0.9), 1.4),
-                            parallel=getattr(creds, "ENRICH_PARALLEL", 8),
-                        )
-                        await self.market.check_free_dm(
-                            wave2,
-                            timeout=max(creds.OWNER_TIMEOUT, 1.2),
-                        )
-                        self.parse_acc_checks += len(wave2) * 2
-                        self._ingest_always(wave2)
-                        for lot in wave2:
-                            if lot.free_dm is False:
-                                continue
-                            if self._is_russian(lot):
-                                candidates.append(lot)
-                        ru = [lot for lot in candidates if self._is_russian(lot)]
-                if self.require_russian:
-                    candidates = list(ru)
-        want_ru = (
-            bool(self.require_russian)
-            if strict_russian is None
-            else bool(strict_russian)
-        )
-        if channel == "parser":
-            want_ru = True
-        # если RU после enrich всё же 0 — не режем в ноль на prefilter;
-        # pick сам отфильтрует, а снаружи будет retry burst
+
         return self._pick_with_fallback(
             candidates,
             limit=None if (by_types or take_all) else lim,
@@ -1972,11 +2041,11 @@ class App:
             shown = await self._prepare_show(
                 pool, limit=None, apply_extra=False, channel="parser"
             )
-            self.parse_ready = len(shown)
             # достаточно типов → сразу выдача и стоп скана
-            min_types = max(12, int(getattr(creds, "SHOW_LIMIT", 30) // 2))
+            min_types = 8
             if len(shown) >= min_types:
                 delivered = True
+                self.parse_ready = len(shown)
                 stop_event.set()
                 now_e = time.monotonic()
                 for lot in shown:
@@ -1987,9 +2056,10 @@ class App:
                 await self._say(
                     f"{screen('Парсинг')}\n"
                     f"Обход #{self.parse_rounds} · выдал "
-                    f"<b>{len(shown)}</b> типов\n"
+                    f"<b>{len(shown)}</b> типов · рандом\n"
                     f"Чеков: {self.parse_coll_checks} · "
-                    f"проверок акка: {self.parse_acc_checks}",
+                    f"проверок акка: {self.parse_acc_checks} · "
+                    f"акков {n_acc}",
                     reply_markup=parse_done_inline(),
                 )
 
@@ -2038,17 +2108,18 @@ class App:
                 apply_extra=False,
                 channel="parser",
             )
-            # пусто/мало — ещё 1–2 полных скана с 3 акков (новые страницы)
-            for retry in range(2):
-                if len(shown) >= max(8, int(getattr(creds, "SHOW_LIMIT", 30) // 3)):
+            # пусто/мало — ещё 1 добор (не тормозить 3 проходами)
+            for retry in range(1):
+                if len(shown) >= 8:
                     break
                 if not self.running:
                     break
                 await self._edit_status(
                     f"{screen('Парсинг')}\n"
-                    f"Мало типов ({len(shown)}) · добор {retry + 1}/2…"
+                    f"Мало типов ({len(shown)}) · добор…"
                 )
                 self.market.reshuffle_collections()
+                self._burst_deep = True
                 try:
                     burst2 = await self.multi_burst(
                         self.min_stars,
@@ -2059,6 +2130,8 @@ class App:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("retry burst: %s", exc)
                     break
+                finally:
+                    self._burst_deep = False
                 extra = [
                     lot
                     for lot in (burst2.all_lots or burst2.lots or [])
@@ -2121,22 +2194,25 @@ class App:
         try:
             await self._edit_status(f"{screen('Парсинг')}\nЗаново · рандом…")
             shown: list[Lot] = []
-            # до 3 живых проходов с 3 акков — новые страницы = новые юзы
-            for attempt in range(3):
+            for attempt in range(2):
                 if not self.running:
                     break
                 await self._edit_status(
                     f"{screen('Парсинг')}\n"
-                    f"Заново · скан {attempt + 1}/3 · акков "
+                    f"Заново · скан {attempt + 1}/2 · акков "
                     f"{max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))}"
                 )
                 self.market.reshuffle_collections()
-                burst = await self.multi_burst(
-                    self.min_stars,
-                    self.max_stars,
-                    progress_cb=None,
-                    early_show_at=0,
-                )
+                self._burst_deep = attempt > 0  # 2-й проход глубже
+                try:
+                    burst = await self.multi_burst(
+                        self.min_stars,
+                        self.max_stars,
+                        progress_cb=None,
+                        early_show_at=0,
+                    )
+                finally:
+                    self._burst_deep = False
                 extra = [
                     lot
                     for lot in (burst.all_lots or burst.lots or [])
@@ -2154,9 +2230,8 @@ class App:
                     strict_russian=True,
                 )
                 self.parse_ready = len(shown)
-                if len(shown) >= max(8, int(getattr(creds, "SHOW_LIMIT", 30) // 3)):
+                if len(shown) >= 8:
                     break
-                # мало/пусто — сбрасываем блок типов (юзы уже выданные всё равно блок)
                 if len(shown) < 3:
                     self._seen_titles.clear()
             if shown:
@@ -2188,6 +2263,7 @@ class App:
         finally:
             self.running = False
             self._task = None
+            self._burst_deep = False
             await self._close_extra_clients()
             await self.ensure_db_farm()
 

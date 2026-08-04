@@ -13,9 +13,9 @@ MAX_STARS = 5000
 # выдача ПО ТИПАМ (коллекциям), не фикс 30 лотов
 PER_TYPE = 1  # по одному с каждого типа NFT
 MAX_TYPES = 0  # 0 = все найденные типы (без потолка)
-# совместимость: сколько типов достаточно для ранней выдачи
-SHOW_LIMIT = 20
-PREVIEW_COUNT = 20
+# цель ранней выдачи / фильтр-лимит
+SHOW_LIMIT = 30
+PREVIEW_COUNT = 30
 
 # 0 = только списком, без карточек по одной
 NOTIFY_CARDS = 0
@@ -101,8 +101,8 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_BURST_PER_COLLECTION": 25,
         "FILTER_BURST_MAX_COLLECTIONS": 0,
         "FILTER_BURST_GAP": 0.0,
-        "FILTER_LIMIT": 80,
-        "FILTER_DB_LIMIT": 80,
+        "FILTER_LIMIT": 60,
+        "FILTER_DB_LIMIT": 120,
         "FILTER_EARLY_SHOW_AT": 14,
         "AFK_PAGE_LIMIT": 50,
         "AFK_GAP": 0.04,

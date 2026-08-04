@@ -695,14 +695,10 @@ class TelegramMarket:
     async def check_free_dm(
         self, lots: list[Lot], *, timeout: float = 2.5
     ) -> None:
-        """Пометить lot.free_dm: True только если можно писать без Stars."""
+        """Пометить free_dm. Ошибки API → None (не режем выдачу)."""
         need = [lot for lot in lots if lot.seller_id is not None]
         if not need:
             return
-        # сброс — решает только GetRequirementsToContact
-        for lot in need:
-            lot.free_dm = None
-        # сгруппируем по id
         by_id: dict[int, list[Lot]] = {}
         for lot in need:
             by_id.setdefault(int(lot.seller_id), []).append(lot)
@@ -717,9 +713,8 @@ class TelegramMarket:
                 inputs.append(ent)
                 id_order.append(uid)
             except Exception:  # noqa: BLE001
-                for lot in by_id[uid]:
-                    # не смогли проверить — не выдаём
-                    lot.free_dm = False
+                # неизвестно — оставляем None, в выдаче покажем
+                continue
 
         for i in range(0, len(inputs), 40):
             chunk = inputs[i : i + 40]
@@ -731,10 +726,6 @@ class TelegramMarket:
                     timeout=timeout,
                 )
             except Exception:  # noqa: BLE001
-                for uid in ids_chunk:
-                    for lot in by_id[uid]:
-                        if lot.free_dm is None:
-                            lot.free_dm = False
                 continue
             reqs = list(result or [])
             for uid, req in zip(ids_chunk, reqs):
@@ -752,22 +743,11 @@ class TelegramMarket:
                 elif isinstance(req, RequirementToContactPremium) or name == (
                     "RequirementToContactPremium"
                 ):
-                    # без Premium писать нельзя — для нас не бесплатно
                     free = False
                 for lot in by_id[uid]:
                     lot.free_dm = free
                     if paid is not None:
                         lot.paid_dm_stars = paid
-            # если API вернул меньше ответов
-            if len(reqs) < len(ids_chunk):
-                for uid in ids_chunk[len(reqs) :]:
-                    for lot in by_id[uid]:
-                        if lot.free_dm is None:
-                            lot.free_dm = False
-
-        for lot in need:
-            if lot.free_dm is None:
-                lot.free_dm = False
 
     async def afk_fetch_page(
         self,

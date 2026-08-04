@@ -822,17 +822,19 @@ class App:
     def _passes_extra_filters(self, lot: Lot) -> bool:
         f = self.filters
         if f.few_gifts:
-            if lot.gifts_count is None or lot.gifts_count > f.max_gifts:
+            # нет данных — не режем
+            if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is None or lot.account_level > f.max_level:
+            if lot.account_level is not None and lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
             if n < 6 or n > f.short_user_max:
                 return False
         if f.no_premium:
-            if lot.is_premium is not False:
+            # только явный premium режем; None = ок
+            if lot.is_premium is True:
                 return False
         return True
 
@@ -844,12 +846,17 @@ class App:
         apply_extra: bool = False,
         track_seen: bool = True,
         channel: str = "parser",
+        require_russian: bool | None = None,
+        require_free_dm: bool = True,
+        ignore_seen: bool = False,
     ) -> list[Lot]:
         """Разнообразие NFT. channel=parser|filter|old — разные режимы."""
         is_filter = channel == "filter"
         is_old = channel == "old"
-        if is_old:
-            # старый парс: не трогаем seen парсера, только уникальность в выдаче
+        want_ru = (
+            self.require_russian if require_russian is None else bool(require_russian)
+        )
+        if is_old or ignore_seen:
             seen_sellers: set[str] = set()
             seen_models: set[str] = set()
             recent_list: list[str] = []
@@ -870,7 +877,11 @@ class App:
         keys: list[str] = []
         local_sellers: set[str] = set()
         local_models: set[str] = set()
-        show_counts = {} if is_filter else self.db.get_collection_show_counts()
+        show_counts = (
+            {}
+            if (is_filter or is_old or ignore_seen)
+            else self.db.get_collection_show_counts()
+        )
         recent = set(recent_list[-100:])
 
         for lot in lots:
@@ -882,35 +893,34 @@ class App:
                 continue
             if self._is_ad(lot):
                 continue
-            if self.require_russian and not self._is_russian(lot):
+            if want_ru and not self._is_russian(lot):
                 continue
-            # только бесплатные ЛС (не за Stars)
-            if lot.free_dm is False:
+            # режем только ЯВНО платные Stars; None = неизвестно → ок
+            if require_free_dm and lot.free_dm is False:
                 continue
-            if lot.free_dm is None:
-                continue
-            # тумблеры SearchFilters — ТОЛЬКО filter-канал
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
-            if lot.owner_key in seen_sellers:
-                continue
-            if lot.model_key in seen_models:
-                continue
-            # DB seen — только парсер
-            if (
-                (not is_filter)
-                and track_seen
-                and self.db.is_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                )
-            ):
-                continue
-            if (
-                (not is_filter)
-                and track_seen
-                and self.db.is_seen_model(lot.model_key)
-            ):
-                continue
+            if not ignore_seen:
+                if lot.owner_key in seen_sellers:
+                    continue
+                if lot.model_key in seen_models:
+                    continue
+                if (
+                    (not is_filter)
+                    and (not is_old)
+                    and track_seen
+                    and self.db.is_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    )
+                ):
+                    continue
+                if (
+                    (not is_filter)
+                    and (not is_old)
+                    and track_seen
+                    and self.db.is_seen_model(lot.model_key)
+                ):
+                    continue
             if lot.owner_key in local_sellers:
                 continue
             if lot.model_key in local_models:
@@ -939,30 +949,28 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
-                if lot.owner_key in seen_sellers:
+                if (not ignore_seen) and lot.owner_key in seen_sellers:
                     continue
-                if lot.model_key in seen_models:
+                if (not ignore_seen) and lot.model_key in seen_models:
+                    continue
+                if lot.owner_key in marked_sellers:
+                    continue
+                if lot.model_key in marked_models:
                     continue
                 return lot
             return None
 
+        marked_sellers: set[str] = set()
+        marked_models: set[str] = set()
+
         def _mark(lot: Lot) -> None:
-            seen_sellers.add(lot.owner_key)
-            seen_models.add(lot.model_key)
-            if (not is_filter) and track_seen:
-                self.db.mark_seen_seller(
-                    username=lot.seller, user_id=lot.seller_id
-                )
-                self.db.mark_seen_model(
-                    lot.model_key, title=lot.model or lot.title
-                )
+            marked_sellers.add(lot.owner_key)
+            marked_models.add(lot.model_key)
 
         primary: list[Lot] = []
         ordered = sorted(keys, key=_rank)
         per_type = max(1, int(getattr(creds, "PER_TYPE", 1)))
         max_types = int(getattr(creds, "MAX_TYPES", 0) or 0)
-        # parser: по типам (1 с каждого), не фикс 30
-        # old: все лоты (уник. продавцы), не по одному типу
         by_types = (not is_filter) and channel == "parser" and (
             limit is None or limit <= 0
         )
@@ -985,7 +993,6 @@ class App:
                     types_taken += 1
             result = list(primary)
         elif take_all:
-            # старый парс: все подходящие лоты за 24ч
             for tk in ordered:
                 while True:
                     lot = _take(tk)
@@ -999,8 +1006,9 @@ class App:
                     break
             result = list(primary)
         else:
+            target = limit if limit is not None else creds.SHOW_LIMIT
             for tk in ordered:
-                if limit is not None and len(primary) >= limit:
+                if len(primary) >= target:
                     break
                 lot = _take(tk)
                 if lot is None:
@@ -1009,10 +1017,10 @@ class App:
                 _mark(lot)
 
             extra: list[Lot] = []
-            if limit is not None and len(primary) < limit:
+            if len(primary) < target:
                 again = sorted(keys, key=_rank)
                 for tk in again:
-                    if len(primary) + len(extra) >= limit:
+                    if len(primary) + len(extra) >= target:
                         break
                     lot = _take(tk)
                     if lot is None:
@@ -1021,8 +1029,7 @@ class App:
                     _mark(lot)
 
             result = list(primary) + list(extra)
-            if limit is not None:
-                result = result[:limit]
+            result = result[:target]
 
         spread: list[Lot] = []
         rest = list(result)
@@ -1037,13 +1044,92 @@ class App:
             spread.append(rest.pop(pick_i))
         result = spread
 
-        for lot in result:
-            tk = self._title_key(lot)
-            if tk:
-                recent_list.append(tk)
-        if len(recent_list) > 250:
-            del recent_list[:-250]
+        if not ignore_seen and track_seen:
+            for lot in result:
+                tk = self._title_key(lot)
+                if tk:
+                    recent_list.append(tk)
+            if len(recent_list) > 250:
+                del recent_list[:-250]
+            if channel == "parser":
+                for lot in result:
+                    self._seen_sellers.add(lot.owner_key)
+                    self._seen_models.add(lot.model_key)
+                    self.db.mark_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    )
+                    self.db.mark_seen_model(
+                        lot.model_key, title=lot.model or lot.title
+                    )
+            elif channel == "filter":
+                for lot in result:
+                    self._filter_seen_sellers.add(lot.owner_key)
+                    self._filter_seen_models.add(lot.model_key)
         return result
+
+    def _pick_with_fallback(
+        self,
+        lots: list[Lot],
+        *,
+        limit: int | None,
+        apply_extra: bool,
+        track_seen: bool,
+        channel: str,
+    ) -> list[Lot]:
+        """Сначала строго, потом ослабляем — чтобы не было 0/1 гифта."""
+        target = (
+            25
+            if channel == "parser" and (limit is None or limit <= 0)
+            else (limit or max(30, creds.SHOW_LIMIT))
+        )
+        best: list[Lot] = []
+        attempts = [
+            (True, True, False, apply_extra),
+            (False, True, False, apply_extra),
+            (False, True, True, apply_extra),
+            (
+                False,
+                False,
+                True,
+                apply_extra if channel == "filter" else False,
+            ),
+        ]
+        for want_ru, want_free, ign_seen, extra in attempts:
+            out = self._pick_clean(
+                lots,
+                limit=limit,
+                apply_extra=extra,
+                track_seen=False,
+                channel=channel,
+                require_russian=want_ru,
+                require_free_dm=want_free,
+                ignore_seen=ign_seen,
+            )
+            if len(out) > len(best):
+                best = out
+            if len(best) >= min(15, target):
+                break
+        if best and track_seen and channel == "parser":
+            for lot in best:
+                self._seen_sellers.add(lot.owner_key)
+                self._seen_models.add(lot.model_key)
+                try:
+                    self.db.mark_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    )
+                    self.db.mark_seen_model(
+                        lot.model_key, title=lot.model or lot.title
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                tk = self._title_key(lot)
+                if tk:
+                    self._recent_titles.append(tk)
+        elif best and channel == "filter":
+            for lot in best:
+                self._filter_seen_sellers.add(lot.owner_key)
+                self._filter_seen_models.add(lot.model_key)
+        return best
 
     async def _prepare_show(
         self,
@@ -1055,23 +1141,18 @@ class App:
         need_full: bool | None = None,
         channel: str = "parser",
     ) -> list[Lot]:
-        # parser: limit=None → выдача по типам (все)
-        # old: все лоты за 24ч
         by_types = channel == "parser" and (limit is None or limit <= 0)
         take_all = channel == "old"
         lim = (
             10_000
             if (by_types or take_all)
-            else (limit or creds.SHOW_LIMIT)
+            else (limit or max(30, creds.SHOW_LIMIT))
         )
         pre = list(lots)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
         without = [lot for lot in pre if not lot.seller]
-        resolve_n = min(
-            len(without),
-            max(lim if not (by_types or take_all) else 200, 60),
-        )
+        resolve_n = min(len(without), 300 if (by_types or take_all) else max(lim * 4, 80))
         if resolve_n:
             await self.market.resolve_owners(
                 without[:resolve_n],
@@ -1093,22 +1174,10 @@ class App:
         ]
         random.shuffle(candidates)
         if candidates:
-            sample_n = min(
-                len(candidates),
-                max(lim * 3, 80)
-                if not (by_types or take_all)
-                else min(len(candidates), 500 if take_all else 220),
-            )
+            sample_n = min(len(candidates), 400 if (by_types or take_all) else max(lim * 6, 120))
             if need_full or apply_extra or channel == "filter":
-                sample_n = min(len(candidates), max(sample_n, lim * 5))
-            need_bio = [
-                lot
-                for lot in candidates[:sample_n]
-                if not (lot.first_name or lot.last_name)
-                or not self._is_russian(lot)
-            ]
-            if channel == "filter" or need_full or apply_extra:
-                need_bio = list(candidates[:sample_n])
+                sample_n = min(len(candidates), max(sample_n, lim * 8, 150))
+            need_bio = list(candidates[:sample_n])
             if need_bio:
                 await self.market.enrich_profiles(
                     need_bio,
@@ -1127,7 +1196,7 @@ class App:
             )
             self._flush_market_users()
             candidates = candidates[:sample_n]
-        return self._pick_clean(
+        return self._pick_with_fallback(
             candidates,
             limit=None if (by_types or take_all) else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
@@ -1141,6 +1210,10 @@ class App:
             await self._say_to(chat_id, f"{screen('Фильтры')}\nуже идёт")
             return
         self.filter_search_running = True
+        # каждый запуск фильтров — свежий seen, иначе быстро 0
+        self._filter_seen_sellers.clear()
+        self._filter_seen_models.clear()
+        self._filter_recent_titles.clear()
         f = self.filters
         mn, mx = self.filter_min_stars, self.filter_max_stars
         label = self.filter_range_label
@@ -1149,7 +1222,7 @@ class App:
             old = self.db.fetch_random_lots(
                 min_stars=mn,
                 max_stars=mx,
-                limit=creds.FILTER_DB_LIMIT,
+                limit=max(80, int(getattr(creds, "FILTER_DB_LIMIT", 30))),
                 require_seller=False,
             )
             live: list[Lot] = []
@@ -1174,7 +1247,7 @@ class App:
             random.shuffle(merged)
             shown = await self._prepare_show(
                 merged,
-                limit=creds.SHOW_LIMIT,
+                limit=max(30, int(creds.SHOW_LIMIT)),
                 apply_extra=True,
                 track_seen=False,
                 need_full=True,
@@ -1612,7 +1685,7 @@ class App:
             )
             self.parse_ready = len(shown)
             # достаточно типов → сразу выдача и стоп скана
-            min_types = max(8, int(creds.SHOW_LIMIT // 2))
+            min_types = 5
             if len(shown) >= min_types:
                 delivered = True
                 stop_event.set()

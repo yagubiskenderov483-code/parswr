@@ -913,10 +913,8 @@ class App:
         want_ru = (
             self.require_russian if require_russian is None else bool(require_russian)
         )
-        # парсер: типы не повторяем даже если ослабляем seen продавцов
+        # парсер: типы не повторяем в рамках обхода (Заново)
         seen_titles = set(self._seen_titles) if channel == "parser" else set()
-        if channel == "parser":
-            seen_titles.update(self._recent_titles[-250:])
         if is_old or ignore_seen:
             seen_sellers: set[str] = set()
             seen_models: set[str] = set()
@@ -931,6 +929,10 @@ class App:
             recent_list = (
                 self._filter_recent_titles if is_filter else self._recent_titles
             )
+        # юзы, которых уже выдавали — ВСЕГДА режем в парсере (даже при fallback)
+        always_block_sellers: set[str] = set()
+        if channel == "parser":
+            always_block_sellers = set(self._seen_sellers)
 
         lots = list(lots)
         random.shuffle(lots)
@@ -956,15 +958,19 @@ class App:
                 continue
             if want_ru and not self._is_russian(lot):
                 continue
-            # free DM: парсер строго True; иначе режем только явный False
-            if require_free_dm:
-                if strict_free_dm or channel == "parser":
-                    if lot.free_dm is not True:
-                        continue
-                elif lot.free_dm is False:
-                    continue
+            # платные Stars / Premium DM — не выдаём; неизвестно (None) — ок
+            if require_free_dm and lot.free_dm is False:
+                continue
             if is_filter and apply_extra and not self._passes_extra_filters(lot):
                 continue
+            # уже выданные юзы — никогда в парсере
+            if channel == "parser":
+                if lot.owner_key in always_block_sellers:
+                    continue
+                if self.db.is_seen_seller(
+                    username=lot.seller, user_id=lot.seller_id
+                ):
+                    continue
             if not ignore_seen:
                 if lot.owner_key in seen_sellers:
                     continue
@@ -974,6 +980,7 @@ class App:
                     (not is_filter)
                     and (not is_old)
                     and track_seen
+                    and channel != "parser"
                     and self.db.is_seen_seller(
                         username=lot.seller, user_id=lot.seller_id
                     )
@@ -993,7 +1000,7 @@ class App:
             tk = self._title_key(lot)
             if not tk:
                 continue
-            # повторные типы NFT не выдаём в парсере
+            # повторные типы NFT не выдаём в парсере (этот обход / Заново)
             if channel == "parser" and tk in seen_titles:
                 continue
             if tk not in buckets:
@@ -1017,6 +1024,8 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
+                if channel == "parser" and lot.owner_key in always_block_sellers:
+                    continue
                 if (not ignore_seen) and lot.owner_key in seen_sellers:
                     continue
                 if (not ignore_seen) and lot.model_key in seen_models:
@@ -1151,7 +1160,7 @@ class App:
         channel: str,
         strict_russian: bool | None = None,
     ) -> list[Lot]:
-        """Сначала строго; парсер — только RU + free DM, без повторов типов."""
+        """Сначала строго; парсер — RU, без платных DM, без повторных юзов/типов."""
         target = (
             25
             if channel == "parser" and (limit is None or limit <= 0)
@@ -1162,18 +1171,17 @@ class App:
             if strict_russian is None
             else bool(strict_russian)
         )
-        # парсер: RU + free DM всегда; ignore_seen только для продавцов (типы всё равно блок)
+        # парсер: юзы уже выданные НЕ возвращаем; ignore_seen только модели
         if channel == "parser" and keep_ru:
             attempts = [
                 (True, True, False, False),
-                (True, True, True, False),  # ignore seller/model seen, keep RU+free
+                (True, True, True, False),  # soften models, sellers still blocked
             ]
         elif channel == "old" and keep_ru:
             attempts = [
                 (True, True, True, False),
             ]
         else:
-            # фильтры: RU сначала; free DM желателен
             attempts = [
                 (True, True, False, apply_extra),
                 (True, True, True, apply_extra),
@@ -1196,7 +1204,7 @@ class App:
                 require_russian=want_ru,
                 require_free_dm=want_free,
                 ignore_seen=ign_seen,
-                strict_free_dm=(channel == "parser" and want_free),
+                strict_free_dm=False,
             )
             if len(out) > len(best):
                 best = out
@@ -1276,22 +1284,48 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
         ]
+        # парсер: сразу выкидываем уже выданные юзы — не тратим на них проверки
+        if channel == "parser":
+            fresh: list[Lot] = []
+            for lot in candidates:
+                if lot.owner_key in self._seen_sellers:
+                    continue
+                try:
+                    if self.db.is_seen_seller(
+                        username=lot.seller, user_id=lot.seller_id
+                    ):
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                fresh.append(lot)
+            candidates = fresh
         random.shuffle(candidates)
         if candidates:
-            sample_n = min(len(candidates), 400 if (by_types or take_all) else max(lim * 6, 120))
+            # больше проверок = больше типов в выдаче
+            sample_n = min(
+                len(candidates),
+                900 if (by_types or take_all) else max(lim * 6, 120),
+            )
             if need_full or apply_extra or channel == "filter":
-                sample_n = min(len(candidates), max(sample_n, lim * 8, 150))
+                sample_n = min(len(candidates), max(sample_n, lim * 8, 200))
+            # сначала те, у кого уже видна кириллица в имени
+            candidates.sort(
+                key=lambda lot: (
+                    0 if self._is_russian(lot) else 1,
+                    random.random(),
+                )
+            )
             need_bio = list(candidates[:sample_n])
             if need_bio:
                 await self.market.enrich_profiles(
                     need_bio,
-                    timeout=min(creds.OWNER_TIMEOUT, 0.7),
+                    timeout=min(max(creds.OWNER_TIMEOUT, 0.8), 1.2),
                     parallel=getattr(creds, "ENRICH_PARALLEL", 8),
                 )
                 self.parse_acc_checks += len(need_bio)
             await self.market.check_free_dm(
                 candidates[:sample_n],
-                timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                timeout=max(creds.OWNER_TIMEOUT, 1.2),
             )
             self.parse_acc_checks += len(candidates[:sample_n])
             # фильтр «в сети» — обновить статус онлайн
@@ -1309,11 +1343,15 @@ class App:
             # профили тоже в БД
             self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
-            # парсер: сразу отсечь платные Stars / без free DM
+            # парсер: режем только ЯВНО платные; RU строго
             if channel == "parser":
-                candidates = [lot for lot in candidates if lot.free_dm is True]
+                candidates = [
+                    lot for lot in candidates if lot.free_dm is not False
+                ]
                 if self.require_russian:
-                    candidates = [lot for lot in candidates if self._is_russian(lot)]
+                    candidates = [
+                        lot for lot in candidates if self._is_russian(lot)
+                    ]
         want_ru = (
             bool(self.require_russian)
             if strict_russian is None
@@ -1886,7 +1924,7 @@ class App:
             )
             self.parse_ready = len(shown)
             # достаточно типов → сразу выдача и стоп скана
-            min_types = 5
+            min_types = max(12, int(getattr(creds, "SHOW_LIMIT", 30) // 2))
             if len(shown) >= min_types:
                 delivered = True
                 stop_event.set()

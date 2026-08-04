@@ -178,10 +178,13 @@ class App:
         self._afk_task: asyncio.Task | None = None
         self.afk_pages = 0
         self.afk_users_added = 0
+        self.afk_models_added = 0
         self.afk_last_error = ""
         self._afk_status_msg_id: int | None = None
         self.afk_collections_total = 0
         self.afk_cursor = 0
+        self._afk_quiet = True  # без спама в чат — только БД
+        self._afk_paused = False
         self.filters = SearchFilters()
         self.filter_search_running = False
         self._filter_task: asyncio.Task | None = None
@@ -482,8 +485,16 @@ class App:
         lines.append(f"{f} Фильтры · {self.filter_range_label}")
         o = "▶️" if self.old_parse_running else "⏹"
         lines.append(f"{o} Старый парс · 24ч")
+        farm = "▶️" if (self.afk_running and not self._afk_paused) else "⏹"
+        lines.append(f"{farm} БД фарм · юзы+модели")
         lines.append("")
-        lines.append("БД gifts+users копится при любом парсе")
+        lines.append("БД gifts+users копится непрерывно")
+        if self.afk_pages:
+            lines.append(
+                f"Фарм: стр. {self.afk_pages} · "
+                f"+юзов {self.afk_users_added:,} · "
+                f"+моделей {self.afk_models_added:,}"
+            )
         lines.append("")
         lines.append(f"Обход: <b>#{self.parse_rounds}</b>")
         lines.append(f"Чеков коллекций: <b>{self.parse_coll_checks}</b>")
@@ -604,6 +615,7 @@ class App:
             logger.warning("save account session: %s", exc)
         self._adding_account = False
         await self._preload_collections()
+        await self.ensure_db_farm()
 
     async def try_restore_account(self) -> bool:
         """Поднять активный акк из БД при старте бота."""
@@ -635,6 +647,7 @@ class App:
             self.db.set_active_account(self.active_account_id)
             self.market.set_client(self.client)
             await self._preload_collections()
+            await self.ensure_db_farm()
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("restore account: %s", exc)
@@ -684,6 +697,8 @@ class App:
         await self._preload_collections()
         if was_running and chat:
             await self.start_monitor(chat)
+        else:
+            await self.ensure_db_farm()
         return f"🔀 Акк: <b>{self.account_name}</b>"
 
     async def rotate_account(self) -> str:
@@ -758,6 +773,7 @@ class App:
             raise RuntimeError("Сначала вход.")
         if self.running:
             await self.stop_monitor()
+        await self.pause_db_farm()
         self.chat_id = chat_id
         self.running = True
         # лоты-seen сбрасываем, продавцов/модели — НЕТ (без повторов юзов)
@@ -824,6 +840,7 @@ class App:
                 pass
             self._task = None
         await self._close_extra_clients()
+        await self.ensure_db_farm()
         return f"{screen('Парсинг')}\nСтоп · выдано {self.lots_notified}"
 
     def _in_price(self, lot: Lot) -> bool:
@@ -1099,25 +1116,45 @@ class App:
         apply_extra: bool,
         track_seen: bool,
         channel: str,
+        strict_russian: bool | None = None,
     ) -> list[Lot]:
-        """Сначала строго, потом ослабляем — чтобы не было 0/1 гифта."""
+        """Сначала строго, потом ослабляем — но RU для парсера не снимаем."""
         target = (
             25
             if channel == "parser" and (limit is None or limit <= 0)
             else (limit or max(30, creds.SHOW_LIMIT))
         )
+        keep_ru = (
+            bool(self.require_russian)
+            if strict_russian is None
+            else bool(strict_russian)
+        )
+        # парсер / again: никогда не выдаём не-русских
+        if channel == "parser" and keep_ru:
+            attempts = [
+                (True, True, False, False),
+                (True, True, True, False),  # ignore seen, keep RU
+                (True, False, True, False),  # drop free_dm, keep RU
+            ]
+        elif channel == "old" and keep_ru:
+            attempts = [
+                (True, True, True, False),
+                (True, False, True, False),
+            ]
+        else:
+            # фильтры: можно чуть мягче, но RU сначала
+            attempts = [
+                (True, True, False, apply_extra),
+                (True, True, True, apply_extra),
+                (True, False, True, apply_extra),
+                (
+                    False if not keep_ru else True,
+                    False,
+                    True,
+                    apply_extra if channel == "filter" else False,
+                ),
+            ]
         best: list[Lot] = []
-        attempts = [
-            (True, True, False, apply_extra),
-            (False, True, False, apply_extra),
-            (False, True, True, apply_extra),
-            (
-                False,
-                False,
-                True,
-                apply_extra if channel == "filter" else False,
-            ),
-        ]
         for want_ru, want_free, ign_seen, extra in attempts:
             out = self._pick_clean(
                 lots,
@@ -1164,6 +1201,7 @@ class App:
         track_seen: bool = True,
         need_full: bool | None = None,
         channel: str = "parser",
+        strict_russian: bool | None = None,
     ) -> list[Lot]:
         by_types = channel == "parser" and (limit is None or limit <= 0)
         take_all = channel == "old"
@@ -1186,12 +1224,15 @@ class App:
                 parallel=getattr(creds, "ENRICH_PARALLEL", 8),
             )
             self.parse_acc_checks += resolve_n
+            # после resolve — сразу в БД
+            self._ingest_always(without[:resolve_n])
         pool = with_seller + without[:resolve_n]
         self.db.upsert_users_from_lots(
-            [lot for lot in pool if lot.seller_id is not None],
+            [lot for lot in pool if lot.seller_id is not None or lot.seller],
             cap=creds.AFK_USER_CAP,
         )
         self._save_models([lot for lot in pool if lot.seller or lot.seller_id])
+        self._flush_market_users()
 
         candidates = [
             lot
@@ -1217,19 +1258,27 @@ class App:
             )
             self.parse_acc_checks += len(candidates[:sample_n])
             self.db.upsert_users_from_lots(
-                [lot for lot in candidates if lot.seller_id is not None],
+                [lot for lot in candidates if lot.seller_id is not None or lot.seller],
                 cap=creds.AFK_USER_CAP,
             )
             self._flush_market_users()
             # профили тоже в БД
             self._ingest_always(candidates[:sample_n])
             candidates = candidates[:sample_n]
+        want_ru = (
+            bool(self.require_russian)
+            if strict_russian is None
+            else bool(strict_russian)
+        )
+        if channel == "parser":
+            want_ru = True if self.require_russian else want_ru
         return self._pick_with_fallback(
             candidates,
             limit=None if (by_types or take_all) else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
             track_seen=bool(track_seen and channel == "parser"),
             channel=channel,
+            strict_russian=want_ru,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
@@ -1242,6 +1291,7 @@ class App:
         self._filter_seen_sellers.clear()
         self._filter_seen_models.clear()
         self._filter_recent_titles.clear()
+        await self.pause_db_farm()
         f = self.filters
         mn, mx = self.filter_min_stars, self.filter_max_stars
         label = self.filter_range_label
@@ -1298,6 +1348,7 @@ class App:
         finally:
             self.filter_search_running = False
             await self._close_extra_clients()
+            await self.ensure_db_farm()
 
     async def run_old_parse(self, chat_id: int, *, hours: float = 24.0) -> None:
         """Все лоты из БД за 24ч в выбранном ценовом диапазоне."""
@@ -1305,6 +1356,7 @@ class App:
             await self._say_to(chat_id, f"{screen('Старый парс')}\nуже идёт")
             return
         self.old_parse_running = True
+        await self.pause_db_farm()
         mn, mx = self.min_stars, self.max_stars
         label = self.range_label
         try:
@@ -1367,6 +1419,7 @@ class App:
             )
         finally:
             self.old_parse_running = False
+            await self.ensure_db_farm()
 
     @staticmethod
     def _format_lot_line(lot: Lot) -> str:
@@ -1512,32 +1565,56 @@ class App:
         except Exception:  # noqa: BLE001
             pass
 
+    async def ensure_db_farm(self) -> None:
+        """Тихий непрерывный скан юзов+моделей в БД (без кнопки AFK)."""
+        if not self.logged_in:
+            return
+        if self.running:
+            # парсер занят — фарм после
+            return
+        if self.afk_running and self._afk_task and not self._afk_task.done():
+            self._afk_paused = False
+            return
+        self._afk_quiet = True
+        self._afk_paused = False
+        self.afk_running = True
+        self.afk_last_error = ""
+        self._afk_task = asyncio.create_task(self._afk_loop(), name="db-farm")
+        logger.info(
+            "DB farm start · users=%s models=%s",
+            self.db.count_users(),
+            self.db.count(),
+        )
+
+    async def pause_db_farm(self) -> None:
+        """Пауза фарма на время парсинга (клиент занят)."""
+        self._afk_paused = True
+        if not self.afk_running and self._afk_task is None:
+            return
+        self.afk_running = False
+        if self._afk_task:
+            self._afk_task.cancel()
+            try:
+                await self._afk_task
+            except asyncio.CancelledError:
+                pass
+            self._afk_task = None
+
     async def start_afk(self, chat_id: int) -> str:
         if not self.logged_in:
             raise RuntimeError("Сначала вход.")
-        if self.afk_running:
-            return (
-                f"🌙 AFK уже крутится.\n"
-                f"Юзов: <b>{self.db.count_users():,}</b> / {creds.AFK_USER_CAP:,}\n"
-                f"Коллекций: <b>{self.db.count_collections()}</b>/"
-                f"{self.afk_collections_total or '?'}"
-            )
         self.chat_id = chat_id
-        self.afk_running = True
-        self.afk_pages = 0
-        self.afk_users_added = 0
-        self.afk_last_error = ""
-        self._afk_status_msg_id = None
-        self._afk_task = asyncio.create_task(self._afk_loop(), name="afk")
+        self._afk_quiet = True
+        await self.ensure_db_farm()
         return (
-            f"🌙 AFK старт · коплю юзов до <b>{creds.AFK_USER_CAP:,}</b>\n"
-            f"Сейчас в БД: <b>{self.db.count_users():,}</b> юзов · "
-            f"<b>{self.db.count()}</b> моделей"
+            f"💾 БД фарм · юзов <b>{self.db.count_users():,}</b> · "
+            f"моделей <b>{self.db.count():,}</b>"
         )
 
     async def stop_afk(self) -> str:
+        self._afk_paused = True
         if not self.afk_running and self._afk_task is None:
-            return "🌙 AFK уже стоп."
+            return "💾 БД фарм уже стоп."
         self.afk_running = False
         if self._afk_task:
             self._afk_task.cancel()
@@ -1547,15 +1624,16 @@ class App:
                 pass
             self._afk_task = None
         return (
-            f"🌙 AFK стоп.\n"
-            f"Юзов в БД: <b>{self.db.count_users():,}</b>\n"
-            f"Коллекций: <b>{self.db.count_collections()}</b>\n"
-            f"Страниц: <b>{self.afk_pages}</b> · +юзов за сессию: "
-            f"<b>{self.afk_users_added}</b>"
+            f"💾 БД фарм стоп.\n"
+            f"Юзов: <b>{self.db.count_users():,}</b>\n"
+            f"Моделей: <b>{self.db.count():,}</b>\n"
+            f"Страниц: <b>{self.afk_pages}</b> · +юзов: "
+            f"<b>{self.afk_users_added}</b> · +моделей: "
+            f"<b>{self.afk_models_added}</b>"
         )
 
     async def _edit_afk(self, text: str) -> None:
-        if not self.bot or not self.chat_id:
+        if self._afk_quiet or not self.bot or not self.chat_id:
             return
         try:
             if self._afk_status_msg_id:
@@ -1573,12 +1651,14 @@ class App:
             self._afk_status_msg_id = msg.message_id
 
     async def _afk_loop(self) -> None:
-        """Фарм по всем коллекциям с пагинацией, пока юзов < 5M."""
+        """Непрерывный фарм коллекций → юзы+модели в БД без остановки."""
         try:
             gift_ids = await self.market.load_collections()
         except Exception as exc:  # noqa: BLE001
             self.afk_last_error = str(exc)
-            await self._say(f"🌙 AFK ошибка коллекций: {_esc(str(exc)[:180])}")
+            logger.warning("DB farm collections: %s", exc)
+            if not self._afk_quiet:
+                await self._say(f"💾 БД фарм ошибка: {_esc(str(exc)[:180])}")
             self.afk_running = False
             return
 
@@ -1586,32 +1666,30 @@ class App:
         gift_ids = list(self.market._gift_ids or gift_ids)
         self.afk_collections_total = len(gift_ids)
         self.afk_cursor = random.randrange(len(gift_ids)) if gift_ids else 0
-        # зарегистрируем все ~149 коллекций
         for gid in gift_ids:
-            self.db.touch_collection(gid, title="", last_offset=self.db.get_collection_offset(gid))
+            self.db.touch_collection(
+                gid, title="", last_offset=self.db.get_collection_offset(gid)
+            )
 
-        await self._say(
-            f"🌙 AFK: коллекций <b>{len(gift_ids)}</b> · "
-            f"цель <b>{creds.AFK_USER_CAP:,}</b> юзов\n"
-            f"Сейчас: <b>{self.db.count_users():,}</b> · старт random"
-        )
+        if not self._afk_quiet:
+            await self._say(
+                f"💾 БД фарм: коллекций <b>{len(gift_ids)}</b> · "
+                f"сейчас юзов <b>{self.db.count_users():,}</b>"
+            )
+        else:
+            logger.info("DB farm quiet · collections=%s", len(gift_ids))
 
         last_status = 0.0
         n = len(gift_ids)
         if n == 0:
-            await self._say("🌙 Нет коллекций.")
             self.afk_running = False
             return
 
-        while self.afk_running:
-            users_now = self.db.count_users()
-            if users_now >= creds.AFK_USER_CAP:
-                await self._say(
-                    f"🌙 AFK готов · набрано <b>{users_now:,}</b> юзов "
-                    f"(лимит {creds.AFK_USER_CAP:,})"
-                )
-                self.afk_running = False
-                break
+        while self.afk_running and not self._afk_paused:
+            # во время активного парсинга — ждём
+            if self.running:
+                await asyncio.sleep(0.4)
+                continue
 
             gid = gift_ids[self.afk_cursor % n]
             self.afk_cursor = (self.afk_cursor + 1) % n
@@ -1634,11 +1712,14 @@ class App:
 
             title = lots[0].title if lots else ""
             if lots:
-                self._save_models(lots)
-            # юзы из ответа API + продавцы лотов
+                ins_m, _upd_m = self._save_models(lots)
+                self.afk_models_added += ins_m
+                # все лоты+юзы через общий ingest
+                self._ingest_always(lots)
+
             batch_users = list(users)
             for lot in lots:
-                if lot.seller_id is not None:
+                if lot.seller_id is not None or lot.seller:
                     batch_users.append(
                         {
                             "user_id": lot.seller_id,
@@ -1647,7 +1728,6 @@ class App:
                             "last_name": lot.last_name,
                         }
                     )
-            # юзы из страницы + всё что market накопил в drain
             drain = self.market.drain_users()
             if drain:
                 batch_users.extend(drain)
@@ -1664,7 +1744,6 @@ class App:
             if self.afk_pages % 5 == 0:
                 self.db.checkpoint()
 
-            # если страница пустая / нет next — с начала коллекции
             new_offset = next_offset if (lots and next_offset) else ""
             self.db.touch_collection(
                 gid,
@@ -1675,28 +1754,35 @@ class App:
             )
 
             now = time.monotonic()
-            if now - last_status >= creds.AFK_STATUS_EVERY:
+            if (not self._afk_quiet) and now - last_status >= creds.AFK_STATUS_EVERY:
                 last_status = now
                 await self._edit_afk(
-                    f"🌙 <b>AFK фарм</b>\n"
+                    f"💾 <b>БД фарм</b>\n"
                     f"Коллекций: <b>{self.db.count_collections()}</b>/"
                     f"<b>{self.afk_collections_total}</b>\n"
                     f"Юзов: <b>{total_u:,}</b> / <b>{creds.AFK_USER_CAP:,}</b>\n"
-                    f"+ за сессию: <b>{self.afk_users_added:,}</b>\n"
-                    f"Моделей в БД: <b>{self.db.count():,}</b>\n"
-                    f"Страниц: <b>{self.afk_pages}</b>\n"
-                    f"Сейчас gift_id=<code>{gid}</code> · listed≈{total}\n"
-                    f"offset: <code>{_esc((offset or '∅')[:40])}</code>"
-                    + (
-                        f"\n⚠️ {_esc(self.afk_last_error[:100])}"
-                        if self.afk_last_error
-                        else ""
-                    )
+                    f"+юзов: <b>{self.afk_users_added:,}</b> · "
+                    f"+моделей: <b>{self.afk_models_added:,}</b>\n"
+                    f"Моделей: <b>{self.db.count():,}</b>\n"
+                    f"Страниц: <b>{self.afk_pages}</b>"
+                )
+            elif self._afk_quiet and self.afk_pages % 50 == 0:
+                logger.info(
+                    "DB farm · pages=%s users=%s models=%s +u=%s +m=%s",
+                    self.afk_pages,
+                    total_u,
+                    self.db.count(),
+                    self.afk_users_added,
+                    self.afk_models_added,
                 )
 
             await asyncio.sleep(0.01)
 
         self._afk_task = None
+        # если не на паузе осознанно — вышли из-за ошибки/стопа
+        if self._afk_paused and self.logged_in and not self.running:
+            # внешний pause сам рестартнет через ensure
+            pass
 
     async def _loop(self) -> None:
         """Один обход: скан → прогресс (чеки/проверки) → выдача по типам."""
@@ -1781,13 +1867,16 @@ class App:
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             self.running = False
+            self._task = None
             await self._say(
                 f"{screen('Парсинг')}\n⚠️ {_esc(str(exc)[:200])}",
                 reply_markup=parse_done_inline(),
             )
+            await self.ensure_db_farm()
             return
 
         if not self.running:
+            await self.ensure_db_farm()
             return
 
         now = time.monotonic()
@@ -1841,6 +1930,7 @@ class App:
         self.running = False
         self._task = None
         await self._close_extra_clients()
+        await self.ensure_db_farm()
 
     async def deliver_again(self) -> None:
         """Ещё одна выдача других лотов из пула / быстрый добор."""
@@ -1848,6 +1938,7 @@ class App:
             raise RuntimeError("Уже парсит — сначала стоп.")
         if not self.logged_in:
             raise RuntimeError("Сначала вход.")
+        await self.pause_db_farm()
         self.running = True
         self.parse_rounds += 1
         self._task = asyncio.create_task(self._again_loop(), name="again")
@@ -1855,34 +1946,50 @@ class App:
     async def _again_loop(self) -> None:
         try:
             await self._edit_status(f"{screen('Парсинг')}\nЗаново · готовлю…")
+            # всегда добор лайвом — пул после выдачи часто без свежих RU
+            burst = await self.multi_burst(
+                self.min_stars,
+                self.max_stars,
+                progress_cb=None,
+                early_show_at=0,
+            )
+            extra = [
+                lot
+                for lot in (burst.all_lots or burst.lots or [])
+                if self._in_price(lot)
+            ]
             pool = [lot for lot in self._last_pool if self._in_price(lot)]
-            random.shuffle(pool)
+            self._last_pool = _dedupe_lots(pool + extra)
+            self._ingest_always(self._last_pool)
+            random.shuffle(self._last_pool)
             shown = await self._prepare_show(
-                pool,
+                self._last_pool,
                 limit=None,
                 apply_extra=False,
                 channel="parser",
+                strict_russian=True,
             )
+            # если мало RU — ещё один быстрый добор, не сдаём не-русских
             if len(shown) < max(5, int(getattr(creds, "SHOW_LIMIT", 20) // 2)):
-                # добор лайвом с 3 акков
-                burst = await self.multi_burst(
+                burst2 = await self.multi_burst(
                     self.min_stars,
                     self.max_stars,
                     progress_cb=None,
                     early_show_at=0,
                 )
-                extra = [
+                extra2 = [
                     lot
-                    for lot in (burst.all_lots or burst.lots or [])
+                    for lot in (burst2.all_lots or burst2.lots or [])
                     if self._in_price(lot)
                 ]
-                self._last_pool = _dedupe_lots(pool + extra)
-                self._save_models(extra)
+                self._last_pool = _dedupe_lots(self._last_pool + extra2)
+                self._ingest_always(extra2)
                 shown = await self._prepare_show(
                     self._last_pool,
                     limit=None,
                     apply_extra=False,
                     channel="parser",
+                    strict_russian=True,
                 )
             self.parse_ready = len(shown)
             if shown:
@@ -1893,14 +2000,14 @@ class App:
                 self.lots_notified += len(shown)
                 await self._say(
                     f"{screen('Парсинг')}\n"
-                    f"Заново · <b>{len(shown)}</b> типов\n"
+                    f"Заново · <b>{len(shown)}</b> типов · RU\n"
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks}",
                     reply_markup=parse_done_inline(),
                 )
             else:
                 await self._say(
-                    f"{screen('Парсинг')}\nПока пусто · free DM",
+                    f"{screen('Парсинг')}\nПока пусто · RU · free DM",
                     reply_markup=parse_done_inline(),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -1913,6 +2020,7 @@ class App:
             self.running = False
             self._task = None
             await self._close_extra_clients()
+            await self.ensure_db_farm()
 
     async def _notify_lot(self, lot: Lot, count_as_new: bool) -> None:
         if not self.chat_id:
@@ -2794,6 +2902,8 @@ async def main() -> None:
     app.bot = bot
     try:
         await app.try_restore_account()
+        if app.logged_in:
+            await app.ensure_db_farm()
     except Exception:  # noqa: BLE001
         pass
     await bot.set_my_commands(

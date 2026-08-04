@@ -498,8 +498,8 @@ class App:
                 sample_n = min(len(candidates), max(sample_n, lim * 5))
             await self.market.enrich_profiles(
                 candidates[:sample_n],
-                timeout=min(creds.OWNER_TIMEOUT, 0.7),
-                parallel=16,
+                timeout=min(creds.OWNER_TIMEOUT, 0.9),
+                parallel=getattr(creds, "ENRICH_PARALLEL", 3),
             )
             self.db.upsert_users_from_lots(
                 [lot for lot in candidates if lot.seller_id is not None],

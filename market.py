@@ -651,13 +651,15 @@ class TelegramMarket:
                 )
             except FloodWaitError as exc:
                 stats["floods"] += 1
-                self._flood_until = time.monotonic() + min(float(exc.seconds) + 0.2, 20.0)
-                self.last_error = f"FloodWait {exc.seconds}s"
-                await asyncio.sleep(min(float(exc.seconds), 2.0))
+                # бережём сессию: ждём почти полностью + запас
+                wait_s = float(exc.seconds) + 1.5
+                self._flood_until = time.monotonic() + min(wait_s, 90.0)
+                self.last_error = f"FloodWait {exc.seconds}s · торможу"
+                await asyncio.sleep(min(wait_s, 45.0))
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
                 self.last_error = str(exc)
-                await asyncio.sleep(0.1 * (attempt + 1))
+                await asyncio.sleep(0.4 * (attempt + 1))
         return None
 
     async def _wait_flood(self) -> None:

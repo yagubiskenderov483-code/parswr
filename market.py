@@ -377,6 +377,18 @@ class TelegramMarket:
                     lots.extend(part)
                 else:
                     stats["errors"] += 1
+            # всегда копить в БД по ходу скана (не ждать выдачи)
+            batch_save = getattr(self, "_batch_save_cb", None)
+            if callable(batch_save):
+                try:
+                    fresh = []
+                    for part in parts:
+                        if isinstance(part, list):
+                            fresh.extend(part)
+                    if fresh:
+                        await batch_save(fresh)
+                except Exception:  # noqa: BLE001
+                    pass
             # уникальные модели/типы в сыром пуле
             titles = {
                 (lot.title or lot.model or "").strip().lower()

@@ -487,25 +487,26 @@ class App:
                     lot.model_key, title=lot.model or lot.title
                 )
 
-        # сначала все разные NFT, потом добор — с разносом подряд
+        # сначала ВСЕ разные NFT, добор только в хвост
         random.shuffle(primary)
-        result = list(primary)
-        for lot in extra:
-            if limit is not None and len(result) >= limit:
-                break
-            # вставить не рядом с тем же title
-            placed = False
-            for i in range(len(result) + 1):
-                left = self._title_key(result[i - 1]) if i > 0 else ""
-                right = self._title_key(result[i]) if i < len(result) else ""
-                tk = self._title_key(lot)
-                if tk != left and tk != right:
-                    result.insert(i, lot)
-                    placed = True
-                    break
-            if not placed:
-                result.append(lot)
-        result = result[:limit] if limit is not None else result
+        random.shuffle(extra)
+        result = list(primary) + list(extra)
+        if limit is not None:
+            result = result[:limit]
+
+        # разнести одинаковые названия, не ломая приоритет уникальных
+        spread: list[Lot] = []
+        rest = list(result)
+        while rest:
+            pick_i = 0
+            if spread:
+                last = self._title_key(spread[-1])
+                for i, lot in enumerate(rest):
+                    if self._title_key(lot) != last:
+                        pick_i = i
+                        break
+            spread.append(rest.pop(pick_i))
+        result = spread
 
         for lot in result:
             tk = self._title_key(lot)

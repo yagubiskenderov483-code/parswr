@@ -1085,14 +1085,10 @@ class App:
             or f.online_only
             or f.fresh_only
             or f.rare_types
-            or f.spice_no_model
-            or f.spice_mid_user
-            or f.spice_has_bio
-            or f.spice_low_stars
         )
 
     def _roll_random_spice(self) -> str:
-        """Рандомные мягкие предпочтения на этот поиск."""
+        """Рандомные мягкие предпочтения (только приоритет, не режем в ноль)."""
         f = self.filters
         f.spice_no_model = False
         f.spice_mid_user = False
@@ -1117,13 +1113,14 @@ class App:
         return " · 🎲 " + "+".join(labels) if labels else ""
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
-        """TGP/lvl/длинный юз/рандом-spice — жёстко, без проскока в fallback."""
+        """Только явные тумблеры. Рандом-spice — мягкий приоритет, не бан."""
         f = self.filters
         if f.few_gifts:
             if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is None or lot.account_level > f.max_level:
+            # unknown lvl не режем — иначе из 12k БД выдача пустая
+            if lot.account_level is not None and lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
@@ -1139,22 +1136,27 @@ class App:
         if f.online_only:
             if lot.is_online is False:
                 return False
-        # рандом-spice (мягкие, но если включены — режем)
-        if f.spice_no_model and not (lot.model or "").strip():
-            return False
+        return True
+
+    def _spice_score(self, lot: Lot) -> float:
+        """Выше = лучше для рандом-микса (не отсев)."""
+        f = self.filters
+        score = random.random()
+        if f.spice_no_model and (lot.model or "").strip():
+            score += 2.0
         if f.spice_mid_user:
             n = len(lot.seller or "")
-            if n < 7 or n > 14:
-                return False
-        if f.spice_has_bio and not (
-            lot.first_name or lot.last_name or lot.about
-        ):
-            return False
+            if 7 <= n <= 14:
+                score += 1.5
+        if f.spice_has_bio and (lot.first_name or lot.last_name or lot.about):
+            score += 1.2
         if f.spice_low_stars:
             mid = (self.filter_min_stars + self.filter_max_stars) / 2.0
-            if lot.stars > mid:
-                return False
-        return True
+            if lot.stars <= mid:
+                score += 1.0
+        if f.rare_types:
+            score += random.random() * 0.5
+        return score
 
     def _pick_clean(
         self,
@@ -1294,10 +1296,25 @@ class App:
                 marked_titles.add(tk)
 
         primary: list[Lot] = []
-        # парсер/фильтры: рандомный разброс типов
+        # парсер/фильтры: рандомный разброс типов (+ spice приоритет)
         if channel in ("parser", "filter"):
             ordered = list(keys)
-            random.shuffle(ordered)
+            if channel == "filter" and (
+                self.filters.random_mix
+                or self.filters.rare_types
+                or self.filters.spice_no_model
+                or self.filters.spice_mid_user
+                or self.filters.spice_has_bio
+                or self.filters.spice_low_stars
+            ):
+                ordered.sort(
+                    key=lambda tk: -max(
+                        (self._spice_score(x) for x in (buckets.get(tk) or [])),
+                        default=0.0,
+                    )
+                )
+            else:
+                random.shuffle(ordered)
         else:
             ordered = sorted(keys, key=_rank)
         per_type = max(1, int(getattr(creds, "PER_TYPE", 1)))
@@ -1429,11 +1446,12 @@ class App:
                 (True, False, True, False),
             ]
         else:
-            # фильтры: всегда RU + free DM; тумблеры не снимаем
+            # фильтры: free DM всегда; RU сначала; если мало — без RU
             keep_extra = bool(apply_extra or self._filters_active())
             attempts = [
                 (True, True, False, keep_extra),
                 (True, True, True, keep_extra),
+                (False, True, True, keep_extra),
             ]
         best: list[Lot] = []
         for want_ru, want_free, ign_seen, extra in attempts:
@@ -1452,7 +1470,8 @@ class App:
                 out = out[:target]
             if len(out) > len(best):
                 best = out
-            if len(best) >= min(20, target):
+            stop_at = target if channel == "filter" else min(20, target)
+            if len(best) >= stop_at:
                 break
         if best:
             best = best[:target]
@@ -1487,7 +1506,13 @@ class App:
         # меньше resolve — больше упор на уже известных продавцов
         resolve_n = min(
             len(without),
-            50 if by_types else (120 if take_all else max(lim * 2, 40)),
+            50
+            if by_types
+            else (
+                120
+                if take_all
+                else (max(lim * 8, 200) if channel == "filter" else max(lim * 2, 40))
+            ),
         )
         if resolve_n:
             await self.market.resolve_owners(
@@ -1537,12 +1562,11 @@ class App:
             want_ru = True
 
         if channel == "filter" and candidates:
-            # === ОСНОВА: фильтры — БД+live, максимум разных типов ===
+            # === ОСНОВА: из большой БД выжать ~30+ разных типов ===
             mn_f, mx_f = self.filter_min_stars, self.filter_max_stars
             candidates = [
                 lot for lot in candidates if mn_f <= lot.stars <= mx_f
             ]
-            # дешёвые фильтры до API (юз / TGP / spice)
             if self._filters_active():
                 pre: list[Lot] = []
                 for lot in candidates:
@@ -1555,49 +1579,48 @@ class App:
                             continue
                     if self.filters.no_premium and lot.is_premium is True:
                         continue
-                    if self.filters.spice_no_model and not (lot.model or "").strip():
-                        continue
-                    if self.filters.spice_mid_user:
-                        n = len(lot.seller or "")
-                        if n < 7 or n > 14:
-                            continue
-                    if self.filters.spice_low_stars:
-                        mid = (mn_f + mx_f) / 2.0
-                        if lot.stars > mid:
-                            continue
-                    if self.filters.spice_has_bio and not (
-                        lot.first_name or lot.last_name or lot.about
-                    ):
-                        # ещё без био — оставим, enrich доберёт
-                        pass
                     pre.append(lot)
                 candidates = pre or candidates
+            # сортируем по spice — сначала «вкусные», но всех оставляем
+            if self.filters.random_mix or self.filters.rare_types:
+                candidates = sorted(
+                    candidates, key=self._spice_score, reverse=True
+                )
             already_ru = [lot for lot in candidates if self._is_russian(lot)]
             need_bio = [lot for lot in candidates if not self._is_russian(lot)]
-            # большой разнообразный сэмпл: цель ≥30 типов после отсева
-            sample = self._sample_diverse_titles(already_ru, 140)
-            if len({self._title_key(x) for x in sample}) < 50:
+            # из 12k БД берём МНОГО разных типов на проверку
+            sample = self._sample_diverse_titles(already_ru, 250)
+            if len({self._title_key(x) for x in sample}) < 80:
                 sample = _dedupe_lots(
-                    sample + self._sample_diverse_titles(need_bio, 160)
+                    sample + self._sample_diverse_titles(need_bio, 350)
                 )
-            if len(sample) < 40:
+            if len({self._title_key(x) for x in sample}) < 60:
                 sample = _dedupe_lots(
-                    sample + self._sample_diverse_titles(candidates, 200)
+                    sample + self._sample_diverse_titles(candidates, 400)
                 )
             need_lvl = bool(self.filters.low_level or self.filters.few_gifts)
-            if need_lvl or self.filters.no_premium:
-                need_enr = list(sample)
-            else:
-                need_enr = [
-                    lot
-                    for lot in sample
-                    if not (lot.first_name or lot.last_name or lot.about)
-                ]
+            # enrich всем без био / без lvl — иначе RU/фильтры режут в ноль
+            need_enr = [
+                lot
+                for lot in sample
+                if not (lot.first_name or lot.last_name or lot.about)
+                or (
+                    need_lvl
+                    and (
+                        lot.account_level is None
+                        or (
+                            self.filters.few_gifts
+                            and lot.gifts_count is None
+                        )
+                    )
+                )
+                or (self.filters.no_premium and lot.is_premium is None)
+            ]
             if need_enr:
                 await self.market.enrich_profiles(
                     need_enr,
                     timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
-                    parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                    parallel=max(8, int(getattr(creds, "ENRICH_PARALLEL", 8))),
                 )
                 self.parse_acc_checks += len(need_enr)
             await self.market.check_free_dm(
@@ -1614,17 +1637,20 @@ class App:
             self._ingest_always(sample)
             candidates = [lot for lot in sample if lot.free_dm is not False]
             if self._filters_active():
-                candidates = [
+                filtered = [
                     lot
                     for lot in candidates
                     if self._passes_extra_filters(lot)
                 ]
+                # не обнуляем пул тумблерами, если совсем пусто
+                if filtered:
+                    candidates = filtered
             ru_titles = {
                 self._title_key(x)
                 for x in candidates
                 if self._is_russian(x) and self._title_key(x)
             }
-            if len(ru_titles) < 30:
+            if len(ru_titles) < 35:
                 used = {lot.id for lot in sample}
                 used_t = {self._title_key(x) for x in sample}
                 left = [
@@ -1632,12 +1658,14 @@ class App:
                     for lot in need_bio
                     if lot.id not in used and self._title_key(lot) not in used_t
                 ]
-                wave2 = self._sample_diverse_titles(left, 120)
+                wave2 = self._sample_diverse_titles(left, 300)
                 if wave2:
                     await self.market.enrich_profiles(
                         wave2,
                         timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
-                        parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                        parallel=max(
+                            8, int(getattr(creds, "ENRICH_PARALLEL", 8))
+                        ),
                     )
                     await self.market.check_free_dm(
                         wave2,
@@ -1661,6 +1689,48 @@ class App:
                         )
                     ]
                     candidates = _dedupe_lots(candidates + add)
+            # ещё волна если всё ещё мало типов
+            if len({self._title_key(x) for x in candidates}) < 30:
+                used = {lot.id for lot in candidates}
+                used_t = {self._title_key(x) for x in candidates}
+                left = [
+                    lot
+                    for lot in (already_ru + need_bio)
+                    if lot.id not in used and self._title_key(lot) not in used_t
+                ]
+                wave3 = self._sample_diverse_titles(left, 250)
+                if wave3:
+                    need_e = [
+                        lot
+                        for lot in wave3
+                        if not (lot.first_name or lot.last_name or lot.about)
+                    ]
+                    if need_e:
+                        await self.market.enrich_profiles(
+                            need_e,
+                            timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
+                            parallel=max(
+                                8, int(getattr(creds, "ENRICH_PARALLEL", 8))
+                            ),
+                        )
+                    await self.market.check_free_dm(
+                        wave3,
+                        timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                    )
+                    self.parse_acc_checks += len(wave3)
+                    self._ingest_always(wave3)
+                    candidates = _dedupe_lots(
+                        candidates
+                        + [
+                            lot
+                            for lot in wave3
+                            if lot.free_dm is not False
+                            and (
+                                not self._filters_active()
+                                or self._passes_extra_filters(lot)
+                            )
+                        ]
+                    )
         elif channel == "parser" and candidates:
             already_ru = [lot for lot in candidates if self._is_russian(lot)]
             need_bio = [lot for lot in candidates if not self._is_russian(lot)]
@@ -1739,7 +1809,7 @@ class App:
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
-        """Фильтр-поиск: БД (основа) + live, максимум новых уникальных лотов."""
+        """Фильтр-поиск: большая БД → ~30 уникальных, free DM."""
         if self.filter_search_running:
             await self._say_to(chat_id, f"{screen('Фильтры')}\nуже идёт")
             return
@@ -1750,6 +1820,10 @@ class App:
         label = self.filter_range_label
         spice_note = self._roll_random_spice()
         target_n = max(30, int(creds.SHOW_LIMIT))
+        # каждый поиск — свежий seen (из 12k БД всегда новые)
+        self._filter_seen_sellers.clear()
+        self._filter_seen_models.clear()
+        self._filter_recent_titles.clear()
         try:
             db_n = 0
             try:
@@ -1767,33 +1841,27 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n{label}{extra}{spice_note}\n"
-                f"БД в диапазоне: <b>{db_n}</b>",
+                f"БД в диапазоне: <b>{db_n}</b> · тяну максимум…",
             )
 
-            async def _db_pool(*, clear_seen: bool = False) -> list[Lot]:
-                if clear_seen:
-                    self._filter_seen_sellers.clear()
-                    self._filter_seen_models.clear()
-                    self._filter_recent_titles.clear()
-                hours = 48.0 if (f.fresh_only or f.spice_fresh_boost) else 72.0
-                if f.fresh_only:
-                    hours = 48.0
-                lim = max(
-                    2500,
-                    int(getattr(creds, "FILTER_DB_LIMIT", 200)) * 8,
+            def _db_pool() -> list[Lot]:
+                hours = 48.0 if f.fresh_only else (
+                    96.0 if f.spice_fresh_boost else 0.0
                 )
-                excl_s = set(self._filter_seen_sellers)
-                excl_t = set(self._filter_recent_titles[-300:])
+                # почти вся БД в диапазоне — не 2–3 тысячи
+                lim = min(max(db_n, 500), 12000)
+                lim = max(lim, int(getattr(creds, "FILTER_DB_LIMIT", 800)) * 10)
+                lim = min(lim, 12000)
                 try:
                     return self.db.fetch_for_filters(
                         min_stars=mn,
                         max_stars=mx,
                         limit=lim,
-                        hours=hours,
+                        hours=hours if hours > 0 else 168.0,
                         require_seller=True,
                         prefer_rare=bool(f.rare_types or f.random_mix),
-                        exclude_sellers=excl_s,
-                        exclude_titles=excl_t,
+                        exclude_sellers=set(),
+                        exclude_titles=set(),
                     )
                 except Exception:  # noqa: BLE001
                     return self.db.fetch_random_lots(
@@ -1804,7 +1872,6 @@ class App:
                     )
 
             async def _live_pool() -> list[Lot]:
-                live: list[Lot] = []
                 try:
                     burst = await self.multi_burst(
                         mn,
@@ -1812,18 +1879,19 @@ class App:
                         progress_cb=None,
                         early_show_at=0,
                     )
-                    if burst:
-                        raw = list(burst.all_lots or burst.lots or [])
-                        if raw:
-                            self._save_models(raw)
-                        self._flush_market_users()
-                        live = list(burst.lots or raw)
+                    if not burst:
+                        return []
+                    raw = list(burst.all_lots or burst.lots or [])
+                    if raw:
+                        self._save_models(raw)
+                    self._flush_market_users()
+                    return list(burst.lots or raw)
                 except Exception as exc:  # noqa: BLE001
                     await self._say_to(
                         chat_id,
                         f"{screen('Фильтры')}\n⚠️ live {_esc(str(exc)[:100])}",
                     )
-                return live
+                    return []
 
             def _merge_unique(
                 base: list[Lot], more: list[Lot], *, cap: int
@@ -1844,20 +1912,16 @@ class App:
                         break
                 return out
 
-            shown: list[Lot] = []
-            # --- проход 1: БД + live ---
-            old = await _db_pool()
-            live = await _live_pool()
-            merged = _dedupe_lots(old + live)
-            random.shuffle(merged)
-            self._ingest_always(merged)
+            # 1) сначала ТОЛЬКО БД (быстро и много при 12k)
+            old = _db_pool()
+            random.shuffle(old)
+            self._ingest_always(old)
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\n"
-                f"пул: БД {len(old)} + live {len(live)} = {len(merged)}",
+                f"{screen('Фильтры')}\nпул БД: <b>{len(old)}</b> лотов",
             )
             shown = await self._prepare_show(
-                merged,
+                old,
                 limit=target_n,
                 apply_extra=True,
                 track_seen=True,
@@ -1865,15 +1929,19 @@ class App:
                 channel="filter",
             )
 
-            # --- проход 2: ещё БД рандом + live, если мало ---
+            # 2) мало — live + ещё рандом из БД
             if len(shown) < target_n:
-                old2 = await _db_pool()
-                live2 = await _live_pool()
-                merged2 = _dedupe_lots(old2 + live2 + merged)
-                random.shuffle(merged2)
-                self._ingest_always(merged2)
+                live = await _live_pool()
+                old2 = _db_pool()
+                merged = _dedupe_lots(old + old2 + live)
+                random.shuffle(merged)
+                self._ingest_always(merged)
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nдобор · БД {len(old2)} + live {len(live)}",
+                )
                 more = await self._prepare_show(
-                    merged2,
+                    merged,
                     limit=target_n,
                     apply_extra=True,
                     track_seen=True,
@@ -1882,30 +1950,19 @@ class App:
                 )
                 shown = _merge_unique(shown, more, cap=target_n)
 
-            # --- проход 3: пусто/мало — сброс filter-seen и полный ретрай ---
-            if len(shown) < 10:
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\nмало ({len(shown)}) · сброс seen · ещё раз",
-                )
-                # временно ослабить spice, чтобы не резать в ноль
-                saved_spice = (
-                    f.spice_no_model,
-                    f.spice_mid_user,
-                    f.spice_has_bio,
-                    f.spice_low_stars,
-                )
+            # 3) всё ещё мало — без spice, ещё раз по всей БД
+            if len(shown) < 20:
                 f.spice_no_model = False
                 f.spice_mid_user = False
                 f.spice_has_bio = False
                 f.spice_low_stars = False
-                old3 = await _db_pool(clear_seen=True)
-                live3 = await _live_pool()
-                merged3 = _dedupe_lots(old3 + live3)
-                random.shuffle(merged3)
-                self._ingest_always(merged3)
+                self._filter_seen_sellers.clear()
+                self._filter_seen_models.clear()
+                # не чистим titles уже показанных в этом запуске —
+                # только sellers, titles оставим в recent чтобы не дублировать в merge
+                old3 = _db_pool()
                 more = await self._prepare_show(
-                    merged3,
+                    old3,
                     limit=target_n,
                     apply_extra=True,
                     track_seen=True,
@@ -1913,18 +1970,12 @@ class App:
                     channel="filter",
                 )
                 shown = _merge_unique(shown, more, cap=target_n)
-                (
-                    f.spice_no_model,
-                    f.spice_mid_user,
-                    f.spice_has_bio,
-                    f.spice_low_stars,
-                ) = saved_spice
 
             if not shown:
                 await self._say_to(
                     chat_id,
                     f"{screen('Фильтры')}\nпусто · БД {db_n} · "
-                    f"смени сложность / сними онлайн / TGP",
+                    f"сними онлайн / смени сложность",
                     reply_markup=filters_inline(),
                 )
                 return
@@ -1932,14 +1983,13 @@ class App:
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> типов · "
-                f"новые · free DM",
+                f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> / {target_n} · "
+                f"из БД {db_n}",
                 reply_markup=filters_inline(),
             )
         finally:
             self.filter_search_running = False
             self._filter_task = None
-            # сбросить spice после поиска
             f.spice_no_model = False
             f.spice_mid_user = False
             f.spice_has_bio = False

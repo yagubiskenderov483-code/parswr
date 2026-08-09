@@ -1591,11 +1591,16 @@ class App:
             self.parse_acc_checks += resolve_n
             self._ingest_always(without[:resolve_n])
         pool = with_seller + without[:resolve_n]
-        self.db.upsert_users_from_lots(
-            [lot for lot in pool if lot.seller_id is not None or lot.seller],
-            cap=creds.AFK_USER_CAP,
-        )
-        self._save_models([lot for lot in pool if lot.seller or lot.seller_id])
+        # в БД только те, кого ещё не выдавали — выданные навсегда стёрты
+        fresh_pool = [
+            lot
+            for lot in pool
+            if (lot.seller or lot.seller_id is not None)
+            and not self._is_delivered_seller(lot)
+        ]
+        if fresh_pool:
+            self.db.upsert_users_from_lots(fresh_pool, cap=creds.AFK_USER_CAP)
+            self._save_models(fresh_pool)
         self._flush_market_users()
 
         candidates = [
@@ -2192,15 +2197,15 @@ class App:
         )
         if not batch:
             return
-        # стереть юзов из БД после выдачи (если ещё не)
-        todo = [
-            lot for lot in batch if lot.owner_key not in self._delivered_sellers
-        ]
-        if todo:
+        # при выдаче — юзер навсегда из БД (users+gifts), повторно не вернётся
+        try:
+            self._mark_delivered(batch, channel=channel)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mark on say: %s", exc)
             try:
-                self._mark_delivered(todo, channel=channel)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("mark on say: %s", exc)
+                self.db.purge_delivered_lots(batch)
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("purge on say: %s", exc2)
         lines = [self._format_lot_line(lot) for lot in batch]
         for i in range(0, len(lines), 10):
             await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
@@ -2247,7 +2252,8 @@ class App:
             self._status_msg_id = msg.message_id
 
     def _save_models(self, lots: list[Lot]) -> tuple[int, int]:
-        """Сохраняет модели в БД (всегда, без условий выдачи)."""
+        """Сохраняет модели в БД (кроме уже выданных юзов — они стёрты навсегда)."""
+        lots = [lot for lot in lots if not self._is_delivered_seller(lot)]
         if not lots:
             return 0, 0
         inserted, updated = self.db.upsert_models(lots)

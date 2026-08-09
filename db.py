@@ -222,6 +222,11 @@ class GiftDB:
         for lot in lots:
             if not lot.id:
                 continue
+            seller = (lot.seller or "").strip()
+            seller_id = lot.seller_id
+            # выданных продавцов в БД больше никогда не пишем
+            if self.is_seen_seller(username=seller, user_id=seller_id):
+                continue
             mk = _model_key(lot)
             model = _model_name(lot)
             row = cur.execute(
@@ -229,8 +234,6 @@ class GiftDB:
                 "model_key, backdrop, symbol, nft_url FROM gifts WHERE id = ?",
                 (lot.id,),
             ).fetchone()
-            seller = (lot.seller or "").strip()
-            seller_id = lot.seller_id
             new_stars = float(lot.stars) if lot.stars is not None else 0.0
             if row is None:
                 cur.execute(
@@ -327,6 +330,9 @@ class GiftDB:
             except (TypeError, ValueError):
                 continue
             username = str(u.get("username") or "").lstrip("@").strip()
+            # навсегда выданные — не возвращаем в users
+            if self.is_seen_seller(username=username, user_id=uid):
+                continue
             first_name = str(u.get("first_name") or "")
             last_name = str(u.get("last_name") or "")
             premium = u.get("is_premium")
@@ -793,22 +799,33 @@ class GiftDB:
     def mark_seen_seller(
         self, *, username: str = "", user_id: int | None = None
     ) -> None:
-        key = self._block_key(username, user_id)
-        if not key:
+        """Пишем и u:, и id: — чтобы юзер не вернулся ни по нику, ни по id."""
+        u = (username or "").lstrip("@").strip().lower()
+        uid: int | None
+        try:
+            uid = int(user_id) if user_id is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        keys: list[str] = []
+        if u:
+            keys.append(f"u:{u}")
+        if uid is not None:
+            keys.append(f"id:{uid}")
+        if not keys:
             return
         now = time.time()
-        u = (username or "").lstrip("@").strip().lower()
-        self._conn.execute(
-            """
-            INSERT INTO seen_sellers (key, username, user_id, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                username = CASE WHEN excluded.username != '' THEN excluded.username ELSE seen_sellers.username END,
-                user_id = COALESCE(excluded.user_id, seen_sellers.user_id),
-                last_seen = excluded.last_seen
-            """,
-            (key, u, user_id, now, now),
-        )
+        for key in keys:
+            self._conn.execute(
+                """
+                INSERT INTO seen_sellers (key, username, user_id, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    username = CASE WHEN excluded.username != '' THEN excluded.username ELSE seen_sellers.username END,
+                    user_id = COALESCE(excluded.user_id, seen_sellers.user_id),
+                    last_seen = excluded.last_seen
+                """,
+                (key, u, uid, now, now),
+            )
         self._conn.commit()
 
     def purge_delivered_seller(
@@ -875,13 +892,29 @@ class GiftDB:
         self._conn.commit()
 
     def is_seen_seller(self, *, username: str = "", user_id: int | None = None) -> bool:
-        key = self._block_key(username, user_id)
-        if not key:
-            return False
         u = (username or "").lstrip("@").strip().lower()
+        uid: int | None
+        try:
+            uid = int(user_id) if user_id is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        if not u and uid is None:
+            return False
         row = self._conn.execute(
-            "SELECT 1 FROM seen_sellers WHERE key = ? OR (? != '' AND username = ?) LIMIT 1",
-            (key, u, u),
+            """
+            SELECT 1 FROM seen_sellers
+            WHERE (? != '' AND (key = ? OR lower(username) = ?))
+               OR (? IS NOT NULL AND (user_id = ? OR key = ?))
+            LIMIT 1
+            """,
+            (
+                u,
+                f"u:{u}" if u else "",
+                u,
+                uid,
+                uid,
+                f"id:{uid}" if uid is not None else "",
+            ),
         ).fetchone()
         return row is not None
 

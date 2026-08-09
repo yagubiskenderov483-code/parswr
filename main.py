@@ -75,7 +75,7 @@ class OwnerOnlyMiddleware(BaseMiddleware):
             out.add(int(creds.OWNER_ID))
         except (TypeError, ValueError):
             pass
-        out.update({8489947571, 8676953948, 8304609240})
+        out.update({741904495, 8676953948, 8304609240})
         return out
 
     async def __call__(

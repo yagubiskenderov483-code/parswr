@@ -5,7 +5,7 @@ API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
 # кто может пользоваться ботом
-OWNER_ID = 8489947571
+OWNER_ID = 741904495
 ALLOWED_USER_IDS: set[int] = {
     OWNER_ID,
     8676953948,

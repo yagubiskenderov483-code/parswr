@@ -1,6 +1,6 @@
 """Hardcoded Telegram credentials + профили скорости."""
 
-BOT_TOKEN = "7974858111:AAHlv4lgtmcGENF3PGzlTf_QiZwvwKPrAUU"
+BOT_TOKEN = "8966504132:AAGTwR9b-jjXnQrVd5dlqOPobLm-cFUY68s"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 

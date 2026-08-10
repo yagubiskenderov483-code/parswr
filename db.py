@@ -422,6 +422,18 @@ class GiftDB:
         if not seller:
             seller = str(r["u_username"] or "").lstrip("@").strip()
         premium = r["u_is_premium"]
+        seen_at = time.time()
+        try:
+            keys = set(r.keys())
+        except Exception:  # noqa: BLE001
+            keys = set()
+        for k in ("last_seen", "first_seen", "g_last_seen", "g_first_seen"):
+            if k in keys and r[k] is not None:
+                try:
+                    seen_at = float(r[k])
+                    break
+                except (TypeError, ValueError):
+                    pass
         return Lot(
             id=str(r["id"]),
             title=str(r["title"] or "Gift"),
@@ -438,7 +450,88 @@ class GiftDB:
             is_premium=None if premium is None else bool(premium),
             account_level=r["u_account_level"],
             gifts_count=r["u_gifts_count"],
+            seen_at=seen_at,
         )
+
+    @staticmethod
+    def _seller_sql() -> str:
+        return (
+            "CASE WHEN IFNULL(g.seller, '') != '' THEN g.seller "
+            "ELSE IFNULL(u.username, '') END"
+        )
+
+    def _profile_filter_sql(
+        self,
+        *,
+        short_username: bool = False,
+        short_user_max: int = 8,
+        long_username: bool = False,
+        long_user_min: int = 9,
+        no_premium: bool = False,
+        with_model: bool = False,
+        no_digits_user: bool = False,
+        few_gifts: bool = False,
+        max_gifts: int = 5,
+        low_level: bool = False,
+        max_level: int = 5,
+        with_bio: bool = False,
+        exclude_seen: bool = True,
+    ) -> tuple[str, list[Any]]:
+        """SQL-условия «в точку» по тумблерам фильтров."""
+        seller = self._seller_sql()
+        parts: list[str] = []
+        params: list[Any] = []
+        if short_username:
+            parts.append(f"length({seller}) BETWEEN 6 AND ?")
+            params.append(int(short_user_max))
+        if long_username:
+            parts.append(f"length({seller}) >= ?")
+            params.append(int(long_user_min))
+        if no_premium:
+            parts.append("(u.is_premium IS NULL OR u.is_premium = 0)")
+        if with_model:
+            parts.append("IFNULL(g.model, '') != ''")
+        if no_digits_user:
+            parts.append(f"({seller}) NOT GLOB '*[0-9]*'")
+        if few_gifts:
+            parts.append(
+                "(u.gifts_count IS NOT NULL AND u.gifts_count <= ?)"
+            )
+            params.append(int(max_gifts))
+        if low_level:
+            parts.append(
+                "(u.account_level IS NOT NULL AND u.account_level <= ?)"
+            )
+            params.append(int(max_level))
+        if with_bio:
+            parts.append(
+                "(IFNULL(u.first_name, '') != '' OR IFNULL(u.last_name, '') != '')"
+            )
+        if exclude_seen:
+            parts.append(
+                f"""
+                NOT EXISTS (
+                    SELECT 1 FROM seen_sellers s
+                    WHERE (
+                        g.seller_id IS NOT NULL
+                        AND (
+                            s.user_id = g.seller_id
+                            OR s.key = 'id:' || CAST(g.seller_id AS TEXT)
+                        )
+                    )
+                    OR (
+                        IFNULL({seller}, '') != ''
+                        AND (
+                            lower(s.username) = lower({seller})
+                            OR s.key = 'u:' || lower({seller})
+                        )
+                    )
+                )
+                """
+            )
+        if not parts:
+            return "", []
+        return " AND " + " AND ".join(parts), params
 
     @staticmethod
     def _mix_by_title(lots: list[Lot]) -> list[Lot]:
@@ -464,12 +557,15 @@ class GiftDB:
         max_stars: float,
         limit: int = 40,
         require_seller: bool = False,
+        extra_sql: str = "",
+        extra_params: list[Any] | None = None,
     ) -> list[Lot]:
         """Старые лоты из БД в диапазоне цены (рандом) + профиль юзера если есть."""
         sql = """
             SELECT
                 g.id, g.title, g.number, g.stars, g.slug, g.model,
                 g.backdrop, g.symbol, g.nft_url, g.seller, g.seller_id,
+                g.first_seen, g.last_seen,
                 u.username AS u_username,
                 u.first_name AS u_first_name,
                 u.last_name AS u_last_name,
@@ -483,6 +579,9 @@ class GiftDB:
         params: list[Any] = [float(min_stars), float(max_stars)]
         if require_seller:
             sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+        if extra_sql:
+            sql += extra_sql
+            params.extend(extra_params or [])
         sql += " ORDER BY RANDOM() LIMIT ?"
         params.append(int(limit))
         rows = self._conn.execute(sql, params).fetchall()
@@ -498,43 +597,81 @@ class GiftDB:
         hours: float = 0.0,
         require_seller: bool = True,
         prefer_rare: bool = True,
+        fresh_only: bool = False,
         exclude_sellers: set[str] | None = None,
         exclude_titles: set[str] | None = None,
+        short_username: bool = False,
+        short_user_max: int = 8,
+        long_username: bool = False,
+        long_user_min: int = 9,
+        no_premium: bool = False,
+        with_model: bool = False,
+        no_digits_user: bool = False,
+        few_gifts: bool = False,
+        max_gifts: int = 5,
+        low_level: bool = False,
+        max_level: int = 5,
+        with_bio: bool = False,
+        exclude_seen: bool = True,
     ) -> list[Lot]:
-        """Большой пул для фильтр-поиска: свежие + рандом + редкие типы."""
+        """Пул под фильтры: SQL сразу режет по тумблерам + без seen."""
         excl_s = {str(x).lower() for x in (exclude_sellers or set()) if x}
         excl_t = {str(x).lower() for x in (exclude_titles or set()) if x}
         half = max(200, int(limit) // 2)
         pools: list[Lot] = []
+        extra_sql, extra_params = self._profile_filter_sql(
+            short_username=short_username,
+            short_user_max=short_user_max,
+            long_username=long_username,
+            long_user_min=long_user_min,
+            no_premium=no_premium,
+            with_model=with_model,
+            no_digits_user=no_digits_user,
+            few_gifts=few_gifts,
+            max_gifts=max_gifts,
+            low_level=low_level,
+            max_level=max_level,
+            with_bio=with_bio,
+            exclude_seen=exclude_seen,
+        )
 
-        # 1) свежие за N часов (если hours>0)
-        if hours and hours > 0:
+        # 1) свежие за N часов
+        use_hours = float(hours or 0.0)
+        if fresh_only and use_hours <= 0:
+            use_hours = 48.0
+        if use_hours > 0:
             pools.extend(
                 self.fetch_lots_last_hours(
                     min_stars=min_stars,
                     max_stars=max_stars,
-                    hours=hours,
+                    hours=use_hours,
                     require_seller=require_seller,
-                    limit=max(half, 800),
+                    limit=max(half, 800) if not fresh_only else max(int(limit), 800),
+                    extra_sql=extra_sql,
+                    extra_params=list(extra_params),
                 )
             )
 
-        # 2) рандом по всему диапазону
-        pools.extend(
-            self.fetch_random_lots(
-                min_stars=min_stars,
-                max_stars=max_stars,
-                limit=max(half, 800),
-                require_seller=require_seller,
+        # 2) рандом по диапазону — только если не «только свежие»
+        if not fresh_only:
+            pools.extend(
+                self.fetch_random_lots(
+                    min_stars=min_stars,
+                    max_stars=max_stars,
+                    limit=max(half, 800),
+                    require_seller=require_seller,
+                    extra_sql=extra_sql,
+                    extra_params=list(extra_params),
+                )
             )
-        )
 
-        # 3) редкие типы (мало показов) — приоритет новизны
-        if prefer_rare:
+        # 3) редкие типы
+        if prefer_rare and not fresh_only:
             sql = """
                 SELECT
                     g.id, g.title, g.number, g.stars, g.slug, g.model,
                     g.backdrop, g.symbol, g.nft_url, g.seller, g.seller_id,
+                    g.first_seen, g.last_seen,
                     u.username AS u_username,
                     u.first_name AS u_first_name,
                     u.last_name AS u_last_name,
@@ -551,6 +688,9 @@ class GiftDB:
             params: list[Any] = [float(min_stars), float(max_stars)]
             if require_seller:
                 sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+            if extra_sql:
+                sql += extra_sql
+                params.extend(extra_params)
             sql += " ORDER BY IFNULL(sc.shown_count, 0) ASC, RANDOM() LIMIT ?"
             params.append(max(half, 600))
             try:
@@ -569,6 +709,10 @@ class GiftDB:
             if sk and sk in excl_s:
                 continue
             if lot.seller_id is not None and f"id:{lot.seller_id}" in excl_s:
+                continue
+            if exclude_seen and self.is_seen_seller(
+                username=lot.seller or "", user_id=lot.seller_id
+            ):
                 continue
             tk = (lot.title or lot.model or "").strip().lower()
             if tk and tk in excl_t:
@@ -595,6 +739,8 @@ class GiftDB:
         hours: float = 24.0,
         require_seller: bool = True,
         limit: int = 0,
+        extra_sql: str = "",
+        extra_params: list[Any] | None = None,
     ) -> list[Lot]:
         """Все лоты в диапазоне цены, которые видели/выставляли за последние N часов."""
         cutoff = time.time() - max(0.1, float(hours)) * 3600.0
@@ -622,6 +768,9 @@ class GiftDB:
         ]
         if require_seller:
             sql += " AND (g.seller != '' OR IFNULL(u.username, '') != '')"
+        if extra_sql:
+            sql += extra_sql
+            params.extend(extra_params or [])
         sql += " ORDER BY g.last_seen DESC"
         if limit and limit > 0:
             sql += " LIMIT ?"
@@ -629,28 +778,7 @@ class GiftDB:
         rows = self._conn.execute(sql, params).fetchall()
         lots: list[Lot] = []
         for r in rows:
-            seller = str(r["seller"] or "").lstrip("@").strip()
-            if not seller:
-                seller = str(r["u_username"] or "").lstrip("@").strip()
-            premium = r["u_is_premium"]
-            lot = Lot(
-                id=str(r["id"]),
-                title=str(r["title"] or "Gift"),
-                number=r["number"],
-                stars=float(r["stars"]),
-                slug=str(r["slug"] or ""),
-                model=str(r["model"] or ""),
-                backdrop=str(r["backdrop"] or ""),
-                symbol=str(r["symbol"] or ""),
-                seller=seller,
-                seller_id=r["seller_id"],
-                first_name=str(r["u_first_name"] or ""),
-                last_name=str(r["u_last_name"] or ""),
-                is_premium=None if premium is None else bool(premium),
-                account_level=r["u_account_level"],
-                gifts_count=r["u_gifts_count"],
-            )
-            lots.append(lot)
+            lots.append(self._lot_from_gift_row(r))
         return lots
 
     def touch_collection(

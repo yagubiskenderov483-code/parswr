@@ -257,6 +257,7 @@ class App:
         self._last_pool: list[Lot] = []
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
+        self._extra_acc_ids: list[int] = []
         self.parse_markets_n = 0
         self._parse_market_labels: list[str] = []
         self._reload_persist_seen(blocklist_only=True)
@@ -290,7 +291,15 @@ class App:
             logger.warning("preload collections: %s", exc)
 
     async def _close_extra_clients(self) -> None:
-        for client in self._extra_clients:
+        # перед отключением — сохранить свежие StringSession в БД
+        acc_ids = getattr(self, "_extra_acc_ids", []) or []
+        for i, client in enumerate(list(self._extra_clients)):
+            try:
+                sess = StringSession.save(client.session)
+                if i < len(acc_ids) and acc_ids[i] is not None:
+                    self.db.update_account_session(int(acc_ids[i]), sess)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 if client.is_connected():
                     await client.disconnect()
@@ -298,9 +307,45 @@ class App:
                 pass
         self._extra_clients.clear()
         self._extra_markets.clear()
+        self._extra_acc_ids = []
+
+    def _persist_client_session(
+        self,
+        client: TelegramClient,
+        *,
+        acc_id: int | None = None,
+        phone: str = "",
+        label: str = "",
+        tg_user_id: int | None = None,
+    ) -> int | None:
+        """Записать актуальный StringSession в БД (чтобы Telegram не «сносил» вход)."""
+        try:
+            sess = StringSession.save(client.session)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("save session string: %s", exc)
+            return acc_id
+        if not sess:
+            return acc_id
+        try:
+            if acc_id is not None:
+                self.db.update_account_session(int(acc_id), sess)
+                return int(acc_id)
+            return self.db.upsert_account(
+                phone=phone or "",
+                session=sess,
+                label=label or "",
+                tg_user_id=tg_user_id,
+                make_active=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persist session: %s", exc)
+            return acc_id
 
     async def _build_parse_markets(self, *, force: bool = True) -> list[TelegramMarket]:
-        """Подключить ВСЕ сохранённые акки (до PARSE_ACCOUNTS) для парса/фарма."""
+        """Подключить ВСЕ сохранённые акки (до PARSE_ACCOUNTS) для парса/фарма.
+
+        Важно: один StringSession = один клиент. Двойной коннект убивает сессию.
+        """
         max_acc = max(1, int(getattr(creds, "PARSE_ACCOUNTS", 6)))
         max_acc = min(
             max_acc, max(1, int(getattr(creds, "MAX_ACCOUNTS", max_acc)))
@@ -312,15 +357,39 @@ class App:
         markets: list[TelegramMarket] = []
         labels: list[str] = []
         used_acc_ids: set[int] = set()
+        used_tg_ids: set[int] = set()
+        self._extra_acc_ids = []
 
-        # 1) активный клиент
+        # 1) активный клиент — только он для своего session
         try:
             await self.market.ensure_connected()
             if await self.client.is_user_authorized():
                 markets.append(self.market)
                 labels.append(self.account_name or "active")
+                me = None
+                try:
+                    me = await self.client.get_me()
+                except Exception:  # noqa: BLE001
+                    pass
+                if me and me.id:
+                    used_tg_ids.add(int(me.id))
+                    # если active_account_id потерялся — восстановить по tg id
+                    if self.active_account_id is None:
+                        for a in self.db.list_accounts():
+                            if a.get("tg_user_id") is not None and int(
+                                a["tg_user_id"]
+                            ) == int(me.id):
+                                self.active_account_id = int(a["id"])
+                                break
                 if self.active_account_id is not None:
                     used_acc_ids.add(int(self.active_account_id))
+                    self._persist_client_session(
+                        self.client,
+                        acc_id=self.active_account_id,
+                        phone=self.phone or "",
+                        label=self.account_name or "",
+                        tg_user_id=int(me.id) if me and me.id else None,
+                    )
                 await self.market.load_collections(force=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("active market connect: %s", exc)
@@ -328,7 +397,7 @@ class App:
         gift_ids = list(getattr(self.market, "_gift_ids", []) or [])
         gift_hash = int(getattr(self.market, "_gifts_hash", 0) or 0)
 
-        # 2) все остальные акки из БД — параллельный парсинг/фарм
+        # 2) остальные акки из БД — каждый session только один раз
         accs = [a for a in self.db.list_accounts() if a.get("session")]
         for acc in accs:
             if len(markets) >= max_acc:
@@ -341,6 +410,9 @@ class App:
                 and acc_id == int(self.active_account_id)
             ):
                 continue
+            tg_uid = acc.get("tg_user_id")
+            if tg_uid is not None and int(tg_uid) in used_tg_ids:
+                continue
             label = str(acc.get("label") or acc.get("phone") or f"#{acc_id}")
             try:
                 client = TelegramClient(
@@ -349,8 +421,27 @@ class App:
                 await client.connect()
                 if not await client.is_user_authorized():
                     await client.disconnect()
-                    logger.warning("acc %s (%s): session dead", acc_id, label)
+                    logger.warning(
+                        "acc %s (%s): session unauthorized (kept in DB)",
+                        acc_id,
+                        label,
+                    )
                     continue
+                me = await client.get_me()
+                if me and me.id:
+                    if int(me.id) in used_tg_ids:
+                        # тот же юзер уже подключен — НЕ держим второй клиент
+                        await client.disconnect()
+                        continue
+                    used_tg_ids.add(int(me.id))
+                # сохранить обновлённый auth key сразу
+                self._persist_client_session(
+                    client,
+                    acc_id=acc_id,
+                    phone=str(acc.get("phone") or ""),
+                    label=label,
+                    tg_user_id=int(me.id) if me and me.id else None,
+                )
                 m = TelegramMarket(client)
                 m.set_catalog_hooks(
                     load_cb=self.db.load_gift_catalog,
@@ -367,6 +458,7 @@ class App:
                         gift_hash = int(getattr(m, "_gifts_hash", 0) or 0)
                 self._extra_clients.append(client)
                 self._extra_markets.append(m)
+                self._extra_acc_ids.append(acc_id)
                 markets.append(m)
                 labels.append(label)
                 used_acc_ids.add(acc_id)
@@ -374,7 +466,6 @@ class App:
                 logger.warning("parse pool acc %s (%s): %s", acc_id, label, exc)
 
         if not markets:
-            # крайний случай — хотя бы активный
             markets = [self.market]
             labels = [self.account_name or "active"]
             try:
@@ -988,6 +1079,14 @@ class App:
             self.phone = str(acc.get("phone") or "")
             self.active_account_id = int(acc["id"])
             self.db.set_active_account(self.active_account_id)
+            # обновить StringSession сразу после успешного входа
+            self._persist_client_session(
+                client,
+                acc_id=self.active_account_id,
+                phone=self.phone or "",
+                label=self.account_name,
+                tg_user_id=int(me.id) if me and me.id else None,
+            )
             self.market.set_client(self.client)
             await self._preload_collections()
             await self.ensure_db_farm()
@@ -3463,18 +3562,16 @@ def _fmt(value: float) -> str:
 
 
 def wipe_disk_junk() -> None:
-    """Чистит session-мусор. gifts.db / WAL / SHM / accounts — НИКОГДА не трогаем.
+    """Чистит только файловый мусор Telethon. Сессии акков живут в gifts.db.
 
-    БД должна переживать редеплой: путь из GIFTS_DB_PATH или /data/gifts.db.
+    StringSession в таблице accounts / gifts.db / WAL — НИКОГДА не трогаем.
     """
     from db import resolve_db_path
 
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
-    protected = {resolve_db_path().resolve()}
-    # классический локальный путь тоже всегда protected
-    protected.add((data / "gifts.db").resolve())
+    protected = {resolve_db_path().resolve(), (data / "gifts.db").resolve()}
     try:
         protected.add(Path("/data/gifts.db").resolve())
     except OSError:
@@ -3486,38 +3583,23 @@ def wipe_disk_junk() -> None:
         except OSError:
             rp = path
         name = path.name.lower()
-        # любые companions: gifts.db, gifts.db-wal, gifts.db-shm, gifts.db-journal
         if name.startswith("gifts.db") or "gifts.db" in name:
             return True
-        for base in list(protected):
-            if rp == base:
-                return True
-            # wal/shm рядом с protected db
-            if str(rp).startswith(str(base)):
+        for base in protected:
+            if rp == base or str(rp).startswith(str(base)):
                 return True
         return False
 
+    # только файловые *.session — НЕ трогаем StringSession в SQLite
     for folder in (data, root):
-        for pattern in ("*session*", "*.session*", "*.session-journal"):
+        for pattern in ("*.session", "*.session-journal"):
             for path in folder.glob(pattern):
                 if path.is_file() and not _is_protected(path):
                     try:
                         path.unlink()
                     except OSError:
                         pass
-        for pattern in ("*.db", "*.db-*", "*.sqlite*"):
-            for path in folder.glob(pattern):
-                if _is_protected(path):
-                    continue
-                # в data/ кроме gifts.* ничего критичного не удаляем
-                if folder == data:
-                    continue
-                if path.is_file():
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-    logger.info("wipe junk done · DB protected at %s", resolve_db_path())
+    logger.info("wipe junk done · DB+sessions protected at %s", resolve_db_path())
 
 
 def _range_by_id(rid: str) -> tuple[str, int, int] | None:

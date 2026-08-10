@@ -3383,26 +3383,51 @@ def _fmt(value: float) -> str:
 
 
 def wipe_disk_junk() -> None:
-    """Чистит session-мусор. gifts.db / WAL / blocklist — НИКОГДА не трогаем."""
+    """Чистит session-мусор. gifts.db / WAL / SHM / accounts — НИКОГДА не трогаем.
+
+    БД должна переживать редеплой: путь из GIFTS_DB_PATH или /data/gifts.db.
+    """
+    from db import resolve_db_path
+
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
+    protected = {resolve_db_path().resolve()}
+    # классический локальный путь тоже всегда protected
+    protected.add((data / "gifts.db").resolve())
+    try:
+        protected.add(Path("/data/gifts.db").resolve())
+    except OSError:
+        pass
 
-    def _is_gifts_db(path: Path) -> bool:
+    def _is_protected(path: Path) -> bool:
+        try:
+            rp = path.resolve()
+        except OSError:
+            rp = path
         name = path.name.lower()
-        return name.startswith("gifts.db") or "gifts.db" in name
+        # любые companions: gifts.db, gifts.db-wal, gifts.db-shm, gifts.db-journal
+        if name.startswith("gifts.db") or "gifts.db" in name:
+            return True
+        for base in list(protected):
+            if rp == base:
+                return True
+            # wal/shm рядом с protected db
+            if str(rp).startswith(str(base)):
+                return True
+        return False
 
     for folder in (data, root):
         for pattern in ("*session*", "*.session*", "*.session-journal"):
             for path in folder.glob(pattern):
-                if path.is_file() and not _is_gifts_db(path):
+                if path.is_file() and not _is_protected(path):
                     try:
                         path.unlink()
                     except OSError:
                         pass
         for pattern in ("*.db", "*.db-*", "*.sqlite*"):
             for path in folder.glob(pattern):
-                if _is_gifts_db(path):
+                if _is_protected(path):
                     continue
                 # в data/ кроме gifts.* ничего критичного не удаляем
                 if folder == data:
@@ -3412,6 +3437,7 @@ def wipe_disk_junk() -> None:
                         path.unlink()
                     except OSError:
                         pass
+    logger.info("wipe junk done · DB protected at %s", resolve_db_path())
 
 
 def _range_by_id(rid: str) -> tuple[str, int, int] | None:
@@ -3991,6 +4017,16 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     app.bot = bot
+    try:
+        logger.info(
+            "startup · DB=%s · gifts=%s · users=%s · accounts=%s",
+            app.db.path,
+            app.db.count(),
+            app.db.count_users(),
+            len(app.db.list_accounts()),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     try:
         await app.try_restore_account()
         if app.logged_in:

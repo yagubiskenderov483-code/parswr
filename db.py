@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import sqlite3
@@ -11,9 +12,36 @@ from typing import Any, Iterable
 
 from market import Lot
 
-# GIFTS_DB_PATH — для persistent volume на деплое
-DB_PATH = Path(os.environ.get("GIFTS_DB_PATH") or (Path("data") / "gifts.db"))
+logger = logging.getLogger(__name__)
+
 USER_CAP = 5_000_000
+
+
+def resolve_db_path() -> Path:
+    """Путь к БД, который переживает редеплой.
+
+    Приоритет:
+    1) GIFTS_DB_PATH
+    2) /data/gifts.db (типичный persistent volume)
+    3) ./data/gifts.db
+    """
+    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    if env:
+        return Path(env)
+    for candidate in (
+        Path("/data/gifts.db"),
+        Path("/var/lib/neptun/gifts.db"),
+    ):
+        # если volume смонтирован — пишем туда
+        try:
+            if candidate.parent.exists() and os.access(candidate.parent, os.W_OK):
+                return candidate
+        except OSError:
+            pass
+    return Path("data") / "gifts.db"
+
+
+DB_PATH = resolve_db_path()
 
 
 def _model_name(lot: Lot) -> str:
@@ -27,14 +55,25 @@ def _model_key(lot: Lot) -> str:
 
 
 class GiftDB:
-    def __init__(self, path: Path | str = DB_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | str | None = None) -> None:
+        self.path = Path(path) if path is not None else resolve_db_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init()
+        try:
+            size_mb = self.path.stat().st_size / (1024 * 1024) if self.path.exists() else 0.0
+        except OSError:
+            size_mb = 0.0
+        logger.info(
+            "DB open · path=%s · size=%.2fMB · gifts=%s · users=%s",
+            self.path,
+            size_mb,
+            self.count(),
+            self.count_users(),
+        )
 
     def _init(self) -> None:
         self._conn.execute(

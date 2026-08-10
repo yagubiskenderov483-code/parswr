@@ -1166,14 +1166,13 @@ class App:
         return " · 🎲 " + "+".join(labels) if labels else ""
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
-        """Только явные тумблеры. Рандом-spice — мягкий приоритет, не бан."""
+        """Тумблеры «в точку»: без мягких unknown, только точное совпадение."""
         f = self.filters
         if f.few_gifts:
-            if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
+            if lot.gifts_count is None or lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            # unknown lvl не режем — иначе из 12k БД выдача пустая
-            if lot.account_level is not None and lot.account_level > f.max_level:
+            if lot.account_level is None or lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
@@ -1184,10 +1183,11 @@ class App:
             if n < f.long_user_min:
                 return False
         if f.no_premium:
-            if lot.is_premium is True:
+            # только явно без TGP
+            if lot.is_premium is not False:
                 return False
         if f.online_only:
-            if lot.is_online is False:
+            if lot.is_online is not True:
                 return False
         if f.with_bio:
             if not (lot.first_name or lot.last_name or lot.about):
@@ -1201,6 +1201,11 @@ class App:
                 return False
         if f.strict_free:
             if lot.free_dm is not True:
+                return False
+        if f.fresh_only:
+            # live лоты (seen_at≈сейчас) ок; из БД — только ≤48ч
+            age_h = (time.time() - float(lot.seen_at or 0)) / 3600.0
+            if age_h > 48.0:
                 return False
         return True
 
@@ -1295,9 +1300,16 @@ class App:
             # платные Stars — мимо; unknown ок
             if require_free_dm and lot.free_dm is False:
                 continue
-            if is_filter and self._filters_active() and not self._passes_extra_filters(lot):
+            if strict_free_dm and lot.free_dm is not True:
                 continue
-            # владельцы без повторов
+            # жёсткие тумблеры фильтров — только точные совпадения
+            if is_filter and (
+                apply_extra or self._filters_active()
+            ) and not self._passes_extra_filters(lot):
+                continue
+            # выданные / seen — навсегда мимо (и по нику, и по id)
+            if self._is_delivered_seller(lot):
+                continue
             if lot.owner_key in always_block_sellers:
                 continue
             if (not ignore_seen) and lot.owner_key in seen_sellers:
@@ -1336,6 +1348,8 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
+                if self._is_delivered_seller(lot):
+                    continue
                 if lot.owner_key in always_block_sellers:
                     continue
                 if lot.owner_key in marked_sellers:
@@ -1348,6 +1362,10 @@ class App:
                     if self._title_key(lot) in marked_titles:
                         continue
                 if require_free_dm and lot.free_dm is False:
+                    continue
+                if is_filter and (
+                    apply_extra or self._filters_active()
+                ) and not self._passes_extra_filters(lot):
                     continue
                 return lot
             return None
@@ -1514,8 +1532,8 @@ class App:
                 (True, False, True, False),
             ]
         else:
-            # фильтры: free DM всегда; RU сначала; если мало — без RU
-            keep_extra = bool(apply_extra or self._filters_active())
+            # фильтры: free DM всегда; тумблеры жёстко; RU сначала
+            keep_extra = True
             attempts = [
                 (True, True, False, keep_extra),
                 (True, True, True, keep_extra),
@@ -1532,7 +1550,11 @@ class App:
                 require_russian=want_ru,
                 require_free_dm=want_free,
                 ignore_seen=ign_seen,
-                strict_free_dm=False,
+                strict_free_dm=(
+                    bool(self.filters.strict_free)
+                    if channel == "filter"
+                    else False
+                ),
             )
             if channel == "parser" and out:
                 out = out[:target]
@@ -1646,6 +1668,7 @@ class App:
             if self._filters_active():
                 pre: list[Lot] = []
                 for lot in candidates:
+                    # ранний отсев по данным из БД (без unknown)
                     if self.filters.short_username:
                         n = len(lot.seller or "")
                         if n < 6 or n > self.filters.short_user_max:
@@ -1661,9 +1684,24 @@ class App:
                         ch.isdigit() for ch in (lot.seller or "")
                     ):
                         continue
+                    if self.filters.few_gifts and (
+                        lot.gifts_count is not None
+                        and lot.gifts_count > self.filters.max_gifts
+                    ):
+                        continue
+                    if self.filters.low_level and (
+                        lot.account_level is not None
+                        and lot.account_level > self.filters.max_level
+                    ):
+                        continue
+                    if self.filters.fresh_only:
+                        age_h = (time.time() - float(lot.seen_at or 0)) / 3600.0
+                        if age_h > 48.0:
+                            continue
                     pre.append(lot)
-                candidates = pre or candidates
-            # сортируем по spice — сначала «вкусные», но всех оставляем
+                # без fallback на нефильтрованный пул — только «в точку»
+                candidates = pre
+            # сортируем по spice — сначала «вкусные»
             if self.filters.random_mix or self.filters.rare_types:
                 candidates = sorted(
                     candidates, key=self._spice_score, reverse=True
@@ -1719,14 +1757,12 @@ class App:
             self._ingest_always(sample)
             candidates = [lot for lot in sample if lot.free_dm is not False]
             if self._filters_active():
-                filtered = [
+                # строго: только лоты, прошедшие тумблеры (пусто = пусто)
+                candidates = [
                     lot
                     for lot in candidates
                     if self._passes_extra_filters(lot)
                 ]
-                # не обнуляем пул тумблерами, если совсем пусто
-                if filtered:
-                    candidates = filtered
             ru_titles = {
                 self._title_key(x)
                 for x in candidates
@@ -1950,11 +1986,25 @@ class App:
                         min_stars=mn,
                         max_stars=mx,
                         limit=lim,
-                        hours=hours if hours > 0 else 168.0,
+                        hours=hours if hours > 0 else 0.0,
                         require_seller=True,
                         prefer_rare=bool(f.rare_types or f.random_mix),
+                        fresh_only=bool(f.fresh_only),
                         exclude_sellers=set(self._delivered_sellers),
                         exclude_titles=set(),
+                        short_username=bool(f.short_username),
+                        short_user_max=int(f.short_user_max),
+                        long_username=bool(f.long_username),
+                        long_user_min=int(f.long_user_min),
+                        no_premium=bool(f.no_premium),
+                        with_model=bool(f.with_model),
+                        no_digits_user=bool(f.no_digits_user),
+                        few_gifts=bool(f.few_gifts),
+                        max_gifts=int(f.max_gifts),
+                        low_level=bool(f.low_level),
+                        max_level=int(f.max_level),
+                        with_bio=bool(f.with_bio),
+                        exclude_seen=True,
                     )
                 except Exception:  # noqa: BLE001
                     return self.db.fetch_random_lots(
@@ -1996,7 +2046,11 @@ class App:
                     tk = self._title_key(lot)
                     if tk in have_t or lot.owner_key in have_o:
                         continue
+                    if self._is_delivered_seller(lot):
+                        continue
                     if lot.free_dm is False:
+                        continue
+                    if self._filters_active() and not self._passes_extra_filters(lot):
                         continue
                     out.append(lot)
                     have_t.add(tk)
@@ -2017,7 +2071,7 @@ class App:
                 old,
                 limit=target_n,
                 apply_extra=True,
-                track_seen=True,
+                track_seen=False,
                 need_full=True,
                 channel="filter",
             )
@@ -2037,7 +2091,7 @@ class App:
                     merged,
                     limit=target_n,
                     apply_extra=True,
-                    track_seen=True,
+                    track_seen=False,
                     need_full=True,
                     channel="filter",
                 )
@@ -2056,7 +2110,7 @@ class App:
                     old3,
                     limit=target_n,
                     apply_extra=True,
-                    track_seen=True,
+                    track_seen=False,
                     need_full=True,
                     channel="filter",
                 )
@@ -2071,6 +2125,7 @@ class App:
                 )
                 return
             shown = shown[:target_n]
+            # выдача → сразу purge из БД навсегда
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
@@ -2526,8 +2581,27 @@ class App:
                         batch_users.extend(drain)
                 except Exception:  # noqa: BLE001
                     pass
+                # выданных навсегда не возвращаем в users
+                clean_users: list[dict] = []
+                for u in batch_users:
+                    uid = u.get("user_id")
+                    uname = str(u.get("username") or "").lstrip("@").strip().lower()
+                    if uname and uname in self._delivered_sellers:
+                        continue
+                    if uid is not None and f"id:{int(uid)}" in self._delivered_sellers:
+                        continue
+                    try:
+                        if self.db.is_seen_seller(username=uname, user_id=uid):
+                            if uname:
+                                self._delivered_sellers.add(uname)
+                            if uid is not None:
+                                self._delivered_sellers.add(f"id:{int(uid)}")
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    clean_users.append(u)
                 ins_u, _upd_u, total_u = self.db.upsert_users(
-                    batch_users, cap=creds.AFK_USER_CAP
+                    clean_users, cap=creds.AFK_USER_CAP
                 )
                 self.afk_users_added += ins_u
                 if ins_u:

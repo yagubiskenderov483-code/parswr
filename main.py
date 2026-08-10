@@ -257,6 +257,8 @@ class App:
         self._last_pool: list[Lot] = []
         self._extra_clients: list[TelegramClient] = []
         self._extra_markets: list[TelegramMarket] = []
+        self.parse_markets_n = 0
+        self._parse_market_labels: list[str] = []
         self._reload_persist_seen(blocklist_only=True)
         self._delivered_sellers = self._load_delivered_sellers()
         self._seen_sellers |= set(self._delivered_sellers)
@@ -297,26 +299,49 @@ class App:
         self._extra_clients.clear()
         self._extra_markets.clear()
 
-    async def _build_parse_markets(self) -> list[TelegramMarket]:
-        """До PARSE_ACCOUNTS Telethon-рынков сразу (основной + все доп. акки)."""
-        markets: list[TelegramMarket] = [self.market]
-        await self.market.ensure_connected()
-        await self.market.load_collections(force=False)
-        # шарим кэш коллекций
-        gift_ids = list(self.market._gift_ids)
+    async def _build_parse_markets(self, *, force: bool = True) -> list[TelegramMarket]:
+        """Подключить ВСЕ сохранённые акки (до PARSE_ACCOUNTS) для парса/фарма."""
+        max_acc = max(1, int(getattr(creds, "PARSE_ACCOUNTS", 6)))
+        max_acc = min(
+            max_acc, max(1, int(getattr(creds, "MAX_ACCOUNTS", max_acc)))
+        )
+
+        if force:
+            await self._close_extra_clients()
+
+        markets: list[TelegramMarket] = []
+        labels: list[str] = []
+        used_acc_ids: set[int] = set()
+
+        # 1) активный клиент
+        try:
+            await self.market.ensure_connected()
+            if await self.client.is_user_authorized():
+                markets.append(self.market)
+                labels.append(self.account_name or "active")
+                if self.active_account_id is not None:
+                    used_acc_ids.add(int(self.active_account_id))
+                await self.market.load_collections(force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("active market connect: %s", exc)
+
+        gift_ids = list(getattr(self.market, "_gift_ids", []) or [])
         gift_hash = int(getattr(self.market, "_gifts_hash", 0) or 0)
 
-        await self._close_extra_clients()
-        max_acc = max(1, int(getattr(creds, "PARSE_ACCOUNTS", 6)))
-        accs = [
-            a
-            for a in self.db.list_accounts()
-            if a.get("session")
-            and int(a["id"]) != (self.active_account_id or -1)
-        ]
-        # берём до max_acc-1 доп. акков (основной уже в markets)
-        need = max(0, max_acc - 1)
-        for acc in accs[:need]:
+        # 2) все остальные акки из БД — параллельный парсинг/фарм
+        accs = [a for a in self.db.list_accounts() if a.get("session")]
+        for acc in accs:
+            if len(markets) >= max_acc:
+                break
+            acc_id = int(acc["id"])
+            if acc_id in used_acc_ids:
+                continue
+            if (
+                self.active_account_id is not None
+                and acc_id == int(self.active_account_id)
+            ):
+                continue
+            label = str(acc.get("label") or acc.get("phone") or f"#{acc_id}")
             try:
                 client = TelegramClient(
                     StringSession(acc["session"]), creds.API_ID, creds.API_HASH
@@ -324,6 +349,7 @@ class App:
                 await client.connect()
                 if not await client.is_user_authorized():
                     await client.disconnect()
+                    logger.warning("acc %s (%s): session dead", acc_id, label)
                     continue
                 m = TelegramMarket(client)
                 m.set_catalog_hooks(
@@ -336,13 +362,47 @@ class App:
                     m._cursor = random.randrange(len(gift_ids))
                 else:
                     await m.load_collections(force=False)
+                    if not gift_ids:
+                        gift_ids = list(m._gift_ids or [])
+                        gift_hash = int(getattr(m, "_gifts_hash", 0) or 0)
                 self._extra_clients.append(client)
                 self._extra_markets.append(m)
                 markets.append(m)
+                labels.append(label)
+                used_acc_ids.add(acc_id)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("parse pool acc %s: %s", acc.get("id"), exc)
-        logger.info("parse/farm markets: %s / max %s", len(markets), max_acc)
+                logger.warning("parse pool acc %s (%s): %s", acc_id, label, exc)
+
+        if not markets:
+            # крайний случай — хотя бы активный
+            markets = [self.market]
+            labels = [self.account_name or "active"]
+            try:
+                await self.market.ensure_connected()
+                await self.market.load_collections(force=False)
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._parse_market_labels = labels
+        self.parse_markets_n = len(markets)
+        logger.info(
+            "parse/farm markets: %s/%s · %s",
+            len(markets),
+            max_acc,
+            ", ".join(labels),
+        )
         return markets
+
+    def connected_accounts_label(self) -> str:
+        n = int(getattr(self, "parse_markets_n", 0) or 0)
+        saved = len(self.db.list_accounts())
+        if n <= 0:
+            n = max(1, min(saved, int(getattr(creds, "PARSE_ACCOUNTS", 6))))
+        labels = getattr(self, "_parse_market_labels", None) or []
+        if labels:
+            short = ", ".join(_esc(x) for x in labels[:6])
+            return f"акков <b>{n}</b>/{saved}: {short}"
+        return f"акков <b>{n}</b>/{saved}"
 
     def _ingest_users_batch(self, users: list[dict], lots: list[Lot] | None = None) -> int:
         """Слить юзов в БД, пропуская навсегда выданных. Возвращает inserted."""
@@ -413,8 +473,16 @@ class App:
         on_early_lots: Any | None = None,
         stop_event: Any | None = None,
     ):
-        """Параллельный burst сразу с нескольких аккаунтов."""
-        markets = await self._build_parse_markets()
+        """Параллельный burst сразу со ВСЕХ сохранённых аккаунтов."""
+        markets = await self._build_parse_markets(force=True)
+        if len(markets) < 2:
+            saved = len([a for a in self.db.list_accounts() if a.get("session")])
+            if saved > 1:
+                logger.warning(
+                    "multi_burst: only %s market(s) live, but %s sessions in DB",
+                    len(markets),
+                    saved,
+                )
         base = markets[0]
         all_ids = list(await base.load_collections(force=False))
         random.shuffle(all_ids)
@@ -2552,7 +2620,7 @@ class App:
             if not self._afk_quiet:
                 await self._say(
                     f"💾 БД фарм: коллекций <b>{len(gift_ids)}</b> · "
-                    f"акков <b>{n_acc}</b> · "
+                    f"{self.connected_accounts_label()}\n"
                     f"сейчас юзов <b>{self.db.count_users():,}</b>"
                 )
             else:
@@ -2736,14 +2804,21 @@ class App:
         self.parse_checked = 0
         self.parse_ready = 0
         self._last_pool = []
-        n_acc = max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))
+        # подключаем все акки ДО скана
+        try:
+            markets = await self._build_parse_markets(force=True)
+            n_acc = len(markets)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("build markets before parse: %s", exc)
+            n_acc = max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))
         stop_event = asyncio.Event()
         delivered = False
 
         async def _status() -> None:
             await self._edit_status(
                 f"{screen('Парсинг')}\n"
-                f"Обход <b>#{self.parse_rounds}</b> · акков {n_acc}\n"
+                f"Обход <b>#{self.parse_rounds}</b> · "
+                f"{self.connected_accounts_label()}\n"
                 f"Чеков коллекций: <b>{self.parse_coll_checks}</b>\n"
                 f"Проверок акка: <b>{self.parse_acc_checks}</b>\n"
                 f"Типов: <b>{self.parse_types}</b> · "
@@ -2751,6 +2826,10 @@ class App:
                 f"Готово: <b>{self.parse_ready}</b> (по типам)"
             )
 
+        await self._say(
+            f"{screen('Парсинг')}\n"
+            f"Старт со всех акков · {self.connected_accounts_label()}"
+        )
         await _status()
         last_prog = 0.0
 
@@ -2799,7 +2878,7 @@ class App:
                     f"<b>{len(shown)}</b> типов · рандом\n"
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks} · "
-                    f"акков {n_acc}",
+                    f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
                 )
 
@@ -2900,7 +2979,7 @@ class App:
                     f"<b>{len(shown)}</b> типов · рандом\n"
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks} · "
-                    f"акков {n_acc}",
+                    f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
                 )
             else:
@@ -2908,7 +2987,8 @@ class App:
                     f"{screen('Парсинг')}\n"
                     f"Обход #{self.parse_rounds} · пока пусто\n"
                     f"Мало новых RU / free DM · жми Заново\n"
-                    f"Чеков: {self.parse_coll_checks} · акков {n_acc}",
+                    f"Чеков: {self.parse_coll_checks} · "
+                    f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
                 )
         elif burst:
@@ -2939,8 +3019,8 @@ class App:
                     break
                 await self._edit_status(
                     f"{screen('Парсинг')}\n"
-                    f"Заново · скан {attempt + 1}/2 · акков "
-                    f"{max(1, len(self.db.list_accounts()[: creds.PARSE_ACCOUNTS]))}"
+                    f"Заново · скан {attempt + 1}/2 · "
+                    f"{self.connected_accounts_label()}"
                 )
                 self.market.reshuffle_collections()
                 self._burst_deep = attempt > 0  # 2-й проход глубже

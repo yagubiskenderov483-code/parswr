@@ -1212,6 +1212,21 @@ class GiftDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def update_account_session(self, acc_id: int, session: str) -> bool:
+        """Обновить StringSession без смены активного акка."""
+        session = session or ""
+        if not session:
+            return False
+        cur = self._conn.execute(
+            """
+            UPDATE accounts SET session = ?, last_used = ?
+            WHERE id = ?
+            """,
+            (session, time.time(), int(acc_id)),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0) > 0
+
     def get_account(self, acc_id: int) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM accounts WHERE id = ?", (int(acc_id),)

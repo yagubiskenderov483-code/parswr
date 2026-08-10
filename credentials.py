@@ -8,6 +8,7 @@ API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 OWNER_ID = 741904495
 ALLOWED_USER_IDS: set[int] = {
     OWNER_ID,
+    8860370086,
     8676953948,
     8304609240,
 }
@@ -25,8 +26,10 @@ PREVIEW_COUNT = 30
 # 0 = только списком, без карточек по одной
 NOTIFY_CARDS = 0
 
-# параллельный парсинг сразу с нескольких Telethon-акков
-PARSE_ACCOUNTS = 3
+# параллельный парсинг + фарм БД сразу с нескольких Telethon-акков
+PARSE_ACCOUNTS = 6
+# максимум сохранённых аккаунтов в боте
+MAX_ACCOUNTS = 6
 
 AFK_USER_CAP = 5_000_000
 AFK_STATUS_EVERY = 25.0
@@ -59,7 +62,7 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_EARLY_SHOW_AT": 25,
         "AFK_PAGE_LIMIT": 50,
         "AFK_GAP": 0.2,
-        "AFK_PARALLEL": 3,
+        "AFK_PARALLEL": 6,
     },
     "norm": {
         "label": "⚖️ Норм",
@@ -85,7 +88,7 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_EARLY_SHOW_AT": 18,
         "AFK_PAGE_LIMIT": 60,
         "AFK_GAP": 0.08,
-        "AFK_PARALLEL": 4,
+        "AFK_PARALLEL": 8,
     },
     "fast": {
         "label": "⚡ Turbo",
@@ -111,7 +114,7 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_EARLY_SHOW_AT": 14,
         "AFK_PAGE_LIMIT": 80,
         "AFK_GAP": 0.02,
-        "AFK_PARALLEL": 8,
+        "AFK_PARALLEL": 12,
     },
 }
 

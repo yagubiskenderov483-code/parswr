@@ -75,7 +75,7 @@ class OwnerOnlyMiddleware(BaseMiddleware):
             out.add(int(creds.OWNER_ID))
         except (TypeError, ValueError):
             pass
-        out.update({741904495, 8676953948, 8304609240})
+        out.update({741904495, 8860370086, 8676953948, 8304609240})
         return out
 
     async def __call__(
@@ -298,7 +298,7 @@ class App:
         self._extra_markets.clear()
 
     async def _build_parse_markets(self) -> list[TelegramMarket]:
-        """До PARSE_ACCOUNTS Telethon-рынков сразу (основной + доп. акки)."""
+        """До PARSE_ACCOUNTS Telethon-рынков сразу (основной + все доп. акки)."""
         markets: list[TelegramMarket] = [self.market]
         await self.market.ensure_connected()
         await self.market.load_collections(force=False)
@@ -307,13 +307,15 @@ class App:
         gift_hash = int(getattr(self.market, "_gifts_hash", 0) or 0)
 
         await self._close_extra_clients()
+        max_acc = max(1, int(getattr(creds, "PARSE_ACCOUNTS", 6)))
         accs = [
             a
             for a in self.db.list_accounts()
             if a.get("session")
             and int(a["id"]) != (self.active_account_id or -1)
         ]
-        need = max(0, int(getattr(creds, "PARSE_ACCOUNTS", 3)) - 1)
+        # берём до max_acc-1 доп. акков (основной уже в markets)
+        need = max(0, max_acc - 1)
         for acc in accs[:need]:
             try:
                 client = TelegramClient(
@@ -339,8 +341,58 @@ class App:
                 markets.append(m)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("parse pool acc %s: %s", acc.get("id"), exc)
-        logger.info("parse markets: %s", len(markets))
+        logger.info("parse/farm markets: %s / max %s", len(markets), max_acc)
         return markets
+
+    def _ingest_users_batch(self, users: list[dict], lots: list[Lot] | None = None) -> int:
+        """Слить юзов в БД, пропуская навсегда выданных. Возвращает inserted."""
+        batch_users = list(users or [])
+        for lot in lots or []:
+            if lot.seller_id is not None or lot.seller:
+                batch_users.append(
+                    {
+                        "user_id": lot.seller_id,
+                        "username": lot.seller,
+                        "first_name": lot.first_name,
+                        "last_name": lot.last_name,
+                    }
+                )
+        for m in [self.market, *list(self._extra_markets)]:
+            try:
+                drain = m.drain_users()
+                if drain:
+                    batch_users.extend(drain)
+            except Exception:  # noqa: BLE001
+                pass
+        clean_users: list[dict] = []
+        for u in batch_users:
+            uid = u.get("user_id")
+            uname = str(u.get("username") or "").lstrip("@").strip().lower()
+            if uname and uname in self._delivered_sellers:
+                continue
+            if uid is not None and f"id:{int(uid)}" in self._delivered_sellers:
+                continue
+            try:
+                if self.db.is_seen_seller(username=uname, user_id=uid):
+                    if uname:
+                        self._delivered_sellers.add(uname)
+                    if uid is not None:
+                        self._delivered_sellers.add(f"id:{int(uid)}")
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            clean_users.append(u)
+        if not clean_users:
+            return 0
+        ins_u, _upd_u, _total = self.db.upsert_users(
+            clean_users, cap=creds.AFK_USER_CAP
+        )
+        if ins_u:
+            try:
+                self.db.bump_daily(users_new=ins_u)
+            except Exception:  # noqa: BLE001
+                pass
+        return int(ins_u or 0)
 
     @staticmethod
     def _split_ids(ids: list[int], n: int) -> list[list[int]]:
@@ -2468,195 +2520,216 @@ class App:
             self._afk_status_msg_id = msg.message_id
 
     async def _afk_loop(self) -> None:
-        """Непрерывный фарм коллекций → юзы+модели в БД без остановки."""
+        """Непрерывный фарм коллекций со ВСЕХ акков → юзы+модели в БД."""
+        markets: list[TelegramMarket] = []
         try:
-            gift_ids = await self.market.load_collections()
-        except Exception as exc:  # noqa: BLE001
-            self.afk_last_error = str(exc)
-            logger.warning("DB farm collections: %s", exc)
-            if not self._afk_quiet:
-                await self._say(f"💾 БД фарм ошибка: {_esc(str(exc)[:180])}")
-            self.afk_running = False
-            return
-
-        self.market.reshuffle_collections()
-        gift_ids = list(self.market._gift_ids or gift_ids)
-        self.afk_collections_total = len(gift_ids)
-        self.afk_cursor = random.randrange(len(gift_ids)) if gift_ids else 0
-        for gid in gift_ids:
-            self.db.touch_collection(
-                gid, title="", last_offset=self.db.get_collection_offset(gid)
-            )
-
-        if not self._afk_quiet:
-            await self._say(
-                f"💾 БД фарм: коллекций <b>{len(gift_ids)}</b> · "
-                f"сейчас юзов <b>{self.db.count_users():,}</b>"
-            )
-        else:
-            logger.info("DB farm quiet · collections=%s", len(gift_ids))
-
-        last_status = 0.0
-        n = len(gift_ids)
-        if n == 0:
-            self.afk_running = False
-            return
-
-        while self.afk_running and not self._afk_paused:
-            # во время активного парсинга — ждём
-            if self.running or self.filter_search_running or self.old_parse_running:
-                await asyncio.sleep(0.4)
-                continue
-
-            parallel = max(2, int(getattr(creds, "AFK_PARALLEL", 4)))
-            batch_gids: list[int] = []
-            for _ in range(parallel):
-                batch_gids.append(gift_ids[self.afk_cursor % n])
-                self.afk_cursor = (self.afk_cursor + 1) % n
-
-            async def _farm_one(gid: int) -> tuple[int, list, list, str, str, int]:
-                offset = self.db.get_collection_offset(gid)
-                lots, users, next_offset, total = await self.market.afk_fetch_page(
-                    gid,
-                    offset=offset,
-                    limit=creds.AFK_PAGE_LIMIT,
-                    gap=creds.AFK_GAP,
-                    timeout=creds.API_TIMEOUT,
-                )
-                # сразу ещё страница — БД растёт быстрее, меньше одних и тех же
-                if lots and next_offset:
-                    try:
-                        lots2, users2, next2, _t2 = await self.market.afk_fetch_page(
-                            gid,
-                            offset=next_offset,
-                            limit=creds.AFK_PAGE_LIMIT,
-                            gap=creds.AFK_GAP,
-                            timeout=creds.API_TIMEOUT,
-                        )
-                        if lots2:
-                            lots = list(lots) + list(lots2)
-                            users = list(users) + list(users2)
-                            next_offset = next2 or ""
-                    except Exception:  # noqa: BLE001
-                        pass
-                title = lots[0].title if lots else ""
-                return gid, lots, users, next_offset or "", title, int(total or 0)
-
+            markets = await self._build_parse_markets()
+            base = markets[0]
             try:
-                parts = await asyncio.gather(
-                    *[_farm_one(g) for g in batch_gids],
-                    return_exceptions=True,
-                )
-            except asyncio.CancelledError:
-                raise
+                gift_ids = await base.load_collections()
             except Exception as exc:  # noqa: BLE001
                 self.afk_last_error = str(exc)
-                await asyncio.sleep(0.4)
-                continue
+                logger.warning("DB farm collections: %s", exc)
+                if not self._afk_quiet:
+                    await self._say(f"💾 БД фарм ошибка: {_esc(str(exc)[:180])}")
+                self.afk_running = False
+                return
 
-            total_u = self.db.count_users()
-            for part in parts:
-                if isinstance(part, Exception):
-                    self.afk_last_error = str(part)
-                    continue
-                gid, lots, users, next_offset, title, _total = part
-                if lots:
-                    ins_m, _upd_m = self._save_models(lots)
-                    self.afk_models_added += ins_m
-                    self._ingest_always(lots)
-                batch_users = list(users)
-                for lot in lots:
-                    if lot.seller_id is not None or lot.seller:
-                        batch_users.append(
-                            {
-                                "user_id": lot.seller_id,
-                                "username": lot.seller,
-                                "first_name": lot.first_name,
-                                "last_name": lot.last_name,
-                            }
-                        )
+            for m in markets:
                 try:
-                    drain = self.market.drain_users()
-                    if drain:
-                        batch_users.extend(drain)
+                    m.reshuffle_collections()
                 except Exception:  # noqa: BLE001
                     pass
-                # выданных навсегда не возвращаем в users
-                clean_users: list[dict] = []
-                for u in batch_users:
-                    uid = u.get("user_id")
-                    uname = str(u.get("username") or "").lstrip("@").strip().lower()
-                    if uname and uname in self._delivered_sellers:
-                        continue
-                    if uid is not None and f"id:{int(uid)}" in self._delivered_sellers:
-                        continue
-                    try:
-                        if self.db.is_seen_seller(username=uname, user_id=uid):
-                            if uname:
-                                self._delivered_sellers.add(uname)
-                            if uid is not None:
-                                self._delivered_sellers.add(f"id:{int(uid)}")
-                            continue
-                    except Exception:  # noqa: BLE001
-                        pass
-                    clean_users.append(u)
-                ins_u, _upd_u, total_u = self.db.upsert_users(
-                    clean_users, cap=creds.AFK_USER_CAP
-                )
-                self.afk_users_added += ins_u
-                if ins_u:
-                    try:
-                        self.db.bump_daily(users_new=ins_u)
-                    except Exception:  # noqa: BLE001
-                        pass
-                self.afk_pages += 1
-                # пустая/конец — сброс offset, чтобы снова пройти глубже с начала
-                new_offset = next_offset if (lots and next_offset) else ""
+            gift_ids = list(base._gift_ids or gift_ids)
+            self.afk_collections_total = len(gift_ids)
+            self.afk_cursor = random.randrange(len(gift_ids)) if gift_ids else 0
+            for gid in gift_ids:
                 self.db.touch_collection(
-                    gid,
-                    title=title,
-                    last_offset=new_offset,
-                    pages_inc=1 + (1 if next_offset else 0),
-                    lots_inc=len(lots),
+                    gid, title="", last_offset=self.db.get_collection_offset(gid)
                 )
 
-            if self.afk_pages % 8 == 0:
-                self.db.checkpoint()
-                # периодически мешаем порядок коллекций
-                if self.afk_pages % 40 == 0:
-                    random.shuffle(gift_ids)
-                    self.afk_cursor = random.randrange(n)
-
-            now = time.monotonic()
-            if (not self._afk_quiet) and now - last_status >= creds.AFK_STATUS_EVERY:
-                last_status = now
-                await self._edit_afk(
-                    f"💾 <b>БД фарм</b>\n"
-                    f"Коллекций: <b>{self.db.count_collections()}</b>/"
-                    f"<b>{self.afk_collections_total}</b>\n"
-                    f"Юзов: <b>{total_u:,}</b> / <b>{creds.AFK_USER_CAP:,}</b>\n"
-                    f"+юзов: <b>{self.afk_users_added:,}</b> · "
-                    f"+моделей: <b>{self.afk_models_added:,}</b>\n"
-                    f"Моделей: <b>{self.db.count():,}</b>\n"
-                    f"Страниц: <b>{self.afk_pages}</b>"
+            n_acc = len(markets)
+            if not self._afk_quiet:
+                await self._say(
+                    f"💾 БД фарм: коллекций <b>{len(gift_ids)}</b> · "
+                    f"акков <b>{n_acc}</b> · "
+                    f"сейчас юзов <b>{self.db.count_users():,}</b>"
                 )
-            elif self._afk_quiet and self.afk_pages % 40 == 0:
+            else:
                 logger.info(
-                    "DB farm · pages=%s users=%s models=%s +u=%s +m=%s",
-                    self.afk_pages,
-                    total_u,
-                    self.db.count(),
-                    self.afk_users_added,
-                    self.afk_models_added,
+                    "DB farm quiet · collections=%s · accounts=%s",
+                    len(gift_ids),
+                    n_acc,
                 )
 
-            await asyncio.sleep(0.01)
+            last_status = 0.0
+            n = len(gift_ids)
+            if n == 0:
+                self.afk_running = False
+                return
 
-        self._afk_task = None
-        # если не на паузе осознанно — вышли из-за ошибки/стопа
-        if self._afk_paused and self.logged_in and not self.running:
-            # внешний pause сам рестартнет через ensure
-            pass
+            chunks = self._split_ids(gift_ids, n_acc)
+            cursors = [
+                random.randrange(len(c)) if c else 0 for c in chunks
+            ]
+            need_rebuild = False
+
+            while self.afk_running and not self._afk_paused:
+                # во время активного парсинга — ждём (парсер сам юзает акки)
+                if self.running or self.filter_search_running or self.old_parse_running:
+                    need_rebuild = True
+                    await asyncio.sleep(0.4)
+                    continue
+
+                if need_rebuild or not markets:
+                    try:
+                        markets = await self._build_parse_markets()
+                        base = markets[0]
+                        gift_ids = list(base._gift_ids or gift_ids)
+                        n = len(gift_ids)
+                        if n == 0:
+                            await asyncio.sleep(1.0)
+                            continue
+                        self.afk_collections_total = n
+                        n_acc = len(markets)
+                        chunks = self._split_ids(gift_ids, n_acc)
+                        cursors = [
+                            random.randrange(len(c)) if c else 0 for c in chunks
+                        ]
+                        need_rebuild = False
+                        logger.info("DB farm rebuild · accounts=%s", n_acc)
+                    except Exception as exc:  # noqa: BLE001
+                        self.afk_last_error = str(exc)
+                        await asyncio.sleep(1.0)
+                        continue
+
+                parallel_total = max(n_acc, int(getattr(creds, "AFK_PARALLEL", 6)))
+                per_acc = max(1, parallel_total // max(1, n_acc))
+
+                async def _farm_one(
+                    market: TelegramMarket, gid: int
+                ) -> tuple[int, list, list, str, str, int]:
+                    offset = self.db.get_collection_offset(gid)
+                    lots, users, next_offset, total = await market.afk_fetch_page(
+                        gid,
+                        offset=offset,
+                        limit=creds.AFK_PAGE_LIMIT,
+                        gap=creds.AFK_GAP,
+                        timeout=creds.API_TIMEOUT,
+                    )
+                    # сразу ещё страница — БД растёт быстрее
+                    if lots and next_offset:
+                        try:
+                            lots2, users2, next2, _t2 = await market.afk_fetch_page(
+                                gid,
+                                offset=next_offset,
+                                limit=creds.AFK_PAGE_LIMIT,
+                                gap=creds.AFK_GAP,
+                                timeout=creds.API_TIMEOUT,
+                            )
+                            if lots2:
+                                lots = list(lots) + list(lots2)
+                                users = list(users) + list(users2)
+                                next_offset = next2 or ""
+                        except Exception:  # noqa: BLE001
+                            pass
+                    title = lots[0].title if lots else ""
+                    return gid, lots, users, next_offset or "", title, int(total or 0)
+
+                tasks = []
+                for mi, market in enumerate(markets):
+                    chunk = chunks[mi] if mi < len(chunks) else []
+                    if not chunk:
+                        continue
+                    cn = len(chunk)
+                    for _ in range(per_acc):
+                        gid = chunk[cursors[mi] % cn]
+                        cursors[mi] = (cursors[mi] + 1) % cn
+                        tasks.append(_farm_one(market, gid))
+
+                if not tasks:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                try:
+                    parts = await asyncio.gather(
+                        *tasks,
+                        return_exceptions=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.afk_last_error = str(exc)
+                    need_rebuild = True
+                    await asyncio.sleep(0.4)
+                    continue
+
+                total_u = self.db.count_users()
+                for part in parts:
+                    if isinstance(part, Exception):
+                        self.afk_last_error = str(part)
+                        continue
+                    gid, lots, users, next_offset, title, _total = part
+                    if lots:
+                        ins_m, _upd_m = self._save_models(lots)
+                        self.afk_models_added += ins_m
+                        self._ingest_always(lots)
+                    ins_u = self._ingest_users_batch(list(users), lots)
+                    self.afk_users_added += ins_u
+                    total_u = self.db.count_users()
+                    self.afk_pages += 1
+                    new_offset = next_offset if (lots and next_offset) else ""
+                    self.db.touch_collection(
+                        gid,
+                        title=title,
+                        last_offset=new_offset,
+                        pages_inc=1 + (1 if next_offset else 0),
+                        lots_inc=len(lots),
+                    )
+
+                if self.afk_pages % 8 == 0:
+                    self.db.checkpoint()
+                    if self.afk_pages % 40 == 0:
+                        for mi, chunk in enumerate(chunks):
+                            if chunk:
+                                random.shuffle(chunk)
+                                cursors[mi] = random.randrange(len(chunk))
+
+                now = time.monotonic()
+                if (not self._afk_quiet) and now - last_status >= creds.AFK_STATUS_EVERY:
+                    last_status = now
+                    await self._edit_afk(
+                        f"💾 <b>БД фарм</b> · акков <b>{n_acc}</b>\n"
+                        f"Коллекций: <b>{self.db.count_collections()}</b>/"
+                        f"<b>{self.afk_collections_total}</b>\n"
+                        f"Юзов: <b>{total_u:,}</b> / <b>{creds.AFK_USER_CAP:,}</b>\n"
+                        f"+юзов: <b>{self.afk_users_added:,}</b> · "
+                        f"+моделей: <b>{self.afk_models_added:,}</b>\n"
+                        f"Моделей: <b>{self.db.count():,}</b>\n"
+                        f"Страниц: <b>{self.afk_pages}</b>"
+                    )
+                elif self._afk_quiet and self.afk_pages % 40 == 0:
+                    logger.info(
+                        "DB farm · acc=%s pages=%s users=%s models=%s +u=%s +m=%s",
+                        n_acc,
+                        self.afk_pages,
+                        total_u,
+                        self.db.count(),
+                        self.afk_users_added,
+                        self.afk_models_added,
+                    )
+
+                await asyncio.sleep(0.01)
+        finally:
+            self._afk_task = None
+            # не рвём акки, если их сейчас забрал парсер/фильтры
+            if not (self.running or self.filter_search_running or self.old_parse_running):
+                try:
+                    await self._close_extra_clients()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._afk_paused and self.logged_in and not self.running:
+                pass
 
     async def _loop(self) -> None:
         """Один обход: скан → прогресс (чеки/проверки) → выдача по типам."""
@@ -3245,6 +3318,8 @@ def jobs_inline() -> InlineKeyboardMarkup:
 
 def accounts_inline() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    nacc = len(app.db.list_accounts())
+    max_acc = int(getattr(creds, "MAX_ACCOUNTS", 6))
     for acc in app.db.list_accounts():
         mark = "✅ " if acc.get("is_active") else ""
         label = acc.get("label") or acc.get("phone") or f"#{acc['id']}"
@@ -3260,10 +3335,25 @@ def accounts_inline() -> InlineKeyboardMarkup:
                 ),
             ]
         )
-    rows.append(
-        [InlineKeyboardButton(text="➕ Добавить акк", callback_data="acc:add")]
-    )
-    if len(app.db.list_accounts()) > 1:
+    if nacc < max_acc:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"➕ Добавить акк ({nacc}/{max_acc})",
+                    callback_data="acc:add",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Акков {nacc}/{max_acc}",
+                    callback_data="acc:full",
+                )
+            ]
+        )
+    if nacc > 1:
         rows.append(
             [InlineKeyboardButton(text="🔀 Ротация", callback_data="acc:rotate")]
         )

@@ -3617,7 +3617,19 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
 
 
 async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
+    try:
+        db_line = (
+            f"💾 БД: <b>{app.db.count():,}</b> NFT · "
+            f"<b>{app.db.count_users():,}</b> юзов\n"
+            f"<code>{app.db.path}</code>"
+        )
+    except Exception:  # noqa: BLE001
+        db_line = ""
     text = screen("Меню")
+    if db_line:
+        text = f"{text}\n{db_line}"
+    if prefix:
+        text = f"{prefix}\n{text}"
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_inline())
         await target.answer()
@@ -4187,6 +4199,12 @@ async def main() -> None:
             app.db.count_users(),
             len(app.db.list_accounts()),
         )
+        if app.db.count() < 50 and str(app.db.path).startswith("/data"):
+            logger.warning(
+                "DB almost empty at %s — mount persistent volume on /data "
+                "or set GIFTS_DB_PATH to a persistent path",
+                app.db.path,
+            )
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -4216,6 +4234,10 @@ async def main() -> None:
         await app._close_extra_clients()
         if app.client.is_connected():
             await app.client.disconnect()
+        try:
+            app.db.checkpoint()
+        except Exception:  # noqa: BLE001
+            pass
         app.db.close()
         await bot.session.close()
 

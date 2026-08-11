@@ -16,29 +16,81 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
+# все известные места, где могла лежать БД до фикса пути
+_LEGACY_DB_PATHS: tuple[Path, ...] = (
+    Path("data/gifts.db"),
+    Path("/workspace/data/gifts.db"),
+    Path("/app/data/gifts.db"),
+    Path("/var/lib/neptun/gifts.db"),
+)
 
-def resolve_db_path() -> Path:
-    """Путь к БД, который переживает редеплой.
 
-    Приоритет:
-    1) GIFTS_DB_PATH
-    2) /data/gifts.db (типичный persistent volume)
-    3) ./data/gifts.db
-    """
-    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    if env:
-        return Path(env)
-    for candidate in (
-        Path("/data/gifts.db"),
-        Path("/var/lib/neptun/gifts.db"),
-    ):
-        # если volume смонтирован — пишем туда
+def _db_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = int(path.stat().st_size)
+    for ext in ("-wal", "-shm"):
+        side = Path(str(path) + ext)
+        if side.exists():
+            total += int(side.stat().st_size)
+    return total
+
+
+def _copy_db_tree(src: Path, dst: Path) -> None:
+    import shutil
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    for ext in ("-wal", "-shm"):
+        side = Path(str(src) + ext)
+        if side.exists():
+            shutil.copy2(side, Path(str(dst) + ext))
+
+
+def migrate_legacy_db(target: Path) -> bool:
+    """Если новая БД пустая — подтянуть самую большую из старых путей."""
+    if _db_bytes(target) > 8192:
+        return False
+    best: Path | None = None
+    best_sz = 0
+    for src in _LEGACY_DB_PATHS:
         try:
-            if candidate.parent.exists() and os.access(candidate.parent, os.W_OK):
-                return candidate
+            if src.resolve() == target.resolve():
+                continue
         except OSError:
             pass
-    return Path("data") / "gifts.db"
+        sz = _db_bytes(src)
+        if sz > best_sz:
+            best_sz = sz
+            best = src
+    if not best or best_sz <= 8192:
+        return False
+    try:
+        _copy_db_tree(best, target)
+        logger.info(
+            "DB migrated %s -> %s (%s bytes)",
+            best,
+            target,
+            best_sz,
+        )
+        return True
+    except OSError as exc:
+        logger.warning("DB migrate failed %s -> %s: %s", best, target, exc)
+        return False
+
+
+def resolve_db_path() -> Path:
+    """Один постоянный путь к gifts.db — переживает редеплой с volume на /data."""
+    env = (os.environ.get("GIFTS_DB_PATH") or "/data/gifts.db").strip()
+    target = Path(env)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(target.parent, os.W_OK):
+            target = Path("data") / "gifts.db"
+    except OSError:
+        target = Path("data") / "gifts.db"
+    migrate_legacy_db(target)
+    return target
 
 
 DB_PATH = resolve_db_path()

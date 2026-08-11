@@ -16,29 +16,87 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
+# старые пути после экспериментов с /data — подтянем, если локальная пустая
+_LEGACY_DB_PATHS: tuple[Path, ...] = (
+    Path("/data/gifts.db"),
+    Path("/var/lib/neptun/gifts.db"),
+    Path("/app/data/gifts.db"),
+    Path("/workspace/data/gifts.db"),
+)
 
-def resolve_db_path() -> Path:
-    """Путь к БД, который переживает редеплой.
 
-    Приоритет:
-    1) GIFTS_DB_PATH
-    2) /data/gifts.db (типичный persistent volume)
-    3) ./data/gifts.db
-    """
-    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    if env:
-        return Path(env)
-    for candidate in (
-        Path("/data/gifts.db"),
-        Path("/var/lib/neptun/gifts.db"),
-    ):
-        # если volume смонтирован — пишем туда
+def _db_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = int(path.stat().st_size)
+    for ext in ("-wal", "-shm"):
+        side = Path(str(path) + ext)
+        if side.exists():
+            total += int(side.stat().st_size)
+    return total
+
+
+def _copy_db_tree(src: Path, dst: Path) -> None:
+    import shutil
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    for ext in ("-wal", "-shm"):
+        side = Path(str(src) + ext)
+        if side.exists():
+            shutil.copy2(side, Path(str(dst) + ext))
+
+
+def migrate_legacy_db(target: Path) -> bool:
+    """Если data/gifts.db пустая — взять самую большую из старых /data и т.п."""
+    if _db_bytes(target) > 8192:
+        return False
+    best: Path | None = None
+    best_sz = 0
+    for src in _LEGACY_DB_PATHS:
         try:
-            if candidate.parent.exists() and os.access(candidate.parent, os.W_OK):
-                return candidate
+            if src.resolve() == target.resolve():
+                continue
         except OSError:
             pass
-    return Path("data") / "gifts.db"
+        sz = _db_bytes(src)
+        if sz > best_sz:
+            best_sz = sz
+            best = src
+    if not best or best_sz <= 8192:
+        return False
+    try:
+        _copy_db_tree(best, target)
+        logger.info(
+            "DB migrated %s -> %s (%s bytes)",
+            best,
+            target,
+            best_sz,
+        )
+        return True
+    except OSError as exc:
+        logger.warning("DB migrate failed %s -> %s: %s", best, target, exc)
+        return False
+
+
+def resolve_db_path() -> Path:
+    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно).
+
+    Игнорим сломанный дефолт /data/gifts.db из env — на деплое без volume
+    он даёт пустую БД (0 NFT) и парсер «не ищет типы».
+    """
+    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    # старый «фикс persistence» писал GIFTS_DB_PATH=/data/gifts.db — не юзаем
+    if env in {"/data/gifts.db", "/data/gifts.db/", "data/gifts.db"}:
+        env = ""
+    target = Path(env) if env else (Path("data") / "gifts.db")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        target = Path("data") / "gifts.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_db(target)
+    return target
 
 
 DB_PATH = resolve_db_path()
@@ -254,7 +312,11 @@ class GiftDB:
         self._conn.commit()
 
     def upsert_models(self, lots: Iterable[Lot]) -> tuple[int, int]:
-        """Только рост/обогащение: строки не удаляем, пустые поля не затираем."""
+        """Только рост/обогащение каталога gifts: строки не удаляем.
+
+        Выданных продавцов тоже пишем в gifts (счётчик копится), а выдача
+        их отсекает через seen_sellers. В users они не возвращаются.
+        """
         now = time.time()
         inserted = updated = 0
         cur = self._conn.cursor()
@@ -263,9 +325,6 @@ class GiftDB:
                 continue
             seller = (lot.seller or "").strip()
             seller_id = lot.seller_id
-            # выданных продавцов в БД больше никогда не пишем
-            if self.is_seen_seller(username=seller, user_id=seller_id):
-                continue
             mk = _model_key(lot)
             model = _model_name(lot)
             row = cur.execute(
@@ -514,9 +573,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = True,
+        exclude_seen: bool = False,
     ) -> tuple[str, list[Any]]:
-        """SQL-условия «в точку» по тумблерам фильтров."""
+        """SQL-условия по тумблерам. exclude_seen — только если явно включён."""
         seller = self._seller_sql()
         parts: list[str] = []
         params: list[Any] = []
@@ -527,19 +586,21 @@ class GiftDB:
             parts.append(f"length({seller}) >= ?")
             params.append(int(long_user_min))
         if no_premium:
+            # unknown (NULL) пропускаем — режем только явный premium
             parts.append("(u.is_premium IS NULL OR u.is_premium = 0)")
         if with_model:
             parts.append("IFNULL(g.model, '') != ''")
         if no_digits_user:
             parts.append(f"({seller}) NOT GLOB '*[0-9]*'")
         if few_gifts:
+            # unknown gifts_count ок; режем только явно > max
             parts.append(
-                "(u.gifts_count IS NOT NULL AND u.gifts_count <= ?)"
+                "(u.gifts_count IS NULL OR u.gifts_count <= ?)"
             )
             params.append(int(max_gifts))
         if low_level:
             parts.append(
-                "(u.account_level IS NOT NULL AND u.account_level <= ?)"
+                "(u.account_level IS NULL OR u.account_level <= ?)"
             )
             params.append(int(max_level))
         if with_bio:
@@ -651,9 +712,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = True,
+        exclude_seen: bool = False,
     ) -> list[Lot]:
-        """Пул под фильтры: SQL сразу режет по тумблерам + без seen."""
+        """Пул под фильтры. seen режем в Python через exclude_sellers; gifts не чистим."""
         excl_s = {str(x).lower() for x in (exclude_sellers or set()) if x}
         excl_t = {str(x).lower() for x in (exclude_titles or set()) if x}
         half = max(200, int(limit) // 2)
@@ -998,35 +1059,30 @@ class GiftDB:
     def purge_delivered_seller(
         self, *, username: str = "", user_id: int | None = None
     ) -> tuple[int, int]:
-        """После выдачи: навсегда в seen + удалить юзера и его лоты из БД."""
+        """После выдачи: навсегда в seen + убрать юзера из users.
+
+        Гифты НЕ удаляем — каталог gifts продолжает копиться, а выдача
+        просто не берёт seen_sellers (SQL + is_seen_seller).
+        """
         self.mark_seen_seller(username=username, user_id=user_id)
         u = (username or "").lstrip("@").strip().lower()
         deleted_users = 0
-        deleted_gifts = 0
         if user_id is not None:
             cur = self._conn.execute(
                 "DELETE FROM users WHERE user_id = ?", (int(user_id),)
             )
             deleted_users += int(cur.rowcount or 0)
-            cur = self._conn.execute(
-                "DELETE FROM gifts WHERE seller_id = ?", (int(user_id),)
-            )
-            deleted_gifts += int(cur.rowcount or 0)
         if u:
             cur = self._conn.execute(
                 "DELETE FROM users WHERE lower(username) = ?", (u,)
             )
             deleted_users += int(cur.rowcount or 0)
-            cur = self._conn.execute(
-                "DELETE FROM gifts WHERE lower(seller) = ?", (u,)
-            )
-            deleted_gifts += int(cur.rowcount or 0)
         self._conn.commit()
-        return deleted_users, deleted_gifts
+        return deleted_users, 0
 
     def purge_delivered_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
-        """Пакетно стереть выданных продавцов из users+gifts."""
-        users_n = gifts_n = 0
+        """Пакетно: seen + удалить юзеров. gifts оставляем."""
+        users_n = 0
         seen_local: set[str] = set()
         for lot in lots:
             key = (lot.seller or "").lower() or (
@@ -1035,13 +1091,12 @@ class GiftDB:
             if not key or key in seen_local:
                 continue
             seen_local.add(key)
-            du, dg = self.purge_delivered_seller(
+            du, _dg = self.purge_delivered_seller(
                 username=lot.seller or "",
                 user_id=lot.seller_id,
             )
             users_n += du
-            gifts_n += dg
-        return users_n, gifts_n
+        return users_n, 0
 
     def mark_seen_model(self, model_key: str, title: str = "") -> None:
         mk = (model_key or "").strip()

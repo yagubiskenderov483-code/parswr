@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
-# старые пути после экспериментов с /data — подтянем, если локальная пустая
-_LEGACY_DB_PATHS: tuple[Path, ...] = (
+# все места, где могла лежать БД — берём самую жирную
+_CANDIDATE_DB_PATHS: tuple[Path, ...] = (
     Path("/data/gifts.db"),
+    Path("data") / "gifts.db",
     Path("/var/lib/neptun/gifts.db"),
     Path("/app/data/gifts.db"),
     Path("/workspace/data/gifts.db"),
@@ -28,11 +29,17 @@ _LEGACY_DB_PATHS: tuple[Path, ...] = (
 def _db_bytes(path: Path) -> int:
     if not path.exists():
         return 0
-    total = int(path.stat().st_size)
+    try:
+        total = int(path.stat().st_size)
+    except OSError:
+        return 0
     for ext in ("-wal", "-shm"):
         side = Path(str(path) + ext)
         if side.exists():
-            total += int(side.stat().st_size)
+            try:
+                total += int(side.stat().st_size)
+            except OSError:
+                pass
     return total
 
 
@@ -47,56 +54,113 @@ def _copy_db_tree(src: Path, dst: Path) -> None:
             shutil.copy2(side, Path(str(dst) + ext))
 
 
-def migrate_legacy_db(target: Path) -> bool:
-    """Если data/gifts.db пустая — взять самую большую из старых /data и т.п."""
-    if _db_bytes(target) > 8192:
-        return False
-    best: Path | None = None
-    best_sz = 0
-    for src in _LEGACY_DB_PATHS:
-        try:
-            if src.resolve() == target.resolve():
-                continue
-        except OSError:
-            pass
-        sz = _db_bytes(src)
-        if sz > best_sz:
-            best_sz = sz
-            best = src
-    if not best or best_sz <= 8192:
-        return False
+def _dir_writable(path: Path) -> bool:
     try:
-        _copy_db_tree(best, target)
-        logger.info(
-            "DB migrated %s -> %s (%s bytes)",
-            best,
-            target,
-            best_sz,
-        )
-        return True
-    except OSError as exc:
-        logger.warning("DB migrate failed %s -> %s: %s", best, target, exc)
+        path.mkdir(parents=True, exist_ok=True)
+        return bool(os.access(path, os.W_OK))
+    except OSError:
         return False
+
+
+def _same_db(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return str(a) == str(b)
 
 
 def resolve_db_path() -> Path:
-    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно).
+    """БД не слетает после деплоя.
 
-    Игнорим сломанный дефолт /data/gifts.db из env — на деплое без volume
-    он даёт пустую БД (0 NFT) и парсер «не ищет типы».
+    Правило:
+    - если уже есть жирная БД — открываем ИМЕННО её (не прыгаем в пустой /data);
+    - если /data смонтирован как volume и там данные — пишем туда;
+    - оба пустые + /data доступен → /data/gifts.db (под persistent volume);
+    - иначе → ./data/gifts.db.
+    Перед открытием копируем самую большую копию в выбранный путь.
     """
-    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    # старый «фикс persistence» писал GIFTS_DB_PATH=/data/gifts.db — не юзаем
-    if env in {"/data/gifts.db", "/data/gifts.db/", "data/gifts.db"}:
-        env = ""
-    target = Path(env) if env else (Path("data") / "gifts.db")
+    local = Path("data") / "gifts.db"
+    vol = Path("/data/gifts.db")
+    env_raw = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    # пустые/дефолтные значения не считаем явным override
+    env = "" if env_raw in {"", "/data/gifts.db", "/data/gifts.db/", "data/gifts.db"} else env_raw
+
+    vol_ok = _dir_writable(vol.parent)
+    local_ok = _dir_writable(local.parent)
+
+    scored: list[tuple[int, Path]] = []
+    seen: set[str] = set()
+    for cand in (
+        ([Path(env)] if env else [])
+        + list(_CANDIDATE_DB_PATHS)
+    ):
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        scored.append((_db_bytes(cand), cand))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_sz, best_path = scored[0] if scored else (0, local)
+    for sz, p in scored:
+        if sz > best_sz:
+            best_sz, best_path = sz, p
+
+    vol_sz = _db_bytes(vol) if vol_ok else -1
+    local_sz = _db_bytes(local) if local_ok else -1
+
+    if env:
+        target = Path(env)
+        _dir_writable(target.parent)
+    elif vol_ok and vol_sz > 8192:
+        # volume уже с данными — канон
+        target = vol
+    elif best_sz > 8192:
+        # данные уже где-то есть — НЕ переезжаем в пустой эфемерный /data
+        target = best_path
+    elif vol_ok:
+        # свежий деплой: пишем в /data (нужен persistent volume на хосте)
+        target = vol
+    else:
+        target = local
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        target = Path("data") / "gifts.db"
+        target = local
         target.parent.mkdir(parents=True, exist_ok=True)
-    migrate_legacy_db(target)
+
+    # если выбранный путь беднее самой жирной копии — мигрируем
+    target_sz = _db_bytes(target)
+    if best_sz > target_sz + 1024 and not _same_db(best_path, target):
+        try:
+            _copy_db_tree(best_path, target)
+            logger.info(
+                "DB migrated %s -> %s (%s bytes)",
+                best_path,
+                target,
+                best_sz,
+            )
+        except OSError as exc:
+            logger.warning(
+                "DB migrate failed %s -> %s: %s", best_path, target, exc
+            )
+            if best_sz > 8192:
+                target = best_path
+
+    logger.info(
+        "DB path=%s · size=%.2fMB · vol=%s local=%s",
+        target,
+        _db_bytes(target) / (1024 * 1024),
+        vol_sz,
+        local_sz,
+    )
     return target
+
+
+# совместимость: старый вызов migrate_legacy_db(target) — no-op,
+# реальная миграция делается в resolve_db_path()
+def migrate_legacy_db(target: Path) -> bool:
+    return _db_bytes(target) > 8192
 
 
 DB_PATH = resolve_db_path()

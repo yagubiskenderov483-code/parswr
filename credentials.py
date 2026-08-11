@@ -6,8 +6,9 @@ BOT_TOKEN = "8966504132:AAEM2--YD439w7zJWot2mnbeNJpSci4yIaI"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
-# БД как раньше: ./data/gifts.db (переопределить через GIFTS_DB_PATH)
-GIFTS_DB_PATH = os.environ.get("GIFTS_DB_PATH", "data/gifts.db")
+# БД: после деплоя не слетает — нужен volume на /data (или GIFTS_DB_PATH).
+# Код сам берёт самую жирную копию и не прыгает в пустой файл.
+GIFTS_DB_PATH = os.environ.get("GIFTS_DB_PATH", "")
 
 # кто может пользоваться ботом
 OWNER_ID = 741904495

@@ -1542,8 +1542,8 @@ class App:
             tk = self._title_key(lot)
             if not tk:
                 continue
-            # типы без повторов (парсер + фильтры)
-            if channel in ("parser", "filter"):
+            # типы без повторов (парсер + фильтры + старый)
+            if channel in ("parser", "filter", "old"):
                 if tk in seen_titles or tk in local_titles:
                     continue
             # модели: только внутри выдачи (не режем историю БД — иначе 1–2 типа)
@@ -1628,19 +1628,19 @@ class App:
             ordered = sorted(keys, key=_rank)
         per_type = max(1, int(getattr(creds, "PER_TYPE", 1)))
         max_types = int(getattr(creds, "MAX_TYPES", 0) or 0)
-        # фильтры и парсер — по 1 с типа, цель ~30
-        by_types = channel in ("parser", "filter") and (
-            limit is None or limit <= 0 or channel == "filter"
+        # парсер/фильтры/старый — по типам, цель ~30 разных NFT
+        by_types = channel in ("parser", "filter", "old") and (
+            limit is None or limit <= 0 or channel in ("filter", "old")
         )
-        take_all = channel == "old"
+        take_all = False
 
         if by_types:
             target_types = (
                 max(30, int(creds.SHOW_LIMIT))
-                if channel == "filter"
+                if channel in ("filter", "old")
                 else (max_types if max_types > 0 else 10_000)
             )
-            if channel == "filter" and limit is not None and limit > 0:
+            if channel in ("filter", "old") and limit is not None and limit > 0:
                 target_types = int(limit)
             types_taken = 0
             for tk in ordered:
@@ -1787,7 +1787,8 @@ class App:
                 out = out[:target]
             if len(out) > len(best):
                 best = out
-            stop_at = target if channel in ("filter", "parser") else min(20, target)
+            # цель — полный SHOW_LIMIT (~30), не останавливаемся на 8–20
+            stop_at = target if channel in ("filter", "parser", "old") else min(20, target)
             if len(best) >= stop_at:
                 break
         if best:
@@ -1808,11 +1809,11 @@ class App:
         strict_russian: bool | None = None,
     ) -> list[Lot]:
         by_types = channel == "parser" and (limit is None or limit <= 0)
-        take_all = channel == "old"
+        take_all = False
         if by_types:
             lim = 10_000
-        elif take_all:
-            lim = int(limit) if (limit is not None and limit > 0) else 30
+        elif channel == "old":
+            lim = int(limit) if (limit is not None and limit > 0) else max(30, creds.SHOW_LIMIT)
         else:
             lim = limit or max(30, creds.SHOW_LIMIT)
         self._ingest_always(list(lots))
@@ -2435,10 +2436,10 @@ class App:
                 return
             shown = await self._prepare_show(
                 lots,
-                limit=30,
+                limit=max(30, int(creds.SHOW_LIMIT)),
                 apply_extra=False,
-                track_seen=False,
-                need_full=False,
+                track_seen=True,
+                need_full=True,
                 channel="old",
             )
             self.parse_ready = len(shown)
@@ -3048,7 +3049,7 @@ class App:
                 pool, limit=None, apply_extra=False, channel="parser"
             )
             # достаточно типов → сразу выдача и стоп скана
-            min_types = 8
+            min_types = max(20, int(creds.SHOW_LIMIT) - 5)
             if len(shown) >= min_types:
                 delivered = True
                 self.parse_ready = len(shown)

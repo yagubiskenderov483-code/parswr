@@ -885,7 +885,7 @@ class App:
         return out
 
     def _mark_delivered(self, lots: list[Lot], *, channel: str) -> None:
-        """После выдачи: юзы навсегда, стереть из БД, больше не показывать."""
+        """После выдачи: юз навсегда в seen, убрать из users, gifts оставить."""
         if not lots:
             return
         for lot in lots:
@@ -2471,7 +2471,8 @@ class App:
         )
         if not batch:
             return
-        # при выдаче — юзер навсегда из БД (users+gifts), повторно не вернётся
+        # при выдаче — юзер в seen навсегда (не показывать снова);
+        # gifts в каталоге остаются, из users убираем
         try:
             self._mark_delivered(batch, channel=channel)
         except Exception as exc:  # noqa: BLE001
@@ -2526,8 +2527,7 @@ class App:
             self._status_msg_id = msg.message_id
 
     def _save_models(self, lots: list[Lot]) -> tuple[int, int]:
-        """Сохраняет модели в БД (кроме уже выданных юзов — они стёрты навсегда)."""
-        lots = [lot for lot in lots if not self._is_delivered_seller(lot)]
+        """Сохраняет ВСЕ модели в каталог gifts (копится всегда)."""
         if not lots:
             return 0, 0
         inserted, updated = self.db.upsert_models(lots)
@@ -2581,23 +2581,21 @@ class App:
         return ins, upd, total
 
     def _ingest_always(self, lots: list[Lot] | None = None) -> None:
-        """Копить gifts+users в БД — кроме уже выданных юзов."""
-        batch = [
-            lot
-            for lot in (lots or [])
-            if not self._is_delivered_seller(lot)
-        ]
+        """Копить gifts всегда; users — только невыданных."""
+        batch = list(lots or [])
         if batch:
             try:
                 self._save_models(batch)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ingest gifts: %s", exc)
             try:
+                # в users — только тех, кого ещё не выдавали
                 self.db.upsert_users_from_lots(
                     [
                         lot
                         for lot in batch
-                        if lot.seller_id is not None or lot.seller
+                        if (lot.seller_id is not None or lot.seller)
+                        and not self._is_delivered_seller(lot)
                     ],
                     cap=creds.AFK_USER_CAP,
                 )
@@ -2613,7 +2611,7 @@ class App:
             pass
 
     async def pause_db_farm(self) -> None:
-        """Мягкая пауза — задачу НЕ убиваем, БД продолжает копиться после."""
+        """Мягкая пауза — задачу НЕ убиваем, ждёт и продолжает копиться."""
         self._afk_paused = True
 
     async def ensure_db_farm(self) -> None:
@@ -2621,6 +2619,7 @@ class App:
         if not self.logged_in:
             return
         if self.running or self.filter_search_running or self.old_parse_running:
+            # парсер занял акки — снимем паузу, когда он закончит
             return
         if self.afk_running and self._afk_task and not self._afk_task.done():
             self._afk_paused = False
@@ -2699,6 +2698,15 @@ class App:
                 logger.warning("DB farm collections: %s", exc)
                 if not self._afk_quiet:
                     await self._say(f"💾 БД фарм ошибка: {_esc(str(exc)[:180])}")
+                # не убиваем фарм навсегда — подождём и перезапустим
+                await asyncio.sleep(3.0)
+                if self.afk_running and self.logged_in:
+                    self._afk_task = None
+                    asyncio.get_running_loop().call_soon(
+                        lambda: asyncio.create_task(
+                            self.ensure_db_farm(), name="db-farm-retry"
+                        )
+                    )
                 self.afk_running = False
                 return
 
@@ -2732,6 +2740,15 @@ class App:
             last_status = 0.0
             n = len(gift_ids)
             if n == 0:
+                logger.warning("DB farm: 0 collections, retry later")
+                await asyncio.sleep(5.0)
+                if self.afk_running and self.logged_in:
+                    self._afk_task = None
+                    asyncio.get_running_loop().call_soon(
+                        lambda: asyncio.create_task(
+                            self.ensure_db_farm(), name="db-farm-empty-retry"
+                        )
+                    )
                 self.afk_running = False
                 return
 
@@ -2741,9 +2758,14 @@ class App:
             ]
             need_rebuild = False
 
-            while self.afk_running and not self._afk_paused:
-                # во время активного парсинга — ждём (парсер сам юзает акки)
-                if self.running or self.filter_search_running or self.old_parse_running:
+            while self.afk_running:
+                # пауза / активный парс — не умираем, ждём и продолжаем копить
+                if (
+                    self._afk_paused
+                    or self.running
+                    or self.filter_search_running
+                    or self.old_parse_running
+                ):
                     need_rebuild = True
                     await asyncio.sleep(0.4)
                     continue
@@ -2895,8 +2917,25 @@ class App:
                     await self._close_extra_clients()
                 except Exception:  # noqa: BLE001
                     pass
-            if self._afk_paused and self.logged_in and not self.running:
-                pass
+            # если вышли из цикла из‑за ошибки/стопа — сбросить флаг
+            if not self.afk_running:
+                self._afk_paused = False
+            # авто-рестарт, если задача умерла, а логин жив и парсер свободен
+            elif (
+                self.logged_in
+                and not self.running
+                and not self.filter_search_running
+                and not self.old_parse_running
+            ):
+                self._afk_paused = False
+                try:
+                    asyncio.get_running_loop().call_soon(
+                        lambda: asyncio.create_task(
+                            self.ensure_db_farm(), name="db-farm-restart"
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _loop(self) -> None:
         """Один обход: скан → прогресс (чеки/проверки) → выдача по типам."""

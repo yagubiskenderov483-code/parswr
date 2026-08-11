@@ -1388,13 +1388,13 @@ class App:
         return " · 🎲 " + "+".join(labels) if labels else ""
 
     def _passes_extra_filters(self, lot: Lot) -> bool:
-        """Тумблеры «в точку»: без мягких unknown, только точное совпадение."""
+        """Тумблеры мягко: unknown (None) не режем — только явный провал."""
         f = self.filters
         if f.few_gifts:
-            if lot.gifts_count is None or lot.gifts_count > f.max_gifts:
+            if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is None or lot.account_level > f.max_level:
+            if lot.account_level is not None and lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
@@ -1405,11 +1405,12 @@ class App:
             if n < f.long_user_min:
                 return False
         if f.no_premium:
-            # только явно без TGP
-            if lot.is_premium is not False:
+            # режем только явный premium; unknown ок
+            if lot.is_premium is True:
                 return False
         if f.online_only:
-            if lot.is_online is not True:
+            # unknown ок — иначе пул схлопывается
+            if lot.is_online is False:
                 return False
         if f.with_bio:
             if not (lot.first_name or lot.last_name or lot.about):
@@ -1744,22 +1745,26 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
+            # сначала RU+free; если мало типов — ослабляем RU
             attempts = [
                 (True, True, False, False),
                 (True, True, True, False),
+                (False, True, True, False),
             ]
         elif channel == "old":
             attempts = [
                 (True, True, True, False),
                 (True, False, True, False),
+                (False, False, True, False),
             ]
         else:
-            # фильтры: free DM всегда; тумблеры жёстко; RU сначала
+            # фильтры: free DM; тумблеры; RU сначала, потом без RU
             keep_extra = True
             attempts = [
                 (True, True, False, keep_extra),
                 (True, True, True, keep_extra),
                 (False, True, True, keep_extra),
+                (False, True, True, False),
             ]
         best: list[Lot] = []
         for want_ru, want_free, ign_seen, extra in attempts:
@@ -1782,7 +1787,7 @@ class App:
                 out = out[:target]
             if len(out) > len(best):
                 best = out
-            stop_at = target if channel == "filter" else min(20, target)
+            stop_at = target if channel in ("filter", "parser") else min(20, target)
             if len(best) >= stop_at:
                 break
         if best:
@@ -2226,7 +2231,7 @@ class App:
                         low_level=bool(f.low_level),
                         max_level=int(f.max_level),
                         with_bio=bool(f.with_bio),
-                        exclude_seen=True,
+                        exclude_seen=False,
                     )
                 except Exception:  # noqa: BLE001
                     return self.db.fetch_random_lots(
@@ -2281,22 +2286,49 @@ class App:
                         break
                 return out
 
-            # 1) сначала ТОЛЬКО БД (быстро и много при 12k)
-            old = _db_pool()
-            random.shuffle(old)
-            self._ingest_always(old)
-            await self._say_to(
-                chat_id,
-                f"{screen('Фильтры')}\nпул БД: <b>{len(old)}</b> лотов",
-            )
-            shown = await self._prepare_show(
-                old,
-                limit=target_n,
-                apply_extra=True,
-                track_seen=False,
-                need_full=True,
-                channel="filter",
-            )
+            # 1) БД пустая/маленькая — сразу live burst (копим + выдаём типы)
+            #    иначе сначала БД (быстро при большом каталоге)
+            shown: list[Lot] = []
+            old: list[Lot] = []
+            if db_n < 500 or total_db < 500:
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nБД мала ({total_db}) — live burst…",
+                )
+                live0 = await _live_pool()
+                self._ingest_always(live0)
+                old = _db_pool()
+                merged0 = _dedupe_lots(live0 + old)
+                random.shuffle(merged0)
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nlive <b>{len(live0)}</b> · "
+                    f"БД <b>{len(old)}</b>",
+                )
+                shown = await self._prepare_show(
+                    merged0,
+                    limit=target_n,
+                    apply_extra=True,
+                    track_seen=False,
+                    need_full=True,
+                    channel="filter",
+                )
+            else:
+                old = _db_pool()
+                random.shuffle(old)
+                self._ingest_always(old)
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nпул БД: <b>{len(old)}</b> лотов",
+                )
+                shown = await self._prepare_show(
+                    old,
+                    limit=target_n,
+                    apply_extra=True,
+                    track_seen=False,
+                    need_full=True,
+                    channel="filter",
+                )
 
             # 2) мало — live + ещё рандом из БД
             if len(shown) < target_n:
@@ -2319,7 +2351,7 @@ class App:
                 )
                 shown = _merge_unique(shown, more, cap=target_n)
 
-            # 3) всё ещё мало — без spice, ещё раз по всей БД
+            # 3) всё ещё мало — без spice + мягкий проход без extra-тумблеров
             if len(shown) < 20:
                 f.spice_no_model = False
                 f.spice_mid_user = False
@@ -2331,7 +2363,7 @@ class App:
                 more = await self._prepare_show(
                     old3,
                     limit=target_n,
-                    apply_extra=True,
+                    apply_extra=False,
                     track_seen=False,
                     need_full=True,
                     channel="filter",
@@ -2631,6 +2663,11 @@ class App:
         self._afk_paused = False
         self.afk_running = True
         self.afk_last_error = ""
+        # новый запуск — счётчики с нуля, иначе Daily врёт «стр.0»
+        self.afk_pages = 0
+        self.afk_models_added = 0
+        self.afk_users_added = 0
+        self.afk_collections_total = 0
         self._afk_task = asyncio.create_task(self._afk_loop(), name="db-farm")
         logger.info(
             "DB farm start · users=%s models=%s",
@@ -2693,9 +2730,18 @@ class App:
         markets: list[TelegramMarket] = []
         try:
             markets = await self._build_parse_markets()
+            if not markets:
+                self.afk_last_error = "нет подключённых акков"
+                self.afk_running = False
+                return
             base = markets[0]
             try:
-                gift_ids = await base.load_collections()
+                # force=True если в БД ещё нет каталога — иначе вечный 0
+                force = self.db.count_collections() < 5 or self.db.count() < 10
+                gift_ids = await asyncio.wait_for(
+                    base.load_collections(force=force),
+                    timeout=45.0,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.afk_last_error = str(exc)
                 logger.warning("DB farm collections: %s", exc)
@@ -3675,8 +3721,9 @@ def _farm_status_line() -> str:
         app.afk_running and app._afk_task and not app._afk_task.done()
     )
     if alive and not app._afk_paused:
+        cols = int(getattr(app, "afk_collections_total", 0) or 0)
         return (
-            f"▶️ БД фарм · стр. {app.afk_pages} · "
+            f"▶️ БД фарм · кол. {cols} · стр. {app.afk_pages} · "
             f"+NFT {app.afk_models_added:,} · +юзов {app.afk_users_added:,}"
         )
     if alive and app._afk_paused:

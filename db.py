@@ -573,9 +573,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = True,
+        exclude_seen: bool = False,
     ) -> tuple[str, list[Any]]:
-        """SQL-условия «в точку» по тумблерам фильтров."""
+        """SQL-условия по тумблерам. exclude_seen — только если явно включён."""
         seller = self._seller_sql()
         parts: list[str] = []
         params: list[Any] = []
@@ -586,19 +586,21 @@ class GiftDB:
             parts.append(f"length({seller}) >= ?")
             params.append(int(long_user_min))
         if no_premium:
+            # unknown (NULL) пропускаем — режем только явный premium
             parts.append("(u.is_premium IS NULL OR u.is_premium = 0)")
         if with_model:
             parts.append("IFNULL(g.model, '') != ''")
         if no_digits_user:
             parts.append(f"({seller}) NOT GLOB '*[0-9]*'")
         if few_gifts:
+            # unknown gifts_count ок; режем только явно > max
             parts.append(
-                "(u.gifts_count IS NOT NULL AND u.gifts_count <= ?)"
+                "(u.gifts_count IS NULL OR u.gifts_count <= ?)"
             )
             params.append(int(max_gifts))
         if low_level:
             parts.append(
-                "(u.account_level IS NOT NULL AND u.account_level <= ?)"
+                "(u.account_level IS NULL OR u.account_level <= ?)"
             )
             params.append(int(max_level))
         if with_bio:
@@ -710,9 +712,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = True,
+        exclude_seen: bool = False,
     ) -> list[Lot]:
-        """Пул под фильтры: SQL сразу режет по тумблерам + без seen."""
+        """Пул под фильтры. seen режем в Python через exclude_sellers; gifts не чистим."""
         excl_s = {str(x).lower() for x in (exclude_sellers or set()) if x}
         excl_t = {str(x).lower() for x in (exclude_titles or set()) if x}
         half = max(200, int(limit) // 2)

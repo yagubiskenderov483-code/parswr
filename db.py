@@ -80,8 +80,15 @@ def migrate_legacy_db(target: Path) -> bool:
 
 
 def resolve_db_path() -> Path:
-    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно)."""
+    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно).
+
+    Игнорим сломанный дефолт /data/gifts.db из env — на деплое без volume
+    он даёт пустую БД (0 NFT) и парсер «не ищет типы».
+    """
     env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    # старый «фикс persistence» писал GIFTS_DB_PATH=/data/gifts.db — не юзаем
+    if env in {"/data/gifts.db", "/data/gifts.db/", "data/gifts.db"}:
+        env = ""
     target = Path(env) if env else (Path("data") / "gifts.db")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

@@ -4326,13 +4326,22 @@ async def main() -> None:
     )
     app.bot = bot
     try:
+        g_n = app.db.count()
+        u_n = app.db.count_users()
+        a_n = len(app.db.list_accounts())
         logger.info(
             "startup · DB=%s · gifts=%s · users=%s · accounts=%s",
             app.db.path,
-            app.db.count(),
-            app.db.count_users(),
-            len(app.db.list_accounts()),
+            g_n,
+            u_n,
+            a_n,
         )
+        if g_n < 10 and u_n < 10:
+            logger.warning(
+                "DB almost empty at %s — mount persistent volume on /data "
+                "so users/gifts survive redeploy (GIFTS_DB_PATH optional)",
+                app.db.path,
+            )
     except Exception:  # noqa: BLE001
         pass
     try:

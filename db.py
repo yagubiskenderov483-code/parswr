@@ -16,12 +16,12 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
-# все известные места, где могла лежать БД до фикса пути
+# старые пути после экспериментов с /data — подтянем, если локальная пустая
 _LEGACY_DB_PATHS: tuple[Path, ...] = (
-    Path("data/gifts.db"),
-    Path("/workspace/data/gifts.db"),
-    Path("/app/data/gifts.db"),
+    Path("/data/gifts.db"),
     Path("/var/lib/neptun/gifts.db"),
+    Path("/app/data/gifts.db"),
+    Path("/workspace/data/gifts.db"),
 )
 
 
@@ -48,7 +48,7 @@ def _copy_db_tree(src: Path, dst: Path) -> None:
 
 
 def migrate_legacy_db(target: Path) -> bool:
-    """Если новая БД пустая — подтянуть самую большую из старых путей."""
+    """Если data/gifts.db пустая — взять самую большую из старых /data и т.п."""
     if _db_bytes(target) > 8192:
         return False
     best: Path | None = None
@@ -80,15 +80,14 @@ def migrate_legacy_db(target: Path) -> bool:
 
 
 def resolve_db_path() -> Path:
-    """Один постоянный путь к gifts.db — переживает редеплой с volume на /data."""
-    env = (os.environ.get("GIFTS_DB_PATH") or "/data/gifts.db").strip()
-    target = Path(env)
+    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно)."""
+    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    target = Path(env) if env else (Path("data") / "gifts.db")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(target.parent, os.W_OK):
-            target = Path("data") / "gifts.db"
     except OSError:
         target = Path("data") / "gifts.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
     migrate_legacy_db(target)
     return target
 

@@ -3945,6 +3945,7 @@ async def cb_settings(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:jobs")
 async def cb_jobs(callback: CallbackQuery) -> None:
+    await _kick_db_farm()
     await callback.message.edit_text(
         app.parse_status_text(),
         reply_markup=jobs_inline(),
@@ -4284,12 +4285,6 @@ async def main() -> None:
             app.db.count_users(),
             len(app.db.list_accounts()),
         )
-        if app.db.count() < 50 and str(app.db.path).startswith("/data"):
-            logger.warning(
-                "DB almost empty at %s — mount persistent volume on /data "
-                "or set GIFTS_DB_PATH to a persistent path",
-                app.db.path,
-            )
     except Exception:  # noqa: BLE001
         pass
     try:

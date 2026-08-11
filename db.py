@@ -16,12 +16,12 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
-# все известные места, где могла лежать БД до фикса пути
+# старые пути после экспериментов с /data — подтянем, если локальная пустая
 _LEGACY_DB_PATHS: tuple[Path, ...] = (
-    Path("data/gifts.db"),
-    Path("/workspace/data/gifts.db"),
-    Path("/app/data/gifts.db"),
+    Path("/data/gifts.db"),
     Path("/var/lib/neptun/gifts.db"),
+    Path("/app/data/gifts.db"),
+    Path("/workspace/data/gifts.db"),
 )
 
 
@@ -48,7 +48,7 @@ def _copy_db_tree(src: Path, dst: Path) -> None:
 
 
 def migrate_legacy_db(target: Path) -> bool:
-    """Если новая БД пустая — подтянуть самую большую из старых путей."""
+    """Если data/gifts.db пустая — взять самую большую из старых /data и т.п."""
     if _db_bytes(target) > 8192:
         return False
     best: Path | None = None
@@ -80,15 +80,14 @@ def migrate_legacy_db(target: Path) -> bool:
 
 
 def resolve_db_path() -> Path:
-    """Один постоянный путь к gifts.db — переживает редеплой с volume на /data."""
-    env = (os.environ.get("GIFTS_DB_PATH") or "/data/gifts.db").strip()
-    target = Path(env)
+    """Как раньше: ./data/gifts.db (или GIFTS_DB_PATH если задан явно)."""
+    env = (os.environ.get("GIFTS_DB_PATH") or "").strip()
+    target = Path(env) if env else (Path("data") / "gifts.db")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(target.parent, os.W_OK):
-            target = Path("data") / "gifts.db"
     except OSError:
         target = Path("data") / "gifts.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
     migrate_legacy_db(target)
     return target
 
@@ -306,7 +305,11 @@ class GiftDB:
         self._conn.commit()
 
     def upsert_models(self, lots: Iterable[Lot]) -> tuple[int, int]:
-        """Только рост/обогащение: строки не удаляем, пустые поля не затираем."""
+        """Только рост/обогащение каталога gifts: строки не удаляем.
+
+        Выданных продавцов тоже пишем в gifts (счётчик копится), а выдача
+        их отсекает через seen_sellers. В users они не возвращаются.
+        """
         now = time.time()
         inserted = updated = 0
         cur = self._conn.cursor()
@@ -315,9 +318,6 @@ class GiftDB:
                 continue
             seller = (lot.seller or "").strip()
             seller_id = lot.seller_id
-            # выданных продавцов в БД больше никогда не пишем
-            if self.is_seen_seller(username=seller, user_id=seller_id):
-                continue
             mk = _model_key(lot)
             model = _model_name(lot)
             row = cur.execute(
@@ -1050,35 +1050,30 @@ class GiftDB:
     def purge_delivered_seller(
         self, *, username: str = "", user_id: int | None = None
     ) -> tuple[int, int]:
-        """После выдачи: навсегда в seen + удалить юзера и его лоты из БД."""
+        """После выдачи: навсегда в seen + убрать юзера из users.
+
+        Гифты НЕ удаляем — каталог gifts продолжает копиться, а выдача
+        просто не берёт seen_sellers (SQL + is_seen_seller).
+        """
         self.mark_seen_seller(username=username, user_id=user_id)
         u = (username or "").lstrip("@").strip().lower()
         deleted_users = 0
-        deleted_gifts = 0
         if user_id is not None:
             cur = self._conn.execute(
                 "DELETE FROM users WHERE user_id = ?", (int(user_id),)
             )
             deleted_users += int(cur.rowcount or 0)
-            cur = self._conn.execute(
-                "DELETE FROM gifts WHERE seller_id = ?", (int(user_id),)
-            )
-            deleted_gifts += int(cur.rowcount or 0)
         if u:
             cur = self._conn.execute(
                 "DELETE FROM users WHERE lower(username) = ?", (u,)
             )
             deleted_users += int(cur.rowcount or 0)
-            cur = self._conn.execute(
-                "DELETE FROM gifts WHERE lower(seller) = ?", (u,)
-            )
-            deleted_gifts += int(cur.rowcount or 0)
         self._conn.commit()
-        return deleted_users, deleted_gifts
+        return deleted_users, 0
 
     def purge_delivered_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
-        """Пакетно стереть выданных продавцов из users+gifts."""
-        users_n = gifts_n = 0
+        """Пакетно: seen + удалить юзеров. gifts оставляем."""
+        users_n = 0
         seen_local: set[str] = set()
         for lot in lots:
             key = (lot.seller or "").lower() or (
@@ -1087,13 +1082,12 @@ class GiftDB:
             if not key or key in seen_local:
                 continue
             seen_local.add(key)
-            du, dg = self.purge_delivered_seller(
+            du, _dg = self.purge_delivered_seller(
                 username=lot.seller or "",
                 user_id=lot.seller_id,
             )
             users_n += du
-            gifts_n += dg
-        return users_n, gifts_n
+        return users_n, 0
 
     def mark_seen_model(self, model_key: str, title: str = "") -> None:
         mk = (model_key or "").strip()

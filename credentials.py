@@ -6,9 +6,8 @@ BOT_TOKEN = "8966504132:AAGr6lufwEIVMA1XgWT_GtVyZiZdXworBbk"
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 
-# БД на деплое — смонтируй persistent volume на /data
-# или задай GIFTS_DB_PATH=/path/to/gifts.db
-GIFTS_DB_PATH = os.environ.get("GIFTS_DB_PATH", "/data/gifts.db")
+# БД как раньше: ./data/gifts.db (переопределить через GIFTS_DB_PATH)
+GIFTS_DB_PATH = os.environ.get("GIFTS_DB_PATH", "data/gifts.db")
 
 # кто может пользоваться ботом
 OWNER_ID = 741904495

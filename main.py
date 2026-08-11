@@ -1745,26 +1745,23 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
-            # сначала RU+free; если мало типов — ослабляем RU
+            # ТОЛЬКО RU — без фолбэка на иноязычных
             attempts = [
                 (True, True, False, False),
                 (True, True, True, False),
-                (False, True, True, False),
             ]
         elif channel == "old":
             attempts = [
                 (True, True, True, False),
                 (True, False, True, False),
-                (False, False, True, False),
             ]
         else:
-            # фильтры: free DM; тумблеры; RU сначала, потом без RU
+            # фильтры: тоже ТОЛЬКО RU
             keep_extra = True
             attempts = [
                 (True, True, False, keep_extra),
                 (True, True, True, keep_extra),
-                (False, True, True, keep_extra),
-                (False, True, True, False),
+                (True, True, True, False),
             ]
         best: list[Lot] = []
         for want_ru, want_free, ign_seen, extra in attempts:
@@ -1793,7 +1790,9 @@ class App:
                 break
         if best:
             best = best[:target]
-        if best and track_seen and channel in ("parser", "filter"):
+            # железный фильтр: только RU, даже если где-то просочились
+            best = [lot for lot in best if self._is_russian(lot)]
+        if best and track_seen and channel in ("parser", "filter", "old"):
             self._mark_delivered(best, channel=channel)
         return best
 
@@ -2149,9 +2148,9 @@ class App:
             candidates,
             limit=None if by_types else lim,
             apply_extra=bool(apply_extra and channel == "filter"),
-            track_seen=bool(track_seen and channel in ("parser", "filter")),
+            track_seen=bool(track_seen and channel in ("parser", "filter", "old")),
             channel=channel,
-            strict_russian=True if channel in ("parser", "filter") else want_ru,
+            strict_russian=True,
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
@@ -2505,6 +2504,8 @@ class App:
             if channel in ("parser", "old")
             else lots[: creds.SHOW_LIMIT]
         )
+        # только русские — отсекаем residual non-RU перед отправкой
+        batch = [lot for lot in batch if self._is_russian(lot)]
         if not batch:
             return
         # при выдаче — юзер в seen навсегда (не показывать снова);

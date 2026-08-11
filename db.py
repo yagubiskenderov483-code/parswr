@@ -70,55 +70,39 @@ def _same_db(a: Path, b: Path) -> bool:
 
 
 def resolve_db_path() -> Path:
-    """БД не слетает после деплоя.
+    """БД переживает деплой: канон = /data/gifts.db (persistent volume).
 
-    Правило:
-    - если уже есть жирная БД — открываем ИМЕННО её (не прыгаем в пустой /data);
-    - если /data смонтирован как volume и там данные — пишем туда;
-    - оба пустые + /data доступен → /data/gifts.db (под persistent volume);
-    - иначе → ./data/gifts.db.
-    Перед открытием копируем самую большую копию в выбранный путь.
+    - если /data доступен для записи → всегда пишем туда;
+    - при старте переносим самую жирную копию (data/, /app/data, …) в /data;
+    - если /data недоступен → fallback ./data/gifts.db.
+    На хостинге обязательно смонтируй volume на /data.
     """
     local = Path("data") / "gifts.db"
     vol = Path("/data/gifts.db")
     env_raw = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    # пустые/дефолтные значения не считаем явным override
-    env = "" if env_raw in {"", "/data/gifts.db", "/data/gifts.db/", "data/gifts.db"} else env_raw
+    # ./data — локальный fallback; /data/gifts.db — нормальный канон
+    env = "" if env_raw in {"", "data/gifts.db", "./data/gifts.db"} else env_raw
 
     vol_ok = _dir_writable(vol.parent)
-    local_ok = _dir_writable(local.parent)
 
     scored: list[tuple[int, Path]] = []
     seen: set[str] = set()
-    for cand in (
-        ([Path(env)] if env else [])
-        + list(_CANDIDATE_DB_PATHS)
-    ):
+    for cand in ([Path(env)] if env else []) + list(_CANDIDATE_DB_PATHS):
         key = str(cand)
         if key in seen:
             continue
         seen.add(key)
         scored.append((_db_bytes(cand), cand))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_sz, best_path = scored[0] if scored else (0, local)
+    best_sz, best_path = (0, local)
     for sz, p in scored:
         if sz > best_sz:
             best_sz, best_path = sz, p
 
-    vol_sz = _db_bytes(vol) if vol_ok else -1
-    local_sz = _db_bytes(local) if local_ok else -1
-
     if env:
         target = Path(env)
         _dir_writable(target.parent)
-    elif vol_ok and vol_sz > 8192:
-        # volume уже с данными — канон
-        target = vol
-    elif best_sz > 8192:
-        # данные уже где-то есть — НЕ переезжаем в пустой эфемерный /data
-        target = best_path
     elif vol_ok:
-        # свежий деплой: пишем в /data (нужен persistent volume на хосте)
+        # канон для деплоя — volume /data
         target = vol
     else:
         target = local
@@ -129,7 +113,6 @@ def resolve_db_path() -> Path:
         target = local
         target.parent.mkdir(parents=True, exist_ok=True)
 
-    # если выбранный путь беднее самой жирной копии — мигрируем
     target_sz = _db_bytes(target)
     if best_sz > target_sz + 1024 and not _same_db(best_path, target):
         try:
@@ -144,15 +127,15 @@ def resolve_db_path() -> Path:
             logger.warning(
                 "DB migrate failed %s -> %s: %s", best_path, target, exc
             )
-            if best_sz > 8192:
+            if best_sz > 8192 and not vol_ok:
                 target = best_path
 
     logger.info(
-        "DB path=%s · size=%.2fMB · vol=%s local=%s",
+        "DB path=%s · size=%.2fMB · best=%s(%s)",
         target,
         _db_bytes(target) / (1024 * 1024),
-        vol_sz,
-        local_sz,
+        best_path,
+        best_sz,
     )
     return target
 
@@ -1571,6 +1554,40 @@ class GiftDB:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:  # noqa: BLE001
             pass
+        # зеркало: если пишем в /data — копируем и в ./data (и наоборот)
+        try:
+            self._mirror_db()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DB mirror: %s", exc)
+
+    def _mirror_db(self) -> None:
+        """Дублируем файл БД между /data и ./data — меньше шансов потерять после деплоя."""
+        primary = Path(self.path)
+        local = Path("data") / "gifts.db"
+        vol = Path("/data/gifts.db")
+        mirrors: list[Path] = []
+        if _same_db(primary, vol):
+            mirrors.append(local)
+        elif _same_db(primary, local):
+            if _dir_writable(vol.parent):
+                mirrors.append(vol)
+        else:
+            if _dir_writable(vol.parent):
+                mirrors.append(vol)
+            mirrors.append(local)
+        src_sz = _db_bytes(primary)
+        if src_sz <= 0:
+            return
+        for dst in mirrors:
+            if _same_db(primary, dst):
+                continue
+            dst_sz = _db_bytes(dst)
+            if src_sz > dst_sz + 1024:
+                try:
+                    _copy_db_tree(primary, dst)
+                    logger.info("DB mirror %s -> %s (%s bytes)", primary, dst, src_sz)
+                except OSError as exc:
+                    logger.warning("DB mirror failed %s -> %s: %s", primary, dst, exc)
 
     def close(self) -> None:
         try:

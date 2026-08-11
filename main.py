@@ -815,6 +815,8 @@ class App:
         lines.append(f"{o} Старый парс · 24ч")
         farm = "▶️" if (self.afk_running and not self._afk_paused) else "⏹"
         lines.append(f"{farm} БД фарм · юзы+модели")
+        if self.afk_last_error and farm.startswith("⏹"):
+            lines.append(f"⚠️ {_esc(self.afk_last_error[:120])}")
         lines.append("")
         lines.append("БД gifts+users копится непрерывно")
         if self.afk_pages:
@@ -841,6 +843,7 @@ class App:
             f"лотов +{st['lots_new']:,} · NFT {st['unique_titles']:,}"
         )
         lines.append(f"Акков Telethon: <b>{st['accounts']}</b>")
+        lines.append(f"<code>{self.db.path}</code>")
         return "\n".join(lines)
 
     def cycle_speed(self) -> str:
@@ -3655,11 +3658,44 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
     return None
 
 
-async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
+async def _kick_db_farm() -> None:
+    """Подвозобновить тихий фарм, если акк залогинен и парсер свободен."""
+    if not app.logged_in:
+        return
     try:
+        await app.ensure_db_farm()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("kick farm: %s", exc)
+
+
+def _farm_status_line() -> str:
+    if not app.logged_in:
+        return "⏹ БД фарм · нет входа"
+    alive = bool(
+        app.afk_running and app._afk_task and not app._afk_task.done()
+    )
+    if alive and not app._afk_paused:
+        return (
+            f"▶️ БД фарм · стр. {app.afk_pages} · "
+            f"+NFT {app.afk_models_added:,} · +юзов {app.afk_users_added:,}"
+        )
+    if alive and app._afk_paused:
+        return "⏸ БД фарм · пауза (идёт парс)"
+    err = (app.afk_last_error or "").strip()
+    if err:
+        return f"⏹ БД фарм · ошибка: {_esc(err[:80])}"
+    return "⏹ БД фарм · стоп"
+
+
+async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
+    await _kick_db_farm()
+    try:
+        n_acc = len(app.db.list_accounts())
         db_line = (
             f"💾 БД: <b>{app.db.count():,}</b> NFT · "
-            f"<b>{app.db.count_users():,}</b> юзов\n"
+            f"<b>{app.db.count_users():,}</b> юзов · "
+            f"акков <b>{n_acc}</b>\n"
+            f"{_farm_status_line()}\n"
             f"<code>{app.db.path}</code>"
         )
     except Exception:  # noqa: BLE001
@@ -4008,16 +4044,21 @@ async def cb_acc_action(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "menu:daily")
 async def cb_daily(callback: CallbackQuery) -> None:
+    await _kick_db_farm()
     st = app.db.get_daily_stats()
     text = (
         f"{screen('Daily')}\n"
+        f"{_farm_status_line()}\n"
+        f"Акков: <b>{st['accounts']}</b> · "
+        f"вход: {'✅' if app.logged_in else '❌'}\n"
         f"Юзов всего: <b>{st['users_total']:,}</b> · "
         f"сегодня +{st['users_new']:,}\n"
         f"Лотов всего: <b>{st['lots_total']:,}</b> · "
         f"сегодня +{st['lots_new']:,}\n"
         f"Выдано: {st['lots_shown']:,} · NFT {st['unique_titles']:,}\n"
         f"Обход #{app.parse_rounds} · чеков {app.parse_coll_checks} · "
-        f"проверок акка {app.parse_acc_checks}"
+        f"проверок акка {app.parse_acc_checks}\n"
+        f"<code>{app.db.path}</code>"
     )
     await callback.message.edit_text(text, reply_markup=settings_inline())
     await callback.answer()
@@ -4025,14 +4066,19 @@ async def cb_daily(callback: CallbackQuery) -> None:
 
 @router.message(Command("daily"))
 async def cmd_daily(message: Message) -> None:
+    await _kick_db_farm()
     st = app.db.get_daily_stats()
     await message.answer(
         f"{screen('Daily')}\n"
+        f"{_farm_status_line()}\n"
+        f"Акков: <b>{st['accounts']}</b> · "
+        f"вход: {'✅' if app.logged_in else '❌'}\n"
         f"Юзов: <b>{st['users_total']:,}</b> (+{st['users_new']:,})\n"
         f"Лотов: <b>{st['lots_total']:,}</b> (+{st['lots_new']:,})\n"
         f"Выдано {st['lots_shown']:,} · NFT {st['unique_titles']:,}\n"
         f"Обход #{app.parse_rounds} · чеков {app.parse_coll_checks} · "
-        f"проверок акка {app.parse_acc_checks}"
+        f"проверок акка {app.parse_acc_checks}\n"
+        f"<code>{app.db.path}</code>"
     )
 
 

@@ -3656,12 +3656,13 @@ def wipe_disk_junk() -> None:
 
     StringSession в таблице accounts / gifts.db / WAL — НИКОГДА не трогаем.
     """
-    from db import resolve_db_path
+    from db import get_db_path
 
     root = Path(__file__).resolve().parent
     data = root / "data"
     data.mkdir(exist_ok=True)
-    protected = {resolve_db_path().resolve(), (data / "gifts.db").resolve()}
+    dbp = get_db_path()
+    protected = {dbp.resolve(), (data / "gifts.db").resolve()}
     for extra in (Path("/app/data/gifts.db"), Path("/data/gifts.db")):
         try:
             protected.add(extra.resolve())
@@ -3690,7 +3691,7 @@ def wipe_disk_junk() -> None:
                         path.unlink()
                     except OSError:
                         pass
-    logger.info("wipe junk done · DB+sessions protected at %s", resolve_db_path())
+    logger.info("wipe junk done · DB+sessions protected at %s", dbp)
 
 
 def _range_by_id(rid: str) -> tuple[str, int, int] | None:
@@ -4365,6 +4366,12 @@ async def main() -> None:
     router.callback_query.middleware(OwnerOnlyMiddleware())
     dp.include_router(router)
     logger.info("Ready | Neptun Parser · owner-only · multi-acc")
+    try:
+        # Bothost/другой инстанс мог повесить webhook — polling иначе Conflict
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("webhook cleared · polling")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete_webhook: %s", exc)
     try:
         await dp.start_polling(bot)
     finally:

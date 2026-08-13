@@ -77,11 +77,32 @@ def _same_db(a: Path, b: Path) -> bool:
         return str(a) == str(b)
 
 
+def _db_live_score(path: Path) -> int:
+    """Сколько реальных строк (gifts+users+accounts). Пустая схема = 0."""
+    if _db_bytes(path) <= 8192:
+        return 0
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            def _cnt(table: str) -> int:
+                try:
+                    row = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+                    return int(row[0] if row else 0)
+                except sqlite3.Error:
+                    return 0
+
+            return _cnt("gifts") + _cnt("users") + _cnt("accounts") * 100
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
 def resolve_db_path() -> Path:
     """БД переживает деплой Bothost: канон = /app/data/gifts.db.
 
     /data и ./data при git-деплое стираются. /app/data — volume Bothost.
-    При старте переносим самую жирную копию (в т.ч. старый /data) сюда.
+    При старте переносим самую ЖИВУЮ копию (не пустую схему) сюда.
     """
     local = Path("data") / "gifts.db"
     vol = _BOTHOST_DB
@@ -90,18 +111,18 @@ def resolve_db_path() -> Path:
 
     vol_ok = _dir_writable(vol.parent)
 
-    scored: list[tuple[int, Path]] = []
+    scored: list[tuple[int, int, Path]] = []
     seen: set[str] = set()
     for cand in ([Path(env)] if env else []) + list(_CANDIDATE_DB_PATHS):
         key = str(cand)
         if key in seen:
             continue
         seen.add(key)
-        scored.append((_db_bytes(cand), cand))
-    best_sz, best_path = (0, local)
-    for sz, p in scored:
-        if sz > best_sz:
-            best_sz, best_path = sz, p
+        scored.append((_db_live_score(cand), _db_bytes(cand), cand))
+    best_rows, best_sz, best_path = (0, 0, local)
+    for rows, sz, p in scored:
+        if (rows, sz) > (best_rows, best_sz):
+            best_rows, best_sz, best_path = rows, sz, p
 
     if env and env not in _EPHEMERAL_ENV:
         target = Path(env)
@@ -117,28 +138,36 @@ def resolve_db_path() -> Path:
         target = local
         target.parent.mkdir(parents=True, exist_ok=True)
 
+    target_rows = _db_live_score(target)
     target_sz = _db_bytes(target)
-    if best_sz > target_sz + 1024 and not _same_db(best_path, target):
-        try:
-            _copy_db_tree(best_path, target)
-            logger.info(
-                "DB migrated %s -> %s (%s bytes)",
-                best_path,
-                target,
-                best_sz,
-            )
-        except OSError as exc:
-            logger.warning(
-                "DB migrate failed %s -> %s: %s", best_path, target, exc
-            )
-            if best_sz > 8192 and not vol_ok:
-                target = best_path
+    # не затираем живую БД пустой схемой; если цель пустая — тянем лучшую
+    if (best_rows > target_rows) or (
+        best_rows == target_rows and best_sz > target_sz + 1024
+        and not _same_db(best_path, target)
+    ):
+        if not _same_db(best_path, target) and (best_rows > 0 or best_sz > target_sz + 1024):
+            try:
+                _copy_db_tree(best_path, target)
+                logger.info(
+                    "DB migrated %s -> %s (rows=%s bytes=%s)",
+                    best_path,
+                    target,
+                    best_rows,
+                    best_sz,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "DB migrate failed %s -> %s: %s", best_path, target, exc
+                )
+                if best_rows > target_rows and not vol_ok:
+                    target = best_path
 
     logger.info(
-        "DB path=%s · size=%.2fMB · best=%s(%s)",
+        "DB path=%s · size=%.2fMB · best=%s(rows=%s bytes=%s)",
         target,
         _db_bytes(target) / (1024 * 1024),
         best_path,
+        best_rows,
         best_sz,
     )
     return target
@@ -150,7 +179,18 @@ def migrate_legacy_db(target: Path) -> bool:
     return _db_bytes(target) > 8192
 
 
-DB_PATH = resolve_db_path()
+# не резолвим на импорте — иначе создаём пустую схему до миграции
+_RESOLVED_DB_PATH: Path | None = None
+
+
+def get_db_path() -> Path:
+    global _RESOLVED_DB_PATH
+    if _RESOLVED_DB_PATH is None:
+        _RESOLVED_DB_PATH = resolve_db_path()
+    return _RESOLVED_DB_PATH
+
+
+DB_PATH = Path("/app/data/gifts.db")
 
 
 def _model_name(lot: Lot) -> str:
@@ -165,7 +205,7 @@ def _model_key(lot: Lot) -> str:
 
 class GiftDB:
     def __init__(self, path: Path | str | None = None) -> None:
-        self.path = Path(path) if path is not None else resolve_db_path()
+        self.path = Path(path) if path is not None else get_db_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

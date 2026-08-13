@@ -893,13 +893,10 @@ class App:
             return
         for lot in lots:
             tk = self._title_key(lot)
-            self._seen_sellers.add(lot.owner_key)
-            self._filter_seen_sellers.add(lot.owner_key)
-            self._delivered_sellers.add(lot.owner_key)
-            if lot.seller:
-                self._delivered_sellers.add(lot.seller.lower())
-            if lot.seller_id is not None:
-                self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+            ban = self._seller_ban_keys(lot)
+            self._seen_sellers |= ban
+            self._filter_seen_sellers |= ban
+            self._delivered_sellers |= ban
             if tk:
                 self._seen_titles.add(tk)
                 self._recent_titles.append(tk)
@@ -944,21 +941,96 @@ class App:
             pass
         return out
 
+    def _refresh_unique_ban(self) -> int:
+        """Глобальный бан: кто хоть раз выдан (парсер/фильтры/старый) — больше нигде.
+
+        Подтягивает seen_sellers из БД во все in-memory сеты.
+        """
+        loaded = self._load_delivered_sellers()
+        self._delivered_sellers |= loaded
+        self._seen_sellers |= set(self._delivered_sellers)
+        self._filter_seen_sellers |= set(self._delivered_sellers)
+        return len(self._delivered_sellers)
+
+    def _seller_ban_keys(self, lot: Lot) -> set[str]:
+        keys: set[str] = set()
+        if lot.seller:
+            u = lot.seller.lstrip("@").strip().lower()
+            if u:
+                keys.add(u)
+                keys.add(f"u:{u}")
+        if lot.seller_id is not None:
+            keys.add(f"id:{int(lot.seller_id)}")
+        if lot.owner_key:
+            keys.add(lot.owner_key)
+        return keys
+
     def _is_delivered_seller(self, lot: Lot) -> bool:
-        if lot.owner_key in self._delivered_sellers:
-            return True
-        if lot.seller and lot.seller.lower() in self._delivered_sellers:
+        """True = этого TG уже выдавали хоть раз — больше не показывать нигде."""
+        for k in self._seller_ban_keys(lot):
+            if k in self._delivered_sellers:
+                return True
+            if k.startswith("u:") and k[2:] in self._delivered_sellers:
+                return True
+        if lot.seller and lot.seller.lstrip("@").strip().lower() in self._delivered_sellers:
             return True
         if lot.seller_id is not None and (
             f"id:{int(lot.seller_id)}" in self._delivered_sellers
         ):
             return True
         try:
-            return self.db.is_seen_seller(
+            if self.db.is_seen_seller(
+                username=lot.seller or "", user_id=lot.seller_id
+            ):
+                # подтянуть в RAM на будущее
+                self._delivered_sellers |= self._seller_ban_keys(lot)
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _only_never_shown(self, lots: list[Lot]) -> list[Lot]:
+        """Оставить только тех, кого ЭТОТ бот ещё ни разу не выдавал."""
+        out: list[Lot] = []
+        local: set[str] = set()
+        for lot in _dedupe_by_seller(lots):
+            if self._is_delivered_seller(lot):
+                continue
+            keys = self._seller_ban_keys(lot)
+            if keys & local:
+                continue
+            local |= keys
+            out.append(lot)
+        return out
+
+    def _seller_discovery_ts(self, lot: Lot) -> float:
+        """Когда МЫ впервые увидели продавца (users/gifts). Меньше = свежее."""
+        try:
+            ts = self.db.seller_first_seen(
                 username=lot.seller or "", user_id=lot.seller_id
             )
+            if ts:
+                return float(ts)
         except Exception:  # noqa: BLE001
-            return False
+            pass
+        return float(lot.seen_at or 0.0) or time.time()
+
+    def _prefer_fresh_exclusive(self, lots: list[Lot]) -> list[Lot]:
+        """Сначала те, кого наша ферма только что нашла — меньше шанс, что уже ушли в чужие боты."""
+        if not lots:
+            return lots
+        now = time.time()
+        scored: list[tuple[float, Lot]] = []
+        for lot in lots:
+            first = self._seller_discovery_ts(lot)
+            age_h = max(0.0, (now - first) / 3600.0) if first else 999.0
+            # lot.seen_at свежий = только что с маркета
+            lot_age_h = max(0.0, (now - float(lot.seen_at or now)) / 3600.0)
+            # чем свежее — тем выше (меньше score)
+            score = age_h * 2.0 + lot_age_h
+            scored.append((score, lot))
+        scored.sort(key=lambda x: x[0])
+        return [lot for _, lot in scored]
 
     def _reload_persist_seen(self, *, blocklist_only: bool = False) -> None:
         """Подтянуть блоклист (+ опционально seen). Парсер не грузит вечный seen —
@@ -1478,7 +1550,12 @@ class App:
         elif is_filter:
             seen_titles = set(self._filter_recent_titles[-300:])
         if is_old or ignore_seen:
-            seen_sellers: set[str] = set()
+            # ignore_seen / old — не трогаем бан продавцов: выданные TG никогда снова
+            seen_sellers: set[str] = (
+                set(self._delivered_sellers)
+                | set(self._seen_sellers)
+                | set(self._filter_seen_sellers)
+            )
             seen_models: set[str] = set()
             recent_list: list[str] = []
         elif is_filter:
@@ -1745,25 +1822,25 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
-            # ТОЛЬКО RU — без фолбэка на иноязычных
+            # ТОЛЬКО RU · НИКОГДА ignore_seen (иначе те же TG снова)
             attempts = [
-                (True, True, False, False),
-                (True, True, True, False),
+                (True, True, False),
+                (True, True, False),
             ]
         elif channel == "old":
             attempts = [
-                (True, True, True, False),
-                (True, False, True, False),
+                (True, True, False),
+                (True, False, False),
             ]
         else:
-            # фильтры: ТОЛЬКО RU, НИКОГДА ignore_seen (иначе те же TG)
+            # фильтры: ТОЛЬКО RU, НИКОГДА ignore_seen
             keep_extra = True
             attempts = [
-                (True, True, False, keep_extra),
-                (True, True, False, False),
+                (True, True, keep_extra),
+                (True, True, False),
             ]
         best: list[Lot] = []
-        for want_ru, want_free, ign_seen, extra in attempts:
+        for want_ru, want_free, extra in attempts:
             out = self._pick_clean(
                 lots,
                 limit=target if channel == "filter" else (None if channel == "parser" else limit),
@@ -1772,7 +1849,7 @@ class App:
                 channel=channel,
                 require_russian=want_ru,
                 require_free_dm=want_free,
-                ignore_seen=ign_seen,
+                ignore_seen=False,
                 strict_free_dm=(
                     bool(self.filters.strict_free)
                     if channel == "filter"
@@ -1791,9 +1868,11 @@ class App:
             best = best[:target]
             # железный фильтр: только RU, даже если где-то просочились
             best = [lot for lot in best if self._is_russian(lot)]
-            best = _dedupe_by_seller(best)
-        if best and track_seen and channel in ("parser", "filter", "old"):
-            self._mark_delivered(best, channel=channel)
+            # глобально уникальные: ни парсер, ни фильтры, ни старый ещё не выдавали
+            best = self._only_never_shown(best)
+            # свежие открытия нашей БД — выше шанс, что другие боты ещё не успели
+            best = self._prefer_fresh_exclusive(best)
+        # mark только при реальной отправке в _say_lot_list_to (иначе say отфильтрует)
         return best
 
     async def _prepare_show(
@@ -2168,9 +2247,9 @@ class App:
         # каждый поиск — новые типы; выданные юзы навсегда (из БД)
         self._filter_recent_titles.clear()
         self._filter_seen_models.clear()
-        self._delivered_sellers |= self._load_delivered_sellers()
+        banned = self._refresh_unique_ban()
         self._filter_seen_sellers = set(self._delivered_sellers)
-        self._seen_sellers |= set(self._delivered_sellers)
+        logger.info("filter unique-ban: %s sellers", banned)
         try:
             db_n = 0
             try:
@@ -2307,12 +2386,10 @@ class App:
                 return _dedupe_by_seller(out)
 
             def _finalize(cands: list[Lot]) -> list[Lot]:
-                """Строго: RU + не выданные + 1 лот на TG."""
+                """Строго: RU + никогда не выдавались + 1 лот на TG · свежие первыми."""
                 clean: list[Lot] = []
-                for lot in _dedupe_by_seller(cands):
+                for lot in self._prefer_fresh_exclusive(self._only_never_shown(cands)):
                     if not self._is_russian(lot):
-                        continue
-                    if self._is_delivered_seller(lot):
                         continue
                     if lot.free_dm is False:
                         continue
@@ -2420,7 +2497,7 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> / {target_n} · "
-                f"из БД {db_n} · без повторов TG",
+                f"из БД {db_n} · только новые TG (ещё не выдавали)",
                 reply_markup=filters_inline(),
             )
         finally:
@@ -2441,6 +2518,8 @@ class App:
             return
         self.old_parse_running = True
         await self.pause_db_farm()
+        banned = self._refresh_unique_ban()
+        logger.info("old unique-ban: %s sellers", banned)
         mn, mx = self.min_stars, self.max_stars
         label = self.range_label
         try:
@@ -2534,17 +2613,15 @@ class App:
     async def _say_lot_list_to(
         self, chat_id: int, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
-        """Выдача СПИСКОМ. channel=parser|filter — раздельный учёт."""
+        """Выдача СПИСКОМ. channel=parser|filter|old — общий бан выданных TG."""
         batch = (
             lots
             if channel in ("parser", "old")
             else lots[: creds.SHOW_LIMIT]
         )
-        # только русские — отсекаем residual non-RU перед отправкой
+        # только русские + никогда нигде не выдавались
         batch = [lot for lot in batch if self._is_russian(lot)]
-        batch = _dedupe_by_seller(batch)
-        # повторно выданных TG не шлём
-        batch = [lot for lot in batch if not self._is_delivered_seller(lot)]
+        batch = self._only_never_shown(batch)
         if not batch:
             return
         # при выдаче — юзер в seen навсегда (не показывать снова);
@@ -3032,6 +3109,8 @@ class App:
         self.parse_checked = 0
         self.parse_ready = 0
         self._last_pool = []
+        banned = self._refresh_unique_ban()
+        logger.info("parser unique-ban: %s sellers", banned)
         # подключаем все акки ДО скана
         try:
             markets = await self._build_parse_markets(force=True)
@@ -3240,6 +3319,8 @@ class App:
 
     async def _again_loop(self) -> None:
         try:
+            banned = self._refresh_unique_ban()
+            logger.info("again unique-ban: %s sellers", banned)
             await self._edit_status(f"{screen('Парсинг')}\nЗаново · рандом…")
             shown: list[Lot] = []
             for attempt in range(2):

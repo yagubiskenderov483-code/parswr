@@ -1231,6 +1231,52 @@ class GiftDB:
         ).fetchone()
         return row is not None
 
+    def seller_first_seen(
+        self, *, username: str = "", user_id: int | None = None
+    ) -> float | None:
+        """Когда наша БД впервые увидела продавца (users → gifts). None = неизвестно."""
+        u = (username or "").lstrip("@").strip().lower()
+        uid: int | None
+        try:
+            uid = int(user_id) if user_id is not None else None
+        except (TypeError, ValueError):
+            uid = None
+        if uid is not None:
+            row = self._conn.execute(
+                "SELECT first_seen FROM users WHERE user_id = ? LIMIT 1", (uid,)
+            ).fetchone()
+            if row and row["first_seen"]:
+                return float(row["first_seen"])
+        if u:
+            row = self._conn.execute(
+                """
+                SELECT first_seen FROM users
+                WHERE lower(username) = ? ORDER BY first_seen ASC LIMIT 1
+                """,
+                (u,),
+            ).fetchone()
+            if row and row["first_seen"]:
+                return float(row["first_seen"])
+            row = self._conn.execute(
+                """
+                SELECT MIN(first_seen) AS fs FROM gifts
+                WHERE lower(seller) = ?
+                """,
+                (u,),
+            ).fetchone()
+            if row and row["fs"]:
+                return float(row["fs"])
+        if uid is not None:
+            row = self._conn.execute(
+                """
+                SELECT MIN(first_seen) AS fs FROM gifts WHERE seller_id = ?
+                """,
+                (uid,),
+            ).fetchone()
+            if row and row["fs"]:
+                return float(row["fs"])
+        return None
+
     def is_seen_model(self, model_key: str) -> bool:
         mk = (model_key or "").strip()
         if not mk:

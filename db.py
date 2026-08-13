@@ -18,6 +18,8 @@ USER_CAP = 5_000_000
 
 # Bothost volume = /app/data. /data — эфемерный, туда НЕ пишем.
 _BOTHOST_DB = Path("/app/data/gifts.db")
+_BOTHOST_DIR = Path("/app/data")
+_DELIVERED_SIDECAR = _BOTHOST_DIR / "delivered_sellers.txt"
 _CANDIDATE_DB_PATHS: tuple[Path, ...] = (
     _BOTHOST_DB,
     Path("/data/gifts.db"),
@@ -103,17 +105,37 @@ def resolve_db_path() -> Path:
 
     /data и ./data при git-деплое стираются. /app/data — volume Bothost.
     При старте переносим самую ЖИВУЮ копию (не пустую схему) сюда.
+    Всегда стараемся писать именно в /app/data.
     """
     local = Path("data") / "gifts.db"
     vol = _BOTHOST_DB
+    # форсируем env на volume — иначе Bothost/старый env пишут в /data и теряют всё
     env_raw = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    env = "" if env_raw in _EPHEMERAL_ENV else env_raw
+    if env_raw in _EPHEMERAL_ENV or not env_raw:
+        os.environ["GIFTS_DB_PATH"] = str(vol)
+        env = str(vol)
+    else:
+        env = env_raw
+        # если явно указали эфемерный путь — всё равно volume
+        if Path(env) in (Path("/data/gifts.db"), local) or str(env).startswith("/data/"):
+            os.environ["GIFTS_DB_PATH"] = str(vol)
+            env = str(vol)
 
     vol_ok = _dir_writable(vol.parent)
+    if not vol_ok:
+        # пробуем создать /app/data жёстко
+        try:
+            vol.parent.mkdir(parents=True, exist_ok=True)
+            probe = vol.parent / ".neptun_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            vol_ok = True
+        except OSError as exc:
+            logger.error(" /app/data NOT writable: %s — БД будет эфемерной!", exc)
 
     scored: list[tuple[int, int, Path]] = []
     seen: set[str] = set()
-    for cand in ([Path(env)] if env else []) + list(_CANDIDATE_DB_PATHS):
+    for cand in ([Path(env)] if env else []) + list(_CANDIDATE_DB_PATHS) + [local]:
         key = str(cand)
         if key in seen:
             continue
@@ -124,13 +146,15 @@ def resolve_db_path() -> Path:
         if (rows, sz) > (best_rows, best_sz):
             best_rows, best_sz, best_path = rows, sz, p
 
-    if env and env not in _EPHEMERAL_ENV:
+    # канон — всегда volume, если пишется
+    if vol_ok:
+        target = vol
+    elif env and env not in _EPHEMERAL_ENV:
         target = Path(env)
         _dir_writable(target.parent)
-    elif vol_ok:
-        target = vol
     else:
         target = local
+        logger.warning("DB fallback to %s (volume unavailable)", target)
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -163,12 +187,13 @@ def resolve_db_path() -> Path:
                     target = best_path
 
     logger.info(
-        "DB path=%s · size=%.2fMB · best=%s(rows=%s bytes=%s)",
+        "DB path=%s · size=%.2fMB · best=%s(rows=%s bytes=%s) · vol_ok=%s",
         target,
         _db_bytes(target) / (1024 * 1024),
         best_path,
         best_rows,
         best_sz,
+        vol_ok,
     )
     return target
 
@@ -210,19 +235,28 @@ class GiftDB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # FULL — иначе при рестарте Bothost WAL может не доехать, gifts «пропадают»
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init()
+        self._upserts_since_flush = 0
         try:
             size_mb = self.path.stat().st_size / (1024 * 1024) if self.path.exists() else 0.0
         except OSError:
             size_mb = 0.0
         logger.info(
-            "DB open · path=%s · size=%.2fMB · gifts=%s · users=%s",
+            "DB open · path=%s · size=%.2fMB · gifts=%s · users=%s · seen=%s",
             self.path,
             size_mb,
             self.count(),
             self.count_users(),
+            self.count_seen_sellers(),
         )
+        # подтянуть sidecar-бан (если SQLite когда-то обнулили)
+        try:
+            self._import_delivered_sidecar()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sidecar import: %s", exc)
 
     def _init(self) -> None:
         self._conn.execute(
@@ -495,6 +529,11 @@ class GiftDB:
                 )
                 updated += 1
         self._conn.commit()
+        self._upserts_since_flush += inserted + updated
+        # часто сливаем на диск — Bothost убивает процесс без graceful stop
+        if self._upserts_since_flush >= 25 or inserted > 0:
+            self.durable_flush()
+            self._upserts_since_flush = 0
         return inserted, updated
 
     def upsert_lots(self, lots: Iterable[Lot]) -> tuple[int, int]:
@@ -584,6 +623,11 @@ class GiftDB:
                 )
                 updated += 1
         self._conn.commit()
+        if inserted > 0:
+            try:
+                self.durable_flush()
+            except Exception:  # noqa: BLE001
+                pass
         return inserted, updated, total
 
     def upsert_users_from_lots(
@@ -662,7 +706,7 @@ class GiftDB:
         few_gifts: bool = False,
         max_gifts: int = 5,
         low_level: bool = False,
-        max_level: int = 5,
+        max_level: int = 2,
         with_bio: bool = False,
         exclude_seen: bool = True,
     ) -> tuple[str, list[Any]]:
@@ -690,8 +734,9 @@ class GiftDB:
             )
             params.append(int(max_gifts))
         if low_level:
+            # мелкий lvl: только известный уровень ≤ max (по умолчанию 2)
             parts.append(
-                "(u.account_level IS NULL OR u.account_level <= ?)"
+                "(u.account_level IS NOT NULL AND u.account_level <= ?)"
             )
             params.append(int(max_level))
         if with_bio:
@@ -801,7 +846,7 @@ class GiftDB:
         few_gifts: bool = False,
         max_gifts: int = 5,
         low_level: bool = False,
-        max_level: int = 5,
+        max_level: int = 2,
         with_bio: bool = False,
         exclude_seen: bool = True,
     ) -> list[Lot]:
@@ -1146,6 +1191,97 @@ class GiftDB:
                 (key, u, uid, now, now),
             )
         self._conn.commit()
+        # дубль на диск — переживает wipe SQLite
+        try:
+            self._append_delivered_sidecar(keys)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sidecar append: %s", exc)
+
+    def count_seen_sellers(self) -> int:
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM seen_sellers"
+            ).fetchone()
+            return int(row["c"] if row else 0)
+        except sqlite3.Error:
+            return 0
+
+    def _sidecar_paths(self) -> list[Path]:
+        paths = [
+            _DELIVERED_SIDECAR,
+            Path("data") / "delivered_sellers.txt",
+            self.path.parent / "delivered_sellers.txt",
+        ]
+        out: list[Path] = []
+        seen: set[str] = set()
+        for p in paths:
+            k = str(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(p)
+        return out
+
+    def _append_delivered_sidecar(self, keys: Iterable[str]) -> None:
+        lines = [f"{k}\n" for k in keys if k]
+        if not lines:
+            return
+        for path in self._sidecar_paths():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.writelines(lines)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError as exc:
+                logger.warning("sidecar write %s: %s", path, exc)
+
+    def _import_delivered_sidecar(self) -> int:
+        """Если seen_sellers пустее sidecar — доливаем ключи в SQLite."""
+        keys: set[str] = set()
+        for path in self._sidecar_paths():
+            if not path.exists():
+                continue
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    k = line.strip().lower()
+                    if k:
+                        keys.add(k)
+            except OSError:
+                continue
+        if not keys:
+            return 0
+        now = time.time()
+        added = 0
+        for key in keys:
+            u = key[2:] if key.startswith("u:") else (
+                "" if key.startswith("id:") else key.lstrip("@")
+            )
+            uid = None
+            if key.startswith("id:"):
+                try:
+                    uid = int(key[3:])
+                except ValueError:
+                    uid = None
+            norm = key if key.startswith(("u:", "id:")) else (
+                f"u:{u}" if u else key
+            )
+            try:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO seen_sellers (key, username, user_id, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    (norm, u, uid, now, now),
+                )
+                added += int(cur.rowcount or 0)
+            except sqlite3.Error:
+                continue
+        if added:
+            self._conn.commit()
+            logger.info("sidecar restored %s seen_sellers keys", added)
+        return added
 
     def purge_delivered_seller(
         self, *, username: str = "", user_id: int | None = None
@@ -1187,6 +1323,11 @@ class GiftDB:
                 user_id=lot.seller_id,
             )
             users_n += du
+        self._conn.commit()
+        try:
+            self.durable_flush()
+        except Exception:  # noqa: BLE001
+            pass
         return users_n, 0
 
     def mark_seen_model(self, model_key: str, title: str = "") -> None:
@@ -1639,18 +1780,25 @@ class GiftDB:
 
     def checkpoint(self) -> None:
         """Слить WAL на диск — чтобы БД переживала рестарт/деплой."""
+        self.durable_flush()
+
+    def durable_flush(self) -> None:
+        """commit + WAL checkpoint + зеркала в /app/data и ./data."""
         try:
             self._conn.commit()
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("PRAGMA wal_checkpoint(FULL)")
         except Exception:  # noqa: BLE001
-            pass
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._mirror_db()
         except Exception as exc:  # noqa: BLE001
             logger.warning("DB mirror: %s", exc)
 
     def _mirror_db(self) -> None:
-        """Дублируем БД в /app/data (Bothost volume). /data не трогаем — он эфемерный."""
+        """Дублируем БД в /app/data (Bothost volume) и ./data."""
         primary = Path(self.path)
         local = Path("data") / "gifts.db"
         vol = _BOTHOST_DB
@@ -1658,13 +1806,24 @@ class GiftDB:
         if not _same_db(primary, vol) and _dir_writable(vol.parent):
             mirrors.append(vol)
         if not _same_db(primary, local):
-            mirrors.append(local)
+            try:
+                local.parent.mkdir(parents=True, exist_ok=True)
+                mirrors.append(local)
+            except OSError:
+                pass
         src_sz = _db_bytes(primary)
         if src_sz <= 0:
             return
+        # fsync основного файла
+        try:
+            with open(primary, "rb") as fh:
+                os.fsync(fh.fileno())
+        except OSError:
+            pass
         for dst in mirrors:
             dst_sz = _db_bytes(dst)
-            if src_sz > dst_sz + 1024:
+            # всегда обновляем зеркало если primary новее/больше
+            if src_sz >= dst_sz:
                 try:
                     _copy_db_tree(primary, dst)
                     logger.info("DB mirror %s -> %s (%s bytes)", primary, dst, src_sz)
@@ -1673,7 +1832,7 @@ class GiftDB:
 
     def close(self) -> None:
         try:
-            self.checkpoint()
+            self.durable_flush()
             self._conn.close()
         except Exception:  # noqa: BLE001
             pass

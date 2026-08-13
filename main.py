@@ -149,7 +149,7 @@ class SearchFilters:
     """Фильтры выдачи / поиска по БД+лайву."""
 
     few_gifts: bool = False  # мало гифтов у акка (<=5)
-    low_level: bool = False  # мелкий lvl (<=5)
+    low_level: bool = False  # мелкий lvl (<=2)
     short_username: bool = False  # короткий юз 6–8 (4–5 всегда бан)
     long_username: bool = False  # длинный юз (9+)
     no_premium: bool = False  # без TGP
@@ -162,7 +162,7 @@ class SearchFilters:
     no_digits_user: bool = False  # юз без цифр
     strict_free: bool = False  # только free_dm=True (не unknown)
     max_gifts: int = 5
-    max_level: int = 5
+    max_level: int = 2  # мелкий lvl: максимум 2
     short_user_max: int = 8
     long_user_min: int = 9
     # активный рандом-микс (выставляется на запуск поиска)
@@ -909,6 +909,7 @@ class App:
                     pass
         try:
             self.db.purge_delivered_lots(lots)
+            self.db.durable_flush()
         except Exception as exc:  # noqa: BLE001
             logger.warning("purge delivered: %s", exc)
             for lot in lots:
@@ -918,6 +919,10 @@ class App:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+            try:
+                self.db.durable_flush()
+            except Exception:  # noqa: BLE001
+                pass
         self.db_total = self.db.count()
         if len(self._recent_titles) > 400:
             del self._recent_titles[:-400]
@@ -925,7 +930,7 @@ class App:
             del self._filter_recent_titles[:-400]
 
     def _load_delivered_sellers(self) -> set[str]:
-        """Ключи юзов, которых уже выдавали (из БД seen)."""
+        """Ключи юзов, которых уже выдавали (из БД seen + sidecar на диске)."""
         out: set[str] = set()
         try:
             for k in self.db.load_seen_seller_keys():
@@ -937,6 +942,23 @@ class App:
                     out.add(k)
                 else:
                     out.add(str(k).lower().lstrip("@"))
+        except Exception:  # noqa: BLE001
+            pass
+        # sidecar — если SQLite обнулили при деплое
+        try:
+            for path in self.db._sidecar_paths():
+                if not path.exists():
+                    continue
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    k = line.strip().lower()
+                    if not k:
+                        continue
+                    if k.startswith("u:"):
+                        out.add(k[2:])
+                    elif k.startswith("id:"):
+                        out.add(k)
+                    else:
+                        out.add(k.lstrip("@"))
         except Exception:  # noqa: BLE001
             pass
         return out
@@ -1466,7 +1488,8 @@ class App:
             if lot.gifts_count is not None and lot.gifts_count > f.max_gifts:
                 return False
         if f.low_level:
-            if lot.account_level is not None and lot.account_level > f.max_level:
+            # только подтверждённый мелкий lvl ≤ max (2)
+            if lot.account_level is None or lot.account_level > f.max_level:
                 return False
         if f.short_username:
             n = len(lot.seller or "")
@@ -1996,8 +2019,8 @@ class App:
                     ):
                         continue
                     if self.filters.low_level and (
-                        lot.account_level is not None
-                        and lot.account_level > self.filters.max_level
+                        lot.account_level is None
+                        or lot.account_level > self.filters.max_level
                     ):
                         continue
                     if self.filters.fresh_only:
@@ -3600,7 +3623,7 @@ def filters_inline() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅" if f.low_level else "⬜️") + " Мелкий lvl",
+                    text=("✅" if f.low_level else "⬜️") + f" Мелкий lvl≤{f.max_level}",
                     callback_data="flt:lvl",
                 )
             ],
@@ -4473,16 +4496,17 @@ async def main() -> None:
         u_n = app.db.count_users()
         a_n = len(app.db.list_accounts())
         logger.info(
-            "startup · DB=%s · gifts=%s · users=%s · accounts=%s",
+            "startup · DB=%s · gifts=%s · users=%s · accounts=%s · seen=%s",
             app.db.path,
             g_n,
             u_n,
             a_n,
+            app.db.count_seen_sellers(),
         )
         if g_n < 10 and u_n < 10:
             logger.warning(
                 "DB almost empty at %s — Bothost keeps data only in /app/data "
-                "(GIFTS_DB_PATH=/app/data/gifts.db)",
+                "(GIFTS_DB_PATH=/app/data/gifts.db). Enable volume /app/data!",
                 app.db.path,
             )
     except Exception:  # noqa: BLE001

@@ -9,8 +9,10 @@ API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 # Bothost: персистентный volume ТОЛЬКО /app/data (не /data — он стирается)
 _BOTHOST_DB = "/app/data/gifts.db"
 _raw = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-if _raw in {"", "/data/gifts.db", "/data/gifts.db/", "data/gifts.db", "./data/gifts.db"}:
+if _raw in {"", "/data/gifts.db", "/data/gifts.db/", "data/gifts.db", "./data/gifts.db"} or _raw.startswith("/data/"):
     os.environ["GIFTS_DB_PATH"] = _BOTHOST_DB
+# всегда канон volume
+os.environ["GIFTS_DB_PATH"] = _BOTHOST_DB
 GIFTS_DB_PATH = os.environ["GIFTS_DB_PATH"]
 
 # кто может пользоваться ботом

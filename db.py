@@ -664,9 +664,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = False,
+        exclude_seen: bool = True,
     ) -> tuple[str, list[Any]]:
-        """SQL-условия по тумблерам. exclude_seen — только если явно включён."""
+        """SQL-условия по тумблерам. exclude_seen=True — не тянем уже выданных."""
         seller = self._seller_sql()
         parts: list[str] = []
         params: list[Any] = []
@@ -803,9 +803,9 @@ class GiftDB:
         low_level: bool = False,
         max_level: int = 5,
         with_bio: bool = False,
-        exclude_seen: bool = False,
+        exclude_seen: bool = True,
     ) -> list[Lot]:
-        """Пул под фильтры. seen режем в Python через exclude_sellers; gifts не чистим."""
+        """Пул под фильтры. seen_sellers режем в SQL; gifts не чистим."""
         excl_s = {str(x).lower() for x in (exclude_sellers or set()) if x}
         excl_t = {str(x).lower() for x in (exclude_titles or set()) if x}
         half = max(200, int(limit) // 2)

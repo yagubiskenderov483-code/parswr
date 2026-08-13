@@ -1756,12 +1756,11 @@ class App:
                 (True, False, True, False),
             ]
         else:
-            # фильтры: тоже ТОЛЬКО RU
+            # фильтры: ТОЛЬКО RU, НИКОГДА ignore_seen (иначе те же TG)
             keep_extra = True
             attempts = [
                 (True, True, False, keep_extra),
-                (True, True, True, keep_extra),
-                (True, True, True, False),
+                (True, True, False, False),
             ]
         best: list[Lot] = []
         for want_ru, want_free, ign_seen, extra in attempts:
@@ -1792,6 +1791,7 @@ class App:
             best = best[:target]
             # железный фильтр: только RU, даже если где-то просочились
             best = [lot for lot in best if self._is_russian(lot)]
+            best = _dedupe_by_seller(best)
         if best and track_seen and channel in ("parser", "filter", "old"):
             self._mark_delivered(best, channel=channel)
         return best
@@ -2231,7 +2231,7 @@ class App:
                         low_level=bool(f.low_level),
                         max_level=int(f.max_level),
                         with_bio=bool(f.with_bio),
-                        exclude_seen=False,
+                        exclude_seen=True,
                     )
                 except Exception:  # noqa: BLE001
                     return self.db.fetch_random_lots(
@@ -2268,10 +2268,49 @@ class App:
             ) -> list[Lot]:
                 have_t = {self._title_key(x) for x in base}
                 have_o = {x.owner_key for x in base}
+                for x in base:
+                    if x.seller:
+                        have_o.add(x.seller.lstrip("@").strip().lower())
+                    if x.seller_id is not None:
+                        have_o.add(f"id:{int(x.seller_id)}")
                 out = list(base)
                 for lot in more:
                     tk = self._title_key(lot)
-                    if tk in have_t or lot.owner_key in have_o:
+                    if tk in have_t:
+                        continue
+                    sk = lot.owner_key
+                    sid = (
+                        f"id:{int(lot.seller_id)}"
+                        if lot.seller_id is not None
+                        else ""
+                    )
+                    su = (lot.seller or "").lstrip("@").strip().lower()
+                    if sk in have_o or (sid and sid in have_o) or (su and su in have_o):
+                        continue
+                    if self._is_delivered_seller(lot):
+                        continue
+                    if lot.free_dm is False:
+                        continue
+                    if not self._is_russian(lot):
+                        continue
+                    if self._filters_active() and not self._passes_extra_filters(lot):
+                        continue
+                    out.append(lot)
+                    have_t.add(tk)
+                    have_o.add(sk)
+                    if sid:
+                        have_o.add(sid)
+                    if su:
+                        have_o.add(su)
+                    if len(out) >= cap:
+                        break
+                return _dedupe_by_seller(out)
+
+            def _finalize(cands: list[Lot]) -> list[Lot]:
+                """Строго: RU + не выданные + 1 лот на TG."""
+                clean: list[Lot] = []
+                for lot in _dedupe_by_seller(cands):
+                    if not self._is_russian(lot):
                         continue
                     if self._is_delivered_seller(lot):
                         continue
@@ -2279,12 +2318,10 @@ class App:
                         continue
                     if self._filters_active() and not self._passes_extra_filters(lot):
                         continue
-                    out.append(lot)
-                    have_t.add(tk)
-                    have_o.add(lot.owner_key)
-                    if len(out) >= cap:
+                    clean.append(lot)
+                    if len(clean) >= target_n:
                         break
-                return out
+                return clean
 
             # 1) БД пустая/маленькая — сразу live burst (копим + выдаём типы)
             #    иначе сначала БД (быстро при большом каталоге)
@@ -2329,6 +2366,7 @@ class App:
                     need_full=True,
                     channel="filter",
                 )
+            shown = _finalize(shown)
 
             # 2) мало — live + ещё рандом из БД
             if len(shown) < target_n:
@@ -2349,16 +2387,14 @@ class App:
                     need_full=True,
                     channel="filter",
                 )
-                shown = _merge_unique(shown, more, cap=target_n)
+                shown = _finalize(_merge_unique(shown, more, cap=target_n))
 
-            # 3) всё ещё мало — без spice + мягкий проход без extra-тумблеров
+            # 3) всё ещё мало — без spice, НЕ сбрасываем seen (иначе те же TG)
             if len(shown) < 20:
                 f.spice_no_model = False
                 f.spice_mid_user = False
                 f.spice_has_bio = False
                 f.spice_low_stars = False
-                self._filter_seen_sellers = set(self._delivered_sellers)
-                self._filter_seen_models.clear()
                 old3 = _db_pool()
                 more = await self._prepare_show(
                     old3,
@@ -2368,8 +2404,9 @@ class App:
                     need_full=True,
                     channel="filter",
                 )
-                shown = _merge_unique(shown, more, cap=target_n)
+                shown = _finalize(_merge_unique(shown, more, cap=target_n))
 
+            shown = _finalize(shown)[:target_n]
             if not shown:
                 await self._say_to(
                     chat_id,
@@ -2378,13 +2415,12 @@ class App:
                     reply_markup=filters_inline(),
                 )
                 return
-            shown = shown[:target_n]
-            # выдача → сразу purge из БД навсегда
+            # выдача → сразу purge из БД навсегда (повторно не вернётся)
             await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> / {target_n} · "
-                f"из БД {db_n}",
+                f"из БД {db_n} · без повторов TG",
                 reply_markup=filters_inline(),
             )
         finally:
@@ -2506,6 +2542,9 @@ class App:
         )
         # только русские — отсекаем residual non-RU перед отправкой
         batch = [lot for lot in batch if self._is_russian(lot)]
+        batch = _dedupe_by_seller(batch)
+        # повторно выданных TG не шлём
+        batch = [lot for lot in batch if not self._is_delivered_seller(lot)]
         if not batch:
             return
         # при выдаче — юзер в seen навсегда (не показывать снова);
@@ -2521,7 +2560,7 @@ class App:
         lines = [self._format_lot_line(lot) for lot in batch]
         for i in range(0, len(lines), 10):
             await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
-        if channel == "parser":
+        if channel in ("parser", "filter"):
             try:
                 self.db.bump_daily(lots_shown=len(batch))
             except Exception:  # noqa: BLE001
@@ -3336,6 +3375,26 @@ def _dedupe_lots(lots: list[Lot]) -> list[Lot]:
         if lot.id in seen:
             continue
         seen.add(lot.id)
+        out.append(lot)
+    return out
+
+
+def _dedupe_by_seller(lots: list[Lot]) -> list[Lot]:
+    """Один лот на один TG (username или id) — без повторов аккаунтов."""
+    seen: set[str] = set()
+    out: list[Lot] = []
+    for lot in lots:
+        keys: list[str] = []
+        if lot.seller:
+            keys.append(lot.seller.lstrip("@").strip().lower())
+        if lot.seller_id is not None:
+            keys.append(f"id:{int(lot.seller_id)}")
+        if not keys:
+            keys.append(f"lot:{lot.id}")
+        if any(k in seen for k in keys):
+            continue
+        for k in keys:
+            seen.add(k)
         out.append(lot)
     return out
 

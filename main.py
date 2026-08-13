@@ -3662,10 +3662,11 @@ def wipe_disk_junk() -> None:
     data = root / "data"
     data.mkdir(exist_ok=True)
     protected = {resolve_db_path().resolve(), (data / "gifts.db").resolve()}
-    try:
-        protected.add(Path("/data/gifts.db").resolve())
-    except OSError:
-        pass
+    for extra in (Path("/app/data/gifts.db"), Path("/data/gifts.db")):
+        try:
+            protected.add(extra.resolve())
+        except OSError:
+            pass
 
     def _is_protected(path: Path) -> bool:
         try:
@@ -4339,8 +4340,8 @@ async def main() -> None:
         )
         if g_n < 10 and u_n < 10:
             logger.warning(
-                "DB almost empty at %s — mount persistent volume on /data "
-                "so users/gifts survive redeploy (GIFTS_DB_PATH optional)",
+                "DB almost empty at %s — Bothost keeps data only in /app/data "
+                "(GIFTS_DB_PATH=/app/data/gifts.db)",
                 app.db.path,
             )
     except Exception:  # noqa: BLE001

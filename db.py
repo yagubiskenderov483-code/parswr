@@ -16,14 +16,22 @@ logger = logging.getLogger(__name__)
 
 USER_CAP = 5_000_000
 
-# все места, где могла лежать БД — берём самую жирную
+# Bothost volume = /app/data. /data — эфемерный, туда НЕ пишем.
+_BOTHOST_DB = Path("/app/data/gifts.db")
 _CANDIDATE_DB_PATHS: tuple[Path, ...] = (
+    _BOTHOST_DB,
     Path("/data/gifts.db"),
     Path("data") / "gifts.db",
     Path("/var/lib/neptun/gifts.db"),
-    Path("/app/data/gifts.db"),
     Path("/workspace/data/gifts.db"),
 )
+_EPHEMERAL_ENV = {
+    "",
+    "/data/gifts.db",
+    "/data/gifts.db/",
+    "data/gifts.db",
+    "./data/gifts.db",
+}
 
 
 def _db_bytes(path: Path) -> int:
@@ -70,18 +78,15 @@ def _same_db(a: Path, b: Path) -> bool:
 
 
 def resolve_db_path() -> Path:
-    """БД переживает деплой: канон = /data/gifts.db (persistent volume).
+    """БД переживает деплой Bothost: канон = /app/data/gifts.db.
 
-    - если /data доступен для записи → всегда пишем туда;
-    - при старте переносим самую жирную копию (data/, /app/data, …) в /data;
-    - если /data недоступен → fallback ./data/gifts.db.
-    На хостинге обязательно смонтируй volume на /data.
+    /data и ./data при git-деплое стираются. /app/data — volume Bothost.
+    При старте переносим самую жирную копию (в т.ч. старый /data) сюда.
     """
     local = Path("data") / "gifts.db"
-    vol = Path("/data/gifts.db")
+    vol = _BOTHOST_DB
     env_raw = (os.environ.get("GIFTS_DB_PATH") or "").strip()
-    # ./data — локальный fallback; /data/gifts.db — нормальный канон
-    env = "" if env_raw in {"", "data/gifts.db", "./data/gifts.db"} else env_raw
+    env = "" if env_raw in _EPHEMERAL_ENV else env_raw
 
     vol_ok = _dir_writable(vol.parent)
 
@@ -98,11 +103,10 @@ def resolve_db_path() -> Path:
         if sz > best_sz:
             best_sz, best_path = sz, p
 
-    if env:
+    if env and env not in _EPHEMERAL_ENV:
         target = Path(env)
         _dir_writable(target.parent)
     elif vol_ok:
-        # канон для деплоя — volume /data
         target = vol
     else:
         target = local
@@ -1554,33 +1558,25 @@ class GiftDB:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:  # noqa: BLE001
             pass
-        # зеркало: если пишем в /data — копируем и в ./data (и наоборот)
         try:
             self._mirror_db()
         except Exception as exc:  # noqa: BLE001
             logger.warning("DB mirror: %s", exc)
 
     def _mirror_db(self) -> None:
-        """Дублируем файл БД между /data и ./data — меньше шансов потерять после деплоя."""
+        """Дублируем БД в /app/data (Bothost volume). /data не трогаем — он эфемерный."""
         primary = Path(self.path)
         local = Path("data") / "gifts.db"
-        vol = Path("/data/gifts.db")
+        vol = _BOTHOST_DB
         mirrors: list[Path] = []
-        if _same_db(primary, vol):
-            mirrors.append(local)
-        elif _same_db(primary, local):
-            if _dir_writable(vol.parent):
-                mirrors.append(vol)
-        else:
-            if _dir_writable(vol.parent):
-                mirrors.append(vol)
+        if not _same_db(primary, vol) and _dir_writable(vol.parent):
+            mirrors.append(vol)
+        if not _same_db(primary, local):
             mirrors.append(local)
         src_sz = _db_bytes(primary)
         if src_sz <= 0:
             return
         for dst in mirrors:
-            if _same_db(primary, dst):
-                continue
             dst_sz = _db_bytes(dst)
             if src_sz > dst_sz + 1024:
                 try:

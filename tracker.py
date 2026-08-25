@@ -211,6 +211,12 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
     else:
         status = "—"
 
+    lvl = lot.account_level
+    if lvl is not None and lvl >= 0:
+        level_line = f"📶 Level: {lvl}"
+    else:
+        level_line = "📶 Level: —"
+
     return "\n".join(
         [
             "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
@@ -219,7 +225,7 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
             f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
             f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
             f"👤 Продавец: {seller}",
-            "📶 Level: -1",
+            level_line,
             f"📢 Сообщения: {dm}",
             f"🕺 Статус: {status}",
             f'🔗 <a href="{lot.nft_url}">{_esc(lot_slug(lot))}</a>',
@@ -350,13 +356,19 @@ async def poll_once(
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
-    """Дотянуть username продавца и статус ЛС — только для новых лотов."""
+    """Дотянуть username, lvl, статус ЛС — только для новых лотов."""
     for lot in lots:
-        if not lot.seller and lot.seller_id:
+        if not lot.seller and (lot.seller_id or lot.slug):
             try:
                 await m.resolve_owner(lot, timeout=1.5)
             except Exception:  # noqa: BLE001
                 pass
+    try:
+        need_lvl = [lot for lot in lots if lot.seller_id is not None]
+        if need_lvl:
+            await m.enrich_profiles(need_lvl, timeout=2.0, parallel=6)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         await m.check_free_dm(lots, timeout=2.5)
     except Exception:  # noqa: BLE001

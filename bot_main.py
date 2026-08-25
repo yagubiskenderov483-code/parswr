@@ -1203,17 +1203,34 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        """RU: кириллица в имени/био, флаг, или lang_code ru/uk/be."""
+        """Только RU: lang_code ru или кириллица в нике/имени/био."""
         lc = (getattr(lot, "lang_code", "") or "").lower()
-        if lc.startswith(("ru", "uk", "be")):
+        if lc.startswith("ru"):
             return True
-        parts = [lot.first_name or "", lot.last_name or "", lot.about or ""]
+        parts = [
+            lot.seller or "",
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+        ]
         blob = " ".join(p for p in parts if p).strip()
         if not blob:
             return False
-        if "🇷🇺" in blob or "🇺🇦" in blob or "🇧🇾" in blob:
+        if "🇷🇺" in blob:
             return True
         return bool(_CYR_RE.search(blob))
+
+    @staticmethod
+    def _is_free_dm(lot: Lot) -> bool:
+        """Строго бесплатные ЛС — unknown и платные не проходят."""
+        return lot.free_dm is True
+
+    @staticmethod
+    def _has_hidden_profile(lot: Lot) -> bool:
+        """Продавец без @username в листинге — скрытый профиль."""
+        return not (lot.seller or "").strip() and (
+            lot.seller_id is not None or bool(lot.slug)
+        )
 
     def block_seller(self, *, username: str = "", user_id: int | None = None) -> bool:
         ok = self.db.block_user(username=username, user_id=user_id, reason="manual")
@@ -1472,9 +1489,12 @@ class App:
                 continue
             if want_ru and not self._is_russian(lot):
                 continue
-            # платные Stars — мимо; unknown ок
-            if require_free_dm and lot.free_dm is False:
-                continue
+            if require_free_dm:
+                if strict_free_dm or channel == "parser":
+                    if not self._is_free_dm(lot):
+                        continue
+                elif lot.free_dm is False:
+                    continue
             if strict_free_dm and lot.free_dm is not True:
                 continue
             # жёсткие тумблеры фильтров — только точные совпадения
@@ -1536,8 +1556,12 @@ class App:
                 if channel in ("parser", "filter"):
                     if self._title_key(lot) in marked_titles:
                         continue
-                if require_free_dm and lot.free_dm is False:
-                    continue
+                if require_free_dm:
+                    if strict_free_dm or channel == "parser":
+                        if not self._is_free_dm(lot):
+                            continue
+                    elif lot.free_dm is False:
+                        continue
                 if is_filter and (
                     apply_extra or self._filters_active()
                 ) and not self._passes_extra_filters(lot):
@@ -1697,10 +1721,9 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
-            # ТОЛЬКО RU — без фолбэка на иноязычных
+            # ТОЛЬКО RU + строго бесплатные ЛС
             attempts = [
                 (True, True, False, False),
-                (True, True, True, False),
             ]
         elif channel == "old":
             attempts = [
@@ -1728,7 +1751,7 @@ class App:
                 strict_free_dm=(
                     bool(self.filters.strict_free)
                     if channel == "filter"
-                    else False
+                    else True
                 ),
             )
             if channel == "parser" and out:
@@ -1743,6 +1766,8 @@ class App:
             best = best[:target]
             # железный фильтр: только RU, даже если где-то просочились
             best = [lot for lot in best if self._is_russian(lot)]
+            if channel == "parser":
+                best = [lot for lot in best if self._is_free_dm(lot)]
             best = _dedupe_by_seller(best)
         if best and track_seen and channel in ("parser", "filter", "old"):
             self._mark_delivered(best, channel=channel)
@@ -1770,24 +1795,31 @@ class App:
         self._ingest_always(list(lots))
         pre = list(lots)
         random.shuffle(pre)
+        hidden = [lot for lot in pre if not lot.seller]
         with_seller = [lot for lot in pre if lot.seller]
-        without = [lot for lot in pre if not lot.seller]
-        # меньше resolve — больше упор на уже известных продавцов
-        resolve_n = min(
-            len(without),
-            50
-            if by_types
-            else (
-                120
-                if take_all
-                else (max(lim * 8, 200) if channel == "filter" else max(lim * 2, 40))
-            ),
-        )
+        without = hidden
+        owner_timeout = max(float(creds.OWNER_TIMEOUT), 1.0)
+        if channel == "parser":
+            resolve_n = min(len(without), 300)
+            owner_timeout = max(owner_timeout, 1.2)
+        else:
+            resolve_n = min(
+                len(without),
+                50
+                if by_types
+                else (
+                    120
+                    if take_all
+                    else (max(lim * 8, 200) if channel == "filter" else max(lim * 2, 40))
+                ),
+            )
         if resolve_n:
             await self.market.resolve_owners(
                 without[:resolve_n],
-                timeout=creds.OWNER_TIMEOUT,
-                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                timeout=owner_timeout,
+                parallel=max(getattr(creds, "ENRICH_PARALLEL", 8), 12)
+                if channel == "parser"
+                else getattr(creds, "ENRICH_PARALLEL", 8),
             )
             self.parse_acc_checks += resolve_n
             self._ingest_always(without[:resolve_n])
@@ -2029,53 +2061,66 @@ class App:
                         ]
                     )
         elif channel == "parser" and candidates:
-            already_ru = [lot for lot in candidates if self._is_russian(lot)]
-            need_bio = [lot for lot in candidates if not self._is_russian(lot)]
-            # ~100 разных типов уже-RU + добор
-            check_ru = self._sample_diverse_titles(already_ru, 100)
-            if check_ru:
-                await self.market.check_free_dm(
-                    check_ru,
-                    timeout=max(creds.OWNER_TIMEOUT, 1.0),
+            hidden = [lot for lot in candidates if self._has_hidden_profile(lot)]
+            visible = [lot for lot in candidates if lot not in hidden]
+            check_pool = _dedupe_lots(
+                self._sample_diverse_titles(hidden, 180)
+                + self._sample_diverse_titles(visible, 120)
+            )
+            if len(check_pool) < 80:
+                check_pool = _dedupe_lots(
+                    check_pool + self._sample_diverse_titles(candidates, 220)
                 )
-                self.parse_acc_checks += len(check_ru)
+            need_enr = [
+                lot
+                for lot in check_pool
+                if lot.account_level is None
+                or not (lot.first_name or lot.last_name or lot.about)
+            ]
+            if need_enr:
+                await self.market.enrich_profiles(
+                    need_enr,
+                    timeout=min(max(owner_timeout, 0.8), 1.2),
+                    parallel=max(getattr(creds, "ENRICH_PARALLEL", 8), 12),
+                )
+                self.parse_acc_checks += len(need_enr)
+            await self.market.check_free_dm(
+                check_pool,
+                timeout=max(owner_timeout, 1.1),
+            )
+            self.parse_acc_checks += len(check_pool)
+            self._ingest_always(check_pool)
             ready = [
                 lot
-                for lot in check_ru
-                if lot.free_dm is not False and self._is_russian(lot)
+                for lot in check_pool
+                if self._is_free_dm(lot) and self._is_russian(lot)
             ]
             titles_ready = {
                 self._title_key(lot) for lot in ready if self._title_key(lot)
             }
             if len(titles_ready) < 35:
-                wave = self._sample_diverse_titles(
-                    [
-                        lot
-                        for lot in need_bio
-                        if self._title_key(lot) not in titles_ready
-                    ],
-                    120,
-                )
+                left = [
+                    lot
+                    for lot in candidates
+                    if self._title_key(lot) not in titles_ready
+                ]
+                wave = self._sample_diverse_titles(left, 180)
                 if wave:
                     await self.market.enrich_profiles(
                         wave,
-                        timeout=min(max(creds.OWNER_TIMEOUT, 0.7), 1.0),
-                        parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                        timeout=min(max(owner_timeout, 0.8), 1.2),
+                        parallel=max(getattr(creds, "ENRICH_PARALLEL", 8), 12),
                     )
                     await self.market.check_free_dm(
                         wave,
-                        timeout=max(creds.OWNER_TIMEOUT, 1.0),
+                        timeout=max(owner_timeout, 1.1),
                     )
-                    self.parse_acc_checks += len(wave)
+                    self.parse_acc_checks += len(wave) * 2
                     self._ingest_always(wave)
                     for lot in wave:
-                        if lot.free_dm is False:
-                            continue
-                        if self._is_russian(lot):
+                        if self._is_free_dm(lot) and self._is_russian(lot):
                             ready.append(lot)
-            candidates = _dedupe_lots(
-                [lot for lot in ready if lot.free_dm is not False]
-            )
+            candidates = _dedupe_lots(ready)
             self._ingest_always(candidates)
         elif candidates:
             sample_n = min(
@@ -2465,12 +2510,15 @@ class App:
         meta = []
         if lot.gifts_count is not None:
             meta.append(f"gifts {lot.gifts_count}")
-        if lot.account_level is not None:
-            meta.append(f"lvl {lot.account_level}")
+        lvl = lot.account_level
+        if lvl is not None and lvl >= 0:
+            meta.append(f"lvl {lvl}")
         if lot.is_premium is False:
             meta.append("no TGP")
         elif lot.is_premium is True:
             meta.append("TGP")
+        if lot.free_dm is True:
+            meta.append("free")
         extra = f" · {', '.join(meta)}" if meta else ""
         return (
             f'🎁 <a href="{lot.nft_url}">{_esc(nft_name)}</a> | '
@@ -2492,8 +2540,10 @@ class App:
             if channel in ("parser", "old")
             else lots[: creds.SHOW_LIMIT]
         )
-        # только русские — отсекаем residual non-RU перед отправкой
+        # только русские + строго бесплатные ЛС
         batch = [lot for lot in batch if self._is_russian(lot)]
+        if channel == "parser":
+            batch = [lot for lot in batch if self._is_free_dm(lot)]
         batch = _dedupe_by_seller(batch)
         # повторно выданных TG не шлём
         batch = [lot for lot in batch if not self._is_delivered_seller(lot)]

@@ -581,6 +581,34 @@ class TelegramMarket:
 
         await asyncio.gather(*[one(lot) for lot in need])
 
+    async def _resolve_via_full_user(self, lot: Lot, *, timeout: float) -> bool:
+        """Дотянуть юзернейм/имя через GetFullUser — для скрытых профилей."""
+        if not lot.seller_id:
+            return False
+        try:
+            await self._wait_flood()
+            full = await asyncio.wait_for(
+                self.client(GetFullUserRequest(lot.seller_id)),
+                timeout=timeout,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        for u in getattr(full, "users", None) or []:
+            if getattr(u, "id", None) == lot.seller_id:
+                _fill_user(lot, u)
+                break
+        uf = getattr(full, "full_user", None)
+        if uf is not None:
+            about = str(getattr(uf, "about", "") or "")
+            if about and not lot.about:
+                lot.about = about
+            rating = getattr(uf, "stars_rating", None)
+            if rating is not None:
+                level = _normalize_level(getattr(rating, "level", None))
+                if level is not None:
+                    lot.account_level = level
+        return bool(lot.seller)
+
     async def resolve_owner(self, lot: Lot, timeout: float = 0.9) -> None:
         if lot.seller and lot.seller_id is not None:
             return
@@ -601,6 +629,10 @@ class TelegramMarket:
                     return
             except Exception:  # noqa: BLE001
                 pass
+            if await self._resolve_via_full_user(lot, timeout=timeout):
+                if lot.slug and lot.seller:
+                    self._owner_cache[lot.slug] = lot.seller
+                return
         if not lot.slug:
             return
         try:
@@ -610,6 +642,8 @@ class TelegramMarket:
                 timeout=timeout,
             )
         except Exception:  # noqa: BLE001
+            if lot.seller_id and not lot.seller:
+                await self._resolve_via_full_user(lot, timeout=timeout)
             return
         gift = getattr(result, "gift", None)
         users = {
@@ -631,6 +665,22 @@ class TelegramMarket:
             _fill_user(lot, users[seller_id])
             if lot.seller:
                 self._owner_cache[lot.slug] = lot.seller
+                return
+        if seller_id and not lot.seller:
+            try:
+                await self._wait_flood()
+                ent = await asyncio.wait_for(
+                    self.client.get_entity(seller_id), timeout=timeout
+                )
+                _fill_user(lot, ent)
+                if lot.seller:
+                    self._owner_cache[lot.slug] = lot.seller
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            await self._resolve_via_full_user(lot, timeout=timeout)
+            if lot.seller and lot.slug:
+                self._owner_cache[lot.slug] = lot.seller
 
     async def load_abouts(
         self, lots: list[Lot], *, timeout: float = 0.7, parallel: int = 8
@@ -647,7 +697,7 @@ class TelegramMarket:
             if not lot.seller_id:
                 return
             cached = self._profile_cache.get(lot.seller_id)
-            if cached:
+            if cached and not cached.get("_failed"):
                 _apply_profile(lot, cached)
                 return
             async with sem:
@@ -658,7 +708,7 @@ class TelegramMarket:
                         timeout=timeout,
                     )
                 except Exception:  # noqa: BLE001
-                    self._profile_cache[lot.seller_id] = {"about": ""}
+                    # не кэшируем навсегда — скрытый профиль может открыться позже
                     return
                 for u in getattr(full, "users", None) or []:
                     if getattr(u, "id", None) == lot.seller_id:
@@ -679,22 +729,17 @@ class TelegramMarket:
                             gifts = None
                     rating = getattr(uf, "stars_rating", None)
                     if rating is not None:
-                        try:
-                            level = int(getattr(rating, "level", 0))
-                        except (TypeError, ValueError):
-                            level = None
-                    # флаг не выставлен → бесплатно; >0 → платно Stars
+                        level = _normalize_level(getattr(rating, "level", None))
+                    # точный free/paid — через check_free_dm; здесь только явно платные
                     if hasattr(uf, "send_paid_messages_stars"):
                         raw_paid = getattr(uf, "send_paid_messages_stars", None)
-                        if raw_paid is None:
-                            free_dm = True
-                            paid_stars = None
-                        else:
+                        if raw_paid is not None:
                             try:
                                 paid_stars = int(raw_paid)
                             except (TypeError, ValueError):
                                 paid_stars = None
-                            free_dm = paid_stars is None or paid_stars <= 0
+                            if paid_stars is not None and paid_stars > 0:
+                                free_dm = False
                 lot.about = about
                 if level is not None:
                     lot.account_level = level
@@ -1046,6 +1091,16 @@ def _user_online_flag(user: Any) -> bool | None:
     return None
 
 
+def _normalize_level(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return level if level >= 0 else None
+
+
 def _fill_user(lot: Lot, user: Any) -> None:
     username = str(getattr(user, "username", "") or "").lstrip("@").strip()
     if not username:
@@ -1103,7 +1158,7 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
     if info.get("is_premium") is not None:
         lot.is_premium = bool(info["is_premium"])
     if info.get("account_level") is not None:
-        lot.account_level = int(info["account_level"])
+        lot.account_level = _normalize_level(info["account_level"])
     if info.get("gifts_count") is not None:
         lot.gifts_count = int(info["gifts_count"])
     if info.get("free_dm") is not None:

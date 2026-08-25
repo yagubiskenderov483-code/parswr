@@ -24,6 +24,7 @@ lot = Lot(
     seller_id=8266964603,
     is_premium=False,
     free_dm=True,
+    account_level=3,
 )
 
 ts = datetime(2026, 8, 25, 15, 53, 9, tzinfo=timezone(timedelta(hours=3))).timestamp()
@@ -35,7 +36,7 @@ expected = """🎉 <b>НОВЫЙ ЛИСТИНГ</b>
 💲 Цена: <b>800 Stars / 8.16 TON</b>
 🏷 Модель: <b>Long Beach</b>
 👤 Продавец: @stichpermskiy (<code>8266964603</code>)
-📶 Level: -1
+📶 Level: 3
 📢 Сообщения: бесплатно
 🕺 Статус: без Premium
 🔗 <a href="https://t.me/nft/SnoopDogg-264094">SnoopDogg-264094</a>

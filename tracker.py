@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+from telethon.errors import (
+    FloodWaitError,
+    InviteHashExpiredError,
+    UserAlreadyParticipantError,
+)
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
@@ -45,7 +49,9 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAGIoGRUd9Pw8LSIJmx5qRSaqZUn2hx4-sI"
-DEFAULT_TARGET_CHANNEL = "https://t.me/+i-rzZn2WNhMwZmQ1"
+# Инвайты протухают — задавай CHANNEL_ID или TARGET_CHANNEL=@username в env
+DEFAULT_TARGET_CHANNEL = ""
+CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
 
 def data_dir() -> Path:
@@ -300,43 +306,76 @@ class Sender:
             await self._bot.session.close()
 
 
+async def find_channel_in_dialogs(client: TelegramClient) -> int | None:
+    """Канал, где юзербот уже состоит (инвайт мог протухнуть)."""
+    try:
+        async for dlg in client.iter_dialogs():
+            if not getattr(dlg, "is_channel", False):
+                continue
+            name = (dlg.name or "").strip().lower()
+            if not name:
+                continue
+            for hint in CHANNEL_NAME_HINTS:
+                if hint in name:
+                    cid = get_peer_id(dlg.entity)
+                    logger.info(
+                        "Канал из диалогов: «%s» → %s", dlg.name, cid
+                    )
+                    return cid
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("поиск канала в диалогах: %s", exc)
+    return None
+
+
 async def resolve_channel(client: TelegramClient, raw: str) -> int:
-    """@username / -100id / инвайт-ссылка t.me/+hash -> numeric chat id."""
+    """@username / -100id / t.me/name / инвайт t.me/+hash -> numeric chat id."""
     raw = raw.strip()
+    if not raw:
+        found = await find_channel_in_dialogs(client)
+        if found is not None:
+            return found
+        raise SystemExit(
+            "Канал не задан. Укажи CHANNEL_ID=-100… или TARGET_CHANNEL=@username "
+            "в переменных Bothost."
+        )
     if re.fullmatch(r"-?\d+", raw):
         return int(raw)
-    m = re.search(r"(?:t\.me/\+|t\.me/joinchat/|^\+)([A-Za-z0-9_-]+)", raw)
-    if m:
-        invite = m.group(1)
 
-        async def _call(req: Any, label: str) -> Any:
-            for attempt in range(4):
-                try:
-                    return await client(req)
-                except FloodWaitError as exc:
-                    wait = min(int(exc.seconds) + 1, 300)
-                    logger.warning(
-                        "FloodWait %ss на %s (попытка %s/4) — жду",
-                        wait,
-                        label,
-                        attempt + 1,
-                    )
-                    await asyncio.sleep(wait)
-            raise SystemExit(
-                f"FloodWait на {label}: Telegram просит подождать. "
-                "Задай CHANNEL_ID=-100… в env Bothost."
-            )
+    async def _call(req: Any, label: str) -> Any:
+        for attempt in range(4):
+            try:
+                return await client(req)
+            except FloodWaitError as exc:
+                wait = min(int(exc.seconds) + 1, 300)
+                logger.warning(
+                    "FloodWait %ss на %s (попытка %s/4) — жду",
+                    wait,
+                    label,
+                    attempt + 1,
+                )
+                await asyncio.sleep(wait)
+            except InviteHashExpiredError:
+                raise
+        raise SystemExit(
+            f"FloodWait на {label}: Telegram просит подождать. "
+            "Задай CHANNEL_ID=-100… в env Bothost."
+        )
 
-        # Сначала Check — если уже в канале, Import не нужен (меньше FloodWait)
-        info = await _call(CheckChatInviteRequest(invite), "CheckChatInvite")
-        chat = getattr(info, "chat", None)
-        if chat is not None:
-            cid = get_peer_id(chat)
-            logger.info("Канал по инвайту (уже участник): %s", cid)
-            return cid
-
+    m_invite = re.search(
+        r"(?:t\.me/\+|t\.me/joinchat/|^\+)([A-Za-z0-9_-]+)", raw
+    )
+    if m_invite:
+        invite = m_invite.group(1)
         try:
-            updates = await _call(ImportChatInviteRequest(invite), "ImportChatInvite")
+            info = await _call(CheckChatInviteRequest(invite), "CheckChatInvite")
+            chat = getattr(info, "chat", None)
+            if chat is not None:
+                cid = get_peer_id(chat)
+                logger.info("Канал по инвайту (уже участник): %s", cid)
+                return cid
+            updates = await _call(
+                ImportChatInviteRequest(invite), "ImportChatInvite"
+            )
             cid = get_peer_id(updates.chats[0])
             logger.info("Вступил в канал по инвайту: %s", cid)
             return cid
@@ -345,10 +384,30 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
             chat = getattr(info, "chat", None)
             if chat is not None:
                 return get_peer_id(chat)
+        except InviteHashExpiredError:
+            logger.warning("Инвайт-ссылка истекла: %s", raw)
+            found = await find_channel_in_dialogs(client)
+            if found is not None:
+                return found
+            raise SystemExit(
+                "Инвайт-ссылка канала истекла. Задай CHANNEL_ID=-100… "
+                "или TARGET_CHANNEL=@username канала в Bothost."
+            ) from None
         raise SystemExit(
             "Не удалось получить канал по инвайт-ссылке. "
-            "Задай CHANNEL_ID=-100… в env или вступи в канал вручную."
+            "Задай CHANNEL_ID=-100… в env."
         )
+
+    m_user = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})$", raw)
+    handle = raw.lstrip("@")
+    if m_user:
+        handle = m_user.group(1)
+    if handle and not handle.startswith("+"):
+        entity = await client.get_entity(handle)
+        cid = get_peer_id(entity)
+        logger.info("Канал по @%s: %s", handle, cid)
+        return cid
+
     entity = await client.get_entity(raw)
     return get_peer_id(entity)
 
@@ -451,7 +510,7 @@ def filter_for_post(
     return out
 
 
-TRACKER_VERSION = "2.1"
+TRACKER_VERSION = "2.2"
 
 
 def _load_session_from_db() -> str:
@@ -541,7 +600,19 @@ async def run() -> None:
     elif state.get("channel_id"):
         chat_id = int(state["channel_id"])
     else:
-        chat_id = await resolve_channel(client, cfg.target_channel)
+        try:
+            chat_id = await resolve_channel(client, cfg.target_channel)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resolve_channel: %s — ищу в диалогах", exc)
+            found = await find_channel_in_dialogs(client)
+            if found is None:
+                raise SystemExit(
+                    "Не найден канал для постинга. Задай CHANNEL_ID=-100… "
+                    "или TARGET_CHANNEL=@username в Bothost."
+                ) from exc
+            chat_id = found
         state["channel_id"] = chat_id
         save_state(state_path, state)
     logger.info("Канал для постинга: %s", chat_id)

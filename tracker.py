@@ -37,6 +37,17 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
+DEFAULT_BOT_TOKEN = "8807847926:AAEjVPEqkFcX76QXsI6ftnh33OrOQ3knywM"
+DEFAULT_TARGET_CHANNEL = "https://t.me/+i-rzZn2WNhMwZmQ1"
+
+
+def data_dir() -> Path:
+    """Bothost хранит данные в /app/data; локально — рядом со скриптом."""
+    bothost = Path("/app/data")
+    if bothost.is_dir():
+        return bothost
+    return BASE_DIR
+
 
 def _load_dotenv() -> None:
     """Мини-загрузчик .env: переменные окружения имеют приоритет."""
@@ -69,7 +80,8 @@ class Config:
     timeout: float = 6.0
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
-    state_file: str = "tracker_state.json"
+    session_file: str = ""
+    state_file: str = ""
     post_on_first_run: bool = False
 
     @classmethod
@@ -83,15 +95,32 @@ class Config:
         api_id = int(os.environ.get("API_ID", "0") or 0)
         api_hash = os.environ.get("API_HASH", "").strip()
         if not api_id or not api_hash:
-            raise SystemExit("API_ID/API_HASH не заданы — заполни .env")
-        target = os.environ.get("TARGET_CHANNEL", "").strip()
-        if not target:
-            raise SystemExit("TARGET_CHANNEL не задан — укажи канал в .env")
+            try:
+                import credentials as creds
+
+                api_id = api_id or int(getattr(creds, "API_ID", 0) or 0)
+                api_hash = api_hash or str(getattr(creds, "API_HASH", "") or "")
+            except ImportError:
+                pass
+        if not api_id or not api_hash:
+            raise SystemExit("API_ID/API_HASH не заданы — заполни .env или credentials.py")
+
+        dd = data_dir()
+        session_file = os.environ.get(
+            "SESSION_FILE", str(dd / "tracker_session.txt")
+        ).strip()
+        state_file = os.environ.get(
+            "STATE_FILE", str(dd / "tracker_state.json")
+        ).strip()
+        bot_token = os.environ.get("BOT_TOKEN", "").strip() or DEFAULT_BOT_TOKEN
+        target = (
+            os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
+        )
         return cls(
             api_id=api_id,
             api_hash=api_hash,
             session_string=os.environ.get("SESSION_STRING", "").strip(),
-            bot_token=os.environ.get("BOT_TOKEN", "").strip(),
+            bot_token=bot_token,
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 900),
@@ -102,7 +131,8 @@ class Config:
             timeout=_f("REQUEST_TIMEOUT", 6.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
-            state_file=os.environ.get("STATE_FILE", "tracker_state.json"),
+            session_file=session_file,
+            state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
         )
 
@@ -333,26 +363,41 @@ async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
         pass
 
 
+async def _load_session_string(cfg: Config) -> str:
+    if cfg.session_string:
+        return cfg.session_string
+    path = Path(cfg.session_file)
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
+async def _get_client(cfg: Config) -> TelegramClient:
+    session_string = await _load_session_string(cfg)
+    if session_string:
+        client = TelegramClient(
+            StringSession(session_string), cfg.api_id, cfg.api_hash
+        )
+        await client.connect()
+        if await client.is_user_authorized():
+            return client
+        await client.disconnect()
+        logger.warning("Сессия недействительна — нужен повторный вход через бота")
+
+    import session_login
+
+    return await session_login.bot_login_wizard(cfg)
+
+
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
-    if not cfg.session_string:
-        raise SystemExit(
-            "SESSION_STRING пуст. Запусти:  python3 generate_session.py"
-        )
 
-    client = TelegramClient(
-        StringSession(cfg.session_string), cfg.api_id, cfg.api_hash
-    )
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise SystemExit(
-            "Сессия недействительна. Пересоздай: python3 generate_session.py"
-        )
+    client = await _get_client(cfg)
     me = await client.get_me()
     logger.info("Вошёл как %s (id=%s)", me.username or me.first_name, me.id)
 
-    state_path = BASE_DIR / cfg.state_file
+    state_path = Path(cfg.state_file)
     state = load_state(state_path)
     seen: dict[str, float] = state["seen"]
 

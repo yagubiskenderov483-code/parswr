@@ -1136,27 +1136,31 @@ def _int_or_none(val: Any) -> int | None:
 
 
 def _parse_stars_level(rating: Any) -> int | None:
-    """StarsRating.level может быть отрицательным (красный минус в профиле)."""
+    """Только StarsRating.level (может быть <0). Поле stars НЕ трогаем — из‑за него везде был -1."""
     if rating is None:
         return None
-    data = rating if isinstance(rating, dict) else None
-    if data is None:
-        level = None
-        for attr in ("level", "current_level"):
-            level = _int_or_none(getattr(rating, attr, None))
-            if level is not None:
-                break
-        stars_val = _int_or_none(getattr(rating, "stars", None))
-    else:
-        level = None
-        for key in ("level", "current_level"):
-            level = _int_or_none(data.get(key))
-            if level is not None:
-                break
-        stars_val = _int_or_none(data.get("stars"))
-    if stars_val is not None and stars_val < 0 and (level is None or level >= 0):
-        return -1
-    return level
+    keys = ("level", "current_level")
+    if isinstance(rating, dict):
+        for key in keys:
+            n = _int_or_none(rating.get(key))
+            if n is not None and abs(n) < 1000:
+                return n
+        return None
+    for attr in keys:
+        n = _int_or_none(getattr(rating, attr, None))
+        if n is not None and abs(n) < 1000:
+            return n
+    if hasattr(rating, "to_dict"):
+        try:
+            data = rating.to_dict() or {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        if isinstance(data, dict):
+            for key in keys:
+                n = _int_or_none(data.get(key))
+                if n is not None and abs(n) < 1000:
+                    return n
+    return None
 
 
 def _extract_level_gifts(uf: Any) -> tuple[int | None, int | None]:

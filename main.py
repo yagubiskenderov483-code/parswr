@@ -140,30 +140,29 @@ PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r60_100", "60k–100k ⭐", 60000, 100000),
 ]
 
-# Рекламные акки — не показываем
+# Рекламные акки / боты — не показываем
 _AD_RE = re.compile(
     r"("
     r"дарю\s*гифт|дарю\s*gift|дарю\s*подар|раздач|"
     r"бесплатн|free\s*gift|giveaway|акци[яи]|"
     r"пиши\s*в\s*лс|реклам|продам\s*гифт|купл[юу]\s*гифт|"
     r"взаимн|nft\s*drop|airdrop|крипт|казино|заработок|инвест|"
-    r"100%\s*profit|ставки"
+    r"100%\s*profit|ставки|"
+    r"\bbot\b|\bбот\b|@\w*bot|t\.me/\w*bot|"
+    r"телеграм\s*бот|telegram\s*bot|наш\s+бот|через\s+бота"
     r")",
     re.IGNORECASE,
 )
 
-# Русские: кириллица в нике/имени/био/описании (просто и достаточно)
+# Русские: кириллица именно в имени (био/флаг иностранцы ставят сами)
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
 
-# Парсер: мелкий акк. Неизвестные статы = мимо (киты проходили как rate 0).
+# Парсер: мелкий RU-акк, free DM, рейт ≤2, мало гифтов
 PARSER_MAX_LEVEL = 2
 PARSER_MAX_GIFTS = 5
 PARSER_MIN_STARS = 1
 PARSER_MAX_STARS = 2000
-# выдача: обычно 1 лот / 3с, иногда 2 лота за секунду
 DELIVER_SLOW_SEC = 3.0
-DELIVER_FAST_SEC = 0.45
-DELIVER_BURST_P = 0.28
 
 
 @dataclass
@@ -1032,21 +1031,25 @@ class App:
         return out
 
     def _is_delivered_seller(self, lot: Lot) -> bool:
-        if lot.owner_key in self._delivered_sellers or lot.owner_key in self._sent_sellers:
+        sent = getattr(self, "_sent_sellers", set())
+        if lot.owner_key in self._delivered_sellers or lot.owner_key in sent:
             return True
-        if lot.seller and (
-            lot.seller.lower() in self._delivered_sellers
-            or lot.seller.lower() in self._sent_sellers
+        u = (lot.seller or "").lstrip("@").strip().lower()
+        if u and (
+            u in self._delivered_sellers
+            or u in sent
+            or f"u:{u}" in self._delivered_sellers
+            or f"u:{u}" in sent
         ):
             return True
         if lot.seller_id is not None and (
             f"id:{int(lot.seller_id)}" in self._delivered_sellers
-            or f"id:{int(lot.seller_id)}" in self._sent_sellers
+            or f"id:{int(lot.seller_id)}" in sent
         ):
             return True
         try:
             return self.db.is_seen_seller(
-                username=lot.seller or "", user_id=lot.seller_id
+                username=u, user_id=lot.seller_id
             )
         except Exception:  # noqa: BLE001
             return False
@@ -1366,63 +1369,49 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        """RU: кириллица в имени/био, флаг, или lang_code ru/uk/be."""
+        """Только русские: lang ru или кириллица в имени/фамилии (не био)."""
         lc = (getattr(lot, "lang_code", "") or "").lower()
-        if lc.startswith(("ru", "uk", "be")):
+        if lc.startswith("ru"):
             return True
-        parts = [
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        ]
-        blob = " ".join(p for p in parts if p).strip()
-        if not blob:
-            return False
-        if "🇷🇺" in blob or "🇺🇦" in blob or "🇧🇾" in blob:
-            return True
-        return bool(_CYR_RE.search(blob))
+        fn = lot.first_name or ""
+        ln = lot.last_name or ""
+        return bool(_CYR_RE.search(fn) or _CYR_RE.search(ln))
+
+    def _mentions_bot(self, lot: Lot) -> bool:
+        blob = " ".join(
+            x for x in (lot.about, lot.first_name, lot.last_name, lot.seller) if x
+        )
+        return bool(blob and _AD_RE.search(blob) and re.search(
+            r"bot|бот", blob, re.IGNORECASE
+        ))
 
     def _is_small_level(self, lot: Lot) -> bool:
-        """Stars rating ≤2, включая красный минус. None = неизвестно → ок для скрытых."""
+        """Рейт известен и ≤2 (минус тоже ок). Неизвестно — мимо."""
         lvl = getattr(lot, "account_level", None)
         if lvl is None:
-            return True
+            return False
         try:
-            return int(lvl) <= PARSER_MAX_LEVEL
+            n = int(lvl)
         except (TypeError, ValueError):
-            return True
+            return False
+        return n <= PARSER_MAX_LEVEL
 
     def _is_few_gifts(self, lot: Lot) -> bool:
-        """Мало гифтов на профиле. None = неизвестно → ок для скрытых."""
+        """Дефолт-профиль: гифтов мало. Неизвестно — мимо."""
         n = getattr(lot, "gifts_count", None)
         if n is None:
-            return True
+            return False
         try:
-            return int(n) <= PARSER_MAX_GIFTS
+            return 0 <= int(n) <= PARSER_MAX_GIFTS
         except (TypeError, ValueError):
-            return True
+            return False
 
     def _parser_stats_ok(self, lot: Lot) -> bool:
-        """Режем только явный кит. Скрытый профиль / неизвестные статы — ок."""
-        lvl = getattr(lot, "account_level", None)
-        gifts = getattr(lot, "gifts_count", None)
-        if lvl is not None:
-            try:
-                if int(lvl) > PARSER_MAX_LEVEL:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        if gifts is not None:
-            try:
-                if int(gifts) > PARSER_MAX_GIFTS:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
+        """Нужны реальные статы: рейт ≤2 и gifts ≤5. Без угадываний."""
+        return self._is_small_level(lot) and self._is_few_gifts(lot)
 
     def _is_free_contact(self, lot: Lot) -> bool:
-        """Платные ЛС — мимо. Неизвестно (скрытый профиль) — ок."""
+        """Только те, кому можно писать бесплатно. Платно / неизвестно — мимо."""
         paid = getattr(lot, "paid_dm_stars", None)
         if paid is not None:
             try:
@@ -1430,9 +1419,7 @@ class App:
                     return False
             except (TypeError, ValueError):
                 return False
-        if lot.free_dm is False:
-            return False
-        return True
+        return lot.free_dm is True
 
     def _passes_parser_quality(self, lot: Lot) -> bool:
         if not lot.seller and lot.seller_id is None:
@@ -1441,8 +1428,9 @@ class App:
             return False
         if self._is_blocked_lot(lot) or self._is_ad(lot):
             return False
-        hidden = not bool(getattr(lot, "profile_checked", False))
-        if not self._is_russian(lot) and not hidden:
+        if self._mentions_bot(lot):
+            return False
+        if not self._is_russian(lot):
             return False
         if not self._is_free_contact(lot):
             return False
@@ -1491,13 +1479,21 @@ class App:
                 uname = str(gift_names.get(uid) or "").lstrip("@").strip()
             if uname and not lot.seller:
                 lot.seller = uname
+            if uname and self.db.is_seen_seller(username=uname, user_id=uid):
+                self._delivered_sellers.add(uname.lower())
+                self._delivered_sellers.add(f"id:{uid}")
+                self._sent_sellers.add(uname.lower())
+                self._sent_sellers.add(f"id:{uid}")
             if u.get("first_name") and not lot.first_name:
                 lot.first_name = str(u["first_name"])
             if u.get("last_name") and not lot.last_name:
                 lot.last_name = str(u["last_name"])
             if lot.account_level is None and u.get("account_level") is not None:
                 try:
-                    lot.account_level = int(u["account_level"])
+                    lv = int(u["account_level"])
+                    # старый баг писал всем -1 — такое из БД не берём
+                    if lv >= 0:
+                        lot.account_level = lv
                 except (TypeError, ValueError):
                     pass
             if lot.gifts_count is None and u.get("gifts_count") is not None:
@@ -1760,7 +1756,7 @@ class App:
         if channel == "parser":
             ignore_seen = False
             require_free_dm = True
-            strict_free_dm = False
+            strict_free_dm = True
             require_russian = True
         want_ru = (
             self.require_russian if require_russian is None else bool(require_russian)
@@ -1823,10 +1819,10 @@ class App:
             if self._is_ad(lot):
                 continue
             if want_ru and not self._is_russian(lot):
-                hidden = channel == "parser" and not getattr(lot, "profile_checked", False)
-                if not hidden:
-                    continue
+                continue
             if channel == "parser":
+                if self._mentions_bot(lot):
+                    continue
                 if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
                     continue
                 if lot.stars > PARSER_MAX_STARS:
@@ -1898,6 +1894,8 @@ class App:
                     if self._title_key(lot) in marked_titles:
                         continue
                 if channel == "parser":
+                    if self._mentions_bot(lot):
+                        continue
                     if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
                         continue
                     if lot.stars > PARSER_MAX_STARS:
@@ -2092,7 +2090,7 @@ class App:
                 require_free_dm=want_free,
                 ignore_seen=ign_seen,
                 strict_free_dm=(
-                    False
+                    True
                     if channel == "parser"
                     else (
                         bool(self.filters.strict_free)
@@ -2111,15 +2109,7 @@ class App:
                 break
         if best:
             best = best[:target]
-            if channel == "parser":
-                best = [
-                    lot
-                    for lot in best
-                    if self._is_russian(lot)
-                    or not getattr(lot, "profile_checked", False)
-                ]
-            else:
-                best = [lot for lot in best if self._is_russian(lot)]
+            best = [lot for lot in best if self._is_russian(lot)]
             best = _dedupe_by_seller(best)
         return best
 
@@ -2982,16 +2972,25 @@ class App:
 
     def _reserve_parser_lot(self, lot: Lot) -> None:
         self._delivered_sellers.add(lot.owner_key)
-        if lot.seller:
-            self._delivered_sellers.add(lot.seller.lower())
+        u = (lot.seller or "").lstrip("@").strip().lower()
+        if u:
+            self._delivered_sellers.add(u)
+            self._delivered_sellers.add(f"u:{u}")
         if lot.seller_id is not None:
             self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
         tk = self._title_key(lot)
         if tk:
             self._seen_titles.add(tk)
+        try:
+            self.db.mark_seen_seller(
+                username=(lot.seller or ""),
+                user_id=lot.seller_id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _enqueue_parser_lots(self, lots: list[Lot]) -> int:
-        """В очередь выдачи: 1 / 3с, иногда 2 за секунду. Только ≤2000⭐."""
+        """В очередь выдачи: строго 1 лот / 3с. Только ≤2000⭐."""
         n = 0
         for lot in lots:
             if lot.stars > PARSER_MAX_STARS:
@@ -3028,8 +3027,7 @@ class App:
         self._deliver_task = None
 
     async def _deliver_worker(self) -> None:
-        """Обычно 1 лот / 3с; иногда следующий через ~0.45с (2/сек)."""
-        burst_next = False
+        """Ровно 1 лот раз в 3 секунды — без пачек и без догона."""
         try:
             while True:
                 try:
@@ -3038,18 +3036,11 @@ class App:
                     if not self.running and self._deliver_q.empty():
                         break
                     continue
-                gap = DELIVER_FAST_SEC if burst_next else DELIVER_SLOW_SEC
-                wait = gap - (time.monotonic() - self._last_deliver_at)
-                if wait > 0:
-                    await asyncio.sleep(wait)
                 sent = await self._send_parser_lot(lot)
-                self._last_deliver_at = time.monotonic()
                 if sent:
                     self.lots_notified += 1
                     self.parse_ready = self.lots_notified
-                burst_next = False
-                if self._deliver_q.qsize() > 0 and random.random() < DELIVER_BURST_P:
-                    burst_next = True
+                    await asyncio.sleep(DELIVER_SLOW_SEC)
         finally:
             self._deliver_task = None
 
@@ -3062,20 +3053,25 @@ class App:
             return False
         if not self._is_free_contact(lot):
             return False
+        if not self._is_russian(lot):
+            return False
+        if self._mentions_bot(lot) or self._is_ad(lot):
+            return False
+        if not self._parser_stats_ok(lot):
+            return False
         tk = self._title_key(lot)
         if tk and tk in self._sent_titles:
             return False
         keys = [lot.owner_key]
-        if lot.seller:
-            keys.append(lot.seller.lower())
+        u = (lot.seller or "").lstrip("@").strip().lower()
+        if u:
+            keys.append(u)
+            keys.append(f"u:{u}")
         if lot.seller_id is not None:
             keys.append(f"id:{int(lot.seller_id)}")
-        if any(k in self._sent_sellers for k in keys):
+        if any(k in self._sent_sellers for k in keys if k):
             return False
-        hidden = not bool(getattr(lot, "profile_checked", False))
-        if not self._is_russian(lot) and not hidden:
-            return False
-        if not self._parser_stats_ok(lot):
+        if self._is_delivered_seller(lot) and lot.owner_key in self._sent_sellers:
             return False
         for k in keys:
             if k:
@@ -3671,8 +3667,7 @@ class App:
         await self._say(
             f"{screen('Парсинг')}\n"
             f"Live жёсткий · первая страница · выдача не тормозит скан\n"
-            f"до {PARSER_MAX_STARS}⭐ · 1 лот / 3с (иногда 2/сек)\n"
-            f"RU · рейт ≤2 · gifts ≤5 · free DM · тип один раз\n"
+            f"до {PARSER_MAX_STARS}⭐ · 1 лот / 3с · только RU · free DM · рейт ≤2 · gifts ≤5\n"
             f"{self.connected_accounts_label()}",
             log=True,
         )

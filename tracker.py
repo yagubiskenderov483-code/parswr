@@ -107,7 +107,7 @@ class Config:
     state_file: str = ""
     post_on_first_run: bool = False
     channel_id: int | None = None
-    strict_ru: bool = False  # как Parser Gift — без жёсткого RU
+    strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
 
     @classmethod
@@ -172,7 +172,7 @@ class Config:
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
             channel_id=channel_id,
-            strict_ru=os.environ.get("TRACKER_STRICT_RU", "0") == "1",
+            strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
         )
 
@@ -995,7 +995,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.1"
+TRACKER_VERSION = "3.2"
 
 
 @dataclass

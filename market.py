@@ -39,6 +39,24 @@ from telethon.tl.types.payments import StarGiftsNotModified
 logger = logging.getLogger(__name__)
 
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
+_ARAB_RE = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]"
+)
+_NON_RU_LANG_PREFIXES = (
+    "ar",
+    "fa",
+    "ur",
+    "ps",
+    "ku",
+    "he",
+    "ckb",
+    "az",
+    "tr",
+    "uz",
+    "kk",
+    "ky",
+    "tg",
+)
 
 
 @dataclass(slots=True)
@@ -1113,10 +1131,13 @@ def _normalize_level(raw: Any) -> int | None:
 
 
 def is_russian_lot(lot: Lot) -> bool:
-    """Только RU: lang_code ru или кириллица в нике/имени/био."""
-    lc = (getattr(lot, "lang_code", "") or "").lower()
-    if lc.startswith("ru"):
-        return True
+    """Только RU: lang ru, кириллица; арабский/восточные lang — нет."""
+    lc = (getattr(lot, "lang_code", "") or "").lower().strip()
+    if lc:
+        if lc.startswith("ru"):
+            return True
+        if any(lc.startswith(p) for p in _NON_RU_LANG_PREFIXES):
+            return False
     parts = [
         lot.seller or "",
         lot.first_name or "",
@@ -1125,11 +1146,17 @@ def is_russian_lot(lot: Lot) -> bool:
     ]
     blob = " ".join(p for p in parts if p).strip()
     if not blob:
-        # скрытый профиль: есть seller_id, но нет текста — не отбрасываем
-        return lot.seller_id is not None
+        return False
+    if _ARAB_RE.search(blob):
+        return False
+    for flag in ("🇸🇦", "🇦🇪", "🇪🇬", "🇮🇶", "🇶🇦", "🇰🇼", "🇧🇭", "🇴🇲", "🇾🇪", "🇵🇸"):
+        if flag in blob:
+            return False
     if "🇷🇺" in blob:
         return True
-    return bool(_CYR_RE.search(blob))
+    if _CYR_RE.search(blob):
+        return True
+    return False
 
 
 def is_free_dm_lot(lot: Lot) -> bool:

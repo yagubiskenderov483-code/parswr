@@ -154,8 +154,40 @@ _AD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Русские: кириллица именно в имени (био/флаг иностранцы ставят сами)
-_CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
+# Любое упоминание бота в профиле / юзе
+_BOT_MENTION_RE = re.compile(
+    r"("
+    r"@[\w]*bot\b|"
+    r"t\.me/[\w]*bot|"
+    r"\bbots?\b|"
+    r"\bбот(?:а|у|ом|е|ы|ов)?\b|"
+    r"телеграм\s*бот|"
+    r"telegram\s*bot"
+    r")",
+    re.IGNORECASE,
+)
+
+# Русские: кириллица ИМЕННО в имени (не био, не флаг). lang=ru у иностранцев не считаем.
+_CYR_RE = re.compile(r"[А-Яа-яЁё]")
+_FOREIGN_SCRIPT_RE = re.compile(
+    r"["
+    r"\u0600-\u06FF"  # араб
+    r"\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF"  # хангыль
+    r"\u3040-\u30FF\u31F0-\u31FF"  # яп. кана
+    r"\u4E00-\u9FFF"  # CJK
+    r"\u0E00-\u0E7F"  # тай
+    r"\u0590-\u05FF"  # иврит
+    r"\u10A0-\u10FF"  # груз
+    r"]"
+)
+_UKR_SPECIFIC_RE = re.compile(r"[ІіЇїЄєҐґ]")
+# не-русские языки клиента — сразу мимо (ru оставляем только вместе с кириллицей в имени)
+_NON_RU_LANG = (
+    "en", "uk", "be", "kk", "uz", "tr", "de", "es", "fr", "it", "pt",
+    "pl", "ar", "fa", "zh", "ja", "ko", "hi", "th", "vi", "id", "ms",
+    "he", "ka", "hy", "az", "tk", "tg", "ky", "mn", "ro", "hu", "cs",
+    "sk", "bg", "sr", "hr", "nl", "sv", "no", "fi", "da", "el",
+)
 
 # Парсер: мелкий RU-акк, free DM, рейт ≤2, мало гифтов
 PARSER_MAX_LEVEL = 2
@@ -163,6 +195,7 @@ PARSER_MAX_GIFTS = 5
 PARSER_MIN_STARS = 1
 PARSER_MAX_STARS = 2000
 DELIVER_SLOW_SEC = 3.0
+DELIVER_QUEUE_MAX = 4
 
 
 @dataclass
@@ -299,6 +332,7 @@ class App:
         self._deliver_q: asyncio.Queue[Lot] = asyncio.Queue()
         self._deliver_task: asyncio.Task | None = None
         self._last_deliver_at = 0.0
+        self._emit_lock = asyncio.Lock()
         self.log_chat_id: int | None = None
         self.log_chat_title = ""
         self.log_chat_username = ""
@@ -982,10 +1016,9 @@ class App:
             self._seen_sellers.add(lot.owner_key)
             self._filter_seen_sellers.add(lot.owner_key)
             self._delivered_sellers.add(lot.owner_key)
-            if lot.seller:
-                self._delivered_sellers.add(lot.seller.lower())
-            if lot.seller_id is not None:
-                self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+            for k in lot.seller_keys():
+                self._delivered_sellers.add(k)
+                self._seen_sellers.add(k)
             if tk:
                 self._seen_titles.add(tk)
                 self._recent_titles.append(tk)
@@ -1032,8 +1065,9 @@ class App:
 
     def _is_delivered_seller(self, lot: Lot) -> bool:
         sent = getattr(self, "_sent_sellers", set())
-        if lot.owner_key in self._delivered_sellers or lot.owner_key in sent:
-            return True
+        for k in lot.seller_keys():
+            if k in self._delivered_sellers or k in sent:
+                return True
         u = (lot.seller or "").lstrip("@").strip().lower()
         if u and (
             u in self._delivered_sellers
@@ -1369,24 +1403,31 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        """Только русские: lang ru или кириллица в имени/фамилии (не био)."""
-        lc = (getattr(lot, "lang_code", "") or "").lower()
-        if lc.startswith("ru"):
-            return True
+        """Только русские: кириллица в имени. lang=ru без кириллицы — иностранец."""
+        lc = (getattr(lot, "lang_code", "") or "").strip().lower()
+        if lc:
+            base = lc.split("-")[0]
+            if base in _NON_RU_LANG or (base and not base.startswith("ru")):
+                return False
         fn = lot.first_name or ""
         ln = lot.last_name or ""
+        name = f"{fn} {ln}".strip()
+        if not name:
+            return False
+        if _FOREIGN_SCRIPT_RE.search(name) or _UKR_SPECIFIC_RE.search(name):
+            return False
         return bool(_CYR_RE.search(fn) or _CYR_RE.search(ln))
 
     def _mentions_bot(self, lot: Lot) -> bool:
+        if getattr(lot, "is_bot", None) is True:
+            return True
         blob = " ".join(
             x for x in (lot.about, lot.first_name, lot.last_name, lot.seller) if x
         )
-        return bool(blob and _AD_RE.search(blob) and re.search(
-            r"bot|бот", blob, re.IGNORECASE
-        ))
+        return bool(blob and _BOT_MENTION_RE.search(blob))
 
     def _is_small_level(self, lot: Lot) -> bool:
-        """Рейт известен и ≤2 (минус тоже ок). Неизвестно — мимо."""
+        """Рейт известен и ≤2 (минус ок). Неизвестно — мимо."""
         lvl = getattr(lot, "account_level", None)
         if lvl is None:
             return False
@@ -1407,7 +1448,9 @@ class App:
             return False
 
     def _parser_stats_ok(self, lot: Lot) -> bool:
-        """Нужны реальные статы: рейт ≤2 и gifts ≤5. Без угадываний."""
+        """Нужны живые статы с GetFullUser: рейт ≤2 и gifts ≤5. Без угадываний."""
+        if not getattr(lot, "profile_checked", False):
+            return False
         return self._is_small_level(lot) and self._is_few_gifts(lot)
 
     def _is_free_contact(self, lot: Lot) -> bool:
@@ -1423,6 +1466,8 @@ class App:
 
     def _passes_parser_quality(self, lot: Lot) -> bool:
         if not lot.seller and lot.seller_id is None:
+            return False
+        if getattr(lot, "is_bot", None) is True:
             return False
         if lot.seller and self._bad_username_len(lot.seller):
             return False
@@ -1842,9 +1887,15 @@ class App:
                 continue
             if channel == "parser" and self._is_seen_title(lot):
                 continue
+            seller_keys = lot.seller_keys()
             if lot.owner_key in always_block_sellers:
                 continue
-            if (not ignore_seen) and lot.owner_key in seen_sellers:
+            if any(k in always_block_sellers or k in local_sellers for k in seller_keys):
+                continue
+            if (not ignore_seen) and (
+                lot.owner_key in seen_sellers
+                or any(k in seen_sellers for k in seller_keys)
+            ):
                 continue
             if lot.owner_key in local_sellers:
                 continue
@@ -1863,6 +1914,8 @@ class App:
                 keys.append(tk)
             buckets[tk].append(lot)
             local_sellers.add(lot.owner_key)
+            for k in lot.seller_keys():
+                local_sellers.add(k)
             local_models.add(lot.model_key)
             local_titles.add(tk)
 
@@ -1880,13 +1933,21 @@ class App:
             bucket = buckets.get(tk) or []
             while bucket:
                 lot = bucket.pop(0)
+                sk = lot.seller_keys()
                 if self._is_delivered_seller(lot):
                     continue
-                if lot.owner_key in always_block_sellers:
+                if lot.owner_key in always_block_sellers or any(
+                    k in always_block_sellers for k in sk
+                ):
                     continue
-                if lot.owner_key in marked_sellers:
+                if lot.owner_key in marked_sellers or any(
+                    k in marked_sellers for k in sk
+                ):
                     continue
-                if (not ignore_seen) and lot.owner_key in seen_sellers:
+                if (not ignore_seen) and (
+                    lot.owner_key in seen_sellers
+                    or any(k in seen_sellers for k in sk)
+                ):
                     continue
                 if channel != "parser" and lot.model_key in marked_models:
                     continue
@@ -1917,6 +1978,8 @@ class App:
 
         def _mark(lot: Lot) -> None:
             marked_sellers.add(lot.owner_key)
+            for k in lot.seller_keys():
+                marked_sellers.add(k)
             marked_models.add(lot.model_key)
             tk = self._title_key(lot)
             if tk:
@@ -2062,6 +2125,7 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
+            target = 3
             # ТОЛЬКО RU + free DM + мелкий рейт; никогда одних и тех же юзов
             attempts = [
                 (True, True, False, False),
@@ -2199,9 +2263,7 @@ class App:
             candidates = [
                 lot
                 for lot in candidates
-                if lot.owner_key not in self._seen_sellers
-                and lot.owner_key not in self._delivered_sellers
-                and lot.owner_key not in self._sent_sellers
+                if not self._is_delivered_seller(lot)
                 and self._title_key(lot) not in blocked_t
             ]
         elif channel == "filter":
@@ -2414,8 +2476,8 @@ class App:
                     )
         elif channel == "parser" and candidates:
             sample = list(candidates)
-            if len(sample) > 80:
-                sample = self._sample_diverse_titles(sample, 80)
+            if len(sample) > 20:
+                sample = self._sample_diverse_titles(sample, 20)
             # GetFullUser: не 0.5с — иначе лвл/гифты пустые и киты проходят
             tmo = min(max(float(getattr(creds, "OWNER_TIMEOUT", 0.8)), 2.0), 3.5)
             await self.market.enrich_profiles(
@@ -2971,13 +3033,8 @@ class App:
                 break
 
     def _reserve_parser_lot(self, lot: Lot) -> None:
-        self._delivered_sellers.add(lot.owner_key)
-        u = (lot.seller or "").lstrip("@").strip().lower()
-        if u:
-            self._delivered_sellers.add(u)
-            self._delivered_sellers.add(f"u:{u}")
-        if lot.seller_id is not None:
-            self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+        for k in lot.seller_keys():
+            self._delivered_sellers.add(k)
         tk = self._title_key(lot)
         if tk:
             self._seen_titles.add(tk)
@@ -2990,7 +3047,7 @@ class App:
             pass
 
     def _enqueue_parser_lots(self, lots: list[Lot]) -> int:
-        """В очередь выдачи: строго 1 лот / 3с. Только ≤2000⭐."""
+        """В очередь выдачи: строго 1 лот / 3с. Только ≤2000⭐. Без повторов юза."""
         n = 0
         for lot in lots:
             if lot.stars > PARSER_MAX_STARS:
@@ -2999,6 +3056,8 @@ class App:
                 continue
             if not self._passes_parser_quality(lot):
                 continue
+            if self._deliver_q.qsize() >= DELIVER_QUEUE_MAX:
+                break
             self._reserve_parser_lot(lot)
             self._deliver_q.put_nowait(lot)
             n += 1
@@ -3027,7 +3086,7 @@ class App:
         self._deliver_task = None
 
     async def _deliver_worker(self) -> None:
-        """Ровно 1 лот раз в 3 секунды — без пачек и без догона."""
+        """Ровно 1 лот раз в 3 секунды — слот по часам, без догона пачкой."""
         try:
             while True:
                 try:
@@ -3036,11 +3095,16 @@ class App:
                     if not self.running and self._deliver_q.empty():
                         break
                     continue
+                now = time.monotonic()
+                wait = DELIVER_SLOW_SEC - (now - float(self._last_deliver_at or 0.0))
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 sent = await self._send_parser_lot(lot)
+                # фиксируем слот всегда — иначе после паузы скана вылетает пачка
+                self._last_deliver_at = time.monotonic()
                 if sent:
                     self.lots_notified += 1
                     self.parse_ready = self.lots_notified
-                    await asyncio.sleep(DELIVER_SLOW_SEC)
         finally:
             self._deliver_task = None
 
@@ -3062,16 +3126,8 @@ class App:
         tk = self._title_key(lot)
         if tk and tk in self._sent_titles:
             return False
-        keys = [lot.owner_key]
-        u = (lot.seller or "").lstrip("@").strip().lower()
-        if u:
-            keys.append(u)
-            keys.append(f"u:{u}")
-        if lot.seller_id is not None:
-            keys.append(f"id:{int(lot.seller_id)}")
+        keys = lot.seller_keys()
         if any(k in self._sent_sellers for k in keys if k):
-            return False
-        if self._is_delivered_seller(lot) and lot.owner_key in self._sent_sellers:
             return False
         for k in keys:
             if k:
@@ -3717,6 +3773,10 @@ class App:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("live emit: %s", exc)
 
+        async def _emit_one(fresh: list[Lot]) -> None:
+            async with self._emit_lock:
+                await _emit(fresh)
+
         async def _on_batch(group_lots: list[Lot]) -> None:
             if not self.running:
                 return
@@ -3730,7 +3790,7 @@ class App:
                 fresh = self._take_fresh_listings(price)
             if not fresh or not self.running:
                 return
-            task = asyncio.create_task(_emit(list(fresh)), name="live-emit")
+            task = asyncio.create_task(_emit_one(list(fresh)), name="live-emit")
             self._live_tasks.add(task)
             task.add_done_callback(self._live_tasks.discard)
 

@@ -79,6 +79,7 @@ class Lot:
     # None=неизвестно, True=сейчас в сети
     is_online: bool | None = None
     lang_code: str = ""
+    is_bot: bool | None = None
     seen_at: float = field(default_factory=time.time)
 
     @property
@@ -89,11 +90,26 @@ class Lot:
 
     @property
     def owner_key(self) -> str:
-        if self.seller:
-            return self.seller.lower()
+        u = (self.seller or "").lstrip("@").strip().lower()
+        if u:
+            return u
         if self.seller_id is not None:
             return f"id:{self.seller_id}"
         return f"lot:{self.id}"
+
+    def seller_keys(self) -> list[str]:
+        """Все ключи продавца: юз, u:, id: — чтобы один человек не проскочил дважды."""
+        keys: list[str] = []
+        u = (self.seller or "").lstrip("@").strip().lower()
+        if u:
+            keys.append(u)
+            keys.append(f"u:{u}")
+        if self.seller_id is not None:
+            keys.append(f"id:{int(self.seller_id)}")
+        ok = self.owner_key
+        if ok and ok not in keys:
+            keys.append(ok)
+        return keys
 
     @property
     def nft_url(self) -> str:
@@ -698,29 +714,29 @@ class TelegramMarket:
                     return
                 about = str(getattr(uf, "about", "") or "")
                 level, gifts = _extract_level_gifts(uf)
-                # нет бейджа = 0; красный минус (level<0) оставляем как есть
-                if level is None:
-                    level = 0
-                if gifts is None:
-                    gifts = 0
+                # неизвестно ≠ 0: иначе киты с пустым TL-полем проходят как дефолт
                 paid_stars: int | None = None
                 free_dm: bool | None = None
                 if hasattr(uf, "send_paid_messages_stars"):
                     raw_paid = getattr(uf, "send_paid_messages_stars", None)
                     if raw_paid is None:
-                        # флаг не выставлен — ещё не знаем, проверит check_free_dm
                         pass
                     else:
                         try:
                             paid_stars = int(raw_paid)
                         except (TypeError, ValueError):
                             paid_stars = None
-                        if paid_stars is not None:
-                            free_dm = paid_stars <= 0
+                        # 0 на флаге ≠ бесплатно (может быть premium-only)
+                        if paid_stars is not None and paid_stars > 0:
+                            free_dm = False
                 lot.about = about
-                lot.account_level = level
-                lot.gifts_count = gifts
+                if level is not None:
+                    lot.account_level = level
+                if gifts is not None:
+                    lot.gifts_count = gifts
                 lot.profile_checked = True
+                if getattr(uf, "bot_info", None) is not None:
+                    lot.is_bot = True
                 if free_dm is not None:
                     lot.free_dm = free_dm
                 if paid_stars is not None:
@@ -736,6 +752,7 @@ class TelegramMarket:
                     "gifts_count": gifts,
                     "free_dm": free_dm,
                     "paid_dm_stars": paid_stars,
+                    "is_bot": lot.is_bot,
                 }
                 self._profile_cache[lot.seller_id] = info
 
@@ -778,23 +795,10 @@ class TelegramMarket:
                 continue
             reqs = list(result or [])
             for uid, req in zip(ids_chunk, reqs):
-                free = True
-                paid = None
-                name = req.__class__.__name__
-                if isinstance(req, RequirementToContactPaidMessages) or name == (
-                    "RequirementToContactPaidMessages"
-                ):
-                    try:
-                        paid = int(getattr(req, "stars_amount", 0) or 0)
-                    except (TypeError, ValueError):
-                        paid = 1
-                    free = paid <= 0
-                elif isinstance(req, RequirementToContactPremium) or name == (
-                    "RequirementToContactPremium"
-                ):
-                    free = False
+                free, paid = _interpret_contact_req(req)
                 for lot in by_id[uid]:
-                    lot.free_dm = free
+                    if free is not None:
+                        lot.free_dm = free
                     if paid is not None:
                         lot.paid_dm_stars = paid
 
@@ -1105,6 +1109,8 @@ def _fill_user(lot: Lot, user: Any) -> None:
         lot.last_name = ln
     if getattr(user, "premium", None) is not None:
         lot.is_premium = bool(user.premium)
+    if getattr(user, "bot", None) is True:
+        lot.is_bot = True
     online = _user_online_flag(user)
     if online is not None:
         lot.is_online = online
@@ -1114,7 +1120,6 @@ def _fill_user(lot: Lot, user: Any) -> None:
     if hasattr(user, "send_paid_messages_stars"):
         raw = getattr(user, "send_paid_messages_stars", None)
         if raw is None:
-            # флаг не выставлен на User — ещё не знаем точно (нужен UserFull/requirements)
             pass
         else:
             try:
@@ -1123,7 +1128,9 @@ def _fill_user(lot: Lot, user: Any) -> None:
                 paid = None
             if paid is not None:
                 lot.paid_dm_stars = paid
-                lot.free_dm = paid <= 0
+                # только платные помечаем; 0/None не значит free
+                if paid > 0:
+                    lot.free_dm = False
 
 
 def _int_or_none(val: Any) -> int | None:
@@ -1135,51 +1142,108 @@ def _int_or_none(val: Any) -> int | None:
         return None
 
 
-def _parse_stars_level(rating: Any) -> int | None:
-    """Только StarsRating.level (может быть <0). Поле stars НЕ трогаем — из‑за него везде был -1."""
-    if rating is None:
-        return None
-    keys = ("level", "current_level")
-    if isinstance(rating, dict):
-        for key in keys:
-            n = _int_or_none(rating.get(key))
-            if n is not None and abs(n) < 1000:
-                return n
-        return None
-    for attr in keys:
-        n = _int_or_none(getattr(rating, attr, None))
-        if n is not None and abs(n) < 1000:
-            return n
-    if hasattr(rating, "to_dict"):
+# StarsRating.level — маленький int. Это НЕ stars / current_level_stars (очки).
+_LEVEL_KEYS = ("level", "current_level")
+_POINTS_KEYS = ("stars",)
+_GIFT_COUNT_KEYS = ("stargifts_count",)
+
+
+def _tl_dict(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    if obj is not None and hasattr(obj, "to_dict"):
         try:
-            data = rating.to_dict() or {}
+            data = obj.to_dict() or {}
         except Exception:  # noqa: BLE001
             data = {}
         if isinstance(data, dict):
-            for key in keys:
-                n = _int_or_none(data.get(key))
-                if n is not None and abs(n) < 1000:
-                    return n
+            return data
+    return {}
+
+
+def _first_int(obj: Any, keys: tuple[str, ...], *, lo: int, hi: int) -> int | None:
+    data = _tl_dict(obj)
+    for key in keys:
+        raw = data.get(key) if data else None
+        if raw is None and obj is not None and not isinstance(obj, dict):
+            raw = getattr(obj, key, None)
+        n = _int_or_none(raw)
+        if n is not None and lo <= n <= hi:
+            return n
     return None
 
 
+def _parse_stars_points(rating: Any) -> int | None:
+    """Очки рейтинга (long). Не уровень."""
+    return _first_int(rating, _POINTS_KEYS, lo=-10_000_000, hi=10_000_000)
+
+
+def _parse_stars_level(rating: Any) -> int | None:
+    """Реальный StarsRating.level. Поле stars (очки) не является уровнем.
+
+    Если level < 0 и очки тоже < 0 — красный минус → -1.
+    Если level < 0 без отрицательных очков — это мусор/дефолт, пишем 0.
+    """
+    if rating is None:
+        return None
+    level = _first_int(rating, _LEVEL_KEYS, lo=-20, hi=200)
+    if level is None:
+        return None
+    if level < 0:
+        pts = _parse_stars_points(rating)
+        if pts is not None and pts < 0:
+            return -1
+        return 0
+    return level
+
+
 def _extract_level_gifts(uf: Any) -> tuple[int | None, int | None]:
-    level = _parse_stars_level(getattr(uf, "stars_rating", None))
-    gifts = None
-    for attr in ("stargifts_count", "stargifts_displayed"):
-        gifts = _int_or_none(getattr(uf, attr, None))
-        if gifts is not None:
-            break
-    if (level is None or gifts is None) and hasattr(uf, "to_dict"):
-        try:
-            data = uf.to_dict() or {}
-        except Exception:  # noqa: BLE001
-            data = {}
-        if level is None:
-            level = _parse_stars_level(data.get("stars_rating"))
-        if gifts is None:
-            gifts = _int_or_none(data.get("stargifts_count"))
+    """level из stars_rating; gifts только total stargifts_count (не displayed).
+
+    После успешного GetFullUser: нет бейджа / нет гифтов в TL → 0, не unknown.
+    Если в схеме Telethon поля нет — unknown (китов не маскируем под 0).
+    """
+    data = _tl_dict(uf)
+    rating = data.get("stars_rating") if data else None
+    if rating is None:
+        rating = getattr(uf, "stars_rating", None)
+    level = _parse_stars_level(rating)
+    if level is None and hasattr(uf, "stars_rating") and rating is None:
+        level = 0
+    gifts = _first_int(uf, _GIFT_COUNT_KEYS, lo=0, hi=1_000_000)
+    if gifts is None and data:
+        gifts = _int_or_none(data.get("stargifts_count"))
+        if gifts is not None and gifts < 0:
+            gifts = None
+    if gifts is None and hasattr(uf, "stargifts_count"):
+        raw = getattr(uf, "stargifts_count", None)
+        gifts = 0 if raw is None else _int_or_none(raw)
+        if gifts is not None and gifts < 0:
+            gifts = None
     return level, gifts
+
+
+def _paid_stars_from_req(req: Any) -> int | None:
+    return _first_int(
+        req, ("stars_amount", "stars", "amount"), lo=0, hi=1_000_000_000
+    )
+
+
+def _interpret_contact_req(req: Any) -> tuple[bool | None, int | None]:
+    """(free_dm, paid_stars). None = неизвестно — не гадаем что бесплатно."""
+    if req is None:
+        return None, None
+    name = req.__class__.__name__
+    if isinstance(req, RequirementToContactPaidMessages) or "PaidMessage" in name:
+        paid = _paid_stars_from_req(req)
+        if paid is None:
+            paid = 1
+        return paid <= 0, paid
+    if isinstance(req, RequirementToContactPremium) or "Premium" in name:
+        return False, None
+    if "Empty" in name:
+        return True, 0
+    return None, None
 
 
 def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
@@ -1194,11 +1258,19 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
     if info.get("is_premium") is not None:
         lot.is_premium = bool(info["is_premium"])
     if info.get("account_level") is not None:
-        lot.account_level = int(info["account_level"])
+        try:
+            lot.account_level = int(info["account_level"])
+        except (TypeError, ValueError):
+            pass
     if info.get("gifts_count") is not None:
-        lot.gifts_count = int(info["gifts_count"])
+        try:
+            lot.gifts_count = int(info["gifts_count"])
+        except (TypeError, ValueError):
+            pass
     if info.get("ok") or info.get("profile_checked"):
         lot.profile_checked = True
+    if info.get("is_bot") is True:
+        lot.is_bot = True
     if info.get("free_dm") is not None:
         lot.free_dm = bool(info["free_dm"])
     if info.get("paid_dm_stars") is not None:

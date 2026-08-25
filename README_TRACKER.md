@@ -81,10 +81,36 @@ python3 tracker.py
 FloodWait от Telegram обрабатывается автоматически (трекер притормаживает).
 Если ловишь много FloodWait — увеличь `POLL_INTERVAL` и уменьши `PARALLEL`.
 
+## Деплой на Bothost
+
+Bothost запускает **`python main.py`** — это только гифт-трекер. Старый
+Neptun Parser (`bot_main.py`) **не стартует**, конфликта ботов больше нет.
+
+Данные (сессия и состояние) хранятся в **`/app/data`**:
+
+| Файл | Назначение |
+|---|---|
+| `/app/data/tracker_session.txt` | строка сессии Telethon |
+| `/app/data/tracker_state.json` | уже увиденные лоты |
+
+### Первый запуск на Bothost
+
+1. Задеплой ветку с `main.py` (Bothost сам выполнит `python main.py`).
+2. Добавь бота **@markskskdbot** админом в канал (право «Публикация сообщений»).
+3. В логах Bothost увидишь: «Напишите /start боту @markskskdbot для входа».
+4. Открой [@markskskdbot](https://t.me/markskskdbot) и отправь **`/start`**.
+5. Введи номер телефона → код из Telegram → пароль 2FA (если включён).
+6. После «✅ Вход выполнен» трекер сам продолжит: polling бота останавливается,
+   сессия сохраняется в `/app/data/tracker_session.txt`, дальше идёт опрос маркета.
+
+Повторный деплой сессию не сбрасывает — файл в `/app/data` переживает рестарты.
+
+Альтернатива локально: `python3 generate_session.py` (запишет `SESSION_STRING` в `.env`).
+
 ## Замечания
 
 - «Level: -1» — заглушка: такого поля нет в официальном API, сторонние
   трекеры считают его по своим базам.
 - «Сообщения» и «Статус» берутся из API: можно ли писать продавцу бесплатно
   и есть ли у него Premium.
-- `.env` и `tracker_state.json` в git не попадают (см. `.gitignore`).
+- `.env`, `tracker_state.json` и `tracker_session.txt` в git не попадают (см. `.gitignore`).

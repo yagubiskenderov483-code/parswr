@@ -282,6 +282,8 @@ class App:
         self._filter_seen_sellers |= set(self._delivered_sellers)
         self._known_lot_ids: set[str] = set()
         self._live_seeded = False
+        self._live_tasks: set[asyncio.Task] = set()
+        self._live_cursor = 0
         self._load_shown_titles()
         self.log_chat_id: int | None = None
         self.log_chat_title = ""
@@ -613,6 +615,9 @@ class App:
         on_batch_lots: Any | None = None,
         stop_event: Any | None = None,
         force_markets: bool = True,
+        shuffle_ids: bool = True,
+        per_collection: int | None = None,
+        live_fast: bool = False,
     ):
         """Параллельный burst сразу со ВСЕХ сохранённых аккаунтов."""
         markets = await self._build_parse_markets(force=force_markets)
@@ -626,10 +631,26 @@ class App:
                 )
         base = markets[0]
         all_ids = list(await base.load_collections(force=False))
-        random.shuffle(all_ids)
+        if shuffle_ids:
+            random.shuffle(all_ids)
+        elif all_ids:
+            off = int(getattr(self, "_live_cursor", 0) or 0) % len(all_ids)
+            all_ids = all_ids[off:] + all_ids[:off]
+            step = max(len(markets) * 8, len(all_ids) // 6, 1)
+            self._live_cursor = (off + step) % len(all_ids)
         chunks = self._split_ids(all_ids, len(markets))
         per_parallel = max(2, min(int(creds.BURST_PARALLEL), 8))
-        deep = bool(getattr(self, "_burst_deep", False))
+        take = (
+            int(per_collection)
+            if per_collection is not None
+            else min(40, max(20, int(creds.BURST_PER_COLLECTION)))
+        )
+        if live_fast:
+            take = min(max(take, 1), 6)
+            gap = 0.03
+        else:
+            gap = max(0.05, float(creds.BURST_GAP))
+        deep = bool(getattr(self, "_burst_deep", False)) and not live_fast
 
         early_lock = asyncio.Lock()
         early_fired = False
@@ -748,10 +769,10 @@ class App:
                     min_stars,
                     max_stars,
                     parallel=per_parallel,
-                    per_collection=min(40, max(20, int(creds.BURST_PER_COLLECTION))),
+                    per_collection=take,
                     max_collections=0,
-                    gap=max(0.05, float(creds.BURST_GAP)),
-                    timeout=creds.API_TIMEOUT,
+                    gap=gap,
+                    timeout=min(float(creds.API_TIMEOUT), 3.0) if live_fast else creds.API_TIMEOUT,
                     limit_results=max(creds.SHOW_LIMIT, 80),
                     bump_check=bump,
                     touch_cursor=False,
@@ -1293,7 +1314,6 @@ class App:
         self.parse_ready = 0
         self.parse_types = 0
         self.parse_models = 0
-        self.market.reshuffle_collections()
         self._task = asyncio.create_task(self._loop(), name="monitor")
 
     def _is_blocked_lot(self, lot: Lot) -> bool:
@@ -1356,6 +1376,9 @@ class App:
             return False
         if self._is_delivered_seller(lot):
             return False
+        tk = self._title_key(lot)
+        if tk and tk in self._seen_titles:
+            return False
         return True
 
     def _load_shown_titles(self) -> None:
@@ -1409,6 +1432,9 @@ class App:
         if not self.running and self._task is None:
             return f"{screen('Парсинг')}\nУже стоп"
         self.running = False
+        for tsk in list(getattr(self, "_live_tasks", set())):
+            tsk.cancel()
+        self._live_tasks = set()
         if self._task:
             self._task.cancel()
             try:
@@ -1425,6 +1451,9 @@ class App:
         stopped: list[str] = []
         if self.running or self._task is not None:
             self.running = False
+            for tsk in list(getattr(self, "_live_tasks", set())):
+                tsk.cancel()
+            self._live_tasks = set()
             if self._task:
                 self._task.cancel()
                 try:
@@ -2220,14 +2249,15 @@ class App:
             sample = list(candidates)
             if len(sample) > 80:
                 sample = self._sample_diverse_titles(sample, 80)
+            tmo = 0.5 if len(sample) <= 16 else min(max(creds.OWNER_TIMEOUT, 0.8), 1.2)
             await self.market.enrich_profiles(
                 sample,
-                timeout=min(max(creds.OWNER_TIMEOUT, 0.8), 1.2),
-                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+                timeout=tmo,
+                parallel=max(8, int(getattr(creds, "ENRICH_PARALLEL", 8))),
             )
             await self.market.check_free_dm(
                 sample,
-                timeout=max(creds.OWNER_TIMEOUT, 1.1),
+                timeout=max(tmo, 0.7),
             )
             self.parse_acc_checks += len(sample) * 2
             self._ingest_always(sample)
@@ -3291,12 +3321,10 @@ class App:
         except Exception as exc:  # noqa: BLE001
             logger.warning("build markets before parse: %s", exc)
 
-        pause = max(1.2, float(getattr(creds, "CHECK_INTERVAL", 1.0) or 1.0))
-
         async def _status(extra: str = "") -> None:
             await self._edit_status(
                 f"{screen('Парсинг')}\n"
-                f"Live · {self.connected_accounts_label()}\n"
+                f"Live жёсткий · {self.connected_accounts_label()}\n"
                 f"Чеков: <b>{self.parse_coll_checks}</b> · "
                 f"проверок акка: <b>{self.parse_acc_checks}</b>\n"
                 f"Выдано: <b>{self.lots_notified}</b>"
@@ -3305,8 +3333,8 @@ class App:
 
         await self._say(
             f"{screen('Парсинг')}\n"
-            f"Live · RU · рейт ≤2 (0 и минус ок) · free DM\n"
-            f"Сначала снимок рынка, потом только новые лоты\n"
+            f"Live жёсткий · первая страница · выдача не тормозит скан\n"
+            f"RU · рейт ≤2 · free DM · тип один раз\n"
             f"{self.connected_accounts_label()}",
             log=True,
         )
@@ -3330,21 +3358,12 @@ class App:
             self.parse_checked = lots_n
             self.parse_types = types_n
             self.parse_models = models_n
-            await _status("скан…" if first else "жду новые лоты…")
+            asyncio.create_task(_status("скан…" if first else "жду новые лоты…"))
 
-        async def _on_batch(group_lots: list[Lot]) -> None:
-            if not self.running:
+        async def _emit(fresh: list[Lot]) -> None:
+            if not self.running or not fresh:
                 return
-            price = [lot for lot in group_lots if self._in_price(lot)]
-            if not price:
-                return
-            if not self._live_seeded:
-                self._remember_listings(price)
-                return
-            async with deliver_lock:
-                fresh = self._take_fresh_listings(price)
-                if not fresh:
-                    return
+            try:
                 shown = await self._prepare_show(
                     fresh,
                     limit=None,
@@ -3352,8 +3371,7 @@ class App:
                     channel="parser",
                     strict_russian=True,
                 )
-                if not shown:
-                    await _status(f"новых {len(fresh)}, фильтр 0")
+                if not shown or not self.running:
                     return
                 now = time.monotonic()
                 for lot in shown:
@@ -3368,6 +3386,25 @@ class App:
                     reply_markup=parse_done_inline(),
                     log=True,
                 )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("live emit: %s", exc)
+
+        async def _on_batch(group_lots: list[Lot]) -> None:
+            if not self.running:
+                return
+            price = [lot for lot in group_lots if self._in_price(lot)]
+            if not price:
+                return
+            async with deliver_lock:
+                if not self._live_seeded:
+                    self._remember_listings(price)
+                    return
+                fresh = self._take_fresh_listings(price)
+            if not fresh or not self.running:
+                return
+            task = asyncio.create_task(_emit(list(fresh)), name="live-emit")
+            self._live_tasks.add(task)
+            task.add_done_callback(self._live_tasks.discard)
 
         try:
             while self.running:
@@ -3384,6 +3421,9 @@ class App:
                         early_show_at=0,
                         on_batch_lots=_on_batch,
                         force_markets=first,
+                        shuffle_ids=False,
+                        per_collection=6,
+                        live_fast=True,
                     )
                 except Exception as exc:  # noqa: BLE001
                     self.last_error = str(exc)
@@ -3414,10 +3454,8 @@ class App:
                         log=True,
                     )
                     await _status("жду новые лоты…")
-                    await asyncio.sleep(pause)
                     continue
                 await _status("жду новые лоты…")
-                await asyncio.sleep(pause)
         finally:
             self.running = False
             self._task = None

@@ -20,9 +20,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import UserAlreadyParticipantError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
@@ -89,6 +90,7 @@ class Config:
     session_file: str = ""
     state_file: str = ""
     post_on_first_run: bool = False
+    channel_id: int | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -122,6 +124,10 @@ class Config:
         target = (
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
+        channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
+        channel_id: int | None = None
+        if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
+            channel_id = int(channel_id_raw)
         return cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -140,6 +146,7 @@ class Config:
             session_file=session_file,
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
+            channel_id=channel_id,
         )
 
 
@@ -301,18 +308,47 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
     m = re.search(r"(?:t\.me/\+|t\.me/joinchat/|^\+)([A-Za-z0-9_-]+)", raw)
     if m:
         invite = m.group(1)
+
+        async def _call(req: Any, label: str) -> Any:
+            for attempt in range(4):
+                try:
+                    return await client(req)
+                except FloodWaitError as exc:
+                    wait = min(int(exc.seconds) + 1, 300)
+                    logger.warning(
+                        "FloodWait %ss на %s (попытка %s/4) — жду",
+                        wait,
+                        label,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(wait)
+            raise SystemExit(
+                f"FloodWait на {label}: Telegram просит подождать. "
+                "Задай CHANNEL_ID=-100… в env Bothost."
+            )
+
+        # Сначала Check — если уже в канале, Import не нужен (меньше FloodWait)
+        info = await _call(CheckChatInviteRequest(invite), "CheckChatInvite")
+        chat = getattr(info, "chat", None)
+        if chat is not None:
+            cid = get_peer_id(chat)
+            logger.info("Канал по инвайту (уже участник): %s", cid)
+            return cid
+
         try:
-            updates = await client(ImportChatInviteRequest(invite))
-            chat = updates.chats[0]
+            updates = await _call(ImportChatInviteRequest(invite), "ImportChatInvite")
+            cid = get_peer_id(updates.chats[0])
+            logger.info("Вступил в канал по инвайту: %s", cid)
+            return cid
         except UserAlreadyParticipantError:
-            info = await client(CheckChatInviteRequest(invite))
+            info = await _call(CheckChatInviteRequest(invite), "CheckChatInvite")
             chat = getattr(info, "chat", None)
-            if chat is None:
-                raise SystemExit(
-                    "Не удалось получить канал по инвайт-ссылке — "
-                    "вступи в канал этим аккаунтом и повтори"
-                )
-        return get_peer_id(chat)
+            if chat is not None:
+                return get_peer_id(chat)
+        raise SystemExit(
+            "Не удалось получить канал по инвайт-ссылке. "
+            "Задай CHANNEL_ID=-100… в env или вступи в канал вручную."
+        )
     entity = await client.get_entity(raw)
     return get_peer_id(entity)
 
@@ -497,7 +533,12 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
 
-    if state.get("channel_id"):
+    if cfg.channel_id:
+        chat_id = int(cfg.channel_id)
+        state["channel_id"] = chat_id
+        save_state(state_path, state)
+        logger.info("Канал из CHANNEL_ID: %s", chat_id)
+    elif state.get("channel_id"):
         chat_id = int(state["channel_id"])
     else:
         chat_id = await resolve_channel(client, cfg.target_channel)

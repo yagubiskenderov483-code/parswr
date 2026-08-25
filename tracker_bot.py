@@ -294,7 +294,8 @@ def build_router(
             )
             lines.append(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
-                f"free={'строго' if cfg.strict_free else 'не платные'}"
+                f"free={'строго' if cfg.strict_free else 'не платные'} · "
+                f"lvl≤{getattr(cfg, 'max_account_level', 2)}"
             )
         if rt:
             lines.extend(
@@ -308,7 +309,8 @@ def build_router(
                     f"В очереди: {rt.queue_pending}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
-                    f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller}",
+                    f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
+                    f"lvl−{rt.last_skip_level}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )

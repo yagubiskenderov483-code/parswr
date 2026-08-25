@@ -66,6 +66,7 @@ class Lot:
     is_online: bool | None = None
     lang_code: str = ""
     seen_at: float = field(default_factory=time.time)
+    discovered_at: float = 0.0  # когда трекер впервые увидел лот
 
     @property
     def model_key(self) -> str:
@@ -1106,10 +1107,9 @@ def _normalize_level(raw: Any) -> int | None:
     if raw is None:
         return None
     try:
-        level = int(raw)
+        return int(raw)
     except (TypeError, ValueError):
         return None
-    return level if level >= 0 else None
 
 
 def is_russian_lot(lot: Lot) -> bool:
@@ -1138,8 +1138,10 @@ def is_free_dm_lot(lot: Lot) -> bool:
 
 
 def format_account_level(lot: Lot) -> str:
-    lvl = _normalize_level(lot.account_level)
-    return str(lvl) if lvl is not None else "—"
+    lvl = lot.account_level
+    if lvl is None or lvl < 0:
+        return "—"
+    return str(lvl)
 
 
 def _fill_user(lot: Lot, user: Any) -> None:

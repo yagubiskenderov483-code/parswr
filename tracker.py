@@ -89,15 +89,17 @@ class Config:
     target_channel: str
     min_stars: float = 500.0
     max_stars: float = 5000.0
-    poll_interval: float = 2.0
+    poll_interval: float = 1.0
     page_limit: int = 25
-    parallel: int = 6
-    gap: float = 0.1
+    parallel: int = 12
+    gap: float = 0.08
     timeout: float = 8.0
-    enrich_cap: int = 60  # макс. лотов на enrich за проход
+    enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 8
-    scan_pages: int = 2  # страниц resale на коллекцию
-    scan_batch: int = 48  # коллекций за проход (0 = все сразу)
+    scan_pages: int = 1  # только 1-я страница resale = самые свежие
+    scan_batch: int = 0  # 0 = все коллекции каждый проход
+    hot_limit: int = 8  # топ-N лотов с 1-й страницы (не старый хвост)
+    max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -152,15 +154,17 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 5000),
-            poll_interval=_f("POLL_INTERVAL", 2.0),
+            poll_interval=_f("POLL_INTERVAL", 1.0),
             page_limit=int(_f("PAGE_LIMIT", 25)),
-            parallel=int(_f("PARALLEL", 6)),
-            gap=_f("REQUEST_GAP", 0.1),
+            parallel=int(_f("PARALLEL", 12)),
+            gap=_f("REQUEST_GAP", 0.08),
             timeout=_f("REQUEST_TIMEOUT", 8.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, int(_f("ENRICH_PARALLEL", 8))),
-            scan_pages=max(1, int(_f("SCAN_PAGES", 2))),
-            scan_batch=int(_f("SCAN_BATCH", 48)),
+            scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
+            scan_batch=int(_f("SCAN_BATCH", 0)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -670,7 +674,11 @@ async def poll_once(
             exc_errors += 1
             logger.warning("коллекция %s: %s", gid, lots)
             continue
-        for lot in lots:
+        for i, lot in enumerate(lots):
+            if i >= cfg.hot_limit:
+                if lot.id not in seen:
+                    seen[lot.id] = now
+                continue
             if lot.id in seen:
                 continue
             if baseline:
@@ -679,6 +687,7 @@ async def poll_once(
             if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
                 seen[lot.id] = now
                 continue
+            lot.discovered_at = now
             fresh.append(lot)
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
@@ -702,6 +711,24 @@ async def poll_once(
                 m.last_error or "неизвестно",
             )
     return fresh, stats
+
+
+async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
+    """Один лот: продавец + level + free_dm (в воркере очереди, не блокирует скан)."""
+    if not lot.seller or lot.seller_id is None:
+        try:
+            await m.resolve_owner(lot, timeout=3.5)
+        except Exception:  # noqa: BLE001
+            pass
+    if lot.seller_id is not None:
+        try:
+            await m.enrich_profiles([lot], timeout=3.5, parallel=1)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await m.check_free_dm([lot], timeout=3.5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot], cfg: Config) -> None:
@@ -743,6 +770,16 @@ def mark_processed_lots(
     return retry
 
 
+def passes_account_level(lot: Lot, max_level: int) -> bool:
+    """Level <= max или отрицательный рейтинг (как у Parser Gift)."""
+    lvl = lot.account_level
+    if lvl is None:
+        return True
+    if lvl < 0:
+        return True
+    return lvl <= max_level
+
+
 def filter_for_post(
     lots: list[Lot],
     seen_sellers: dict[str, float],
@@ -750,8 +787,9 @@ def filter_for_post(
     now: float,
     strict_ru: bool = True,
     strict_free: bool = False,
+    max_account_level: int = 2,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """RU + бесплатные ЛС + один раз на продавца."""
+    """RU + level + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
     stats = {
@@ -760,6 +798,7 @@ def filter_for_post(
         "non_ru": 0,
         "paid": 0,
         "unknown_dm": 0,
+        "level": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -774,6 +813,9 @@ def filter_for_post(
             continue
         if strict_ru and not is_russian_lot(lot):
             stats["non_ru"] += 1
+            continue
+        if not passes_account_level(lot, max_account_level):
+            stats["level"] += 1
             continue
         if strict_free:
             if lot.free_dm is not True:
@@ -844,12 +886,14 @@ def rank_for_queue(lots: list[Lot]) -> list[Lot]:
 
 
 class PostQueue:
-    """Очередь лотов: воркер шлёт по одному, интервал в Sender/PostRateLimiter."""
+    """Очередь: enrich+фильтр+send в воркере — сканер не ждёт и не даёт пауз."""
 
     def __init__(
         self,
         sender: Sender,
-        *,
+        market: TelegramMarket,
+        cfg: Config,
+        seen: dict[str, float],
         seen_sellers: dict[str, float],
         state: dict,
         state_path: Path,
@@ -857,11 +901,14 @@ class PostQueue:
         post_interval: float = 4.0,
     ) -> None:
         self._sender = sender
-        self._interval = max(1.0, float(post_interval))
+        self._m = market
+        self._cfg = cfg
+        self._seen = seen
         self._seen_sellers = seen_sellers
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
+        self._interval = max(1.0, float(post_interval))
         self._q: asyncio.Queue[Lot | None] = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._closed = False
@@ -895,7 +942,7 @@ class PostQueue:
 
     async def _drip_worker(self) -> None:
         logger.info(
-            "Drip-постинг: 1 лот каждые %ss (лимит в Sender, очередь отдельно)",
+            "Drip: enrich+фильтр+send каждые %ss (сканер параллельно)",
             int(self._interval),
         )
         while not self._closed:
@@ -903,8 +950,28 @@ class PostQueue:
             if lot is None:
                 break
             try:
+                await enrich_one(self._m, lot, self._cfg)
                 now = time.time()
+                to_post, fstats = filter_for_post(
+                    [lot],
+                    self._seen_sellers,
+                    now=now,
+                    strict_ru=self._cfg.strict_ru,
+                    strict_free=self._cfg.strict_free,
+                    max_account_level=self._cfg.max_account_level,
+                )
+                self._runtime.last_skip_ru = fstats["non_ru"]
+                self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
+                self._runtime.last_skip_dup = fstats["dup"]
+                self._runtime.last_skip_noseller = fstats["no_seller"]
+                self._runtime.last_skip_level = fstats["level"]
+                if not to_post:
+                    if lot.seller_key:
+                        self._seen[lot.id] = now
+                    continue
+                lot = to_post[0]
                 await self._sender.send(lot)
+                self._seen[lot.id] = now
                 key = lot.seller_key
                 if key:
                     self._seen_sellers[key] = now
@@ -913,12 +980,12 @@ class PostQueue:
                 self._runtime.posted_total += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · очередь %s · интервал %ss",
+                    "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
                     self.pending,
-                    int(self._interval),
+                    format_account_level(lot),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
@@ -926,7 +993,7 @@ class PostQueue:
                 self._q.task_done()
 
 
-TRACKER_VERSION = "2.9"
+TRACKER_VERSION = "3.0"
 
 
 @dataclass
@@ -941,6 +1008,7 @@ class TrackerRuntime:
     last_skip_dm: int = 0
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
+    last_skip_level: int = 0
     seen_lots: int = 0
     queue_pending: int = 0
     collections_total: int = 0
@@ -1033,6 +1101,77 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
     return client, bot
 
 
+async def scanner_loop(
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    cfg: Config,
+    post_queue: PostQueue,
+    runtime: TrackerRuntime,
+    state_path: Path,
+    state: dict,
+) -> None:
+    """Быстрый скан всех коллекций (page1, hot_limit) — сразу в очередь без enrich."""
+    catalog_refreshed = time.monotonic()
+    pass_no = 0
+    while True:
+        started = time.monotonic()
+        pass_no += 1
+        runtime.passes = pass_no
+        runtime.seen_lots = len(seen)
+        try:
+            fresh, scan = await poll_once(m, gift_ids, seen, cfg, baseline=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Проход упал: %s", exc)
+            await asyncio.sleep(2)
+            continue
+
+        runtime.last_scan_batch = int(scan.get("batch_size", 0))
+        runtime.last_scan_parsed = int(scan.get("parsed", 0))
+        runtime.last_scan_errors = int(scan.get("errors", 0))
+        runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
+        if runtime.last_scan_errors:
+            runtime.last_api_error = m.last_error or ""
+
+        runtime.last_fresh = len(fresh)
+        if fresh:
+            n = post_queue.enqueue(fresh)
+            runtime.queue_pending = post_queue.pending
+            runtime.last_posted = n
+            logger.info(
+                "Проход #%s: +%s свежих → очередь +%s (ждут %s · %ss)",
+                pass_no,
+                len(fresh),
+                n,
+                post_queue.pending,
+                scan.get("elapsed", "?"),
+            )
+        elif pass_no % 10 == 0:
+            logger.info(
+                "Проход #%s: скан %s/%s колл · %s лотов · +0 "
+                "(err=%s · %ss)",
+                pass_no,
+                scan.get("batch_size", "?"),
+                scan.get("collections_total", "?"),
+                scan.get("parsed", 0),
+                scan.get("errors", 0),
+                scan.get("elapsed", "?"),
+            )
+
+        save_state(state_path, state)
+
+        if time.monotonic() - catalog_refreshed > 600:
+            try:
+                gift_ids[:] = await m.load_collections(force=True)
+                runtime.collections_total = len(gift_ids)
+                catalog_refreshed = time.monotonic()
+            except Exception:  # noqa: BLE001
+                pass
+
+        spent = time.monotonic() - started
+        await asyncio.sleep(max(cfg.poll_interval - spent, 0.05))
+
+
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
@@ -1077,6 +1216,7 @@ async def run() -> None:
         dd / "tracker_post.lock",
         dd / "tracker_last_post.txt",
     )
+    m = TelegramMarket(client)
     sender = Sender(cfg, client, rate_limiter=rate_limiter)
     sender.chat_id = chat_id
     control_bot.runtime = runtime
@@ -1084,24 +1224,27 @@ async def run() -> None:
 
     post_queue = PostQueue(
         sender,
-        seen_sellers=seen_sellers,
-        state=state,
-        state_path=state_path,
-        runtime=runtime,
+        m,
+        cfg,
+        seen,
+        seen_sellers,
+        state,
+        state_path,
+        runtime,
         post_interval=cfg.post_interval,
     )
     post_queue.start()
     control_bot.post_queue = post_queue
 
-    m = TelegramMarket(client)
     gift_ids = await m.load_collections(force=True)
     if not gift_ids:
         raise SystemExit("Не удалось загрузить список коллекций подарков")
     logger.info(
-        "Коллекций с resale: %s · batch %s · drip %ss",
+        "Коллекций: %s · scan page1 hot=%s · все колл/проход · drip %ss · lvl≤%s",
         len(gift_ids),
-        cfg.scan_batch or "все",
+        cfg.hot_limit,
         int(cfg.post_interval),
+        cfg.max_account_level,
     )
 
     runtime.collections_total = len(gift_ids)
@@ -1120,101 +1263,16 @@ async def run() -> None:
             baseline_stats.get("elapsed", "?"),
         )
 
-    catalog_refreshed = time.monotonic()
-    pass_no = 0
+    scan_task = asyncio.create_task(
+        scanner_loop(
+            m, gift_ids, seen, cfg, post_queue, runtime, state_path, state
+        ),
+        name="scanner",
+    )
     try:
-        while True:
-            started = time.monotonic()
-            pass_no += 1
-            runtime.passes = pass_no
-            runtime.seen_lots = len(seen)
-            try:
-                fresh, scan = await poll_once(
-                    m, gift_ids, seen, cfg, baseline=False
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Проход упал: %s", exc)
-                await asyncio.sleep(3)
-                continue
-
-            runtime.last_scan_batch = int(scan.get("batch_size", 0))
-            runtime.last_scan_parsed = int(scan.get("parsed", 0))
-            runtime.last_scan_errors = int(scan.get("errors", 0))
-            runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
-            if runtime.last_scan_errors:
-                runtime.last_api_error = m.last_error or ""
-
-            runtime.last_fresh = len(fresh)
-            if fresh:
-                if len(fresh) > cfg.enrich_cap:
-                    logger.info(
-                        "Проход #%s: enrich %s из %s новых (лимит %s)",
-                        pass_no,
-                        cfg.enrich_cap,
-                        len(fresh),
-                        cfg.enrich_cap,
-                    )
-                    batch_fresh = fresh[: cfg.enrich_cap]
-                else:
-                    batch_fresh = fresh
-                batch_fresh.sort(key=lambda l: l.stars)
-                await enrich(m, batch_fresh, cfg)
-                now = time.time()
-                to_post, fstats = filter_for_post(
-                    batch_fresh,
-                    seen_sellers,
-                    now=now,
-                    strict_ru=cfg.strict_ru,
-                    strict_free=cfg.strict_free,
-                )
-                retry_owner = mark_processed_lots(batch_fresh, seen, now=now)
-                logger.info(
-                    "Проход #%s: новых %s → в очередь %s "
-                    "(ru−%s dm−%s dup−%s noseller−%s retry−%s · ждут %s)",
-                    pass_no,
-                    len(fresh),
-                    len(to_post),
-                    fstats["non_ru"],
-                    fstats["paid"] + fstats["unknown_dm"],
-                    fstats["dup"],
-                    fstats["no_seller"],
-                    retry_owner,
-                    post_queue.pending,
-                )
-                runtime.last_skip_ru = fstats["non_ru"]
-                runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
-                runtime.last_skip_dup = fstats["dup"]
-                runtime.last_skip_noseller = fstats["no_seller"]
-                if to_post:
-                    post_queue.enqueue(to_post)
-                    runtime.queue_pending = post_queue.pending
-                    runtime.last_posted = len(to_post)
-            else:
-                logger.info(
-                    "Проход #%s: скан %s/%s колл · %s лотов · +0 новых "
-                    "(err=%s · %ss · seen=%s)",
-                    pass_no,
-                    scan.get("batch_size", "?"),
-                    scan.get("collections_total", "?"),
-                    scan.get("parsed", 0),
-                    scan.get("errors", 0),
-                    scan.get("elapsed", "?"),
-                    len(seen),
-                )
-
-            save_state(state_path, state)
-
-            # каталог коллекций обновляем раз в 10 минут (новые гифты)
-            if time.monotonic() - catalog_refreshed > 600:
-                try:
-                    gift_ids = await m.load_collections(force=True)
-                    catalog_refreshed = time.monotonic()
-                except Exception:  # noqa: BLE001
-                    pass
-
-            spent = time.monotonic() - started
-            await asyncio.sleep(max(cfg.poll_interval - spent, 0.2))
+        await scan_task
     finally:
+        scan_task.cancel()
         await post_queue.stop()
         await sender.close()
         if control_bot:

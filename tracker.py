@@ -51,7 +51,8 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAHm55kTDzTCKl2Oe4uWavN_c7R0e1joLus"
-# Инвайты протухают — задавай CHANNEL_ID или TARGET_CHANNEL=@username в env
+# Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
+DEFAULT_CHANNEL_ID = -1004384888475
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
@@ -138,7 +139,7 @@ class Config:
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
         channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
-        channel_id: int | None = None
+        channel_id: int | None = DEFAULT_CHANNEL_ID
         if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
             channel_id = int(channel_id_raw)
         return cls(

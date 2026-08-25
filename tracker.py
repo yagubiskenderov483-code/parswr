@@ -86,9 +86,9 @@ class Config:
     bot_token: str
     target_channel: str
     min_stars: float = 500.0
-    max_stars: float = 900.0
+    max_stars: float = 5000.0
     poll_interval: float = 2.0
-    page_limit: int = 12
+    page_limit: int = 20
     parallel: int = 8
     gap: float = 0.05
     timeout: float = 6.0
@@ -98,6 +98,8 @@ class Config:
     state_file: str = ""
     post_on_first_run: bool = False
     channel_id: int | None = None
+    strict_ru: bool = True
+    strict_free: bool = False  # False = скип только платных; True = только free_dm=True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -142,7 +144,7 @@ class Config:
             bot_token=bot_token,
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 900),
+            max_stars=_f("MAX_STARS", 5000),
             poll_interval=_f("POLL_INTERVAL", 2.0),
             page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=int(_f("PARALLEL", 8)),
@@ -154,6 +156,8 @@ class Config:
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
             channel_id=channel_id,
+            strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") != "0",
+            strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
         )
 
 
@@ -544,39 +548,72 @@ async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
 
 
 def filter_for_post(
-    lots: list[Lot], seen_sellers: dict[str, float], *, now: float
-) -> list[Lot]:
-    """Только RU + бесплатные ЛС + один раз на продавца."""
+    lots: list[Lot],
+    seen_sellers: dict[str, float],
+    *,
+    now: float,
+    strict_ru: bool = True,
+    strict_free: bool = False,
+) -> tuple[list[Lot], dict[str, int]]:
+    """RU + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
+    stats = {
+        "no_seller": 0,
+        "dup": 0,
+        "non_ru": 0,
+        "paid": 0,
+        "unknown_dm": 0,
+    }
     for lot in lots:
         key = lot.seller_key
         if not key:
-            logger.info("skip: нет продавца (%s)", lot_slug(lot))
+            stats["no_seller"] += 1
             continue
         if key in used:
             continue
         prev = seen_sellers.get(key)
         if prev is not None and now - float(prev) < SELLER_TTL:
-            logger.info("skip dup seller: %s", key)
+            stats["dup"] += 1
             continue
-        if not is_russian_lot(lot):
-            logger.info("skip non-ru: %s", key)
+        if strict_ru and not is_russian_lot(lot):
+            stats["non_ru"] += 1
             continue
-        if not is_free_dm_lot(lot):
-            logger.info(
-                "skip dm (%s): %s free=%s paid=%s",
-                key,
-                lot.free_dm,
-                lot.paid_dm_stars,
-            )
+        if strict_free:
+            if lot.free_dm is not True:
+                if lot.free_dm is False:
+                    stats["paid"] += 1
+                else:
+                    stats["unknown_dm"] += 1
+                continue
+        elif lot.free_dm is False:
+            stats["paid"] += 1
             continue
         used.add(key)
         out.append(lot)
-    return out
+    return out, stats
 
 
-TRACKER_VERSION = "2.3"
+TRACKER_VERSION = "2.4"
+
+
+@dataclass
+class TrackerRuntime:
+    """Статистика для /status и логов."""
+
+    passes: int = 0
+    posted_total: int = 0
+    last_fresh: int = 0
+    last_posted: int = 0
+    last_skip_ru: int = 0
+    last_skip_dm: int = 0
+    last_skip_dup: int = 0
+    last_skip_noseller: int = 0
+    seen_lots: int = 0
+    channel_id: int | None = None
+    cfg: Config | None = None
+    state_path: Path | None = None
+    state: dict | None = None
 
 
 def _load_session_from_db() -> str:
@@ -678,10 +715,27 @@ async def run() -> None:
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
-    logger.info("Канал для постинга: %s", chat_id)
+    logger.info(
+        "Канал для постинга: %s · диапазон %s–%s⭐ · RU=%s · free=%s",
+        chat_id,
+        int(cfg.min_stars),
+        int(cfg.max_stars),
+        "строго" if cfg.strict_ru else "нет",
+        "только✓" if cfg.strict_free else "не платные",
+    )
+
+    runtime = TrackerRuntime(
+        channel_id=chat_id,
+        cfg=cfg,
+        state_path=state_path,
+        state=state,
+        seen_lots=len(seen),
+    )
 
     sender = Sender(cfg, client)
     sender.chat_id = chat_id
+    control_bot.runtime = runtime
+    control_bot.sender = sender
 
     m = TelegramMarket(client)
     gift_ids = await m.load_collections(force=True)
@@ -697,9 +751,13 @@ async def run() -> None:
         logger.info("Запомнено %s лотов. Слежу за новыми.", len(seen))
 
     catalog_refreshed = time.monotonic()
+    pass_no = 0
     try:
         while True:
             started = time.monotonic()
+            pass_no += 1
+            runtime.passes = pass_no
+            runtime.seen_lots = len(seen)
             try:
                 fresh = await poll_once(m, gift_ids, seen, cfg, baseline=False)
             except Exception as exc:  # noqa: BLE001
@@ -707,19 +765,34 @@ async def run() -> None:
                 await asyncio.sleep(3)
                 continue
 
+            runtime.last_fresh = len(fresh)
             if fresh:
                 fresh.sort(key=lambda l: l.stars)
                 await enrich(m, fresh)
                 now = time.time()
-                to_post = filter_for_post(fresh, seen_sellers, now=now)
-                skipped = len(fresh) - len(to_post)
-                if skipped:
-                    logger.info(
-                        "Проход: %s новых, к посту %s, отсеяно %s",
-                        len(fresh),
-                        len(to_post),
-                        skipped,
-                    )
+                to_post, fstats = filter_for_post(
+                    fresh,
+                    seen_sellers,
+                    now=now,
+                    strict_ru=cfg.strict_ru,
+                    strict_free=cfg.strict_free,
+                )
+                runtime.last_posted = len(to_post)
+                runtime.last_skip_ru = fstats["non_ru"]
+                runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
+                runtime.last_skip_dup = fstats["dup"]
+                runtime.last_skip_noseller = fstats["no_seller"]
+                logger.info(
+                    "Проход #%s: новых %s → к посту %s "
+                    "(ru−%s dm−%s dup−%s noseller−%s)",
+                    pass_no,
+                    len(fresh),
+                    len(to_post),
+                    fstats["non_ru"],
+                    fstats["paid"] + fstats["unknown_dm"],
+                    fstats["dup"],
+                    fstats["no_seller"],
+                )
                 for lot in to_post:
                     try:
                         await sender.send(lot)
@@ -734,10 +807,20 @@ async def run() -> None:
                             lot_slug(lot),
                             lot.seller or "?",
                         )
+                        runtime.posted_total += 1
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Не отправилось (%s): %s", lot.id, exc)
                 state["seen_sellers"] = seen_sellers
                 save_state(state_path, state)
+            elif pass_no % 15 == 0:
+                logger.info(
+                    "Проход #%s: новых лотов в %s–%s⭐ нет (seen=%s, posted=%s)",
+                    pass_no,
+                    int(cfg.min_stars),
+                    int(cfg.max_stars),
+                    len(seen),
+                    runtime.posted_total,
+                )
 
             # каталог коллекций обновляем раз в 10 минут (новые гифты)
             if time.monotonic() - catalog_refreshed > 600:

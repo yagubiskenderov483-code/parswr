@@ -6,8 +6,9 @@ import asyncio
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -15,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, ReplyKeyboardRemove
+from html import escape as _esc
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -185,6 +187,7 @@ def build_router(
     *,
     login_done: asyncio.Event | None = None,
     tracker_version: str = "",
+    control: ControlBot | None = None,
 ) -> Router:
     router = Router()
 
@@ -207,7 +210,9 @@ def build_router(
                 "/setchannel @username — канал для постов\n"
                 "/setchannel -100… — id канала\n"
                 "/channels — список твоих каналов\n"
-                "/status — статус",
+                "/status — статус\n"
+                "/test — тестовая карточка в канал\n"
+                "/resetseen — сбросить seen (тест)",
             )
             if login_done and not login_done.is_set():
                 login_done.set()
@@ -241,6 +246,11 @@ def build_router(
             await message.answer(f"⚠️ Не нашёл канал: {exc}")
             return
         store.save(cid)
+        if control:
+            if control.runtime is not None:
+                control.runtime.channel_id = cid
+            if control.sender is not None:
+                control.sender.chat_id = cid
         await message.answer(f"✅ Канал задан: <code>{cid}</code>")
 
     @router.message(Command("channels"))
@@ -266,16 +276,91 @@ def build_router(
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
         cid = store.get() or store.load()
-        if await _authorized():
-            me = await client.get_me()
-            name = me.username or me.first_name or me.id
-            await message.answer(
-                f"✅ Трекер v{tracker_version}\n"
-                f"Аккаунт: {name}\n"
-                f"Канал: <code>{cid or 'не задан'}</code>"
-            )
-        else:
+        if not await _authorized():
             await message.answer("❌ Не авторизован — /start")
+            return
+        me = await client.get_me()
+        name = me.username or me.first_name or me.id
+        rt = control.runtime if control else None
+        cfg = rt.cfg if rt else None
+        lines = [
+            f"✅ Трекер v{tracker_version}",
+            f"Аккаунт: {name}",
+            f"Канал: <code>{cid or 'не задан'}</code>",
+        ]
+        if cfg:
+            lines.append(
+                f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
+            )
+            lines.append(
+                f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
+                f"free={'строго' if cfg.strict_free else 'не платные'}"
+            )
+        if rt:
+            lines.extend(
+                [
+                    f"Проходов: {rt.passes}",
+                    f"Всего отправлено: {rt.posted_total}",
+                    f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} к посту",
+                    f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
+                    f"dup−{rt.last_skip_dup}",
+                    f"Seen лотов: {rt.seen_lots}",
+                ]
+            )
+        await message.answer("\n".join(lines))
+
+    @router.message(Command("test"))
+    async def cmd_test(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        if not control or not control.sender or not control.sender.chat_id:
+            await message.answer("Канал не задан — /setchannel @channel")
+            return
+        from market import Lot
+
+        lot = Lot(
+            id="test-post",
+            title="Test Gift",
+            number=1,
+            stars=600.0,
+            slug="TestGift-1",
+            model="Test",
+            seller="testuser",
+            seller_id=1,
+            free_dm=True,
+            account_level=1,
+            is_premium=False,
+        )
+        try:
+            await control.sender.send(lot)
+            await message.answer(
+                f"✅ Тест отправлен в канал <code>{control.sender.chat_id}</code>"
+            )
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(
+                f"❌ Не отправилось: {_esc(str(exc)[:200])}\n"
+                "Проверь: @markskskdbot — админ канала с правом публикации."
+            )
+
+    @router.message(Command("resetseen"))
+    async def cmd_resetseen(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        rt = control.runtime if control else None
+        if not rt or not rt.state or not rt.state_path:
+            await message.answer("Трекер ещё не запущен полностью.")
+            return
+        from tracker import save_state
+
+        n = len(rt.state.get("seen", {}))
+        rt.state["seen"] = {}
+        save_state(rt.state_path, rt.state)
+        rt.seen_lots = 0
+        await message.answer(
+            f"✅ Seen сброшен ({n} лотов). Новые листинги снова будут ловиться."
+        )
 
     @router.message(StateFilter(LoginStates.phone))
     async def got_phone(message: Message, state: FSMContext) -> None:
@@ -351,6 +436,8 @@ class ControlBot:
         self._task: asyncio.Task | None = None
         self._login_done = asyncio.Event()
         self._auth = AuthFlow(client, session_file)
+        self.runtime: Any | None = None
+        self.sender: Any | None = None
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -366,6 +453,7 @@ class ControlBot:
             self.store,
             login_done=self._login_done,
             tracker_version=self.tracker_version,
+            control=self,
         )
         self._dp.include_router(router)
         info = await self._bot.get_me()

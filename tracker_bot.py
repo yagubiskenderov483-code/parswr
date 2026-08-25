@@ -301,7 +301,8 @@ def build_router(
                 [
                     f"Проходов: {rt.passes}",
                     f"Всего отправлено: {rt.posted_total}",
-                    f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} к посту",
+                    f"В очереди: {rt.queue_pending}",
+                    f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup}",
                     f"Seen лотов: {rt.seen_lots}",
@@ -438,6 +439,7 @@ class ControlBot:
         self._auth = AuthFlow(client, session_file)
         self.runtime: Any | None = None
         self.sender: Any | None = None
+        self.post_queue: Any | None = None
 
     async def start(self) -> None:
         if self._task and not self._task.done():

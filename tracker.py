@@ -15,6 +15,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -88,10 +89,12 @@ class Config:
     min_stars: float = 500.0
     max_stars: float = 5000.0
     poll_interval: float = 2.0
-    page_limit: int = 20
-    parallel: int = 8
+    page_limit: int = 25
+    parallel: int = 10
     gap: float = 0.05
     timeout: float = 6.0
+    scan_pages: int = 2  # страниц resale на коллекцию
+    post_interval: float = 4.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -146,10 +149,12 @@ class Config:
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 5000),
             poll_interval=_f("POLL_INTERVAL", 2.0),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
-            parallel=int(_f("PARALLEL", 8)),
+            page_limit=int(_f("PAGE_LIMIT", 25)),
+            parallel=int(_f("PARALLEL", 10)),
             gap=_f("REQUEST_GAP", 0.05),
             timeout=_f("REQUEST_TIMEOUT", 6.0),
+            scan_pages=max(1, int(_f("SCAN_PAGES", 2))),
+            post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -493,18 +498,31 @@ async def poll_once(
     *,
     baseline: bool,
 ) -> list[Lot]:
-    """Один проход по всем коллекциям: первая страница = самые свежие лоты."""
+    """Проход по всем коллекциям (несколько страниц) — лоты до max_stars."""
     stats = {"ok": 0, "errors": 0, "floods": 0}
     sem = asyncio.Semaphore(cfg.parallel)
 
     async def one(gid: int) -> list[Lot]:
         async with sem:
-            result = await m._request(
-                gid, cfg.page_limit, True, stats, cfg.gap, cfg.timeout
-            )
-            if result is None:
-                return []
-            return market_mod._parse_result(result)
+            out: list[Lot] = []
+            offset = ""
+            for _ in range(max(1, int(cfg.scan_pages))):
+                result = await m._request(
+                    gid,
+                    cfg.page_limit,
+                    True,
+                    stats,
+                    cfg.gap,
+                    cfg.timeout,
+                    offset=offset,
+                )
+                if result is None:
+                    break
+                out.extend(market_mod._parse_result(result))
+                offset = str(getattr(result, "next_offset", "") or "")
+                if not offset:
+                    break
+            return out
 
     chunks = await asyncio.gather(
         *(one(g) for g in gift_ids), return_exceptions=True
@@ -594,7 +612,137 @@ def filter_for_post(
     return out, stats
 
 
-TRACKER_VERSION = "2.4"
+_FEMALE_HINT_RE = re.compile(
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀)",
+    re.IGNORECASE,
+)
+
+def _looks_female(lot: Lot) -> bool:
+    blob = " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+            lot.seller or "",
+        )
+        if x
+    ).lower()
+    if _FEMALE_HINT_RE.search(blob):
+        return True
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3:
+        if fn.endswith(("ия", "ья", "на", "та", "са", "ка", "ла", "ра", "ва", "ша")):
+            return True
+        if fn[-1] in "ая":
+            return True
+    return False
+
+
+def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
+    """Выше = раньше в очереди. Без TGP в приоритете, девочки — иногда."""
+    score = random.random() * 0.3
+    if lot.is_premium is False:
+        score += 4.0
+    elif lot.is_premium is True:
+        score -= 3.0
+    if lot.free_dm is True:
+        score += 1.5
+    elif lot.free_dm is False:
+        score -= 5.0
+    if boost_female and _looks_female(lot):
+        score += 2.5
+    return score
+
+
+def rank_for_queue(lots: list[Lot]) -> list[Lot]:
+    boost_female = random.random() < 0.35
+    ranked = sorted(
+        lots, key=lambda lot: -_lot_priority(lot, boost_female=boost_female)
+    )
+    if boost_female:
+        logger.info("очередь: буст «девочки» включён для этого батча")
+    return ranked
+
+
+class PostQueue:
+    """Очередь постинга: 1 лот каждые N секунд (не пачкой)."""
+
+    def __init__(
+        self,
+        sender: Sender,
+        *,
+        interval: float,
+        seen_sellers: dict[str, float],
+        state: dict,
+        state_path: Path,
+        runtime: TrackerRuntime,
+    ) -> None:
+        self._sender = sender
+        self._interval = max(1.0, float(interval))
+        self._seen_sellers = seen_sellers
+        self._state = state
+        self._state_path = state_path
+        self._runtime = runtime
+        self._q: asyncio.Queue[Lot | None] = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+
+    @property
+    def pending(self) -> int:
+        return self._q.qsize()
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._worker(), name="post-queue")
+
+    async def stop(self) -> None:
+        if self._task and not self._task.done():
+            await self._q.put(None)
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+
+    def enqueue(self, lots: list[Lot]) -> int:
+        if not lots:
+            return 0
+        for lot in rank_for_queue(lots):
+            self._q.put_nowait(lot)
+        return len(lots)
+
+    async def _worker(self) -> None:
+        while True:
+            lot = await self._q.get()
+            try:
+                if lot is None:
+                    break
+                now = time.time()
+                await self._sender.send(lot)
+                key = lot.seller_key
+                if key:
+                    self._seen_sellers[key] = now
+                self._state["seen_sellers"] = self._seen_sellers
+                save_state(self._state_path, self._state)
+                self._runtime.posted_total += 1
+                self._runtime.queue_pending = self.pending
+                logger.info(
+                    "Отправил: %s за %s⭐ lvl=%s (%s @%s) · в очереди %s",
+                    lot.title,
+                    int(lot.stars),
+                    format_account_level(lot),
+                    lot_slug(lot),
+                    lot.seller or "?",
+                    self.pending,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
+            finally:
+                self._q.task_done()
+            await asyncio.sleep(self._interval)
+
+
+TRACKER_VERSION = "2.5"
 
 
 @dataclass
@@ -610,6 +758,7 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     seen_lots: int = 0
+    queue_pending: int = 0
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -716,12 +865,12 @@ async def run() -> None:
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
     logger.info(
-        "Канал для постинга: %s · диапазон %s–%s⭐ · RU=%s · free=%s",
+        "Канал для постинга: %s · диапазон %s–%s⭐ · пост /%ss · RU=%s",
         chat_id,
         int(cfg.min_stars),
         int(cfg.max_stars),
+        cfg.post_interval,
         "строго" if cfg.strict_ru else "нет",
-        "только✓" if cfg.strict_free else "не платные",
     )
 
     runtime = TrackerRuntime(
@@ -736,6 +885,17 @@ async def run() -> None:
     sender.chat_id = chat_id
     control_bot.runtime = runtime
     control_bot.sender = sender
+
+    post_queue = PostQueue(
+        sender,
+        interval=cfg.post_interval,
+        seen_sellers=seen_sellers,
+        state=state,
+        state_path=state_path,
+        runtime=runtime,
+    )
+    post_queue.start()
+    control_bot.post_queue = post_queue
 
     m = TelegramMarket(client)
     gift_ids = await m.load_collections(force=True)
@@ -777,14 +937,9 @@ async def run() -> None:
                     strict_ru=cfg.strict_ru,
                     strict_free=cfg.strict_free,
                 )
-                runtime.last_posted = len(to_post)
-                runtime.last_skip_ru = fstats["non_ru"]
-                runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
-                runtime.last_skip_dup = fstats["dup"]
-                runtime.last_skip_noseller = fstats["no_seller"]
                 logger.info(
-                    "Проход #%s: новых %s → к посту %s "
-                    "(ru−%s dm−%s dup−%s noseller−%s)",
+                    "Проход #%s: новых %s → в очередь %s "
+                    "(ru−%s dm−%s dup−%s noseller−%s · ждут %s)",
                     pass_no,
                     len(fresh),
                     len(to_post),
@@ -792,26 +947,16 @@ async def run() -> None:
                     fstats["paid"] + fstats["unknown_dm"],
                     fstats["dup"],
                     fstats["no_seller"],
+                    post_queue.pending,
                 )
-                for lot in to_post:
-                    try:
-                        await sender.send(lot)
-                        key = lot.seller_key
-                        if key:
-                            seen_sellers[key] = now
-                        logger.info(
-                            "Отправил: %s за %s⭐ lvl=%s (%s @%s)",
-                            lot.title,
-                            int(lot.stars),
-                            format_account_level(lot),
-                            lot_slug(lot),
-                            lot.seller or "?",
-                        )
-                        runtime.posted_total += 1
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Не отправилось (%s): %s", lot.id, exc)
-                state["seen_sellers"] = seen_sellers
-                save_state(state_path, state)
+                runtime.last_skip_ru = fstats["non_ru"]
+                runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
+                runtime.last_skip_dup = fstats["dup"]
+                runtime.last_skip_noseller = fstats["no_seller"]
+                if to_post:
+                    post_queue.enqueue(to_post)
+                    runtime.queue_pending = post_queue.pending
+                    runtime.last_posted = len(to_post)
             elif pass_no % 15 == 0:
                 logger.info(
                     "Проход #%s: новых лотов в %s–%s⭐ нет (seen=%s, posted=%s)",
@@ -833,6 +978,7 @@ async def run() -> None:
             spent = time.monotonic() - started
             await asyncio.sleep(max(cfg.poll_interval - spent, 0.2))
     finally:
+        await post_queue.stop()
         await sender.close()
         if control_bot:
             await control_bot.stop()

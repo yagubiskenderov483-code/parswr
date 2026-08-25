@@ -698,7 +698,7 @@ class TelegramMarket:
                     return
                 about = str(getattr(uf, "about", "") or "")
                 level, gifts = _extract_level_gifts(uf)
-                # нет поля = нет рейтинга / не светят гифты, не «неизвестно»
+                # нет бейджа = 0; красный минус (level<0) оставляем как есть
                 if level is None:
                     level = 0
                 if gifts is None:
@@ -708,14 +708,15 @@ class TelegramMarket:
                 if hasattr(uf, "send_paid_messages_stars"):
                     raw_paid = getattr(uf, "send_paid_messages_stars", None)
                     if raw_paid is None:
-                        free_dm = True
-                        paid_stars = None
+                        # флаг не выставлен — ещё не знаем, проверит check_free_dm
+                        pass
                     else:
                         try:
                             paid_stars = int(raw_paid)
                         except (TypeError, ValueError):
                             paid_stars = None
-                        free_dm = paid_stars is None or paid_stars <= 0
+                        if paid_stars is not None:
+                            free_dm = paid_stars <= 0
                 lot.about = about
                 lot.account_level = level
                 lot.gifts_count = gifts
@@ -1135,20 +1136,27 @@ def _int_or_none(val: Any) -> int | None:
 
 
 def _parse_stars_level(rating: Any) -> int | None:
-    """StarsRating.level; старые слои — current_level. Не подставлять 0 наугад."""
+    """StarsRating.level может быть отрицательным (красный минус в профиле)."""
     if rating is None:
         return None
-    if isinstance(rating, dict):
+    data = rating if isinstance(rating, dict) else None
+    if data is None:
+        level = None
+        for attr in ("level", "current_level"):
+            level = _int_or_none(getattr(rating, attr, None))
+            if level is not None:
+                break
+        stars_val = _int_or_none(getattr(rating, "stars", None))
+    else:
+        level = None
         for key in ("level", "current_level"):
-            n = _int_or_none(rating.get(key))
-            if n is not None:
-                return n
-        return None
-    for attr in ("level", "current_level"):
-        n = _int_or_none(getattr(rating, attr, None))
-        if n is not None:
-            return n
-    return None
+            level = _int_or_none(data.get(key))
+            if level is not None:
+                break
+        stars_val = _int_or_none(data.get("stars"))
+    if stars_val is not None and stars_val < 0 and (level is None or level >= 0):
+        return -1
+    return level
 
 
 def _extract_level_gifts(uf: Any) -> tuple[int | None, int | None]:

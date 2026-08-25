@@ -1054,6 +1054,12 @@ class App:
         await self._preload_collections()
         await self.ensure_db_farm()
 
+    async def ensure_logged_in(self) -> bool:
+        """В памяти logged_in сбрасывается при рестарте — поднять сессию из БД."""
+        if self.logged_in:
+            return True
+        return await self.try_restore_account()
+
     async def try_restore_account(self) -> bool:
         """Поднять активный акк из БД при старте бота."""
         acc = self.db.get_active_account()
@@ -1214,7 +1220,7 @@ class App:
         self.filter_max_stars = float(mx)
 
     async def start_monitor(self, chat_id: int) -> None:
-        if not self.logged_in:
+        if not await self.ensure_logged_in():
             raise RuntimeError("Сначала вход.")
         if self.running:
             await self.stop_monitor()
@@ -1719,8 +1725,7 @@ class App:
             spread.append(rest.pop(pick_i))
         result = spread
 
-        if not ignore_seen and track_seen and result:
-            self._mark_delivered(result, channel=channel)
+        # mark delivered only after _say_lot_list_to succeeds
         return result
 
     def _pick_with_fallback(
@@ -1792,8 +1797,6 @@ class App:
             # железный фильтр: только RU, даже если где-то просочились
             best = [lot for lot in best if self._is_russian(lot)]
             best = _dedupe_by_seller(best)
-        if best and track_seen and channel in ("parser", "filter", "old"):
-            self._mark_delivered(best, channel=channel)
         return best
 
     async def _prepare_show(
@@ -3231,7 +3234,7 @@ class App:
         """Ещё одна выдача других лотов из пула / быстрый добор."""
         if self.running:
             raise RuntimeError("Уже парсит — сначала стоп.")
-        if not self.logged_in:
+        if not await self.ensure_logged_in():
             raise RuntimeError("Сначала вход.")
         await self.pause_db_farm()
         self.running = True
@@ -3767,9 +3770,14 @@ def _diff_by_id(rid: str) -> tuple[str, int, int] | None:
     return None
 
 
+async def _require_login() -> bool:
+    """Проверка входа с авто-восстановлением сессии из БД после рестарта."""
+    return await app.ensure_logged_in()
+
+
 async def _kick_db_farm() -> None:
     """Подвозобновить тихий фарм, если акк залогинен и парсер свободен."""
-    if not app.logged_in:
+    if not await _require_login():
         return
     try:
         await app.ensure_db_farm()
@@ -3825,10 +3833,7 @@ async def _send_menu(target: Message | CallbackQuery, prefix: str = "") -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if app.logged_in:
-        await _send_menu(message)
-        return
-    if await app.try_restore_account():
+    if await app.ensure_logged_in():
         await _send_menu(message)
         return
     wipe_disk_junk()
@@ -3894,7 +3899,7 @@ async def got_password(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "menu:home")
 async def cb_home(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала /start", show_alert=True)
         return
     await _send_menu(callback)
@@ -3902,7 +3907,7 @@ async def cb_home(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:parse")
 async def cb_parse(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     await callback.message.edit_text(
@@ -3914,7 +3919,7 @@ async def cb_parse(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:old")
 async def cb_old_menu(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     await callback.message.edit_text(
@@ -3926,7 +3931,7 @@ async def cb_old_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("old:"))
 async def cb_old_start(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     if app.old_parse_running:
@@ -3952,7 +3957,7 @@ async def cb_old_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:filters")
 async def cb_filters(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     await callback.message.edit_text(
@@ -3964,7 +3969,7 @@ async def cb_filters(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("fdiff:"))
 async def cb_filter_diff(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     rid = (callback.data or "").split(":", 1)[-1]
@@ -3986,7 +3991,7 @@ async def cb_filter_diff(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("flt:"))
 async def cb_filter_toggle(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     key = (callback.data or "").split(":", 1)[-1]
@@ -4065,7 +4070,7 @@ async def cb_jobs(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:speed")
 async def cb_speed(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     label = app.cycle_speed()
@@ -4078,7 +4083,7 @@ async def cb_speed(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:accounts")
 async def cb_accounts(callback: CallbackQuery) -> None:
-    if not app.logged_in and not app.db.list_accounts():
+    if not await app.ensure_logged_in() and not app.db.list_accounts():
         await callback.answer("Сначала вход", show_alert=True)
         return
     lines = [screen("Аккаунты")]
@@ -4211,7 +4216,7 @@ async def cb_status(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("block:"))
 async def cb_block_user(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     username = (callback.data or "").split(":", 1)[-1].lstrip("@").strip()
@@ -4228,7 +4233,7 @@ async def cb_block_user(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("blockid:"))
 async def cb_block_id(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     raw = (callback.data or "").split(":", 1)[-1]
@@ -4247,7 +4252,7 @@ async def cb_block_id(callback: CallbackQuery) -> None:
 
 @router.message(Command("block"))
 async def cmd_block(message: Message) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await message.answer("Сначала /start")
         return
     parts = (message.text or "").split(maxsplit=1)
@@ -4261,7 +4266,7 @@ async def cmd_block(message: Message) -> None:
 
 @router.message(Command("unblock"))
 async def cmd_unblock(message: Message) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await message.answer("Сначала /start")
         return
     parts = (message.text or "").split(maxsplit=1)
@@ -4296,7 +4301,7 @@ async def cmd_blocked(message: Message) -> None:
 @router.callback_query(F.data.startswith("diff:"))
 async def cb_diff_pick(callback: CallbackQuery) -> None:
     """Сложность → экран с кнопкой Начать парсить (не старт сразу)."""
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     rid = (callback.data or "").split(":", 1)[-1]
@@ -4318,7 +4323,7 @@ async def cb_diff_pick(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "parse:go")
 async def cb_parse_go(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     if app.running:
@@ -4342,7 +4347,7 @@ async def cb_parse_go(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "parse:again")
 async def cb_parse_again(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     if app.running:
@@ -4361,7 +4366,7 @@ async def cb_parse_again(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("price:"))
 async def cb_price_start(callback: CallbackQuery) -> None:
-    if not app.logged_in:
+    if not await _require_login():
         await callback.answer("Сначала вход", show_alert=True)
         return
     rid = (callback.data or "").split(":", 1)[-1]

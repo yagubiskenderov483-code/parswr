@@ -13,8 +13,9 @@ if _raw in {"", "/data/gifts.db", "/data/gifts.db/", "data/gifts.db", "./data/gi
     os.environ["GIFTS_DB_PATH"] = _BOTHOST_DB
 GIFTS_DB_PATH = os.environ["GIFTS_DB_PATH"]
 
-# кто может пользоваться ботом
+# владелец (для справки; доступ к боту не ограничен)
 OWNER_ID = 741904495
+# устарело: раньше ограничивало доступ; сейчас бот публичный
 ALLOWED_USER_IDS: set[int] = {
     741904495,
     8860370086,

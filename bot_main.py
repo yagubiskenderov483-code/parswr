@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -35,9 +35,8 @@ from aiogram.types import (
     MenuButtonCommands,
     Message,
     ReplyKeyboardRemove,
-    TelegramObject,
 )
-from typing import Any, Awaitable, Callable
+from typing import Any
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -58,53 +57,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 router = Router()
-
-
-class OwnerOnlyMiddleware(BaseMiddleware):
-    """Бот только для ALLOWED_USER_IDS."""
-
-    @staticmethod
-    def _allowed() -> set[int]:
-        out: set[int] = set()
-        for x in getattr(creds, "ALLOWED_USER_IDS", None) or []:
-            try:
-                out.add(int(x))
-            except (TypeError, ValueError):
-                pass
-        try:
-            out.add(int(creds.OWNER_ID))
-        except (TypeError, ValueError):
-            pass
-        out.update({741904495, 8860370086, 8959759145})
-        return out
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user = data.get("event_from_user") or getattr(event, "from_user", None)
-        raw = getattr(user, "id", None) if user else None
-        try:
-            uid = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            uid = None
-        allowed = self._allowed()
-        if uid is None or uid not in allowed:
-            msg = f"Нет доступа (id: {uid})" if uid is not None else "Нет доступа"
-            if isinstance(event, CallbackQuery):
-                try:
-                    await event.answer(msg, show_alert=True)
-                except Exception:  # noqa: BLE001
-                    pass
-            elif isinstance(event, Message):
-                try:
-                    await event.answer(msg)
-                except Exception:  # noqa: BLE001
-                    pass
-            return None
-        return await handler(event, data)
 
 
 def screen(where: str) -> str:
@@ -4421,10 +4373,8 @@ async def main() -> None:
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     dp = Dispatcher(storage=MemoryStorage())
-    router.message.middleware(OwnerOnlyMiddleware())
-    router.callback_query.middleware(OwnerOnlyMiddleware())
     dp.include_router(router)
-    logger.info("Ready | Neptun Parser · owner-only · multi-acc")
+    logger.info("Ready | Neptun Parser · public · multi-acc")
     try:
         # Bothost/другой инстанс мог повесить webhook — polling иначе Conflict
         await bot.delete_webhook(drop_pending_updates=False)

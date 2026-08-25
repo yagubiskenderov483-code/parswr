@@ -6,16 +6,15 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Any, Awaitable, Callable
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardRemove, TelegramObject
+from aiogram.types import Message, ReplyKeyboardRemove
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -26,8 +25,6 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 
-import credentials as creds
-
 logger = logging.getLogger("session_login")
 
 
@@ -35,40 +32,6 @@ class LoginStates(StatesGroup):
     phone = State()
     code = State()
     password = State()
-
-
-def _allowed_user_ids() -> set[int]:
-    out: set[int] = set(getattr(creds, "ALLOWED_USER_IDS", None) or [])
-    try:
-        out.add(int(creds.OWNER_ID))
-    except (TypeError, ValueError):
-        pass
-    return out
-
-
-class OwnerOnlyMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user = data.get("event_from_user") or getattr(event, "from_user", None)
-        raw = getattr(user, "id", None) if user else None
-        try:
-            uid = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            uid = None
-        allowed = _allowed_user_ids()
-        if uid is None or uid not in allowed:
-            msg = f"Нет доступа (id: {uid})" if uid is not None else "Нет доступа"
-            if isinstance(event, Message):
-                try:
-                    await event.answer(msg)
-                except Exception:  # noqa: BLE001
-                    pass
-            return None
-        return await handler(event, data)
 
 
 def _normalize_phone(phone: str) -> str:
@@ -157,7 +120,6 @@ async def bot_login_wizard(cfg) -> TelegramClient:
     )
     dp = Dispatcher(storage=MemoryStorage())
     router = Router()
-    dp.message.middleware(OwnerOnlyMiddleware())
 
     async def finish_success(message: Message) -> None:
         me = await client.get_me()

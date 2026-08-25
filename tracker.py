@@ -91,9 +91,11 @@ class Config:
     max_stars: float = 5000.0
     poll_interval: float = 2.0
     page_limit: int = 25
-    parallel: int = 10
-    gap: float = 0.05
-    timeout: float = 6.0
+    parallel: int = 6
+    gap: float = 0.1
+    timeout: float = 8.0
+    enrich_cap: int = 60  # макс. лотов на enrich за проход
+    enrich_parallel: int = 8
     scan_pages: int = 2  # страниц resale на коллекцию
     scan_batch: int = 48  # коллекций за проход (0 = все сразу)
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
@@ -152,9 +154,11 @@ class Config:
             max_stars=_f("MAX_STARS", 5000),
             poll_interval=_f("POLL_INTERVAL", 2.0),
             page_limit=int(_f("PAGE_LIMIT", 25)),
-            parallel=int(_f("PARALLEL", 10)),
-            gap=_f("REQUEST_GAP", 0.05),
-            timeout=_f("REQUEST_TIMEOUT", 6.0),
+            parallel=int(_f("PARALLEL", 6)),
+            gap=_f("REQUEST_GAP", 0.1),
+            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
+            enrich_parallel=max(2, int(_f("ENRICH_PARALLEL", 8))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 2))),
             scan_batch=int(_f("SCAN_BATCH", 48)),
             post_interval=_f("POST_INTERVAL", 4.0),
@@ -669,11 +673,13 @@ async def poll_once(
         for lot in lots:
             if lot.id in seen:
                 continue
-            seen[lot.id] = now
             if baseline:
+                seen[lot.id] = now
                 continue
-            if cfg.min_stars <= lot.stars <= cfg.max_stars:
-                fresh.append(lot)
+            if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
+                seen[lot.id] = now
+                continue
+            fresh.append(lot)
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
         "parsed": api_stats.get("parsed", 0),
@@ -698,24 +704,43 @@ async def poll_once(
     return fresh, stats
 
 
-async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
-    """Дотянуть username, lvl, статус ЛС — для каждого нового лота."""
-    for lot in lots:
-        if not lot.seller or not lot.seller_id:
-            try:
-                await m.resolve_owner(lot, timeout=2.5)
-            except Exception:  # noqa: BLE001
-                pass
+async def enrich(m: TelegramMarket, lots: list[Lot], cfg: Config) -> None:
+    """Дотянуть username, lvl, статус ЛС — параллельно."""
+    need_resolve = [lot for lot in lots if not lot.seller or lot.seller_id is None]
+    if need_resolve:
+        try:
+            await m.resolve_owners(
+                need_resolve,
+                timeout=4.0,
+                parallel=cfg.enrich_parallel,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resolve_owners: %s", exc)
     need_lvl = [lot for lot in lots if lot.seller_id is not None]
     if need_lvl:
         try:
-            await m.enrich_profiles(need_lvl, timeout=3.0, parallel=4)
+            await m.enrich_profiles(
+                need_lvl, timeout=4.0, parallel=cfg.enrich_parallel
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("enrich_profiles: %s", exc)
     try:
-        await m.check_free_dm(lots, timeout=3.0)
+        await m.check_free_dm(lots, timeout=4.0)
     except Exception as exc:  # noqa: BLE001
         logger.warning("check_free_dm: %s", exc)
+
+
+def mark_processed_lots(
+    fresh: list[Lot], seen: dict[str, float], *, now: float
+) -> int:
+    """Помечаем обработанные лоты; без seller_key — оставляем на повтор."""
+    retry = 0
+    for lot in fresh:
+        if not lot.seller_key:
+            retry += 1
+            continue
+        seen[lot.id] = now
+    return retry
 
 
 def filter_for_post(
@@ -901,7 +926,7 @@ class PostQueue:
                 self._q.task_done()
 
 
-TRACKER_VERSION = "2.8"
+TRACKER_VERSION = "2.9"
 
 
 @dataclass
@@ -1121,19 +1146,31 @@ async def run() -> None:
 
             runtime.last_fresh = len(fresh)
             if fresh:
-                fresh.sort(key=lambda l: l.stars)
-                await enrich(m, fresh)
+                if len(fresh) > cfg.enrich_cap:
+                    logger.info(
+                        "Проход #%s: enrich %s из %s новых (лимит %s)",
+                        pass_no,
+                        cfg.enrich_cap,
+                        len(fresh),
+                        cfg.enrich_cap,
+                    )
+                    batch_fresh = fresh[: cfg.enrich_cap]
+                else:
+                    batch_fresh = fresh
+                batch_fresh.sort(key=lambda l: l.stars)
+                await enrich(m, batch_fresh, cfg)
                 now = time.time()
                 to_post, fstats = filter_for_post(
-                    fresh,
+                    batch_fresh,
                     seen_sellers,
                     now=now,
                     strict_ru=cfg.strict_ru,
                     strict_free=cfg.strict_free,
                 )
+                retry_owner = mark_processed_lots(batch_fresh, seen, now=now)
                 logger.info(
                     "Проход #%s: новых %s → в очередь %s "
-                    "(ru−%s dm−%s dup−%s noseller−%s · ждут %s)",
+                    "(ru−%s dm−%s dup−%s noseller−%s retry−%s · ждут %s)",
                     pass_no,
                     len(fresh),
                     len(to_post),
@@ -1141,6 +1178,7 @@ async def run() -> None:
                     fstats["paid"] + fstats["unknown_dm"],
                     fstats["dup"],
                     fstats["no_seller"],
+                    retry_owner,
                     post_queue.pending,
                 )
                 runtime.last_skip_ru = fstats["non_ru"]

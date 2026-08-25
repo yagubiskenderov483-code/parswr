@@ -308,7 +308,7 @@ def build_router(
                     f"В очереди: {rt.queue_pending}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
-                    f"dup−{rt.last_skip_dup}",
+                    f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )

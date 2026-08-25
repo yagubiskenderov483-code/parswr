@@ -1125,7 +1125,8 @@ def is_russian_lot(lot: Lot) -> bool:
     ]
     blob = " ".join(p for p in parts if p).strip()
     if not blob:
-        return False
+        # скрытый профиль: есть seller_id, но нет текста — не отбрасываем
+        return lot.seller_id is not None
     if "🇷🇺" in blob:
         return True
     return bool(_CYR_RE.search(blob))

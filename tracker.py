@@ -1,0 +1,437 @@
+"""
+Гифт-трекер внутреннего маркета Telegram.
+
+Ловит только что выставленные на перепродажу NFT-подарки (за Stars),
+фильтрует по цене MIN_STARS..MAX_STARS и постит карточки в канал.
+
+Запуск:  python3 tracker.py
+Настройки берутся из .env (см. .env.example) или переменных окружения.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from telethon import TelegramClient
+from telethon.errors import UserAlreadyParticipantError
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest,
+    ImportChatInviteRequest,
+)
+from telethon.utils import get_peer_id
+
+import market as market_mod
+from market import Lot, TelegramMarket
+
+logger = logging.getLogger("tracker")
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _load_dotenv() -> None:
+    """Мини-загрузчик .env: переменные окружения имеют приоритет."""
+    path = BASE_DIR / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and value:
+            os.environ.setdefault(key, value)
+
+
+@dataclass(slots=True)
+class Config:
+    api_id: int
+    api_hash: str
+    session_string: str
+    bot_token: str
+    target_channel: str
+    min_stars: float = 500.0
+    max_stars: float = 900.0
+    poll_interval: float = 2.0
+    page_limit: int = 12
+    parallel: int = 8
+    gap: float = 0.05
+    timeout: float = 6.0
+    ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
+    tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
+    state_file: str = "tracker_state.json"
+    post_on_first_run: bool = False
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        def _f(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, "") or default)
+            except ValueError:
+                return default
+
+        api_id = int(os.environ.get("API_ID", "0") or 0)
+        api_hash = os.environ.get("API_HASH", "").strip()
+        if not api_id or not api_hash:
+            raise SystemExit("API_ID/API_HASH не заданы — заполни .env")
+        target = os.environ.get("TARGET_CHANNEL", "").strip()
+        if not target:
+            raise SystemExit("TARGET_CHANNEL не задан — укажи канал в .env")
+        return cls(
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=os.environ.get("SESSION_STRING", "").strip(),
+            bot_token=os.environ.get("BOT_TOKEN", "").strip(),
+            target_channel=target,
+            min_stars=_f("MIN_STARS", 500),
+            max_stars=_f("MAX_STARS", 900),
+            poll_interval=_f("POLL_INTERVAL", 2.0),
+            page_limit=int(_f("PAGE_LIMIT", 12)),
+            parallel=int(_f("PARALLEL", 8)),
+            gap=_f("REQUEST_GAP", 0.05),
+            timeout=_f("REQUEST_TIMEOUT", 6.0),
+            ton_rate=_f("TON_RATE", 0.0102),
+            tz_offset=_f("TZ_OFFSET", 3.0),
+            state_file=os.environ.get("STATE_FILE", "tracker_state.json"),
+            post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
+        )
+
+
+# ---------------------------------------------------------------- state
+
+SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
+
+
+def load_state(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("seen", {})
+            data.setdefault("channel_id", None)
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"seen": {}, "channel_id": None}
+
+
+def save_state(path: Path, state: dict) -> None:
+    now = time.time()
+    seen = state.get("seen", {})
+    if len(seen) > 200_000:
+        state["seen"] = {
+            k: v for k, v in seen.items() if now - float(v) < SEEN_TTL
+        }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------- format
+
+_esc = html.escape
+
+
+def lot_slug(lot: Lot) -> str:
+    if lot.slug:
+        return lot.slug
+    if lot.number is not None:
+        clean = "".join(ch for ch in lot.title if ch.isalnum())
+        return f"{clean}-{lot.number}"
+    return lot.title
+
+
+def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
+    stars = int(lot.stars) if float(lot.stars).is_integer() else lot.stars
+    ton = lot.stars * cfg.ton_rate
+    tz = timezone(timedelta(hours=cfg.tz_offset))
+    when = datetime.fromtimestamp(ts or time.time(), tz=tz).strftime(
+        "%d.%m.%Y %H:%M:%S"
+    )
+
+    if lot.seller:
+        seller = f"@{lot.seller}"
+        if lot.seller_id:
+            seller += f" (<code>{lot.seller_id}</code>)"
+    elif lot.seller_id:
+        seller = f"<code>{lot.seller_id}</code>"
+    else:
+        seller = "скрыт"
+
+    if lot.free_dm is True:
+        dm = "бесплатно"
+    elif lot.free_dm is False:
+        dm = f"платно ({lot.paid_dm_stars} ⭐)" if lot.paid_dm_stars else "платно"
+    else:
+        dm = "—"
+
+    if lot.is_premium is True:
+        status = "Premium"
+    elif lot.is_premium is False:
+        status = "без Premium"
+    else:
+        status = "—"
+
+    return "\n".join(
+        [
+            "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
+            "",
+            f"🎁 Гифт: <b>{_esc(lot.title)}</b>",
+            f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
+            f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
+            f"👤 Продавец: {seller}",
+            "📶 Level: -1",
+            f"📢 Сообщения: {dm}",
+            f"🕺 Статус: {status}",
+            f'🔗 <a href="{lot.nft_url}">{_esc(lot_slug(lot))}</a>',
+            f"🕒 {when}",
+        ]
+    )
+
+
+# ---------------------------------------------------------------- sending
+
+
+class Sender:
+    """Шлёт карточки: через бота (с кнопками) или от юзер-сессии."""
+
+    def __init__(self, cfg: Config, client: TelegramClient) -> None:
+        self.cfg = cfg
+        self.client = client
+        self.chat_id: int | None = None
+        self._bot = None
+        if cfg.bot_token:
+            from aiogram import Bot
+
+            self._bot = Bot(token=cfg.bot_token)
+
+    def _keyboard(self, lot: Lot):
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        rows = [[InlineKeyboardButton(text="✓ Занять", url=lot.nft_url)]]
+        second = [InlineKeyboardButton(text="🎁 Открыть лот", url=lot.nft_url)]
+        if lot.seller:
+            second.append(
+                InlineKeyboardButton(
+                    text="👤 Продавец", url=f"https://t.me/{lot.seller}"
+                )
+            )
+        rows.append(second)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def send(self, lot: Lot) -> None:
+        text = format_lot(lot, self.cfg)
+        if self._bot is not None:
+            from aiogram.types import LinkPreviewOptions
+
+            await self._bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=self._keyboard(lot),
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        else:
+            await self.client.send_message(
+                self.chat_id, text, parse_mode="html", link_preview=False
+            )
+
+    async def close(self) -> None:
+        if self._bot is not None:
+            await self._bot.session.close()
+
+
+async def resolve_channel(client: TelegramClient, raw: str) -> int:
+    """@username / -100id / инвайт-ссылка t.me/+hash -> numeric chat id."""
+    raw = raw.strip()
+    if re.fullmatch(r"-?\d+", raw):
+        return int(raw)
+    m = re.search(r"(?:t\.me/\+|t\.me/joinchat/|^\+)([A-Za-z0-9_-]+)", raw)
+    if m:
+        invite = m.group(1)
+        try:
+            updates = await client(ImportChatInviteRequest(invite))
+            chat = updates.chats[0]
+        except UserAlreadyParticipantError:
+            info = await client(CheckChatInviteRequest(invite))
+            chat = getattr(info, "chat", None)
+            if chat is None:
+                raise SystemExit(
+                    "Не удалось получить канал по инвайт-ссылке — "
+                    "вступи в канал этим аккаунтом и повтори"
+                )
+        return get_peer_id(chat)
+    entity = await client.get_entity(raw)
+    return get_peer_id(entity)
+
+
+# ---------------------------------------------------------------- tracker
+
+
+async def poll_once(
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    cfg: Config,
+    *,
+    baseline: bool,
+) -> list[Lot]:
+    """Один проход по всем коллекциям: первая страница = самые свежие лоты."""
+    stats = {"ok": 0, "errors": 0, "floods": 0}
+    sem = asyncio.Semaphore(cfg.parallel)
+
+    async def one(gid: int) -> list[Lot]:
+        async with sem:
+            result = await m._request(
+                gid, cfg.page_limit, True, stats, cfg.gap, cfg.timeout
+            )
+            if result is None:
+                return []
+            return market_mod._parse_result(result)
+
+    chunks = await asyncio.gather(
+        *(one(g) for g in gift_ids), return_exceptions=True
+    )
+    now = time.time()
+    fresh: list[Lot] = []
+    for lots in chunks:
+        if isinstance(lots, BaseException):
+            continue
+        for lot in lots:
+            if lot.id in seen:
+                continue
+            seen[lot.id] = now
+            if baseline:
+                continue
+            if cfg.min_stars <= lot.stars <= cfg.max_stars:
+                fresh.append(lot)
+    if stats["floods"]:
+        logger.warning("FloodWait x%s за проход — снижаю темп", stats["floods"])
+    return fresh
+
+
+async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
+    """Дотянуть username продавца и статус ЛС — только для новых лотов."""
+    for lot in lots:
+        if not lot.seller and lot.seller_id:
+            try:
+                await m.resolve_owner(lot, timeout=1.5)
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        await m.check_free_dm(lots, timeout=2.5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def run() -> None:
+    _load_dotenv()
+    cfg = Config.from_env()
+    if not cfg.session_string:
+        raise SystemExit(
+            "SESSION_STRING пуст. Запусти:  python3 generate_session.py"
+        )
+
+    client = TelegramClient(
+        StringSession(cfg.session_string), cfg.api_id, cfg.api_hash
+    )
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise SystemExit(
+            "Сессия недействительна. Пересоздай: python3 generate_session.py"
+        )
+    me = await client.get_me()
+    logger.info("Вошёл как %s (id=%s)", me.username or me.first_name, me.id)
+
+    state_path = BASE_DIR / cfg.state_file
+    state = load_state(state_path)
+    seen: dict[str, float] = state["seen"]
+
+    if state.get("channel_id"):
+        chat_id = int(state["channel_id"])
+    else:
+        chat_id = await resolve_channel(client, cfg.target_channel)
+        state["channel_id"] = chat_id
+        save_state(state_path, state)
+    logger.info("Канал для постинга: %s", chat_id)
+
+    sender = Sender(cfg, client)
+    sender.chat_id = chat_id
+
+    m = TelegramMarket(client)
+    gift_ids = await m.load_collections(force=True)
+    if not gift_ids:
+        raise SystemExit("Не удалось загрузить список коллекций подарков")
+    logger.info("Коллекций с resale: %s", len(gift_ids))
+
+    baseline = not seen and not cfg.post_on_first_run
+    if baseline:
+        logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
+        await poll_once(m, gift_ids, seen, cfg, baseline=True)
+        save_state(state_path, state)
+        logger.info("Запомнено %s лотов. Слежу за новыми.", len(seen))
+
+    catalog_refreshed = time.monotonic()
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                fresh = await poll_once(m, gift_ids, seen, cfg, baseline=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Проход упал: %s", exc)
+                await asyncio.sleep(3)
+                continue
+
+            if fresh:
+                fresh.sort(key=lambda l: l.stars)
+                await enrich(m, fresh)
+                for lot in fresh:
+                    try:
+                        await sender.send(lot)
+                        logger.info(
+                            "Отправил: %s за %s⭐ (%s)",
+                            lot.title,
+                            int(lot.stars),
+                            lot_slug(lot),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Не отправилось (%s): %s", lot.id, exc)
+                save_state(state_path, state)
+
+            # каталог коллекций обновляем раз в 10 минут (новые гифты)
+            if time.monotonic() - catalog_refreshed > 600:
+                try:
+                    gift_ids = await m.load_collections(force=True)
+                    catalog_refreshed = time.monotonic()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            spent = time.monotonic() - started
+            await asyncio.sleep(max(cfg.poll_interval - spent, 0.2))
+    finally:
+        await sender.close()
+        await client.disconnect()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("Остановлен.")
+
+
+if __name__ == "__main__":
+    main()

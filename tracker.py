@@ -50,7 +50,7 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAGIoGRUd9Pw8LSIJmx5qRSaqZUn2hx4-sI"
+DEFAULT_BOT_TOKEN = "8807847926:AAHm55kTDzTCKl2Oe4uWavN_c7R0e1joLus"
 # Инвайты протухают — задавай CHANNEL_ID или TARGET_CHANNEL=@username в env
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")

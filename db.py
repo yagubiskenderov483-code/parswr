@@ -1248,6 +1248,14 @@ class GiftDB:
         ).fetchone()
         return row is not None
 
+    def load_gift_id_set(self) -> set[str]:
+        """Все id лотов, которые уже видели (чтобы не выдавать старый рынок)."""
+        try:
+            rows = self._conn.execute("SELECT id FROM gifts").fetchall()
+        except sqlite3.Error:
+            return set()
+        return {str(r["id"]) for r in rows if r["id"]}
+
     def load_seen_seller_keys(self) -> set[str]:
         rows = self._conn.execute(
             "SELECT key, username, user_id FROM seen_sellers"

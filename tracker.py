@@ -94,6 +94,7 @@ class Config:
     gap: float = 0.05
     timeout: float = 6.0
     scan_pages: int = 2  # страниц resale на коллекцию
+    scan_batch: int = 48  # коллекций за проход (0 = все сразу)
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -154,6 +155,7 @@ class Config:
             gap=_f("REQUEST_GAP", 0.05),
             timeout=_f("REQUEST_TIMEOUT", 6.0),
             scan_pages=max(1, int(_f("SCAN_PAGES", 2))),
+            scan_batch=int(_f("SCAN_BATCH", 48)),
             post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -571,6 +573,69 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
 # ---------------------------------------------------------------- tracker
 
 
+def _select_scan_batch(
+    gift_ids: list[int],
+    m: TelegramMarket,
+    cfg: Config,
+    *,
+    baseline: bool,
+) -> list[int]:
+    n = len(gift_ids)
+    if n == 0:
+        return []
+    if baseline or cfg.scan_batch <= 0 or cfg.scan_batch >= n:
+        batch = list(gift_ids)
+        random.shuffle(batch)
+        return batch
+    take = min(n, cfg.scan_batch)
+    batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
+    m._cursor = (m._cursor + take) % n
+    return batch
+
+
+async def _fetch_collection_pages(
+    m: TelegramMarket,
+    gid: int,
+    cfg: Config,
+    stats: dict[str, int],
+) -> list[Lot]:
+    """Страницы resale одной коллекции; fallback stars_only=False как в market."""
+    out: list[Lot] = []
+    offset = ""
+    for _ in range(max(1, int(cfg.scan_pages))):
+        result = await m._request(
+            gid,
+            cfg.page_limit,
+            True,
+            stats,
+            cfg.gap,
+            cfg.timeout,
+            offset=offset,
+        )
+        if result is None:
+            result = await m._request(
+                gid,
+                cfg.page_limit,
+                False,
+                stats,
+                cfg.gap,
+                cfg.timeout,
+                offset=offset,
+            )
+        if result is None:
+            break
+        m._remember_users(market_mod._extract_users(result))
+        parsed = market_mod._parse_result(result)
+        if parsed:
+            stats["parsed"] += len(parsed)
+            stats["ok"] += 1
+        out.extend(parsed)
+        offset = str(getattr(result, "next_offset", "") or "")
+        if not offset:
+            break
+    return out
+
+
 async def poll_once(
     m: TelegramMarket,
     gift_ids: list[int],
@@ -578,40 +643,27 @@ async def poll_once(
     cfg: Config,
     *,
     baseline: bool,
-) -> list[Lot]:
-    """Проход по всем коллекциям (несколько страниц) — лоты до max_stars."""
-    stats = {"ok": 0, "errors": 0, "floods": 0}
+) -> tuple[list[Lot], dict[str, int | float | str]]:
+    """Проход по коллекциям (ротация batch) — лоты в диапазоне MIN..MAX."""
+    started = time.monotonic()
+    api_stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
+    batch = _select_scan_batch(gift_ids, m, cfg, baseline=baseline)
     sem = asyncio.Semaphore(cfg.parallel)
 
     async def one(gid: int) -> list[Lot]:
         async with sem:
-            out: list[Lot] = []
-            offset = ""
-            for _ in range(max(1, int(cfg.scan_pages))):
-                result = await m._request(
-                    gid,
-                    cfg.page_limit,
-                    True,
-                    stats,
-                    cfg.gap,
-                    cfg.timeout,
-                    offset=offset,
-                )
-                if result is None:
-                    break
-                out.extend(market_mod._parse_result(result))
-                offset = str(getattr(result, "next_offset", "") or "")
-                if not offset:
-                    break
-            return out
+            return await _fetch_collection_pages(m, gid, cfg, api_stats)
 
     chunks = await asyncio.gather(
-        *(one(g) for g in gift_ids), return_exceptions=True
+        *(one(g) for g in batch), return_exceptions=True
     )
     now = time.time()
     fresh: list[Lot] = []
-    for lots in chunks:
+    exc_errors = 0
+    for gid, lots in zip(batch, chunks):
         if isinstance(lots, BaseException):
+            exc_errors += 1
+            logger.warning("коллекция %s: %s", gid, lots)
             continue
         for lot in lots:
             if lot.id in seen:
@@ -621,9 +673,28 @@ async def poll_once(
                 continue
             if cfg.min_stars <= lot.stars <= cfg.max_stars:
                 fresh.append(lot)
+    stats: dict[str, int | float | str] = {
+        "scanned": len(batch),
+        "parsed": api_stats.get("parsed", 0),
+        "ok": api_stats.get("ok", 0),
+        "errors": api_stats.get("errors", 0) + exc_errors,
+        "floods": api_stats.get("floods", 0),
+        "collections_total": len(gift_ids),
+        "batch_size": len(batch),
+        "elapsed": round(time.monotonic() - started, 2),
+    }
     if stats["floods"]:
         logger.warning("FloodWait x%s за проход — снижаю темп", stats["floods"])
-    return fresh
+    if int(stats["errors"]) > 0 and int(stats["scanned"]) > 0:
+        err_ratio = int(stats["errors"]) / int(stats["scanned"])
+        if err_ratio >= 0.5:
+            logger.error(
+                "Много ошибок API (%s/%s): %s",
+                stats["errors"],
+                stats["scanned"],
+                m.last_error or "неизвестно",
+            )
+    return fresh, stats
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
@@ -829,7 +900,7 @@ class PostQueue:
                 self._q.task_done()
 
 
-TRACKER_VERSION = "2.7"
+TRACKER_VERSION = "2.8"
 
 
 @dataclass
@@ -846,6 +917,12 @@ class TrackerRuntime:
     last_skip_noseller: int = 0
     seen_lots: int = 0
     queue_pending: int = 0
+    collections_total: int = 0
+    last_scan_batch: int = 0
+    last_scan_parsed: int = 0
+    last_scan_errors: int = 0
+    last_scan_elapsed: float = 0.0
+    last_api_error: str = ""
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -995,17 +1072,27 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить список коллекций подарков")
     logger.info(
-        "Коллекций с resale: %s · drip %ss · очередь отдельным потоком",
+        "Коллекций с resale: %s · batch %s · drip %ss",
         len(gift_ids),
+        cfg.scan_batch or "все",
         int(cfg.post_interval),
     )
+
+    runtime.collections_total = len(gift_ids)
 
     baseline = not seen and not cfg.post_on_first_run
     if baseline:
         logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
-        await poll_once(m, gift_ids, seen, cfg, baseline=True)
+        _, baseline_stats = await poll_once(
+            m, gift_ids, seen, cfg, baseline=True
+        )
         save_state(state_path, state)
-        logger.info("Запомнено %s лотов. Слежу за новыми.", len(seen))
+        logger.info(
+            "Запомнено %s лотов (скан %s колл · %ss). Слежу за новыми.",
+            len(seen),
+            baseline_stats.get("scanned", "?"),
+            baseline_stats.get("elapsed", "?"),
+        )
 
     catalog_refreshed = time.monotonic()
     pass_no = 0
@@ -1016,11 +1103,20 @@ async def run() -> None:
             runtime.passes = pass_no
             runtime.seen_lots = len(seen)
             try:
-                fresh = await poll_once(m, gift_ids, seen, cfg, baseline=False)
+                fresh, scan = await poll_once(
+                    m, gift_ids, seen, cfg, baseline=False
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Проход упал: %s", exc)
                 await asyncio.sleep(3)
                 continue
+
+            runtime.last_scan_batch = int(scan.get("batch_size", 0))
+            runtime.last_scan_parsed = int(scan.get("parsed", 0))
+            runtime.last_scan_errors = int(scan.get("errors", 0))
+            runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
+            if runtime.last_scan_errors:
+                runtime.last_api_error = m.last_error or ""
 
             runtime.last_fresh = len(fresh)
             if fresh:
@@ -1054,14 +1150,17 @@ async def run() -> None:
                     post_queue.enqueue(to_post)
                     runtime.queue_pending = post_queue.pending
                     runtime.last_posted = len(to_post)
-            elif pass_no % 15 == 0:
+            else:
                 logger.info(
-                    "Проход #%s: новых лотов в %s–%s⭐ нет (seen=%s, posted=%s)",
+                    "Проход #%s: скан %s/%s колл · %s лотов · +0 новых "
+                    "(err=%s · %ss · seen=%s)",
                     pass_no,
-                    int(cfg.min_stars),
-                    int(cfg.max_stars),
+                    scan.get("batch_size", "?"),
+                    scan.get("collections_total", "?"),
+                    scan.get("parsed", 0),
+                    scan.get("errors", 0),
+                    scan.get("elapsed", "?"),
                     len(seen),
-                    runtime.posted_total,
                 )
 
             save_state(state_path, state)

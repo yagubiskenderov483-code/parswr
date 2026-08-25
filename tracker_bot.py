@@ -300,6 +300,10 @@ def build_router(
             lines.extend(
                 [
                     f"Проходов: {rt.passes}",
+                    f"Коллекций: {rt.collections_total or '—'} "
+                    f"(batch {getattr(rt.cfg, 'scan_batch', 48) if cfg else 48})",
+                    f"Последний скан: {rt.last_scan_batch} колл · "
+                    f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
                     f"Всего отправлено: {rt.posted_total}",
                     f"В очереди: {rt.queue_pending}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
@@ -308,6 +312,11 @@ def build_router(
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )
+            if rt.last_scan_errors:
+                lines.append(
+                    f"⚠️ Ошибки API: {rt.last_scan_errors}"
+                    + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
+                )
         await message.answer("\n".join(lines))
 
     @router.message(Command("test"))

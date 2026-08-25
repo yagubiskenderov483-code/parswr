@@ -282,6 +282,7 @@ class App:
         self._filter_seen_sellers |= set(self._delivered_sellers)
         self._known_lot_ids: set[str] = set()
         self._live_seeded = False
+        self._load_shown_titles()
         self.log_chat_id: int | None = None
         self.log_chat_title = ""
         self.log_chat_username = ""
@@ -609,6 +610,7 @@ class App:
         progress_cb: Any | None = None,
         early_show_at: int = 0,
         on_early_lots: Any | None = None,
+        on_batch_lots: Any | None = None,
         stop_event: Any | None = None,
         force_markets: bool = True,
     ):
@@ -756,6 +758,7 @@ class App:
                     time_budget=0,
                     early_show_at=early_show_at,
                     on_early_lots=_early,
+                    on_batch_lots=on_batch_lots,
                     collection_ids=ids,
                     stop_event=stop_event,
                     deep=deep,
@@ -1355,6 +1358,15 @@ class App:
             return False
         return True
 
+    def _load_shown_titles(self) -> None:
+        """Типы, которые уже выдавали — больше не повторяем."""
+        try:
+            for tk in self.db.get_collection_show_counts():
+                if tk:
+                    self._seen_titles.add(str(tk).strip().lower())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load shown titles: %s", exc)
+
     def _load_known_lot_ids(self) -> None:
         if self._known_lot_ids:
             return
@@ -1596,7 +1608,7 @@ class App:
         # типы: каждый канал — свой seen (фильтры ≠ парсер)
         seen_titles: set[str] = set()
         if channel == "parser":
-            seen_titles = set()
+            seen_titles = set(self._seen_titles) | set(self._recent_titles[-200:])
         elif is_filter:
             seen_titles = set(self._filter_recent_titles[-300:])
         if is_old or ignore_seen:
@@ -1667,11 +1679,11 @@ class App:
             tk = self._title_key(lot)
             if not tk:
                 continue
-            # парсер: типы можно повторять (важен новый юз); фильтры — без повторов типов
-            if channel in ("filter", "old"):
+            # типы без повторов (парсер + фильтры + старый)
+            if channel in ("parser", "filter", "old"):
                 if tk in seen_titles or tk in local_titles:
                     continue
-            # модели: фильтры без дублей в одной выдаче; парсер — разные юзы ок
+            # модели: фильтры без дублей в одной выдаче
             if channel != "parser" and lot.model_key in local_models:
                 continue
             if tk not in buckets:
@@ -1706,7 +1718,7 @@ class App:
                     continue
                 if channel != "parser" and lot.model_key in marked_models:
                     continue
-                if channel == "filter":
+                if channel in ("parser", "filter"):
                     if self._title_key(lot) in marked_titles:
                         continue
                 if channel == "parser":
@@ -1988,11 +2000,13 @@ class App:
         ]
         # без уже выданных юзов/типов — каналы раздельно
         if channel == "parser":
+            blocked_t = set(self._seen_titles) | set(self._recent_titles[-200:])
             candidates = [
                 lot
                 for lot in candidates
                 if lot.owner_key not in self._seen_sellers
                 and lot.owner_key not in self._delivered_sellers
+                and self._title_key(lot) not in blocked_t
             ]
         elif channel == "filter":
             blocked_t = set(self._filter_recent_titles[-300:])
@@ -3298,6 +3312,7 @@ class App:
         )
         await _status("снимок маркета…")
         last_prog = 0.0
+        deliver_lock = asyncio.Lock()
 
         async def _burst_progress(
             done: int,
@@ -3317,6 +3332,43 @@ class App:
             self.parse_models = models_n
             await _status("скан…" if first else "жду новые лоты…")
 
+        async def _on_batch(group_lots: list[Lot]) -> None:
+            if not self.running:
+                return
+            price = [lot for lot in group_lots if self._in_price(lot)]
+            if not price:
+                return
+            if not self._live_seeded:
+                self._remember_listings(price)
+                return
+            async with deliver_lock:
+                fresh = self._take_fresh_listings(price)
+                if not fresh:
+                    return
+                shown = await self._prepare_show(
+                    fresh,
+                    limit=None,
+                    apply_extra=False,
+                    channel="parser",
+                    strict_russian=True,
+                )
+                if not shown:
+                    await _status(f"новых {len(fresh)}, фильтр 0")
+                    return
+                now = time.monotonic()
+                for lot in shown:
+                    self._seen[lot.id] = now
+                await self._say_lot_list(shown, channel="parser")
+                self.lots_notified += len(shown)
+                self.parse_ready = self.lots_notified
+                await self._say(
+                    f"{screen('Парсинг')}\n"
+                    f"🆕 только что выставили · <b>{len(shown)}</b> типов\n"
+                    f"RU · free DM · рейт ≤2 · без повтора типов",
+                    reply_markup=parse_done_inline(),
+                    log=True,
+                )
+
         try:
             while self.running:
                 flood_left = resale_flood_remaining()
@@ -3330,6 +3382,7 @@ class App:
                         self.max_stars,
                         progress_cb=_burst_progress,
                         early_show_at=0,
+                        on_batch_lots=_on_batch,
                         force_markets=first,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -3355,45 +3408,15 @@ class App:
                     await self._say(
                         f"{screen('Парсинг')}\n"
                         f"Снял рынок · <b>{len(price_pool)}</b> лотов\n"
-                        f"Дальше только кто выставит <b>сейчас</b>\n"
-                        f"RU · рейт ≤2 · free DM · без повторов юзов",
+                        f"Дальше — типы, которые выставят <b>сейчас</b>\n"
+                        f"RU · free DM · рейт ≤2 · тип один раз",
                         reply_markup=parse_done_inline(),
                         log=True,
                     )
                     await _status("жду новые лоты…")
                     await asyncio.sleep(pause)
                     continue
-                fresh = self._take_fresh_listings(price_pool)
-                self.parse_checked = len(fresh)
-                if not fresh:
-                    await _status("жду новые лоты…")
-                    await asyncio.sleep(pause)
-                    continue
-                shown = await self._prepare_show(
-                    fresh,
-                    limit=None,
-                    apply_extra=False,
-                    channel="parser",
-                    strict_russian=True,
-                )
-                self.parse_ready = len(shown)
-                if shown:
-                    now = time.monotonic()
-                    for lot in shown:
-                        self._seen[lot.id] = now
-                    await self._say_lot_list(shown, channel="parser")
-                    self.lots_notified += len(shown)
-                    await self._say(
-                        f"{screen('Парсинг')}\n"
-                        f"🆕 только что выставили · <b>{len(shown)}</b>\n"
-                        f"RU · рейт ≤2 · free DM",
-                        reply_markup=parse_done_inline(),
-                        log=True,
-                    )
-                else:
-                    await _status(
-                        f"новых {len(fresh)}, после фильтров 0 · жду дальше"
-                    )
+                await _status("жду новые лоты…")
                 await asyncio.sleep(pause)
         finally:
             self.running = False

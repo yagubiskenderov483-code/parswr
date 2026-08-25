@@ -336,6 +336,7 @@ class TelegramMarket:
         time_budget: float = 3.5,
         early_show_at: int = 0,
         on_early_lots: Any | None = None,
+        on_batch_lots: Any | None = None,
         collection_ids: list[int] | None = None,
         stop_event: Any | None = None,
         deep: bool = False,
@@ -405,12 +406,19 @@ class TelegramMarket:
                 break
             group = batch[i : i + parallel]
             parts = await asyncio.gather(*[one(g) for g in group], return_exceptions=True)
+            group_lots: list[Lot] = []
             for part in parts:
                 stats["scanned"] += 1
                 if isinstance(part, list):
                     lots.extend(part)
+                    group_lots.extend(part)
                 else:
                     stats["errors"] += 1
+            if callable(on_batch_lots) and group_lots:
+                try:
+                    await on_batch_lots(group_lots)
+                except Exception:  # noqa: BLE001
+                    pass
             # всегда копить в БД по ходу скана (не ждать выдачи)
             batch_save = getattr(self, "_batch_save_cb", None)
             if callable(batch_save):

@@ -400,6 +400,9 @@ class GiftDB:
             "CREATE INDEX IF NOT EXISTS idx_gifts_seller ON gifts(seller)"
         )
         self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gifts_seller_id ON gifts(seller_id)"
+        )
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)"
         )
         self._conn.execute(
@@ -613,6 +616,76 @@ class GiftDB:
                 }
             )
         return self.upsert_users(users, cap=cap)
+
+    def get_users_by_ids(self, user_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Юзы из фарма БД — чтобы достать скрытый @username по id."""
+        out: dict[int, dict[str, Any]] = {}
+        ids: list[int] = []
+        for raw in user_ids:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return out
+        chunk = 400
+        for i in range(0, len(ids), chunk):
+            part = ids[i : i + chunk]
+            q = ",".join("?" * len(part))
+            rows = self._conn.execute(
+                f"""
+                SELECT user_id, username, first_name, last_name,
+                       is_premium, account_level, gifts_count
+                FROM users WHERE user_id IN ({q})
+                """,
+                part,
+            ).fetchall()
+            for r in rows:
+                uid = int(r["user_id"])
+                out[uid] = {
+                    "user_id": uid,
+                    "username": str(r["username"] or "").lstrip("@").strip(),
+                    "first_name": str(r["first_name"] or ""),
+                    "last_name": str(r["last_name"] or ""),
+                    "is_premium": None
+                    if r["is_premium"] is None
+                    else bool(r["is_premium"]),
+                    "account_level": r["account_level"],
+                    "gifts_count": r["gifts_count"],
+                }
+        return out
+
+    def get_seller_names_by_ids(self, user_ids: list[int]) -> dict[int, str]:
+        """Запасной @юз из gifts, если в users уже пусто."""
+        out: dict[int, str] = {}
+        ids: list[int] = []
+        for raw in user_ids:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return out
+        chunk = 400
+        for i in range(0, len(ids), chunk):
+            part = ids[i : i + chunk]
+            q = ",".join("?" * len(part))
+            rows = self._conn.execute(
+                f"""
+                SELECT seller_id, seller FROM gifts
+                WHERE seller_id IN ({q}) AND seller != ''
+                """,
+                part,
+            ).fetchall()
+            for r in rows:
+                try:
+                    uid = int(r["seller_id"])
+                except (TypeError, ValueError):
+                    continue
+                name = str(r["seller"] or "").lstrip("@").strip()
+                if uid and name and uid not in out:
+                    out[uid] = name
+        return out
 
     def _lot_from_gift_row(self, r: Any) -> Lot:
         seller = str(r["seller"] or "").lstrip("@").strip()

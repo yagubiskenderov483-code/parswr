@@ -1330,7 +1330,12 @@ class App:
         lc = (getattr(lot, "lang_code", "") or "").lower()
         if lc.startswith(("ru", "uk", "be")):
             return True
-        parts = [lot.first_name or "", lot.last_name or "", lot.about or ""]
+        parts = [
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+            lot.seller or "",
+        ]
         blob = " ".join(p for p in parts if p).strip()
         if not blob:
             return False
@@ -1362,9 +1367,9 @@ class App:
         return True
 
     def _passes_parser_quality(self, lot: Lot) -> bool:
-        if not lot.seller:
+        if not lot.seller and lot.seller_id is None:
             return False
-        if self._bad_username_len(lot.seller):
+        if lot.seller and self._bad_username_len(lot.seller):
             return False
         if self._is_blocked_lot(lot) or self._is_ad(lot):
             return False
@@ -1380,6 +1385,58 @@ class App:
         if tk and tk in self._seen_titles:
             return False
         return True
+
+    def _hydrate_lots_from_db(self, lots: list[Lot]) -> None:
+        """Подтянуть скрытый юз / имя / лвл из фарм-БД по seller_id."""
+        need_ids = [
+            int(lot.seller_id)
+            for lot in lots
+            if lot.seller_id is not None
+        ]
+        if not need_ids:
+            return
+        try:
+            by_id = self.db.get_users_by_ids(need_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("hydrate users: %s", exc)
+            by_id = {}
+        missing = [
+            uid
+            for uid in need_ids
+            if not (by_id.get(uid) or {}).get("username")
+        ]
+        gift_names: dict[int, str] = {}
+        if missing:
+            try:
+                gift_names = self.db.get_seller_names_by_ids(missing)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("hydrate gifts: %s", exc)
+        for lot in lots:
+            if lot.seller_id is None:
+                continue
+            uid = int(lot.seller_id)
+            u = by_id.get(uid) or {}
+            uname = str(u.get("username") or "").lstrip("@").strip()
+            if not uname:
+                uname = str(gift_names.get(uid) or "").lstrip("@").strip()
+            if uname and not lot.seller:
+                lot.seller = uname
+            if u.get("first_name") and not lot.first_name:
+                lot.first_name = str(u["first_name"])
+            if u.get("last_name") and not lot.last_name:
+                lot.last_name = str(u["last_name"])
+            if lot.account_level is None and u.get("account_level") is not None:
+                try:
+                    lot.account_level = int(u["account_level"])
+                except (TypeError, ValueError):
+                    pass
+            if lot.gifts_count is None and u.get("gifts_count") is not None:
+                try:
+                    lot.gifts_count = int(u["gifts_count"])
+                except (TypeError, ValueError):
+                    pass
+            if lot.is_premium is None and u.get("is_premium") is not None:
+                lot.is_premium = bool(u["is_premium"])
 
     def _load_shown_titles(self) -> None:
         """Типы, которые уже выдавали — больше не повторяем."""
@@ -1673,10 +1730,16 @@ class App:
         recent = set(recent_list[-100:]) | seen_titles
 
         for lot in lots:
-            if not lot.seller:
-                continue
-            if self._bad_username_len(lot.seller):
-                continue
+            if channel == "parser":
+                if not lot.seller and lot.seller_id is None:
+                    continue
+                if lot.seller and self._bad_username_len(lot.seller):
+                    continue
+            else:
+                if not lot.seller:
+                    continue
+                if self._bad_username_len(lot.seller):
+                    continue
             if self._is_blocked_lot(lot):
                 continue
             if self._is_ad(lot):
@@ -1986,6 +2049,7 @@ class App:
             lim = limit or max(30, creds.SHOW_LIMIT)
         self._ingest_always(list(lots))
         pre = list(lots)
+        self._hydrate_lots_from_db(pre)
         random.shuffle(pre)
         with_seller = [lot for lot in pre if lot.seller]
         without = [lot for lot in pre if not lot.seller]
@@ -2008,7 +2072,17 @@ class App:
             )
             self.parse_acc_checks += resolve_n
             self._ingest_always(without[:resolve_n])
-        pool = with_seller + without[:resolve_n]
+            # после slug-resolve мог появиться seller_id — ещё раз из БД
+            self._hydrate_lots_from_db(without[:resolve_n])
+        if channel == "parser":
+            # скрытый @ не выкидываем: хватает seller_id (+ юз из БД если был)
+            pool = [
+                lot
+                for lot in pre
+                if lot.seller or lot.seller_id is not None
+            ]
+        else:
+            pool = with_seller + without[:resolve_n]
         # в БД только те, кого ещё не выдавали — выданные навсегда стёрты
         fresh_pool = [
             lot
@@ -2024,7 +2098,10 @@ class App:
         candidates = [
             lot
             for lot in pool
-            if lot.seller and not self._bad_username_len(lot.seller)
+            if (
+                (lot.seller and not self._bad_username_len(lot.seller))
+                or (channel == "parser" and lot.seller_id is not None and not lot.seller)
+            )
             and not self._is_delivered_seller(lot)
         ]
         # без уже выданных юзов/типов — каналы раздельно
@@ -2661,9 +2738,16 @@ class App:
         elif lot.is_premium is True:
             meta.append("TGP")
         extra = f" · {', '.join(meta)}" if meta else ""
+        if lot.seller:
+            who = f"@{_esc(lot.seller)}"
+        elif lot.seller_id is not None:
+            uid = int(lot.seller_id)
+            who = f'<a href="tg://user?id={uid}">id:{uid}</a>'
+        else:
+            who = "hidden"
         return (
             f'🎁 <a href="{lot.nft_url}">{_esc(nft_name)}</a> | '
-            f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
+            f"{who} | {_fmt(lot.stars)}⭐{extra}"
         )
 
     def _load_log_chat(self) -> None:
@@ -3557,9 +3641,11 @@ class App:
     async def _notify_lot_to(
         self, chat_id: int, lot: Lot, count_as_new: bool
     ) -> None:
-        if not self.bot or not chat_id or not lot.seller:
+        if not self.bot or not chat_id:
             return
-        if self._bad_username_len(lot.seller):
+        if not lot.seller and lot.seller_id is None:
+            return
+        if lot.seller and self._bad_username_len(lot.seller):
             return
         if self._is_blocked_lot(lot):
             return

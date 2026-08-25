@@ -89,16 +89,16 @@ class Config:
     target_channel: str
     min_stars: float = 500.0
     max_stars: float = 5000.0
-    poll_interval: float = 1.0
-    page_limit: int = 25
-    parallel: int = 12
-    gap: float = 0.08
-    timeout: float = 8.0
+    poll_interval: float = 0.15
+    page_limit: int = 12  # только верх resale-листа
+    parallel: int = 8
+    gap: float = 0.14
+    timeout: float = 10.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
-    enrich_parallel: int = 8
+    enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
     scan_batch: int = 0  # 0 = все коллекции каждый проход
-    hot_limit: int = 8  # топ-N лотов с 1-й страницы (не старый хвост)
+    hot_limit: int = 4  # топ-N = только что выставленные
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
@@ -107,7 +107,7 @@ class Config:
     state_file: str = ""
     post_on_first_run: bool = False
     channel_id: int | None = None
-    strict_ru: bool = True
+    strict_ru: bool = False  # как Parser Gift — без жёсткого RU
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
 
     @classmethod
@@ -154,16 +154,16 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 5000),
-            poll_interval=_f("POLL_INTERVAL", 1.0),
-            page_limit=int(_f("PAGE_LIMIT", 25)),
-            parallel=int(_f("PARALLEL", 12)),
-            gap=_f("REQUEST_GAP", 0.08),
-            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            poll_interval=_f("POLL_INTERVAL", 0.15),
+            page_limit=int(_f("PAGE_LIMIT", 12)),
+            parallel=int(_f("PARALLEL", 8)),
+            gap=_f("REQUEST_GAP", 0.14),
+            timeout=_f("REQUEST_TIMEOUT", 10.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
-            enrich_parallel=max(2, int(_f("ENRICH_PARALLEL", 8))),
+            enrich_parallel=max(2, int(_f("ENRICH_PARALLEL", 6))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
@@ -172,7 +172,7 @@ class Config:
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
             channel_id=channel_id,
-            strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") != "0",
+            strict_ru=os.environ.get("TRACKER_STRICT_RU", "0") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
         )
 
@@ -608,41 +608,35 @@ async def _fetch_collection_pages(
     cfg: Config,
     stats: dict[str, int],
 ) -> list[Lot]:
-    """Страницы resale одной коллекции; fallback stars_only=False как в market."""
-    out: list[Lot] = []
-    offset = ""
-    for _ in range(max(1, int(cfg.scan_pages))):
+    """Только page1 resale; fallback без двойного счёта ошибок."""
+    local: dict[str, int] = {"errors": 0, "floods": 0}
+    result = await m._request(
+        gid,
+        cfg.page_limit,
+        True,
+        local,
+        cfg.gap,
+        cfg.timeout,
+    )
+    if result is None:
         result = await m._request(
             gid,
             cfg.page_limit,
-            True,
-            stats,
+            False,
+            local,
             cfg.gap,
             cfg.timeout,
-            offset=offset,
         )
-        if result is None:
-            result = await m._request(
-                gid,
-                cfg.page_limit,
-                False,
-                stats,
-                cfg.gap,
-                cfg.timeout,
-                offset=offset,
-            )
-        if result is None:
-            break
-        m._remember_users(market_mod._extract_users(result))
-        parsed = market_mod._parse_result(result)
-        if parsed:
-            stats["parsed"] += len(parsed)
-            stats["ok"] += 1
-        out.extend(parsed)
-        offset = str(getattr(result, "next_offset", "") or "")
-        if not offset:
-            break
-    return out
+    stats["floods"] += local.get("floods", 0)
+    if result is None:
+        stats["errors"] += 1
+        return []
+    m._remember_users(market_mod._extract_users(result))
+    parsed = market_mod._parse_result(result)
+    if parsed:
+        stats["parsed"] += len(parsed)
+        stats["ok"] += 1
+    return parsed
 
 
 async def poll_once(
@@ -714,21 +708,28 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Один лот: продавец + level + free_dm (в воркере очереди, не блокирует скан)."""
+    """Быстрый enrich одного лота (только недостающие поля)."""
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=3.5)
+            await m.resolve_owner(lot, timeout=2.5)
         except Exception:  # noqa: BLE001
             pass
-    if lot.seller_id is not None:
+    need_profile = lot.seller_id is not None and (
+        lot.account_level is None
+        or lot.free_dm is None
+        or lot.is_premium is None
+        or (cfg.strict_ru and not lot.lang_code)
+    )
+    if need_profile:
         try:
-            await m.enrich_profiles([lot], timeout=3.5, parallel=1)
+            await m.enrich_profiles([lot], timeout=2.5, parallel=1)
         except Exception:  # noqa: BLE001
             pass
-    try:
-        await m.check_free_dm([lot], timeout=3.5)
-    except Exception:  # noqa: BLE001
-        pass
+    if lot.free_dm is None and lot.seller_id is not None:
+        try:
+            await m.check_free_dm([lot], timeout=2.5)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot], cfg: Config) -> None:
@@ -876,13 +877,8 @@ def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
 
 
 def rank_for_queue(lots: list[Lot]) -> list[Lot]:
-    boost_female = random.random() < 0.35
-    ranked = sorted(
-        lots, key=lambda lot: -_lot_priority(lot, boost_female=boost_female)
-    )
-    if boost_female:
-        logger.info("очередь: буст «девочки» включён для этого батча")
-    return ranked
+    """Сначала самые свежие (только что увидели на маркете)."""
+    return sorted(lots, key=lambda lot: -float(lot.discovered_at or 0))
 
 
 class PostQueue:
@@ -909,13 +905,16 @@ class PostQueue:
         self._state_path = state_path
         self._runtime = runtime
         self._interval = max(1.0, float(post_interval))
-        self._q: asyncio.Queue[Lot | None] = asyncio.Queue()
+        self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
+            asyncio.PriorityQueue()
+        )
+        self._seq = 0
         self._task: asyncio.Task | None = None
         self._closed = False
 
     @property
     def pending(self) -> int:
-        return self._q.qsize()
+        return self._pq.qsize()
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -925,7 +924,8 @@ class PostQueue:
     async def stop(self) -> None:
         self._closed = True
         if self._task and not self._task.done():
-            await self._q.put(None)
+            self._seq += 1
+            await self._pq.put((0.0, self._seq, None))
             try:
                 await asyncio.wait_for(self._task, timeout=self._interval + 10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -936,17 +936,19 @@ class PostQueue:
         if not lots:
             return 0
         for lot in rank_for_queue(lots):
-            self._q.put_nowait(lot)
+            self._seq += 1
+            prio = -float(lot.discovered_at or time.time())
+            self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
 
     async def _drip_worker(self) -> None:
         logger.info(
-            "Drip: enrich+фильтр+send каждые %ss (сканер параллельно)",
+            "Drip: свежие первые · enrich+send /%ss (сканер параллельно)",
             int(self._interval),
         )
         while not self._closed:
-            lot = await self._q.get()
+            _, _, lot = await self._pq.get()
             if lot is None:
                 break
             try:
@@ -990,10 +992,10 @@ class PostQueue:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
             finally:
-                self._q.task_done()
+                self._pq.task_done()
 
 
-TRACKER_VERSION = "3.0"
+TRACKER_VERSION = "3.1"
 
 
 @dataclass
@@ -1009,6 +1011,7 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0
     collections_total: int = 0
@@ -1169,7 +1172,24 @@ async def scanner_loop(
                 pass
 
         spent = time.monotonic() - started
-        await asyncio.sleep(max(cfg.poll_interval - spent, 0.05))
+        scanned = int(scan.get("scanned", 0) or 0)
+        errors = int(scan.get("errors", 0) or 0)
+        if scanned > 0:
+            ratio = errors / scanned
+            if ratio > 0.35 and runtime.scan_parallel > 4:
+                runtime.scan_parallel -= 1
+                cfg.parallel = runtime.scan_parallel
+                logger.warning(
+                    "Много ошибок API (%s/%s) — parallel=%s",
+                    errors,
+                    scanned,
+                    runtime.scan_parallel,
+                )
+            elif ratio < 0.12 and runtime.scan_parallel < 12:
+                runtime.scan_parallel += 1
+                cfg.parallel = runtime.scan_parallel
+
+        await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
 
 
 async def run() -> None:
@@ -1181,10 +1201,12 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s запущен · %s (id=%s) · фильтры: RU + бесплатные ЛС",
+        "✅ Трекер v%s · %s · RU=%s · lvl≤%s · hot=%s",
         TRACKER_VERSION,
         me.username or me.first_name,
-        me.id,
+        "да" if cfg.strict_ru else "нет",
+        cfg.max_account_level,
+        cfg.hot_limit,
     )
 
     state_path = Path(cfg.state_file)
@@ -1208,6 +1230,7 @@ async def run() -> None:
         state_path=state_path,
         state=state,
         seen_lots=len(seen),
+        scan_parallel=cfg.parallel,
     )
 
     dd = data_dir()

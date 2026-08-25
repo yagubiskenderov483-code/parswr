@@ -302,7 +302,7 @@ def build_router(
                 [
                     f"Проходов: {rt.passes}",
                     f"Коллекций: {rt.collections_total or '—'} "
-                    f"(batch {getattr(rt.cfg, 'scan_batch', 48) if cfg else 48})",
+                    f"(parallel {rt.scan_parallel or 8})",
                     f"Последний скан: {rt.last_scan_batch} колл · "
                     f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
                     f"Всего отправлено: {rt.posted_total}",

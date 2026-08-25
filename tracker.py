@@ -43,6 +43,7 @@ from market import (
     is_free_dm_lot,
     is_russian_lot,
 )
+from tracker_bot import ChannelStore, ControlBot, channel_file_path
 
 logger = logging.getLogger("tracker")
 
@@ -308,23 +309,91 @@ class Sender:
 
 async def find_channel_in_dialogs(client: TelegramClient) -> int | None:
     """Канал, где юзербот уже состоит (инвайт мог протухнуть)."""
+    channels: list[tuple[str, int]] = []
     try:
-        async for dlg in client.iter_dialogs():
+        async for dlg in client.iter_dialogs(limit=80):
             if not getattr(dlg, "is_channel", False):
                 continue
-            name = (dlg.name or "").strip().lower()
+            name = (dlg.name or "").strip()
             if not name:
                 continue
+            cid = get_peer_id(dlg.entity)
+            channels.append((name, cid))
+            low = name.lower()
             for hint in CHANNEL_NAME_HINTS:
-                if hint in name:
-                    cid = get_peer_id(dlg.entity)
-                    logger.info(
-                        "Канал из диалогов: «%s» → %s", dlg.name, cid
-                    )
+                if hint in low:
+                    logger.info("Канал из диалогов: «%s» → %s", name, cid)
                     return cid
+        if channels:
+            preview = ", ".join(f"«{n}»({c})" for n, c in channels[:12])
+            logger.info("Каналы Mary в диалогах: %s", preview)
+        if len(channels) == 1:
+            name, cid = channels[0]
+            logger.info("Единственный канал в диалогах: «%s» → %s", name, cid)
+            return cid
     except Exception as exc:  # noqa: BLE001
         logger.warning("поиск канала в диалогах: %s", exc)
     return None
+
+
+async def obtain_channel_id(
+    client: TelegramClient,
+    cfg: Config,
+    state: dict,
+    state_path: Path,
+    store: Any,
+) -> int:
+    """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
+    if cfg.channel_id:
+        cid = int(cfg.channel_id)
+        store.save(cid)
+        state["channel_id"] = cid
+        save_state(state_path, state)
+        logger.info("Канал из CHANNEL_ID: %s", cid)
+        return cid
+
+    saved = store.load()
+    if saved is not None:
+        state["channel_id"] = saved
+        save_state(state_path, state)
+        logger.info("Канал из файла: %s", saved)
+        return saved
+
+    if state.get("channel_id"):
+        cid = int(state["channel_id"])
+        store.save(cid)
+        logger.info("Канал из state: %s", cid)
+        return cid
+
+    while True:
+        if cfg.target_channel.strip():
+            try:
+                cid = await resolve_channel(client, cfg.target_channel)
+                store.save(cid)
+                state["channel_id"] = cid
+                save_state(state_path, state)
+                return cid
+            except SystemExit as exc:
+                logger.warning("resolve_channel: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("resolve_channel: %s", exc)
+
+        found = await find_channel_in_dialogs(client)
+        if found is not None:
+            store.save(found)
+            state["channel_id"] = found
+            save_state(state_path, state)
+            return found
+
+        logger.warning(
+            "Канал не задан. Открой @markskskdbot → /channels или "
+            "/setchannel @имя_канала (жду 60с…)"
+        )
+        waited = await store.wait(timeout=60.0)
+        if waited is not None:
+            state["channel_id"] = waited
+            save_state(state_path, state)
+            return waited
 
 
 async def resolve_channel(client: TelegramClient, raw: str) -> int:
@@ -334,10 +403,7 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
         found = await find_channel_in_dialogs(client)
         if found is not None:
             return found
-        raise SystemExit(
-            "Канал не задан. Укажи CHANNEL_ID=-100… или TARGET_CHANNEL=@username "
-            "в переменных Bothost."
-        )
+        raise SystemExit("Канал не задан — /setchannel в @markskskdbot")
     if re.fullmatch(r"-?\d+", raw):
         return int(raw)
 
@@ -510,7 +576,7 @@ def filter_for_post(
     return out
 
 
-TRACKER_VERSION = "2.2"
+TRACKER_VERSION = "2.3"
 
 
 def _load_session_from_db() -> str:
@@ -549,36 +615,55 @@ async def _load_session_string(cfg: Config) -> str:
     return fallback
 
 
-async def _get_client(cfg: Config) -> TelegramClient:
+async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient, ControlBot]:
     session_string = await _load_session_string(cfg)
+    client: TelegramClient
     if session_string:
         client = TelegramClient(
             StringSession(session_string), cfg.api_id, cfg.api_hash
         )
         await client.connect()
-        if await client.is_user_authorized():
-            return client
-        await client.disconnect()
-        logger.warning(
-            "Сессия в %s недействительна — нужен повторный вход",
-            cfg.session_file,
-        )
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            logger.warning(
+                "Сессия в %s недействительна — нужен повторный вход",
+                cfg.session_file,
+            )
+            client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+            await client.connect()
+    else:
+        client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+        await client.connect()
 
-    logger.warning(
-        "⚠️ Трекер v%s: нет сессии — постинг ОТКЛЮЧЁН до входа. "
-        "Лоты в канале сейчас могут идти от старого деплоя.",
-        TRACKER_VERSION,
+    bot = ControlBot(
+        cfg.bot_token,
+        client,
+        cfg.session_file,
+        store,
+        tracker_version=TRACKER_VERSION,
     )
-    import session_login
+    await bot.start()
 
-    return await session_login.bot_login_wizard(cfg)
+    if not await client.is_user_authorized():
+        logger.warning(
+            "⚠️ Трекер v%s: нет сессии — войди через @markskskdbot /start",
+            TRACKER_VERSION,
+        )
+        await bot.wait_login()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError("Вход не завершён")
+
+    return client, bot
 
 
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
+    store = ChannelStore(channel_file_path(data_dir()))
+    control_bot: ControlBot | None = None
 
-    client = await _get_client(cfg)
+    client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
         "✅ Трекер v%s запущен · %s (id=%s) · фильтры: RU + бесплатные ЛС",
@@ -592,29 +677,7 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
 
-    if cfg.channel_id:
-        chat_id = int(cfg.channel_id)
-        state["channel_id"] = chat_id
-        save_state(state_path, state)
-        logger.info("Канал из CHANNEL_ID: %s", chat_id)
-    elif state.get("channel_id"):
-        chat_id = int(state["channel_id"])
-    else:
-        try:
-            chat_id = await resolve_channel(client, cfg.target_channel)
-        except SystemExit:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("resolve_channel: %s — ищу в диалогах", exc)
-            found = await find_channel_in_dialogs(client)
-            if found is None:
-                raise SystemExit(
-                    "Не найден канал для постинга. Задай CHANNEL_ID=-100… "
-                    "или TARGET_CHANNEL=@username в Bothost."
-                ) from exc
-            chat_id = found
-        state["channel_id"] = chat_id
-        save_state(state_path, state)
+    chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
     logger.info("Канал для постинга: %s", chat_id)
 
     sender = Sender(cfg, client)
@@ -688,6 +751,8 @@ async def run() -> None:
             await asyncio.sleep(max(cfg.poll_interval - spent, 0.2))
     finally:
         await sender.close()
+        if control_bot:
+            await control_bot.stop()
         await client.disconnect()
 
 

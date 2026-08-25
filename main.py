@@ -15,6 +15,7 @@ import asyncio
 import logging
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ from pathlib import Path
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -4380,6 +4382,28 @@ async def cb_price_start(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+async def ensure_solo_polling(bot: Bot) -> None:
+    """Webhook снимаем; если другой инстанс уже делает getUpdates — выходим сразу."""
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("webhook cleared")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete_webhook: %s", exc)
+    try:
+        await bot.get_updates(limit=1, timeout=0)
+        logger.info("polling slot free")
+    except TelegramConflictError:
+        me = await bot.get_me()
+        logger.error(
+            "Конфликт polling для @%s (id=%s): другой процесс уже делает getUpdates. "
+            "Остановите локальный запуск, старый контейнер Bothost или второй проект "
+            "с тем же BOT_TOKEN — одновременно может работать только один инстанс.",
+            me.username,
+            me.id,
+        )
+        raise SystemExit(1) from None
+
+
 async def main() -> None:
     wipe_disk_junk()
     bot = Bot(
@@ -4425,12 +4449,8 @@ async def main() -> None:
     router.callback_query.middleware(OwnerOnlyMiddleware())
     dp.include_router(router)
     logger.info("Ready | Neptun Parser · owner-only · multi-acc")
-    try:
-        # Bothost/другой инстанс мог повесить webhook — polling иначе Conflict
-        await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("webhook cleared · polling")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("delete_webhook: %s", exc)
+    await ensure_solo_polling(bot)
+    logger.info("start polling")
     try:
         await dp.start_polling(bot)
     finally:

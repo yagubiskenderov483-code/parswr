@@ -31,7 +31,13 @@ from telethon.tl.functions.messages import (
 from telethon.utils import get_peer_id
 
 import market as market_mod
-from market import Lot, TelegramMarket
+from market import (
+    Lot,
+    TelegramMarket,
+    format_account_level,
+    is_free_dm_lot,
+    is_russian_lot,
+)
 
 logger = logging.getLogger("tracker")
 
@@ -140,6 +146,7 @@ class Config:
 # ---------------------------------------------------------------- state
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
+SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
 
 
 def load_state(path: Path) -> dict:
@@ -147,11 +154,12 @@ def load_state(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data.setdefault("seen", {})
+            data.setdefault("seen_sellers", {})
             data.setdefault("channel_id", None)
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "channel_id": None}
+    return {"seen": {}, "seen_sellers": {}, "channel_id": None}
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -160,6 +168,11 @@ def save_state(path: Path, state: dict) -> None:
     if len(seen) > 200_000:
         state["seen"] = {
             k: v for k, v in seen.items() if now - float(v) < SEEN_TTL
+        }
+    sellers = state.get("seen_sellers", {})
+    if len(sellers) > 100_000:
+        state["seen_sellers"] = {
+            k: v for k, v in sellers.items() if now - float(v) < SELLER_TTL
         }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -211,12 +224,6 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
     else:
         status = "—"
 
-    lvl = lot.account_level
-    if lvl is not None and lvl >= 0:
-        level_line = f"📶 Level: {lvl}"
-    else:
-        level_line = "📶 Level: —"
-
     return "\n".join(
         [
             "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
@@ -225,7 +232,7 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
             f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
             f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
             f"👤 Продавец: {seller}",
-            level_line,
+            f"📶 Level: {format_account_level(lot)}",
             f"📢 Сообщения: {dm}",
             f"🕺 Статус: {status}",
             f'🔗 <a href="{lot.nft_url}">{_esc(lot_slug(lot))}</a>',
@@ -356,23 +363,56 @@ async def poll_once(
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot]) -> None:
-    """Дотянуть username, lvl, статус ЛС — только для новых лотов."""
+    """Дотянуть username, lvl, статус ЛС — для каждого нового лота."""
     for lot in lots:
-        if not lot.seller and (lot.seller_id or lot.slug):
+        if not lot.seller or not lot.seller_id:
             try:
-                await m.resolve_owner(lot, timeout=1.5)
+                await m.resolve_owner(lot, timeout=2.5)
             except Exception:  # noqa: BLE001
                 pass
+    need_lvl = [lot for lot in lots if lot.seller_id is not None]
+    if need_lvl:
+        try:
+            await m.enrich_profiles(need_lvl, timeout=3.0, parallel=4)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("enrich_profiles: %s", exc)
     try:
-        need_lvl = [lot for lot in lots if lot.seller_id is not None]
-        if need_lvl:
-            await m.enrich_profiles(need_lvl, timeout=2.0, parallel=6)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        await m.check_free_dm(lots, timeout=2.5)
-    except Exception:  # noqa: BLE001
-        pass
+        await m.check_free_dm(lots, timeout=3.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("check_free_dm: %s", exc)
+
+
+def filter_for_post(
+    lots: list[Lot], seen_sellers: dict[str, float], *, now: float
+) -> list[Lot]:
+    """Только RU + бесплатные ЛС + один раз на продавца."""
+    out: list[Lot] = []
+    used: set[str] = set()
+    for lot in lots:
+        key = lot.seller_key
+        if not key:
+            logger.info("skip: нет продавца (%s)", lot_slug(lot))
+            continue
+        if key in used:
+            continue
+        prev = seen_sellers.get(key)
+        if prev is not None and now - float(prev) < SELLER_TTL:
+            logger.info("skip dup seller: %s", key)
+            continue
+        if not is_russian_lot(lot):
+            logger.info("skip non-ru: %s", key)
+            continue
+        if not is_free_dm_lot(lot):
+            logger.info(
+                "skip dm (%s): %s free=%s paid=%s",
+                key,
+                lot.free_dm,
+                lot.paid_dm_stars,
+            )
+            continue
+        used.add(key)
+        out.append(lot)
+    return out
 
 
 async def _load_session_string(cfg: Config) -> str:
@@ -412,6 +452,7 @@ async def run() -> None:
     state_path = Path(cfg.state_file)
     state = load_state(state_path)
     seen: dict[str, float] = state["seen"]
+    seen_sellers: dict[str, float] = state.get("seen_sellers", {})
 
     if state.get("channel_id"):
         chat_id = int(state["channel_id"])
@@ -451,17 +492,25 @@ async def run() -> None:
             if fresh:
                 fresh.sort(key=lambda l: l.stars)
                 await enrich(m, fresh)
-                for lot in fresh:
+                now = time.time()
+                to_post = filter_for_post(fresh, seen_sellers, now=now)
+                for lot in to_post:
                     try:
                         await sender.send(lot)
+                        key = lot.seller_key
+                        if key:
+                            seen_sellers[key] = now
                         logger.info(
-                            "Отправил: %s за %s⭐ (%s)",
+                            "Отправил: %s за %s⭐ lvl=%s (%s @%s)",
                             lot.title,
                             int(lot.stars),
+                            format_account_level(lot),
                             lot_slug(lot),
+                            lot.seller or "?",
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Не отправилось (%s): %s", lot.id, exc)
+                state["seen_sellers"] = seen_sellers
                 save_state(state_path, state)
 
             # каталог коллекций обновляем раз в 10 минут (новые гифты)

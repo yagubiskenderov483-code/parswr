@@ -50,7 +50,22 @@ assert text == expected, "Формат карточки не совпал с о�
 lot2 = Lot(id="2", title="Lol Pop", number=7, stars=505.0, slug="LolPop-7", seller_id=42)
 text2 = format_lot(lot2, cfg, ts=ts)
 assert "👤 Продавец: <code>42</code>" in text2
+assert "📶 Level: —" in text2
 assert "📢 Сообщения: —" in text2
 assert "🕺 Статус: —" in text2
+
+# -1 из API не показываем
+lot3 = Lot(
+    id="3",
+    title="Test",
+    number=1,
+    stars=600.0,
+    slug="Test-1",
+    seller="testuser",
+    account_level=-1,
+)
+text3 = format_lot(lot3, cfg, ts=ts)
+assert "📶 Level: -1" not in text3
+assert "📶 Level: —" in text3
 
 print("OK: формат карточки совпадает с образцом")

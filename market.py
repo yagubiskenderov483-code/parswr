@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +37,8 @@ from telethon.tl.types import (
 from telethon.tl.types.payments import StarGiftsNotModified
 
 logger = logging.getLogger(__name__)
+
+_CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
 
 
 @dataclass(slots=True)
@@ -86,6 +89,14 @@ class Lot:
             clean = "".join(ch for ch in self.title if ch.isalnum())
             return f"https://t.me/nft/{clean}-{self.number}"
         return "https://t.me/nft/"
+
+    @property
+    def seller_key(self) -> str:
+        if self.seller:
+            return self.seller.lower().lstrip("@").strip()
+        if self.seller_id is not None:
+            return f"id:{int(self.seller_id)}"
+        return ""
 
     @property
     def display(self) -> str:
@@ -1101,6 +1112,35 @@ def _normalize_level(raw: Any) -> int | None:
     return level if level >= 0 else None
 
 
+def is_russian_lot(lot: Lot) -> bool:
+    """Только RU: lang_code ru или кириллица в нике/имени/био."""
+    lc = (getattr(lot, "lang_code", "") or "").lower()
+    if lc.startswith("ru"):
+        return True
+    parts = [
+        lot.seller or "",
+        lot.first_name or "",
+        lot.last_name or "",
+        lot.about or "",
+    ]
+    blob = " ".join(p for p in parts if p).strip()
+    if not blob:
+        return False
+    if "🇷🇺" in blob:
+        return True
+    return bool(_CYR_RE.search(blob))
+
+
+def is_free_dm_lot(lot: Lot) -> bool:
+    """Строго бесплатные ЛС."""
+    return lot.free_dm is True
+
+
+def format_account_level(lot: Lot) -> str:
+    lvl = _normalize_level(lot.account_level)
+    return str(lvl) if lvl is not None else "—"
+
+
 def _fill_user(lot: Lot, user: Any) -> None:
     username = str(getattr(user, "username", "") or "").lstrip("@").strip()
     if not username:
@@ -1131,6 +1171,9 @@ def _fill_user(lot: Lot, user: Any) -> None:
     lc = str(getattr(user, "lang_code", "") or "").strip().lower()
     if lc:
         lot.lang_code = lc
+    rating = getattr(user, "stars_rating", None)
+    if rating is not None and lot.account_level is None:
+        lot.account_level = _normalize_level(getattr(rating, "level", None))
     if hasattr(user, "send_paid_messages_stars"):
         raw = getattr(user, "send_paid_messages_stars", None)
         if raw is None:

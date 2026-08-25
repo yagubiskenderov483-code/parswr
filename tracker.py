@@ -94,7 +94,7 @@ class Config:
     gap: float = 0.05
     timeout: float = 6.0
     scan_pages: int = 2  # страниц resale на коллекцию
-    post_interval: float = 3.0  # сек между постами в канал (строгий тикер)
+    post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -154,7 +154,7 @@ class Config:
             gap=_f("REQUEST_GAP", 0.05),
             timeout=_f("REQUEST_TIMEOUT", 6.0),
             scan_pages=max(1, int(_f("SCAN_PAGES", 2))),
-            post_interval=_f("POST_INTERVAL", 3.0),
+            post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -267,14 +267,85 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
 # ---------------------------------------------------------------- sending
 
 
+class PostRateLimiter:
+    """Один пост на весь Bothost: блокирующий flock + общий timestamp-файл."""
+
+    def __init__(
+        self, interval: float, lock_path: Path, timestamp_path: Path
+    ) -> None:
+        self._interval = max(1.0, float(interval))
+        self._lock_path = lock_path
+        self._ts_path = timestamp_path
+        self._async_lock = asyncio.Lock()
+        self._lock_handle: Any | None = None
+
+    def _read_last_post(self) -> float:
+        try:
+            raw = self._ts_path.read_text(encoding="utf-8").strip()
+            if raw:
+                return float(raw)
+        except (OSError, ValueError):
+            pass
+        return 0.0
+
+    def _write_last_post(self, ts: float) -> None:
+        self._ts_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._ts_path.with_suffix(".tmp")
+        tmp.write_text(f"{ts:.6f}", encoding="utf-8")
+        tmp.replace(self._ts_path)
+
+    def _acquire_and_wait(self) -> None:
+        import fcntl
+
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self._lock_path.open("w")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # ждём, не скипаем
+        last = self._read_last_post()
+        if last > 0:
+            wait = self._interval - (time.time() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._lock_handle = handle
+
+    def _release_after_send(self) -> None:
+        import fcntl
+
+        try:
+            self._write_last_post(time.time())
+        finally:
+            if self._lock_handle is not None:
+                try:
+                    fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+                    self._lock_handle.close()
+                except OSError:
+                    pass
+                self._lock_handle = None
+
+    async def gated(self, action: Any) -> None:
+        """Ждёт слот (между процессами), выполняет action, фиксирует время."""
+        async with self._async_lock:
+            await asyncio.to_thread(self._acquire_and_wait)
+            try:
+                await action()
+            finally:
+                await asyncio.to_thread(self._release_after_send)
+
+
 class Sender:
     """Шлёт карточки: через бота (с кнопками) или от юзер-сессии."""
 
-    def __init__(self, cfg: Config, client: TelegramClient) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        client: TelegramClient,
+        *,
+        rate_limiter: PostRateLimiter | None = None,
+    ) -> None:
         self.cfg = cfg
         self.client = client
         self.chat_id: int | None = None
         self._bot = None
+        self._rate_limiter = rate_limiter
         if cfg.bot_token:
             from aiogram import Bot
 
@@ -294,8 +365,7 @@ class Sender:
         rows.append(second)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def send(self, lot: Lot) -> None:
-        text = format_lot(lot, self.cfg)
+    async def _do_send(self, lot: Lot, text: str) -> None:
         if self._bot is not None:
             from aiogram.types import LinkPreviewOptions
 
@@ -310,6 +380,17 @@ class Sender:
             await self.client.send_message(
                 self.chat_id, text, parse_mode="html", link_preview=False
             )
+
+    async def send(self, lot: Lot) -> None:
+        text = format_lot(lot, self.cfg)
+
+        async def _send() -> None:
+            await self._do_send(lot, text)
+
+        if self._rate_limiter is not None:
+            await self._rate_limiter.gated(_send)
+        else:
+            await _send()
 
     async def close(self) -> None:
         if self._bot is not None:
@@ -666,31 +747,27 @@ def rank_for_queue(lots: list[Lot]) -> list[Lot]:
 
 
 class PostQueue:
-    """Строгий drip: максимум 1 пост каждые N секунд (не пачкой)."""
+    """Очередь лотов: воркер шлёт по одному, интервал в Sender/PostRateLimiter."""
 
     def __init__(
         self,
         sender: Sender,
         *,
-        interval: float,
         seen_sellers: dict[str, float],
         state: dict,
         state_path: Path,
         runtime: TrackerRuntime,
-        lock_path: Path | None = None,
+        post_interval: float = 4.0,
     ) -> None:
         self._sender = sender
-        self._interval = max(1.0, float(interval))
+        self._interval = max(1.0, float(post_interval))
         self._seen_sellers = seen_sellers
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
-        self._lock_path = lock_path
         self._q: asyncio.Queue[Lot | None] = asyncio.Queue()
         self._task: asyncio.Task | None = None
-        self._send_lock = asyncio.Lock()
         self._closed = False
-        self._last_post_mono = 0.0
 
     @property
     def pending(self) -> int:
@@ -706,7 +783,7 @@ class PostQueue:
         if self._task and not self._task.done():
             await self._q.put(None)
             try:
-                await asyncio.wait_for(self._task, timeout=self._interval + 5)
+                await asyncio.wait_for(self._task, timeout=self._interval + 10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
         self._task = None
@@ -719,41 +796,18 @@ class PostQueue:
         self._runtime.queue_pending = self.pending
         return len(lots)
 
-    async def _wait_tick(self) -> None:
-        """Ровный интервал от предыдущего поста."""
-        now = time.monotonic()
-        if self._last_post_mono > 0:
-            wait = self._interval - (now - self._last_post_mono)
-            if wait > 0:
-                await asyncio.sleep(wait)
-        else:
-            await asyncio.sleep(self._interval)
-
-    def _try_file_lock(self) -> Any | None:
-        if not self._lock_path:
-            return None
-        try:
-            import fcntl
-
-            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = self._lock_path.open("w")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return handle
-        except OSError:
-            return None
-
-    async def _send_one(self, lot: Lot) -> None:
-        async with self._send_lock:
-            lock_handle = self._try_file_lock()
-            if self._lock_path is not None and lock_handle is None:
-                # другой инстанс Bothost постит — вернём в очередь
-                self._q.put_nowait(lot)
-                logger.warning("другой инстанс постит — лот возвращён в очередь")
-                return
+    async def _drip_worker(self) -> None:
+        logger.info(
+            "Drip-постинг: 1 лот каждые %ss (лимит в Sender, очередь отдельно)",
+            int(self._interval),
+        )
+        while not self._closed:
+            lot = await self._q.get()
+            if lot is None:
+                break
             try:
                 now = time.time()
                 await self._sender.send(lot)
-                self._last_post_mono = time.monotonic()
                 key = lot.seller_key
                 if key:
                     self._seen_sellers[key] = now
@@ -769,39 +823,13 @@ class PostQueue:
                     self.pending,
                     int(self._interval),
                 )
-            finally:
-                if lock_handle is not None:
-                    try:
-                        import fcntl
-
-                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-                        lock_handle.close()
-                    except OSError:
-                        pass
-
-    async def _drip_worker(self) -> None:
-        logger.info(
-            "Drip-постинг: 1 лот каждые %ss (очередь отдельно от парсера)",
-            int(self._interval),
-        )
-        while not self._closed:
-            await self._wait_tick()
-            if self._closed:
-                break
-            lot: Lot | None = None
-            try:
-                lot = self._q.get_nowait()
-            except asyncio.QueueEmpty:
-                continue
-            if lot is None:
-                break
-            try:
-                await self._send_one(lot)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
+            finally:
+                self._q.task_done()
 
 
-TRACKER_VERSION = "2.6"
+TRACKER_VERSION = "2.7"
 
 
 @dataclass
@@ -940,19 +968,24 @@ async def run() -> None:
         seen_lots=len(seen),
     )
 
-    sender = Sender(cfg, client)
+    dd = data_dir()
+    rate_limiter = PostRateLimiter(
+        cfg.post_interval,
+        dd / "tracker_post.lock",
+        dd / "tracker_last_post.txt",
+    )
+    sender = Sender(cfg, client, rate_limiter=rate_limiter)
     sender.chat_id = chat_id
     control_bot.runtime = runtime
     control_bot.sender = sender
 
     post_queue = PostQueue(
         sender,
-        interval=cfg.post_interval,
         seen_sellers=seen_sellers,
         state=state,
         state_path=state_path,
         runtime=runtime,
-        lock_path=data_dir() / "tracker_post.lock",
+        post_interval=cfg.post_interval,
     )
     post_queue.start()
     control_bot.post_queue = post_queue
@@ -1030,6 +1063,8 @@ async def run() -> None:
                     len(seen),
                     runtime.posted_total,
                 )
+
+            save_state(state_path, state)
 
             # каталог коллекций обновляем раз в 10 минут (новые гифты)
             if time.monotonic() - catalog_refreshed > 600:

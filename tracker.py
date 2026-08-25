@@ -415,13 +415,43 @@ def filter_for_post(
     return out
 
 
+TRACKER_VERSION = "2.1"
+
+
+def _load_session_from_db() -> str:
+    """Сессия из Neptun Parser (gifts.db) — тот же volume /app/data."""
+    try:
+        from db import GiftDB
+
+        db = GiftDB()
+        acc = db.get_active_account()
+        if acc and str(acc.get("session") or "").strip():
+            return str(acc["session"]).strip()
+        for row in db.list_accounts():
+            sess = str(row.get("session") or "").strip()
+            if sess:
+                return sess
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("session from db: %s", exc)
+    return ""
+
+
 async def _load_session_string(cfg: Config) -> str:
     if cfg.session_string:
         return cfg.session_string
     path = Path(cfg.session_file)
     if path.exists():
-        return path.read_text(encoding="utf-8").strip()
-    return ""
+        raw = path.read_text(encoding="utf-8").strip()
+        if raw:
+            return raw
+    fallback = _load_session_from_db()
+    if fallback:
+        logger.info(
+            "Сессия взята из gifts.db → сохраняю в %s", cfg.session_file
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(fallback, encoding="utf-8")
+    return fallback
 
 
 async def _get_client(cfg: Config) -> TelegramClient:
@@ -434,8 +464,16 @@ async def _get_client(cfg: Config) -> TelegramClient:
         if await client.is_user_authorized():
             return client
         await client.disconnect()
-        logger.warning("Сессия недействительна — нужен повторный вход через бота")
+        logger.warning(
+            "Сессия в %s недействительна — нужен повторный вход",
+            cfg.session_file,
+        )
 
+    logger.warning(
+        "⚠️ Трекер v%s: нет сессии — постинг ОТКЛЮЧЁН до входа. "
+        "Лоты в канале сейчас могут идти от старого деплоя.",
+        TRACKER_VERSION,
+    )
     import session_login
 
     return await session_login.bot_login_wizard(cfg)
@@ -447,7 +485,12 @@ async def run() -> None:
 
     client = await _get_client(cfg)
     me = await client.get_me()
-    logger.info("Вошёл как %s (id=%s)", me.username or me.first_name, me.id)
+    logger.info(
+        "✅ Трекер v%s запущен · %s (id=%s) · фильтры: RU + бесплатные ЛС",
+        TRACKER_VERSION,
+        me.username or me.first_name,
+        me.id,
+    )
 
     state_path = Path(cfg.state_file)
     state = load_state(state_path)
@@ -494,6 +537,14 @@ async def run() -> None:
                 await enrich(m, fresh)
                 now = time.time()
                 to_post = filter_for_post(fresh, seen_sellers, now=now)
+                skipped = len(fresh) - len(to_post)
+                if skipped:
+                    logger.info(
+                        "Проход: %s новых, к посту %s, отсеяно %s",
+                        len(fresh),
+                        len(to_post),
+                        skipped,
+                    )
                 for lot in to_post:
                     try:
                         await sender.send(lot)

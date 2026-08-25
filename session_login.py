@@ -183,7 +183,8 @@ async def bot_login_wizard(cfg) -> TelegramClient:
 
     bot_info = await bot.get_me()
     logger.info(
-        "Сессия не найдена. Напишите /start боту @%s для входа.",
+        "Сессия не найдена. Напишите /start боту @%s для входа. "
+        "Пока вход не завершён — этот процесс НЕ постит в канал.",
         bot_info.username,
     )
 

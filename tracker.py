@@ -43,7 +43,7 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAEjVPEqkFcX76QXsI6ftnh33OrOQ3knywM"
+DEFAULT_BOT_TOKEN = "8807847926:AAGIoGRUd9Pw8LSIJmx5qRSaqZUn2hx4-sI"
 DEFAULT_TARGET_CHANNEL = "https://t.me/+i-rzZn2WNhMwZmQ1"
 
 

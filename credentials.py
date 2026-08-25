@@ -21,8 +21,8 @@ ALLOWED_USER_IDS: set[int] = {
     8959759145,
 }
 
-MIN_STARS = 2000
-MAX_STARS = 5000
+MIN_STARS = 1
+MAX_STARS = 2000
 
 # выдача ПО ТИПАМ (коллекциям), не фикс 30 лотов
 PER_TYPE = 1  # по одному с каждого типа NFT

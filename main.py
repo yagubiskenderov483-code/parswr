@@ -126,10 +126,10 @@ def screen(where: str) -> str:
 
 # Сложности парсинга
 DIFFICULTIES: list[tuple[str, str, int, int]] = [
-    ("easy", "🟢 Лёгкий · 2k–5k", 2000, 5000),
-    ("mid", "🟡 Средний · 5k–15k", 5000, 15000),
-    ("hard", "🔴 Сложный · 15k–30k", 15000, 30000),
-    ("impos", "💀 Impossible · 30k–60k", 30000, 60000),
+    ("easy", "🟢 Лёгкий · до 2k", 1, 2000),
+    ("mid", "🟡 Средний · 2k–5k", 2000, 5000),
+    ("hard", "🔴 Сложный · 5k–15k", 5000, 15000),
+    ("impos", "💀 Impossible · 15k–60k", 15000, 60000),
 ]
 
 PRICE_RANGES: list[tuple[str, str, int, int]] = [
@@ -158,6 +158,12 @@ _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
 # Парсер: мелкий акк. Неизвестные статы = мимо (киты проходили как rate 0).
 PARSER_MAX_LEVEL = 2
 PARSER_MAX_GIFTS = 5
+PARSER_MIN_STARS = 1
+PARSER_MAX_STARS = 2000
+# выдача: обычно 1 лот / 3с, иногда 2 лота за секунду
+DELIVER_SLOW_SEC = 3.0
+DELIVER_FAST_SEC = 0.45
+DELIVER_BURST_P = 0.28
 
 
 @dataclass
@@ -219,13 +225,13 @@ class App:
         self._delivered_sellers: set[str] = set()  # юзы после выдачи — навсегда
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
-        self.min_stars = 2000.0
-        self.max_stars = 5000.0
-        self.range_label = "2k–5k ⭐"
+        self.min_stars = float(PARSER_MIN_STARS)
+        self.max_stars = float(PARSER_MAX_STARS)
+        self.range_label = "🟢 Лёгкий · до 2k"
         # Отдельная сложность ТОЛЬКО для фильтр-поиска (парсер не трогает)
-        self.filter_min_stars = 2000.0
-        self.filter_max_stars = 5000.0
-        self.filter_range_label = "🟢 Лёгкий · 2k–5k"
+        self.filter_min_stars = float(PARSER_MIN_STARS)
+        self.filter_max_stars = float(PARSER_MAX_STARS)
+        self.filter_range_label = "🟢 Лёгкий · до 2k"
         self.logged_in = False
         self.account_name = ""
         self.lots_notified = 0
@@ -288,6 +294,9 @@ class App:
         self._live_seeded = False
         self._live_tasks: set[asyncio.Task] = set()
         self._live_cursor = 0
+        self._deliver_q: asyncio.Queue[Lot] = asyncio.Queue()
+        self._deliver_task: asyncio.Task | None = None
+        self._last_deliver_at = 0.0
         self._load_shown_titles()
         self.log_chat_id: int | None = None
         self.log_chat_title = ""
@@ -1279,11 +1288,19 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
 
-    def set_range(self, label: str, mn: int, mx: int) -> None:
-        """Сложность/цена парсера (монитор)."""
+    def set_range(self, label: str, mn: int, mx: int, *, clamp: bool = True) -> None:
+        """Сложность/цена парсера (монитор). Жёсткий потолок — 2000⭐."""
+        mn_i, mx_i = int(mn), int(mx)
+        if clamp:
+            mx_i = min(mx_i, PARSER_MAX_STARS)
+            if mn_i > PARSER_MAX_STARS or mn_i > mx_i:
+                mn_i, mx_i = PARSER_MIN_STARS, PARSER_MAX_STARS
+                label = "🟢 Лёгкий · до 2k"
+            else:
+                mn_i = max(PARSER_MIN_STARS, min(mn_i, mx_i))
         self.range_label = label
-        self.min_stars = float(mn)
-        self.max_stars = float(mx)
+        self.min_stars = float(mn_i)
+        self.max_stars = float(mx_i)
 
     def set_filter_range(self, label: str, mn: int, mx: int) -> None:
         """Сложность ТОЛЬКО для фильтр-поиска — парсер не меняется."""
@@ -1318,7 +1335,10 @@ class App:
         self.parse_ready = 0
         self.parse_types = 0
         self.parse_models = 0
+        self._clear_deliver_queue()
+        self._last_deliver_at = 0.0
         self._task = asyncio.create_task(self._loop(), name="monitor")
+        self._ensure_deliver_worker()
 
     def _is_blocked_lot(self, lot: Lot) -> bool:
         u = (lot.seller or "").lower()
@@ -1412,6 +1432,8 @@ class App:
         if not self._is_free_contact(lot):
             return False
         if not self._parser_stats_ok(lot):
+            return False
+        if lot.stars > PARSER_MAX_STARS:
             return False
         if self._is_delivered_seller(lot):
             return False
@@ -1523,6 +1545,7 @@ class App:
         if not self.running and self._task is None:
             return f"{screen('Парсинг')}\nУже стоп"
         self.running = False
+        await self._stop_deliver_worker()
         for tsk in list(getattr(self, "_live_tasks", set())):
             tsk.cancel()
         self._live_tasks = set()
@@ -1542,6 +1565,7 @@ class App:
         stopped: list[str] = []
         if self.running or self._task is not None:
             self.running = False
+            await self._stop_deliver_worker()
             for tsk in list(getattr(self, "_live_tasks", set())):
                 tsk.cancel()
             self._live_tasks = set()
@@ -1582,6 +1606,8 @@ class App:
         return f"{screen('Стоп')}\nостановлено: {', '.join(stopped)}"
 
     def _in_price(self, lot: Lot) -> bool:
+        if lot.stars > PARSER_MAX_STARS:
+            return False
         return self.min_stars <= lot.stars <= self.max_stars
 
     def _is_ad(self, lot: Lot) -> bool:
@@ -1783,6 +1809,8 @@ class App:
             if channel == "parser":
                 if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
                     continue
+                if lot.stars > PARSER_MAX_STARS:
+                    continue
             # платные Stars — мимо; unknown ок (кроме парсера — там строго)
             if require_free_dm and lot.free_dm is False:
                 continue
@@ -1849,6 +1877,8 @@ class App:
                         continue
                 if channel == "parser":
                     if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
+                        continue
+                    if lot.stars > PARSER_MAX_STARS:
                         continue
                 if require_free_dm and lot.free_dm is False:
                     continue
@@ -2892,6 +2922,115 @@ class App:
         self.log_chat_username = ""
         return f"{screen('Админ')}\nГруппа отвязана · логи только в бота"
 
+    def _clear_deliver_queue(self) -> None:
+        q = getattr(self, "_deliver_q", None)
+        if q is None:
+            self._deliver_q = asyncio.Queue()
+            return
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _reserve_parser_lot(self, lot: Lot) -> None:
+        self._delivered_sellers.add(lot.owner_key)
+        if lot.seller:
+            self._delivered_sellers.add(lot.seller.lower())
+        if lot.seller_id is not None:
+            self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+        tk = self._title_key(lot)
+        if tk:
+            self._seen_titles.add(tk)
+
+    def _enqueue_parser_lots(self, lots: list[Lot]) -> int:
+        """В очередь выдачи: 1 / 3с, иногда 2 за секунду. Только ≤2000⭐."""
+        n = 0
+        for lot in lots:
+            if lot.stars > PARSER_MAX_STARS:
+                continue
+            if not self._passes_parser_quality(lot):
+                continue
+            self._reserve_parser_lot(lot)
+            self._deliver_q.put_nowait(lot)
+            n += 1
+        if n:
+            self._ensure_deliver_worker()
+        return n
+
+    def _ensure_deliver_worker(self) -> None:
+        tsk = getattr(self, "_deliver_task", None)
+        if tsk is not None and not tsk.done():
+            return
+        self._deliver_task = asyncio.create_task(
+            self._deliver_worker(), name="deliver-lots"
+        )
+
+    async def _stop_deliver_worker(self) -> None:
+        self._clear_deliver_queue()
+        tdel = getattr(self, "_deliver_task", None)
+        if tdel is None:
+            return
+        tdel.cancel()
+        try:
+            await tdel
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._deliver_task = None
+
+    async def _deliver_worker(self) -> None:
+        """Обычно 1 лот / 3с; иногда следующий через ~0.45с (2/сек)."""
+        burst_next = False
+        try:
+            while True:
+                try:
+                    lot = await asyncio.wait_for(self._deliver_q.get(), timeout=0.4)
+                except asyncio.TimeoutError:
+                    if not self.running and self._deliver_q.empty():
+                        break
+                    continue
+                gap = DELIVER_FAST_SEC if burst_next else DELIVER_SLOW_SEC
+                wait = gap - (time.monotonic() - self._last_deliver_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                sent = await self._send_parser_lot(lot)
+                self._last_deliver_at = time.monotonic()
+                if sent:
+                    self.lots_notified += 1
+                    self.parse_ready = self.lots_notified
+                burst_next = False
+                if self._deliver_q.qsize() > 0 and random.random() < DELIVER_BURST_P:
+                    burst_next = True
+        finally:
+            self._deliver_task = None
+
+    async def _send_parser_lot(self, lot: Lot) -> bool:
+        if not self.bot:
+            return False
+        if lot.stars > PARSER_MAX_STARS:
+            return False
+        if self._is_blocked_lot(lot) or self._is_ad(lot):
+            return False
+        try:
+            self._mark_delivered([lot], channel="parser")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mark on send: %s", exc)
+        text = self._format_lot_line(lot)
+        targets = self._delivery_chats(self.chat_id)
+        if not targets:
+            return False
+        ok = False
+        for tid in targets:
+            msg = await self._say_to(tid, text)
+            if msg is not None:
+                ok = True
+        if ok:
+            try:
+                self.db.bump_daily(lots_shown=1)
+            except Exception:  # noqa: BLE001
+                pass
+        return ok
+
     async def _say_lot_list(
         self, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
@@ -2913,7 +3052,11 @@ class App:
         batch = [lot for lot in batch if not self._is_delivered_seller(lot)]
         if channel == "parser":
             batch = [lot for lot in batch if self._passes_parser_quality(lot)]
+            batch = [lot for lot in batch if lot.stars <= PARSER_MAX_STARS]
         if not batch:
+            return
+        if channel == "parser":
+            self._enqueue_parser_lots(batch)
             return
         # при выдаче — юзер в seen навсегда (не показывать снова);
         # gifts в каталоге остаются, из users убираем
@@ -3445,12 +3588,18 @@ class App:
                 f"Чеков: <b>{self.parse_coll_checks}</b> · "
                 f"проверок акка: <b>{self.parse_acc_checks}</b>\n"
                 f"Выдано: <b>{self.lots_notified}</b>"
+                + (
+                    f" · очередь {self._deliver_q.qsize()}"
+                    if self._deliver_q.qsize()
+                    else ""
+                )
                 + (f"\n{extra}" if extra else "")
             )
 
         await self._say(
             f"{screen('Парсинг')}\n"
             f"Live жёсткий · первая страница · выдача не тормозит скан\n"
+            f"до {PARSER_MAX_STARS}⭐ · 1 лот / 3с (иногда 2/сек)\n"
             f"RU · рейт ≤2 · gifts ≤5 · free DM · тип один раз\n"
             f"{self.connected_accounts_label()}",
             log=True,
@@ -3494,14 +3643,9 @@ class App:
                 for lot in shown:
                     self._seen[lot.id] = now
                 await self._say_lot_list(shown, channel="parser")
-                self.lots_notified += len(shown)
-                self.parse_ready = self.lots_notified
-                await self._say(
-                    f"{screen('Парсинг')}\n"
-                    f"🆕 только что выставили · <b>{len(shown)}</b> типов\n"
-                    f"RU · free DM · рейт ≤2 · gifts ≤5 · без повтора типов",
-                    reply_markup=parse_done_inline(),
-                    log=True,
+                asyncio.create_task(
+                    _status(f"🆕 +{len(shown)} в выдачу"),
+                    name="live-status",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("live emit: %s", exc)
@@ -3566,7 +3710,7 @@ class App:
                         f"{screen('Парсинг')}\n"
                         f"Снял рынок · <b>{len(price_pool)}</b> лотов\n"
                         f"Дальше — типы, которые выставят <b>сейчас</b>\n"
-                        f"RU · free DM · рейт ≤2 · gifts ≤5 · тип один раз",
+                        f"до {PARSER_MAX_STARS}⭐ · 1 лот / 3с · RU · free DM · рейт ≤2",
                         reply_markup=parse_done_inline(),
                         log=True,
                     )
@@ -3635,10 +3779,10 @@ class App:
                 for lot in shown:
                     self._seen[lot.id] = now
                 await self._say_lot_list(shown, channel="parser")
-                self.lots_notified += len(shown)
                 await self._say(
                     f"{screen('Парсинг')}\n"
-                    f"Заново · <b>{len(shown)}</b> новых · RU · рейт ≤2 · gifts ≤5 · free DM\n"
+                    f"Заново · <b>{len(shown)}</b> в очередь · до {PARSER_MAX_STARS}⭐\n"
+                    f"выдача 1/3с · RU · рейт ≤2 · gifts ≤5 · free DM\n"
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks}",
                     reply_markup=parse_done_inline(),
@@ -4382,7 +4526,7 @@ async def cb_old_start(callback: CallbackQuery) -> None:
         await callback.answer("?", show_alert=True)
         return
     label, mn, mx = chosen
-    app.set_range(label, mn, mx)
+    app.set_range(label, mn, mx, clamp=False)
     await callback.message.edit_text(
         f"{screen('Старый парс')}\n{label}\nищу за 24ч…",
         reply_markup=main_inline(),

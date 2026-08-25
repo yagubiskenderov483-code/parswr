@@ -155,6 +155,10 @@ _AD_RE = re.compile(
 # Русские: кириллица в нике/имени/био/описании (просто и достаточно)
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
 
+# Парсер: мелкий акк. Неизвестные статы = мимо (киты проходили как rate 0).
+PARSER_MAX_LEVEL = 2
+PARSER_MAX_GIFTS = 5
+
 
 @dataclass
 class SearchFilters:
@@ -1344,14 +1348,44 @@ class App:
         return bool(_CYR_RE.search(blob))
 
     def _is_small_level(self, lot: Lot) -> bool:
-        """Stars rating: нет / отриц / 0 / 1 / 2 — ок. Выше 2 — мимо."""
+        """Stars rating ≤2. None = ещё не сняли профиль → мимо."""
         lvl = getattr(lot, "account_level", None)
         if lvl is None:
-            return True
+            return False
         try:
-            return int(lvl) <= 2
+            return int(lvl) <= PARSER_MAX_LEVEL
         except (TypeError, ValueError):
-            return True
+            return False
+
+    def _is_few_gifts(self, lot: Lot) -> bool:
+        """Мало гифтов на профиле. None = не сняли → мимо."""
+        n = getattr(lot, "gifts_count", None)
+        if n is None:
+            return False
+        try:
+            return int(n) <= PARSER_MAX_GIFTS
+        except (TypeError, ValueError):
+            return False
+
+    def _parser_stats_ok(self, lot: Lot) -> bool:
+        """Рейт ≤2 и gifts ≤5 только после реального GetFullUser."""
+        lvl = getattr(lot, "account_level", None)
+        gifts = getattr(lot, "gifts_count", None)
+        if lvl is not None:
+            try:
+                if int(lvl) > PARSER_MAX_LEVEL:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if gifts is not None:
+            try:
+                if int(gifts) > PARSER_MAX_GIFTS:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if not getattr(lot, "profile_checked", False):
+            return False
+        return self._is_small_level(lot) and self._is_few_gifts(lot)
 
     def _is_free_contact(self, lot: Lot) -> bool:
         """Только бесплатные ЛС, без платных сообщений."""
@@ -1377,7 +1411,7 @@ class App:
             return False
         if not self._is_free_contact(lot):
             return False
-        if not self._is_small_level(lot):
+        if not self._parser_stats_ok(lot):
             return False
         if self._is_delivered_seller(lot):
             return False
@@ -1747,7 +1781,7 @@ class App:
             if want_ru and not self._is_russian(lot):
                 continue
             if channel == "parser":
-                if not self._is_free_contact(lot) or not self._is_small_level(lot):
+                if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
                     continue
             # платные Stars — мимо; unknown ок (кроме парсера — там строго)
             if require_free_dm and lot.free_dm is False:
@@ -1814,7 +1848,7 @@ class App:
                     if self._title_key(lot) in marked_titles:
                         continue
                 if channel == "parser":
-                    if not self._is_free_contact(lot) or not self._is_small_level(lot):
+                    if not self._is_free_contact(lot) or not self._parser_stats_ok(lot):
                         continue
                 if require_free_dm and lot.free_dm is False:
                     continue
@@ -2326,7 +2360,8 @@ class App:
             sample = list(candidates)
             if len(sample) > 80:
                 sample = self._sample_diverse_titles(sample, 80)
-            tmo = 0.5 if len(sample) <= 16 else min(max(creds.OWNER_TIMEOUT, 0.8), 1.2)
+            # GetFullUser: не 0.5с — иначе лвл/гифты пустые и киты проходят
+            tmo = min(max(float(getattr(creds, "OWNER_TIMEOUT", 0.8)), 2.0), 3.5)
             await self.market.enrich_profiles(
                 sample,
                 timeout=tmo,
@@ -2334,7 +2369,7 @@ class App:
             )
             await self.market.check_free_dm(
                 sample,
-                timeout=max(tmo, 0.7),
+                timeout=max(tmo, 1.2),
             )
             self.parse_acc_checks += len(sample) * 2
             self._ingest_always(sample)
@@ -2731,8 +2766,6 @@ class App:
             meta.append(f"gifts {lot.gifts_count}")
         if lot.account_level is not None:
             meta.append(f"rate {lot.account_level}")
-        else:
-            meta.append("rate 0")
         if lot.is_premium is False:
             meta.append("no TGP")
         elif lot.is_premium is True:
@@ -3418,7 +3451,7 @@ class App:
         await self._say(
             f"{screen('Парсинг')}\n"
             f"Live жёсткий · первая страница · выдача не тормозит скан\n"
-            f"RU · рейт ≤2 · free DM · тип один раз\n"
+            f"RU · рейт ≤2 · gifts ≤5 · free DM · тип один раз\n"
             f"{self.connected_accounts_label()}",
             log=True,
         )
@@ -3466,7 +3499,7 @@ class App:
                 await self._say(
                     f"{screen('Парсинг')}\n"
                     f"🆕 только что выставили · <b>{len(shown)}</b> типов\n"
-                    f"RU · free DM · рейт ≤2 · без повтора типов",
+                    f"RU · free DM · рейт ≤2 · gifts ≤5 · без повтора типов",
                     reply_markup=parse_done_inline(),
                     log=True,
                 )
@@ -3533,7 +3566,7 @@ class App:
                         f"{screen('Парсинг')}\n"
                         f"Снял рынок · <b>{len(price_pool)}</b> лотов\n"
                         f"Дальше — типы, которые выставят <b>сейчас</b>\n"
-                        f"RU · free DM · рейт ≤2 · тип один раз",
+                        f"RU · free DM · рейт ≤2 · gifts ≤5 · тип один раз",
                         reply_markup=parse_done_inline(),
                         log=True,
                     )
@@ -3605,7 +3638,7 @@ class App:
                 self.lots_notified += len(shown)
                 await self._say(
                     f"{screen('Парсинг')}\n"
-                    f"Заново · <b>{len(shown)}</b> новых · RU · рейт ≤2 · free DM\n"
+                    f"Заново · <b>{len(shown)}</b> новых · RU · рейт ≤2 · gifts ≤5 · free DM\n"
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks}",
                     reply_markup=parse_done_inline(),

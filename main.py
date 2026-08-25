@@ -29,6 +29,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -50,7 +51,7 @@ from telethon.sessions import StringSession
 
 import credentials as creds
 from db import GiftDB
-from market import Lot, TelegramMarket
+from market import Lot, TelegramMarket, resale_flood_remaining
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +59,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 router = Router()
+
+
+def _make_tg_client(session: str | StringSession | None = None) -> TelegramClient:
+    """Telethon-клиент без авто-сна на FloodWait — обрабатываем сами."""
+    sess = session if isinstance(session, StringSession) else StringSession(session or "")
+    client = TelegramClient(sess, creds.API_ID, creds.API_HASH)
+    try:
+        client.flood_sleep_threshold = 0
+    except Exception:  # noqa: BLE001
+        pass
+    return client
 
 
 class OwnerOnlyMiddleware(BaseMiddleware):
@@ -180,10 +192,14 @@ class AuthStates(StatesGroup):
     password = State()
 
 
+class AdminStates(StatesGroup):
+    bind_chat = State()
+
+
 class App:
     def __init__(self) -> None:
         Path("data").mkdir(exist_ok=True)
-        self.client = TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
+        self.client = _make_tg_client()
         self.db = GiftDB()
         self.market = TelegramMarket(self.client)
         self._wire_market()
@@ -264,6 +280,10 @@ class App:
         self._delivered_sellers = self._load_delivered_sellers()
         self._seen_sellers |= set(self._delivered_sellers)
         self._filter_seen_sellers |= set(self._delivered_sellers)
+        self.log_chat_id: int | None = None
+        self.log_chat_title = ""
+        self.log_chat_username = ""
+        self._load_log_chat()
 
     def _wire_market(self) -> None:
         """Кэш коллекций в БД + хуки на текущий market."""
@@ -415,9 +435,7 @@ class App:
                 continue
             label = str(acc.get("label") or acc.get("phone") or f"#{acc_id}")
             try:
-                client = TelegramClient(
-                    StringSession(acc["session"]), creds.API_ID, creds.API_HASH
-                )
+                client = _make_tg_client(acc["session"])
                 await client.connect()
                 if not await client.is_user_authorized():
                     await client.disconnect()
@@ -578,7 +596,7 @@ class App:
         all_ids = list(await base.load_collections(force=False))
         random.shuffle(all_ids)
         chunks = self._split_ids(all_ids, len(markets))
-        per_parallel = max(12, int(creds.BURST_PARALLEL))
+        per_parallel = max(2, min(int(creds.BURST_PARALLEL), 8))
         deep = bool(getattr(self, "_burst_deep", False))
 
         early_lock = asyncio.Lock()
@@ -700,7 +718,7 @@ class App:
                     parallel=per_parallel,
                     per_collection=min(40, max(20, int(creds.BURST_PER_COLLECTION))),
                     max_collections=0,
-                    gap=creds.BURST_GAP,
+                    gap=max(0.05, float(creds.BURST_GAP)),
                     timeout=creds.API_TIMEOUT,
                     limit_results=max(creds.SHOW_LIMIT, 80),
                     bump_check=bump,
@@ -986,7 +1004,7 @@ class App:
             pass
 
     def _new_client(self) -> TelegramClient:
-        return TelegramClient(StringSession(), creds.API_ID, creds.API_HASH)
+        return _make_tg_client()
 
     async def ensure_connected(self) -> TelegramClient:
         if not self.client.is_connected():
@@ -1066,9 +1084,7 @@ class App:
         if not acc or not acc.get("session"):
             return False
         try:
-            client = TelegramClient(
-                StringSession(acc["session"]), creds.API_ID, creds.API_HASH
-            )
+            client = _make_tg_client(acc["session"])
             await client.connect()
             if not await client.is_user_authorized():
                 await client.disconnect()
@@ -1117,9 +1133,7 @@ class App:
                 await self.client.disconnect()
         except Exception:  # noqa: BLE001
             pass
-        client = TelegramClient(
-            StringSession(acc["session"]), creds.API_ID, creds.API_HASH
-        )
+        client = _make_tg_client(acc["session"])
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -2528,14 +2542,122 @@ class App:
             f"@{lot.seller} | {_fmt(lot.stars)}⭐{extra}"
         )
 
+    def _load_log_chat(self) -> None:
+        row = None
+        try:
+            row = self.db.get_log_chat()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load log chat: %s", exc)
+        if not row:
+            self.log_chat_id = None
+            self.log_chat_title = ""
+            self.log_chat_username = ""
+            return
+        try:
+            self.log_chat_id = int(row["chat_id"])
+        except (TypeError, ValueError):
+            self.log_chat_id = None
+        self.log_chat_title = str(row.get("title") or "")
+        self.log_chat_username = str(row.get("username") or "").lstrip("@")
+
+    def _log_chat_label(self) -> str:
+        if not self.log_chat_id:
+            return "не привязана"
+        uname = f"@{self.log_chat_username}" if self.log_chat_username else ""
+        title = self.log_chat_title or "группа"
+        extra = f" {uname}" if uname else ""
+        return f"{title}{extra} · <code>{self.log_chat_id}</code>"
+
+    def _delivery_chats(self, *chat_ids: int | None) -> list[int]:
+        seen: set[int] = set()
+        out: list[int] = []
+        for raw in list(chat_ids) + [self.log_chat_id]:
+            if raw is None:
+                continue
+            try:
+                cid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+        return out
+
+    async def _check_bot_admin(self, chat_id: int) -> tuple[bool, str]:
+        if not self.bot:
+            return False, "бот не запущен"
+        try:
+            me = await self.bot.get_me()
+            member = await self.bot.get_chat_member(chat_id, me.id)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"бота нет в чате ({_esc(str(exc)[:80])})"
+        status = str(getattr(member, "status", "") or "")
+        status = status.split(".")[-1].lower()
+        if status not in ("administrator", "creator", "owner"):
+            return False, f"бот не админ (сейчас: {status or '?'})"
+        chat_type = ""
+        try:
+            chat = await self.bot.get_chat(chat_id)
+            chat_type = str(getattr(chat, "type", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        if "channel" in chat_type and getattr(member, "can_post_messages", True) is False:
+            return False, "нет права писать в канал"
+        return True, "ok"
+
+    async def bind_log_chat(self, chat_id: int) -> str:
+        if not self.bot:
+            raise RuntimeError("Бот не готов.")
+        try:
+            chat = await self.bot.get_chat(int(chat_id))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Не нашёл чат: {exc}") from exc
+        ctype = str(getattr(chat, "type", "") or "")
+        if ctype not in ("group", "supergroup", "channel"):
+            raise RuntimeError("Нужна группа или канал, не личка.")
+        ok, why = await self._check_bot_admin(int(chat.id))
+        if not ok:
+            raise RuntimeError(
+                f"{why}. Добавь бота в группу и дай права админа (писать сообщения)."
+            )
+        title = str(getattr(chat, "title", "") or "") or str(chat.id)
+        username = str(getattr(chat, "username", "") or "").lstrip("@")
+        self.db.set_log_chat(
+            chat_id=int(chat.id),
+            title=title,
+            username=username,
+            chat_type=ctype,
+        )
+        self.log_chat_id = int(chat.id)
+        self.log_chat_title = title
+        self.log_chat_username = username
+        test = await self._say_to(
+            int(chat.id),
+            f"{screen('Лог')}\n✅ Группа привязана\nСюда пойдут лоты NFT и логи парсера",
+        )
+        if test is None:
+            raise RuntimeError("Админ есть, но написать не смог — проверь право «отправка сообщений».")
+        return (
+            f"{screen('Админ')}\n"
+            f"Привязал: <b>{_esc(title)}</b>\n"
+            f"{self._log_chat_label()}"
+        )
+
+    def unbind_log_chat(self) -> str:
+        self.db.set_log_chat(chat_id=None)
+        self.log_chat_id = None
+        self.log_chat_title = ""
+        self.log_chat_username = ""
+        return f"{screen('Админ')}\nГруппа отвязана · логи только в бота"
+
     async def _say_lot_list(
         self, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
-        if self.chat_id:
-            await self._say_lot_list_to(self.chat_id, lots, channel=channel)
+        await self._say_lot_list_to(self.chat_id, lots, channel=channel)
 
     async def _say_lot_list_to(
-        self, chat_id: int, lots: list[Lot], *, channel: str = "parser"
+        self, chat_id: int | None, lots: list[Lot], *, channel: str = "parser"
     ) -> None:
         """Выдача СПИСКОМ. channel=parser|filter — раздельный учёт."""
         batch = (
@@ -2561,18 +2683,34 @@ class App:
             except Exception as exc2:  # noqa: BLE001
                 logger.warning("purge on say: %s", exc2)
         lines = [self._format_lot_line(lot) for lot in batch]
-        for i in range(0, len(lines), 10):
-            await self._say_to(chat_id, "\n".join(lines[i : i + 10]))
+        targets = self._delivery_chats(chat_id)
+        if not targets:
+            return
+        for tid in targets:
+            for i in range(0, len(lines), 10):
+                await self._say_to(tid, "\n".join(lines[i : i + 10]))
         if channel in ("parser", "filter"):
             try:
                 self.db.bump_daily(lots_shown=len(batch))
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _say(self, text: str, reply_markup=None) -> Message | None:
-        if not self.chat_id:
+    async def _say(
+        self, text: str, reply_markup=None, *, log: bool = False
+    ) -> Message | None:
+        msg = None
+        if self.chat_id:
+            msg = await self._say_to(self.chat_id, text, reply_markup=reply_markup)
+        if log:
+            await self._say_log(text)
+        return msg
+
+    async def _say_log(self, text: str) -> Message | None:
+        if not self.log_chat_id:
             return None
-        return await self._say_to(self.chat_id, text, reply_markup=reply_markup)
+        if self.chat_id and int(self.log_chat_id) == int(self.chat_id):
+            return None
+        return await self._say_to(self.log_chat_id, text)
 
     async def _say_to(
         self, chat_id: int, text: str, reply_markup=None
@@ -2584,7 +2722,18 @@ class App:
                 chat_id, text, reply_markup=reply_markup
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("say: %s", exc)
+            logger.error("say %s: %s", chat_id, exc)
+            if self.log_chat_id and int(chat_id) == int(self.log_chat_id):
+                err = str(exc).lower()
+                if any(
+                    x in err
+                    for x in ("kicked", "blocked", "not enough rights", "chat not found")
+                ):
+                    logger.warning("log chat lost, unbinding")
+                    try:
+                        self.unbind_log_chat()
+                    except Exception:  # noqa: BLE001
+                        pass
             return None
 
     async def _edit_status(self, text: str) -> None:
@@ -2887,6 +3036,10 @@ class App:
 
                 parallel_total = max(n_acc, int(getattr(creds, "AFK_PARALLEL", 6)))
                 per_acc = max(1, parallel_total // max(1, n_acc))
+                flood_left = resale_flood_remaining()
+                if flood_left > 2:
+                    await asyncio.sleep(min(flood_left, 20.0))
+                    continue
 
                 async def _farm_one(
                     market: TelegramMarket, gid: int
@@ -3059,7 +3212,8 @@ class App:
 
         await self._say(
             f"{screen('Парсинг')}\n"
-            f"Старт со всех акков · {self.connected_accounts_label()}"
+            f"Старт со всех акков · {self.connected_accounts_label()}",
+            log=True,
         )
         await _status()
         last_prog = 0.0
@@ -3111,6 +3265,7 @@ class App:
                     f"проверок акка: {self.parse_acc_checks} · "
                     f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
+                    log=True,
                 )
 
         try:
@@ -3129,6 +3284,7 @@ class App:
             await self._say(
                 f"{screen('Парсинг')}\n⚠️ {_esc(str(exc)[:200])}",
                 reply_markup=parse_done_inline(),
+                log=True,
             )
             await self.ensure_db_farm()
             return
@@ -3140,6 +3296,11 @@ class App:
         now = time.monotonic()
         to_save = (burst.all_lots or burst.lots) if burst else []
         self._ingest_always(to_save)
+        if burst and int(getattr(burst, "floods", 0) or 0) > 0:
+            await self._say_log(
+                f"{screen('Лог')}\n⏳ FloodWait Telegram · {burst.floods} пауз · "
+                f"парсер замедлён"
+            )
         if to_save:
             for lot in to_save:
                 self._seen.setdefault(lot.id, now)
@@ -3212,6 +3373,7 @@ class App:
                     f"проверок акка: {self.parse_acc_checks} · "
                     f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
+                    log=True,
                 )
             else:
                 await self._say(
@@ -3221,6 +3383,7 @@ class App:
                     f"Чеков: {self.parse_coll_checks} · "
                     f"{self.connected_accounts_label()}",
                     reply_markup=parse_done_inline(),
+                    log=True,
                 )
         elif burst:
             self.checks = burst.check_no
@@ -3296,6 +3459,7 @@ class App:
                     f"Чеков: {self.parse_coll_checks} · "
                     f"проверок акка: {self.parse_acc_checks}",
                     reply_markup=parse_done_inline(),
+                    log=True,
                 )
             else:
                 await self._say(
@@ -3303,12 +3467,14 @@ class App:
                     f"Пока пусто · мало новых RU/free DM\n"
                     f"Жми Заново или смени сложность",
                     reply_markup=parse_done_inline(),
+                    log=True,
                 )
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             await self._say(
                 f"{screen('Парсинг')}\n⚠️ {_esc(str(exc)[:180])}",
                 reply_markup=parse_done_inline(),
+                log=True,
             )
         finally:
             self.running = False
@@ -3628,9 +3794,38 @@ def settings_inline() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="📡 Парсинги", callback_data="menu:jobs")],
             [InlineKeyboardButton(text="📅 /daily", callback_data="menu:daily")],
+            [InlineKeyboardButton(text="🛡 Админ / лог-группа", callback_data="menu:admin")],
             [InlineKeyboardButton(text=stop, callback_data="menu:stop")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")],
         ]
+    )
+
+
+def admin_inline() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔗 Привязать группу", callback_data="admin:bind")],
+    ]
+    if app.log_chat_id:
+        rows.append(
+            [InlineKeyboardButton(text="🧪 Тест лог", callback_data="admin:test")]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="❌ Отвязать", callback_data="admin:unbind")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _admin_text() -> str:
+    return (
+        f"{screen('Админ')}\n"
+        f"Лог-группа: {app._log_chat_label()}\n\n"
+        f"Как привязать:\n"
+        f"1. Добавь бота в группу\n"
+        f"2. Сделай бота <b>админом</b> (писать сообщения)\n"
+        f"3. Жми «Привязать» и перешли любое сообщение из группы\n"
+        f"   или напиши <code>@username</code> / id\n"
+        f"   или напиши <code>/admin</code> прямо в группе"
     )
 
 
@@ -3844,6 +4039,47 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
 
 
+def _extract_forwarded_chat(message: Message):
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        if chat is not None and getattr(chat, "id", None) is not None:
+            return chat
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None and getattr(chat, "id", None) is not None:
+        return chat
+    return None
+
+
+async def _bind_from_ref(ref: str) -> str:
+    raw = (ref or "").strip()
+    if not raw:
+        raise RuntimeError("Пусто.")
+    if not app.bot:
+        raise RuntimeError("Бот не готов.")
+    if raw.startswith("@"):
+        chat = await app.bot.get_chat(raw)
+        return await app.bind_log_chat(int(chat.id))
+    if re.fullmatch(r"-?\d{5,}", raw):
+        return await app.bind_log_chat(int(raw))
+    raise RuntimeError("Пришли @username, id группы или перешли сообщение из неё.")
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    ctype = str(getattr(message.chat, "type", "") or "")
+    if ctype in ("group", "supergroup", "channel"):
+        try:
+            text = await app.bind_log_chat(int(message.chat.id))
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"⚠️ {exc}")
+            return
+        await message.answer(text)
+        return
+    await message.answer(_admin_text(), reply_markup=admin_inline())
+
+
 @router.message(Command("stop"))
 async def cmd_stop(message: Message) -> None:
     text = await app.stop_all_jobs()
@@ -3855,6 +4091,24 @@ async def cmd_logout(message: Message, state: FSMContext) -> None:
     await app.reset_auth()
     await state.set_state(AuthStates.phone)
     await message.answer("Сброшено. Номер:")
+
+
+@router.message(StateFilter(AdminStates.bind_chat))
+async def got_bind_chat(message: Message, state: FSMContext) -> None:
+    text = (message.text or message.caption or "").strip()
+    if text.startswith("/"):
+        return
+    try:
+        fwd = _extract_forwarded_chat(message)
+        if fwd is not None:
+            result = await app.bind_log_chat(int(fwd.id))
+        else:
+            result = await _bind_from_ref(text)
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"⚠️ {exc}", reply_markup=admin_inline())
+        return
+    await state.clear()
+    await message.answer(result, reply_markup=admin_inline())
 
 
 @router.message(StateFilter(AuthStates.phone))
@@ -4056,6 +4310,62 @@ async def cb_settings(callback: CallbackQuery) -> None:
         reply_markup=settings_inline(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu:admin")
+async def cb_admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(_admin_text(), reply_markup=admin_inline())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:bind")
+async def cb_admin_bind(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStates.bind_chat)
+    await callback.message.edit_text(
+        f"{screen('Админ')}\n"
+        f"Перешли сообщение из группы\n"
+        f"или пришли <code>@username</code> / <code>-100...</code>",
+        reply_markup=admin_inline(),
+    )
+    await callback.answer("Жду группу")
+
+
+@router.callback_query(F.data == "admin:unbind")
+async def cb_admin_unbind(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text = app.unbind_log_chat()
+    await callback.message.edit_text(text, reply_markup=admin_inline())
+    await callback.answer("Отвязал")
+
+
+@router.callback_query(F.data == "admin:test")
+async def cb_admin_test(callback: CallbackQuery) -> None:
+    if not app.log_chat_id:
+        await callback.answer("Сначала привяжи группу", show_alert=True)
+        return
+    ok, why = await app._check_bot_admin(int(app.log_chat_id))
+    if not ok:
+        await callback.answer(why[:180], show_alert=True)
+        return
+    msg = await app._say_log(f"{screen('Лог')}\n🧪 тест · бот пишет сюда")
+    if msg is None:
+        await callback.answer("Не смог написать в группу", show_alert=True)
+        return
+    await callback.answer("Отправил")
+
+
+@router.callback_query(F.data.startswith("admin:use:"))
+async def cb_admin_use(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    raw = (callback.data or "").split(":", 2)[-1]
+    try:
+        text = await app.bind_log_chat(int(raw))
+    except Exception as exc:  # noqa: BLE001
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await callback.message.edit_text(text, reply_markup=admin_inline())
+    await callback.answer("Привязал")
 
 
 @router.callback_query(F.data == "menu:jobs")
@@ -4385,6 +4695,52 @@ async def cb_price_start(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated) -> None:
+    chat = event.chat
+    ctype = str(getattr(chat, "type", "") or "")
+    if ctype not in ("group", "supergroup", "channel"):
+        return
+    new = event.new_chat_member
+    status = str(getattr(new, "status", "") or "").split(".")[-1].lower()
+    title = str(getattr(chat, "title", "") or chat.id)
+    owner = int(creds.OWNER_ID)
+    if status in ("kicked", "left"):
+        if app.log_chat_id and int(app.log_chat_id) == int(chat.id):
+            app.unbind_log_chat()
+            try:
+                await event.bot.send_message(
+                    owner,
+                    f"{screen('Админ')}\n"
+                    f"Бот убран из <b>{_esc(str(title))}</b> · лог-группа сброшена",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    if status not in ("administrator", "creator", "owner"):
+        return
+    try:
+        await event.bot.send_message(
+            owner,
+            f"{screen('Админ')}\n"
+            f"Бот админ в <b>{_esc(str(title))}</b>\n"
+            f"<code>{chat.id}</code>\n"
+            f"Привязать как лог-группу?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔗 Привязать",
+                            callback_data=f"admin:use:{chat.id}",
+                        )
+                    ]
+                ]
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def main() -> None:
     wipe_disk_junk()
     bot = Bot(
@@ -4420,6 +4776,7 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Меню"),
+            BotCommand(command="admin", description="Админ · лог-группа"),
             BotCommand(command="stop", description="Стоп"),
             BotCommand(command="daily", description="Стата за день"),
         ]
@@ -4437,7 +4794,7 @@ async def main() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("delete_webhook: %s", exc)
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await app.stop_monitor()
         await app.stop_afk()

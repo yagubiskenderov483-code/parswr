@@ -380,6 +380,14 @@ class GiftDB:
             """
         )
         self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gifts_stars ON gifts(stars)"
         )
         self._conn.execute(
@@ -1590,6 +1598,64 @@ class GiftDB:
             "lots_total": self.count(),
             "accounts": len(self.list_accounts()),
         }
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (str(key),)
+        ).fetchone()
+        if not row:
+            return default
+        return str(row["value"] if row["value"] is not None else default)
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(key), "" if value is None else str(value)),
+        )
+        self._conn.commit()
+
+    def get_log_chat(self) -> dict[str, Any] | None:
+        raw = (self.get_setting("log_chat_id") or "").strip()
+        if not raw:
+            return None
+        try:
+            chat_id = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return {
+            "chat_id": chat_id,
+            "title": self.get_setting("log_chat_title"),
+            "username": self.get_setting("log_chat_username"),
+            "type": self.get_setting("log_chat_type"),
+        }
+
+    def set_log_chat(
+        self,
+        *,
+        chat_id: int | None,
+        title: str = "",
+        username: str = "",
+        chat_type: str = "",
+    ) -> None:
+        if chat_id is None:
+            self._conn.execute(
+                "DELETE FROM settings WHERE key IN (?, ?, ?, ?)",
+                (
+                    "log_chat_id",
+                    "log_chat_title",
+                    "log_chat_username",
+                    "log_chat_type",
+                ),
+            )
+            self._conn.commit()
+            return
+        self.set_setting("log_chat_id", str(int(chat_id)))
+        self.set_setting("log_chat_title", title or "")
+        self.set_setting("log_chat_username", (username or "").lstrip("@"))
+        self.set_setting("log_chat_type", chat_type or "")
 
     def checkpoint(self) -> None:
         """Слить WAL на диск — чтобы БД переживала рестарт/деплой."""

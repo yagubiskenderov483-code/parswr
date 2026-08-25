@@ -100,10 +100,10 @@ SPEED_PROFILES: dict[str, dict] = {
     },
     "fast": {
         "label": "⚡ Turbo",
-        "BURST_PARALLEL": 56,
-        "BURST_PER_COLLECTION": 25,
+        "BURST_PARALLEL": 12,
+        "BURST_PER_COLLECTION": 12,
         "BURST_MAX_COLLECTIONS": 0,
-        "BURST_GAP": 0.0,
+        "BURST_GAP": 0.08,
         "API_TIMEOUT": 2.5,
         "BURST_EARLY_SHOW_AT": 14,
         "CHECK_INTERVAL": 0.1,
@@ -121,12 +121,12 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_DB_LIMIT": 2000,
         "FILTER_EARLY_SHOW_AT": 14,
         "AFK_PAGE_LIMIT": 80,
-        "AFK_GAP": 0.02,
-        "AFK_PARALLEL": 12,
+        "AFK_GAP": 0.08,
+        "AFK_PARALLEL": 6,
     },
 }
 
-DEFAULT_SPEED = "fast"
+DEFAULT_SPEED = "norm"
 
 
 def apply_speed(name: str) -> str:

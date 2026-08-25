@@ -37,6 +37,21 @@ from telethon.tl.types.payments import StarGiftsNotModified
 
 logger = logging.getLogger(__name__)
 
+# общий FloodWait на GetResaleStarGifts — все акки делят одну паузу
+_resale_flood_until = 0.0
+
+
+def resale_flood_remaining() -> float:
+    return max(0.0, _resale_flood_until - time.monotonic())
+
+
+def mark_resale_flood(seconds: float) -> None:
+    global _resale_flood_until
+    wait = min(max(float(seconds), 0.0) + 0.6, 90.0)
+    until = time.monotonic() + wait
+    if until > _resale_flood_until:
+        _resale_flood_until = until
+
 
 @dataclass(slots=True)
 class Lot:
@@ -381,6 +396,10 @@ class TelegramMarket:
         progress_cb = getattr(self, "_progress_cb", None)
         for i in range(0, len(batch), parallel):
             if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                break
+            flood_left = resale_flood_remaining()
+            if flood_left > 10:
+                logger.info("burst stop: resale flood %.0fs left", flood_left)
                 break
             if 0 < time_budget < 1e8 and time.monotonic() - started > time_budget:
                 break
@@ -965,8 +984,14 @@ class TelegramMarket:
         offset: str = "",
     ) -> Any | None:
         for attempt in range(2):
+            left = resale_flood_remaining()
+            if left > 10:
+                stats["floods"] += 1
+                self.last_error = f"FloodWait {int(left)}s · пауза"
+                return None
             try:
-                await self._wait_flood()
+                if left > 0:
+                    await asyncio.sleep(left)
                 await self.ensure_connected()
                 async with self._gap_lock:
                     wait = gap - (time.monotonic() - self._last_req)
@@ -986,10 +1011,17 @@ class TelegramMarket:
                 )
             except FloodWaitError as exc:
                 stats["floods"] += 1
-                wait_s = float(exc.seconds) + 0.8
-                self._flood_until = time.monotonic() + min(wait_s, 60.0)
-                self.last_error = f"FloodWait {exc.seconds}s · торможу"
-                await asyncio.sleep(min(wait_s, 30.0))
+                mark_resale_flood(float(exc.seconds))
+                self._flood_until = time.monotonic() + min(float(exc.seconds) + 0.8, 60.0)
+                self.last_error = f"FloodWait {exc.seconds}s · пауза"
+                logger.warning(
+                    "GetResaleStarGifts flood %ss — skip extra calls",
+                    exc.seconds,
+                )
+                if float(exc.seconds) <= 8:
+                    await asyncio.sleep(float(exc.seconds) + 0.4)
+                    continue
+                return None
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
                 self.last_error = str(exc)

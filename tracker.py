@@ -65,6 +65,25 @@ def data_dir() -> Path:
     return BASE_DIR
 
 
+def acquire_singleton_lock() -> Any:
+    """Один процесс на volume — второй инстанс рвёт auth key и вылетает сессия."""
+    import fcntl
+
+    path = data_dir() / "tracker_singleton.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise SystemExit(
+            "Уже запущен другой трекер (tracker_singleton.lock). "
+            "На Bothost должен быть ОДИН инстанс — иначе Telegram кикает сессию."
+        ) from exc
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
 def _load_dotenv() -> None:
     """Мини-загрузчик .env: переменные окружения имеют приоритет."""
     path = BASE_DIR / ".env"
@@ -89,15 +108,15 @@ class Config:
     target_channel: str
     min_stars: float = 500.0
     max_stars: float = 5000.0
-    poll_interval: float = 0.15
+    poll_interval: float = 2.0
     page_limit: int = 12  # только верх resale-листа
-    parallel: int = 8
-    gap: float = 0.14
+    parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
+    gap: float = 0.25
     timeout: float = 10.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
-    enrich_parallel: int = 6
+    enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 0  # 0 = все коллекции каждый проход
+    scan_batch: int = 50  # ротация: не долбим все 149 колл за раз
     hot_limit: int = 4  # топ-N = только что выставленные
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
@@ -154,15 +173,15 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 5000),
-            poll_interval=_f("POLL_INTERVAL", 0.15),
+            poll_interval=_f("POLL_INTERVAL", 2.0),
             page_limit=int(_f("PAGE_LIMIT", 12)),
-            parallel=int(_f("PARALLEL", 8)),
-            gap=_f("REQUEST_GAP", 0.14),
+            parallel=min(6, int(_f("PARALLEL", 4))),
+            gap=_f("REQUEST_GAP", 0.25),
             timeout=_f("REQUEST_TIMEOUT", 10.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
-            enrich_parallel=max(2, int(_f("ENRICH_PARALLEL", 6))),
+            enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 0)),
+            scan_batch=int(_f("SCAN_BATCH", 50)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             post_interval=_f("POST_INTERVAL", 4.0),
@@ -995,7 +1014,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.2"
+TRACKER_VERSION = "3.3"
 
 
 @dataclass
@@ -1185,7 +1204,7 @@ async def scanner_loop(
                     scanned,
                     runtime.scan_parallel,
                 )
-            elif ratio < 0.12 and runtime.scan_parallel < 12:
+            elif ratio < 0.12 and runtime.scan_parallel < 6:
                 runtime.scan_parallel += 1
                 cfg.parallel = runtime.scan_parallel
 
@@ -1195,18 +1214,23 @@ async def scanner_loop(
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
+    _singleton_lock = acquire_singleton_lock()
     store = ChannelStore(channel_file_path(data_dir()))
     control_bot: ControlBot | None = None
 
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · lvl≤%s · hot=%s",
+        "✅ Трекер v%s · %s · RU=%s · parallel≤%s · batch=%s",
         TRACKER_VERSION,
         me.username or me.first_name,
         "да" if cfg.strict_ru else "нет",
-        cfg.max_account_level,
-        cfg.hot_limit,
+        cfg.parallel,
+        cfg.scan_batch or "все",
+    )
+    logger.warning(
+        "Сессия: один инстанс Bothost; не жми /start повторно; "
+        "не запускай parser+tracker на одном аккаунте"
     )
 
     state_path = Path(cfg.state_file)

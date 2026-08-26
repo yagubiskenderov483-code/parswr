@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -197,8 +197,9 @@ class Config:
     scan_batch: int = 50  # ротация: не долбим все 149 колл за раз
     hot_limit: int = 4  # топ-N = только что выставленные
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    noob_mode: bool = True  # без премиум/профи: низкий lvl, мало gifts
-    max_gifts_count: int = 5  # в noob_mode: gifts_count > N → профи
+    noob_mode: bool = True  # низкий lvl, мало gifts; TGP ок для девочек
+    max_gifts_count: int = 5  # gifts_count > N → профи (кроме женских)
+    female_mix_target: float = 0.30  # ~30% постов — «богатые» женские профили
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -266,6 +267,7 @@ class Config:
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             noob_mode=os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 5))),
+            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 0.30))),
             post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -740,6 +742,32 @@ async def _fetch_collection_pages(
     return parsed
 
 
+def _collect_fresh_lot(
+    lot: Lot,
+    i: int,
+    seen: dict[str, float],
+    cfg: Config,
+    *,
+    baseline: bool,
+    now: float,
+) -> Lot | None:
+    """Проверка одного лота со страницы resale; None = не в очередь."""
+    if i >= cfg.hot_limit:
+        if lot.id not in seen:
+            seen[lot.id] = now
+        return None
+    if lot.id in seen:
+        return None
+    if baseline:
+        seen[lot.id] = now
+        return None
+    if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
+        seen[lot.id] = now
+        return None
+    lot.discovered_at = now
+    return lot
+
+
 async def poll_once(
     m: TelegramMarket,
     gift_ids: list[int],
@@ -747,43 +775,40 @@ async def poll_once(
     cfg: Config,
     *,
     baseline: bool,
+    on_lot: Callable[[Lot], None] | None = None,
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
-    """Проход по коллекциям (ротация batch) — лоты в диапазоне MIN..MAX."""
+    """Проход по коллекциям — лоты в очередь сразу по мере нахождения."""
     started = time.monotonic()
     api_stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
     batch = _select_scan_batch(gift_ids, m, cfg, baseline=baseline)
     sem = asyncio.Semaphore(cfg.parallel)
 
-    async def one(gid: int) -> list[Lot]:
+    async def one(gid: int) -> tuple[int, list[Lot] | BaseException]:
         async with sem:
-            return await _fetch_collection_pages(m, gid, cfg, api_stats)
+            try:
+                return gid, await _fetch_collection_pages(m, gid, cfg, api_stats)
+            except BaseException as exc:
+                return gid, exc
 
-    chunks = await asyncio.gather(
-        *(one(g) for g in batch), return_exceptions=True
-    )
-    now = time.time()
     fresh: list[Lot] = []
     exc_errors = 0
-    for gid, lots in zip(batch, chunks):
-        if isinstance(lots, BaseException):
+    tasks = [asyncio.create_task(one(g)) for g in batch]
+    for fut in asyncio.as_completed(tasks):
+        gid, result = await fut
+        if isinstance(result, BaseException):
             exc_errors += 1
-            logger.warning("коллекция %s: %s", gid, lots)
+            logger.warning("коллекция %s: %s", gid, result)
             continue
-        for i, lot in enumerate(lots):
-            if i >= cfg.hot_limit:
-                if lot.id not in seen:
-                    seen[lot.id] = now
+        now = time.time()
+        for i, lot in enumerate(result):
+            accepted = _collect_fresh_lot(
+                lot, i, seen, cfg, baseline=baseline, now=now
+            )
+            if accepted is None:
                 continue
-            if lot.id in seen:
-                continue
-            if baseline:
-                seen[lot.id] = now
-                continue
-            if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
-                seen[lot.id] = now
-                continue
-            lot.discovered_at = now
-            fresh.append(lot)
+            fresh.append(accepted)
+            if on_lot is not None:
+                on_lot(accepted)
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
         "parsed": api_stats.get("parsed", 0),
@@ -819,6 +844,8 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         lot.account_level is None
         or lot.free_dm is None
         or lot.is_premium is None
+        or lot.has_photo is None
+        or lot.has_personal_channel is None
         or (cfg.noob_mode and lot.gifts_count is None)
         or (cfg.strict_ru and not lot.lang_code)
     )
@@ -885,12 +912,31 @@ def passes_account_level(
     return lvl <= max_level
 
 
-def passes_noob_seller(lot: Lot, *, max_gifts: int) -> str | None:
-    """Режим нубов: без Premium и без «профи» с кучей NFT."""
+def passes_persona_filter(lot: Lot, *, max_gifts: int) -> str | None:
+    """Персоны: девочки (TGP ок) · пустые мужики без TGP · остальные нубы."""
+    female = _looks_female(lot)
+    gifts = lot.gifts_count
+    if gifts is not None and gifts > max_gifts:
+        cap = max_gifts * 3 if female else max_gifts
+        if gifts > cap:
+            return "pro"
+
+    if female:
+        return None
+
     if lot.is_premium is True:
-        return "premium"
-    if lot.gifts_count is not None and lot.gifts_count > max_gifts:
-        return "pro"
+        about = (lot.about or "").strip()
+        sparse = (
+            lot.has_photo is not True
+            and not lot.has_personal_channel
+            and len(about) < 24
+        )
+        if sparse or _matches_male_empty(lot):
+            return "premium"
+
+    if _matches_male_empty(lot):
+        return None
+
     return None
 
 
@@ -938,7 +984,7 @@ def filter_for_post(
             stats["level"] += 1
             continue
         if noob_mode:
-            skip = passes_noob_seller(lot, max_gifts=max_gifts_count)
+            skip = passes_persona_filter(lot, max_gifts=max_gifts_count)
             if skip:
                 stats[skip] += 1
                 continue
@@ -958,9 +1004,19 @@ def filter_for_post(
 
 
 _FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀)",
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby)",
     re.IGNORECASE,
 )
+_MOTO_RE = re.compile(
+    r"(мото|motor|bike|biker|байк|квадро|drive|тачк|авто|yamaha|kawasaki|harley)",
+    re.IGNORECASE,
+)
+_CRINGE_NICK_RE = re.compile(
+    r"(💕|🌸|✨|🎀|🌷|💋|kitty|angel|babe|xxx|ххх|милаш|princess|queen|baby|"
+    r"солныш|зайка|киса|милая|душа|love|sweet)",
+    re.IGNORECASE,
+)
+
 
 def _looks_female(lot: Lot) -> bool:
     blob = " ".join(
@@ -977,11 +1033,88 @@ def _looks_female(lot: Lot) -> bool:
         return True
     fn = (lot.first_name or "").strip().lower()
     if len(fn) >= 3:
-        if fn.endswith(("ия", "ья", "на", "та", "са", "ка", "ла", "ра", "ва", "ша")):
+        if fn.endswith(
+            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша")
+        ):
             return True
-        if fn[-1] in "ая":
+        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")) and not fn.endswith(
+            ("ася", "ося")
+        ):
+            return True
+        if fn.endswith("ая"):
             return True
     return False
+
+
+def _cringe_nick(lot: Lot) -> bool:
+    blob = f"{lot.seller or ''} {lot.first_name or ''}".strip()
+    if not blob:
+        return False
+    if _CRINGE_NICK_RE.search(blob):
+        return True
+    if re.search(r"[_\.]{2,}|[0-9]{3,}", blob):
+        return True
+    if any(ch in blob for ch in "💕🌸✨🎀🌷💋👑"):
+        return True
+    return False
+
+
+def _matches_male_empty(lot: Lot) -> bool:
+    """Пустой мужской акк: без авы, без TGP, мото/пустое био."""
+    if _looks_female(lot):
+        return False
+    if lot.is_premium is True:
+        return False
+    if lot.has_photo is True:
+        return False
+    if lot.gifts_count is not None and lot.gifts_count > 3:
+        return False
+    if lot.has_personal_channel is True:
+        return False
+    about = (lot.about or "").strip()
+    if _MOTO_RE.search(about):
+        return True
+    if about:
+        return len(about) < 48
+    return True
+
+
+def _female_rich_score(lot: Lot) -> float:
+    if not _looks_female(lot):
+        return 0.0
+    score = 0.0
+    if lot.has_photo:
+        score += 2.5
+    if (lot.about or "").strip():
+        score += 1.5
+    if lot.has_personal_channel:
+        score += 2.0
+    if lot.gifts_count and lot.gifts_count > 0:
+        score += 1.0
+    if _cringe_nick(lot):
+        score += 2.0
+    if lot.is_premium:
+        score += 1.0
+    return score
+
+
+def is_female_rich(lot: Lot, *, threshold: float = 4.0) -> bool:
+    return _female_rich_score(lot) >= threshold
+
+
+def _queue_priority(lot: Lot, cfg: Config, runtime: "TrackerRuntime") -> float:
+    """Свежее первым; ~30% очереди — женские «кринж»-профили."""
+    prio = -float(lot.discovered_at or time.time())
+    if not is_female_rich(lot):
+        return prio
+    total = max(runtime.posted_total, 1)
+    ratio = runtime.posted_female_rich / total
+    target = cfg.female_mix_target
+    if ratio < target:
+        prio -= 800.0
+    elif ratio > target + 0.12:
+        prio += 400.0
+    return prio
 
 
 def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
@@ -1059,9 +1192,9 @@ class PostQueue:
     def enqueue(self, lots: list[Lot]) -> int:
         if not lots:
             return 0
-        for lot in rank_for_queue(lots):
+        for lot in lots:
             self._seq += 1
-            prio = -float(lot.discovered_at or time.time())
+            prio = _queue_priority(lot, self._cfg, self._runtime)
             self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
@@ -1108,6 +1241,8 @@ class PostQueue:
                 self._state["seen_sellers"] = self._seen_sellers
                 save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
+                if is_female_rich(lot):
+                    self._runtime.posted_female_rich += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
                     "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
@@ -1123,7 +1258,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.5"
+TRACKER_VERSION = "3.6"
 
 
 @dataclass
@@ -1132,6 +1267,7 @@ class TrackerRuntime:
 
     passes: int = 0
     posted_total: int = 0
+    posted_female_rich: int = 0
     last_fresh: int = 0
     last_posted: int = 0
     last_skip_ru: int = 0
@@ -1244,16 +1380,27 @@ async def scanner_loop(
     state_path: Path,
     state: dict,
 ) -> None:
-    """Быстрый скан всех коллекций (page1, hot_limit) — сразу в очередь без enrich."""
+    """Скан коллекций — лот в очередь сразу при нахождении (не ждём весь batch)."""
     catalog_refreshed = time.monotonic()
     pass_no = 0
+
+    def _on_fresh(lot: Lot) -> None:
+        post_queue.enqueue([lot])
+
     while True:
         started = time.monotonic()
         pass_no += 1
         runtime.passes = pass_no
         runtime.seen_lots = len(seen)
         try:
-            fresh, scan = await poll_once(m, gift_ids, seen, cfg, baseline=False)
+            fresh, scan = await poll_once(
+                m,
+                gift_ids,
+                seen,
+                cfg,
+                baseline=False,
+                on_lot=_on_fresh,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
             await asyncio.sleep(2)
@@ -1268,14 +1415,13 @@ async def scanner_loop(
 
         runtime.last_fresh = len(fresh)
         if fresh:
-            n = post_queue.enqueue(fresh)
             runtime.queue_pending = post_queue.pending
-            runtime.last_posted = n
+            runtime.last_posted = len(fresh)
             logger.info(
-                "Проход #%s: +%s свежих → очередь +%s (ждут %s · %ss)",
+                "Проход #%s: +%s свежих → очередь %s (ждут %s · %ss)",
                 pass_no,
                 len(fresh),
-                n,
+                post_queue.pending,
                 post_queue.pending,
                 scan.get("elapsed", "?"),
             )
@@ -1332,15 +1478,13 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · нубы=%s · lvl≤%s · gifts≤%s · parallel≤%s · batch=%s",
+        "✅ Трекер v%s · %s · RU=%s · персоны · mix≈%s%% жен · lvl≤%s · parallel≤%s",
         TRACKER_VERSION,
         me.username or me.first_name,
         "да" if cfg.strict_ru else "нет",
-        "да" if cfg.noob_mode else "нет",
+        int(cfg.female_mix_target * 100),
         cfg.max_account_level,
-        cfg.max_gifts_count if cfg.noob_mode else "—",
         cfg.parallel,
-        cfg.scan_batch or "все",
     )
     logger.warning(
         "Сессия: один инстанс Bothost; не жми /start повторно; "

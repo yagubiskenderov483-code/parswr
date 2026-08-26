@@ -32,6 +32,7 @@ from telethon.tl.types import (
     StarsTonAmount,
     RequirementToContactPaidMessages,
     RequirementToContactPremium,
+    UserProfilePhotoEmpty,
     UserStatusOnline,
 )
 from telethon.tl.types.payments import StarGiftsNotModified
@@ -83,6 +84,8 @@ class Lot:
     # None=неизвестно, True=сейчас в сети
     is_online: bool | None = None
     lang_code: str = ""
+    has_photo: bool | None = None
+    has_personal_channel: bool | None = None
     seen_at: float = field(default_factory=time.time)
     discovered_at: float = 0.0  # когда трекер впервые увидел лот
 
@@ -766,8 +769,10 @@ class TelegramMarket:
                 except Exception:  # noqa: BLE001
                     # не кэшируем навсегда — скрытый профиль может открыться позже
                     return
+                user_obj = None
                 for u in getattr(full, "users", None) or []:
                     if getattr(u, "id", None) == lot.seller_id:
+                        user_obj = u
                         _fill_user(lot, u)
                         break
                 uf = getattr(full, "full_user", None)
@@ -796,6 +801,18 @@ class TelegramMarket:
                                 paid_stars = None
                             if paid_stars is not None and paid_stars > 0:
                                 free_dm = False
+                has_photo: bool | None = None
+                has_channel: bool | None = None
+                if user_obj is not None:
+                    photo = getattr(user_obj, "photo", None)
+                    if photo is not None:
+                        has_photo = not isinstance(photo, UserProfilePhotoEmpty)
+                if uf is not None:
+                    pch = getattr(uf, "personal_channel_id", None)
+                    if pch is None:
+                        pch = getattr(uf, "personal_channel_message", None)
+                    if pch is not None:
+                        has_channel = bool(pch)
                 lot.about = about
                 if level is not None:
                     lot.account_level = level
@@ -805,6 +822,10 @@ class TelegramMarket:
                     lot.free_dm = free_dm
                 if paid_stars is not None:
                     lot.paid_dm_stars = paid_stars
+                if has_photo is not None:
+                    lot.has_photo = has_photo
+                if has_channel is not None:
+                    lot.has_personal_channel = has_channel
                 info = {
                     "username": lot.seller,
                     "first_name": lot.first_name,
@@ -815,6 +836,8 @@ class TelegramMarket:
                     "gifts_count": gifts,
                     "free_dm": free_dm,
                     "paid_dm_stars": paid_stars,
+                    "has_photo": has_photo,
+                    "has_personal_channel": has_channel,
                 }
                 self._profile_cache[lot.seller_id] = info
 
@@ -1260,6 +1283,10 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
         lot.account_level = _normalize_level(info["account_level"])
     if info.get("gifts_count") is not None:
         lot.gifts_count = int(info["gifts_count"])
+    if info.get("has_photo") is not None:
+        lot.has_photo = bool(info["has_photo"])
+    if info.get("has_personal_channel") is not None:
+        lot.has_personal_channel = bool(info["has_personal_channel"])
     if info.get("free_dm") is not None:
         lot.free_dm = bool(info["free_dm"])
     if info.get("paid_dm_stars") is not None:

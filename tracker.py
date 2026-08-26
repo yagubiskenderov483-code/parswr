@@ -84,6 +84,84 @@ def acquire_singleton_lock() -> Any:
     return handle
 
 
+def _catalog_file_path() -> Path:
+    return data_dir() / "tracker_catalog.json"
+
+
+def _load_catalog_file() -> tuple[list[int], int] | None:
+    path = _catalog_file_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        ids = [int(x) for x in data.get("gift_ids", []) if str(x).isdigit()]
+        if not ids:
+            return None
+        return ids, int(data.get("hash", 0) or 0)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_catalog_file(gift_ids: list[int], hash_val: int = 0) -> None:
+    if not gift_ids:
+        return
+    path = _catalog_file_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({"gift_ids": gift_ids, "hash": int(hash_val or 0)}),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _setup_catalog_hooks(m: TelegramMarket) -> None:
+    """Кэш коллекций: gifts.db → tracker_catalog.json → сеть."""
+
+    def _load() -> tuple[list[int], int] | None:
+        cached = _load_catalog_file()
+        if cached:
+            return cached
+        try:
+            from db import GiftDB
+
+            return GiftDB().load_gift_catalog()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _save(ids: list[int], h: int) -> None:
+        _save_catalog_file(ids, h)
+        try:
+            from db import GiftDB
+
+            GiftDB().save_gift_catalog(ids, h)
+        except Exception:  # noqa: BLE001
+            pass
+
+    m.set_catalog_hooks(load_cb=_load, save_cb=_save)
+
+
+async def wait_for_gift_ids(m: TelegramMarket) -> list[int]:
+    """Не падаем при collections=0 — ждём сеть/сессию, крутим кэш."""
+    for attempt in range(1, 9999):
+        try:
+            if attempt == 1:
+                ids = await m.load_collections(force=False)
+            else:
+                ids = await m.load_collections(force=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("load_collections: %s", exc)
+            ids = []
+        if ids:
+            return ids
+        logger.error(
+            "Коллекций 0 (попытка %s) — жду 30с. "
+            "Проверь: /start в @markskskdbot, сессия жива, аккаунт не в бане",
+            attempt,
+        )
+        await asyncio.sleep(30)
+    return []
+
+
 def _load_dotenv() -> None:
     """Мини-загрузчик .env: переменные окружения имеют приоритет."""
     path = BASE_DIR / ".env"
@@ -1014,7 +1092,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.3"
+TRACKER_VERSION = "3.4"
 
 
 @dataclass
@@ -1264,6 +1342,7 @@ async def run() -> None:
         dd / "tracker_last_post.txt",
     )
     m = TelegramMarket(client)
+    _setup_catalog_hooks(m)
     sender = Sender(cfg, client, rate_limiter=rate_limiter)
     sender.chat_id = chat_id
     control_bot.runtime = runtime
@@ -1283,9 +1362,9 @@ async def run() -> None:
     post_queue.start()
     control_bot.post_queue = post_queue
 
-    gift_ids = await m.load_collections(force=True)
+    gift_ids = await wait_for_gift_ids(m)
     if not gift_ids:
-        raise SystemExit("Не удалось загрузить список коллекций подарков")
+        raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
         "Коллекций: %s · scan page1 hot=%s · все колл/проход · drip %ss · lvl≤%s",
         len(gift_ids),

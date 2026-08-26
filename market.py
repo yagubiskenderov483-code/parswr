@@ -256,44 +256,70 @@ class TelegramMarket:
 
     async def _fetch_collections_remote(self, *, use_hash: bool = True) -> list[int]:
         await self.ensure_connected()
-        req_hash = int(self._gifts_hash or 0) if use_hash else 0
-        result = await asyncio.wait_for(
-            self.client(GetStarGiftsRequest(hash=req_hash)),
-            timeout=8.0,
-        )
-        if isinstance(result, StarGiftsNotModified) or result.__class__.__name__ == (
-            "StarGiftsNotModified"
-        ):
-            if self._gift_ids:
-                return self._gift_ids
-            # hash устарел локально — тянем полный список
-            result = await asyncio.wait_for(
-                self.client(GetStarGiftsRequest(hash=0)),
-                timeout=8.0,
-            )
-        gifts = getattr(result, "gifts", []) or []
-        ids = self._ids_from_gifts(gifts)
-        try:
-            self._gifts_hash = int(getattr(result, "hash", 0) or 0)
-        except (TypeError, ValueError):
-            self._gifts_hash = 0
-        if ids:
-            # сохраняем порядок shuffle только если список реально новый
-            if set(ids) != set(self._gift_ids):
-                random.shuffle(ids)
-                self._gift_ids = ids
-                self._cursor = random.randrange(len(ids)) if ids else 0
-            elif not self._gift_ids:
-                random.shuffle(ids)
-                self._gift_ids = ids
-                self._cursor = random.randrange(len(ids)) if ids else 0
-            self._persist_catalog()
-        logger.info(
-            "collections=%s hash=%s cursor=%s",
-            len(self._gift_ids),
-            self._gifts_hash,
-            self._cursor,
-        )
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            try:
+                req_hash = 0 if attempt >= 2 else (
+                    int(self._gifts_hash or 0) if use_hash else 0
+                )
+                result = await asyncio.wait_for(
+                    self.client(GetStarGiftsRequest(hash=req_hash)),
+                    timeout=20.0,
+                )
+                if isinstance(result, StarGiftsNotModified) or (
+                    result.__class__.__name__ == "StarGiftsNotModified"
+                ):
+                    if self._gift_ids:
+                        return self._gift_ids
+                    result = await asyncio.wait_for(
+                        self.client(GetStarGiftsRequest(hash=0)),
+                        timeout=20.0,
+                    )
+                gifts = getattr(result, "gifts", []) or []
+                ids = self._ids_from_gifts(gifts)
+                if not ids and gifts:
+                    ids = [
+                        int(g.id)
+                        for g in gifts
+                        if getattr(g, "id", None) is not None
+                    ]
+                try:
+                    self._gifts_hash = int(getattr(result, "hash", 0) or 0)
+                except (TypeError, ValueError):
+                    self._gifts_hash = 0
+                if ids:
+                    if set(ids) != set(self._gift_ids):
+                        random.shuffle(ids)
+                        self._gift_ids = ids
+                        self._cursor = random.randrange(len(ids))
+                    elif not self._gift_ids:
+                        random.shuffle(ids)
+                        self._gift_ids = ids
+                        self._cursor = random.randrange(len(ids))
+                    self._persist_catalog()
+                logger.info(
+                    "collections=%s hash=%s cursor=%s (api gifts=%s attempt=%s)",
+                    len(self._gift_ids),
+                    self._gifts_hash,
+                    self._cursor,
+                    len(gifts),
+                    attempt + 1,
+                )
+                if self._gift_ids:
+                    return self._gift_ids
+                logger.warning(
+                    "GetStarGifts: api вернул %s gifts, resale ids=0",
+                    len(gifts),
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                self.last_error = str(exc)
+                logger.warning(
+                    "GetStarGifts attempt %s/4: %s", attempt + 1, exc
+                )
+                await asyncio.sleep(2.0 * (attempt + 1))
+        if last_exc:
+            logger.error("catalog fetch failed: %s", last_exc)
         return self._gift_ids
 
     def _schedule_refresh(self) -> None:

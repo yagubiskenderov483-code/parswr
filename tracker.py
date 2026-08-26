@@ -197,6 +197,8 @@ class Config:
     scan_batch: int = 50  # ротация: не долбим все 149 колл за раз
     hot_limit: int = 4  # топ-N = только что выставленные
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
+    noob_mode: bool = True  # без премиум/профи: низкий lvl, мало gifts
+    max_gifts_count: int = 5  # в noob_mode: gifts_count > N → профи
     post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -262,6 +264,8 @@ class Config:
             scan_batch=int(_f("SCAN_BATCH", 50)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
+            noob_mode=os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
+            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 5))),
             post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -815,6 +819,7 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         lot.account_level is None
         or lot.free_dm is None
         or lot.is_premium is None
+        or (cfg.noob_mode and lot.gifts_count is None)
         or (cfg.strict_ru and not lot.lang_code)
     )
     if need_profile:
@@ -868,14 +873,25 @@ def mark_processed_lots(
     return retry
 
 
-def passes_account_level(lot: Lot, max_level: int) -> bool:
+def passes_account_level(
+    lot: Lot, max_level: int, *, require_known: bool = False
+) -> bool:
     """Level <= max или отрицательный рейтинг (как у Parser Gift)."""
     lvl = lot.account_level
     if lvl is None:
-        return True
+        return not require_known
     if lvl < 0:
         return True
     return lvl <= max_level
+
+
+def passes_noob_seller(lot: Lot, *, max_gifts: int) -> str | None:
+    """Режим нубов: без Premium и без «профи» с кучей NFT."""
+    if lot.is_premium is True:
+        return "premium"
+    if lot.gifts_count is not None and lot.gifts_count > max_gifts:
+        return "pro"
+    return None
 
 
 def filter_for_post(
@@ -886,6 +902,8 @@ def filter_for_post(
     strict_ru: bool = True,
     strict_free: bool = False,
     max_account_level: int = 2,
+    noob_mode: bool = True,
+    max_gifts_count: int = 5,
 ) -> tuple[list[Lot], dict[str, int]]:
     """RU + level + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
@@ -897,6 +915,8 @@ def filter_for_post(
         "paid": 0,
         "unknown_dm": 0,
         "level": 0,
+        "premium": 0,
+        "pro": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -912,9 +932,16 @@ def filter_for_post(
         if strict_ru and not is_russian_lot(lot):
             stats["non_ru"] += 1
             continue
-        if not passes_account_level(lot, max_account_level):
+        if not passes_account_level(
+            lot, max_account_level, require_known=noob_mode
+        ):
             stats["level"] += 1
             continue
+        if noob_mode:
+            skip = passes_noob_seller(lot, max_gifts=max_gifts_count)
+            if skip:
+                stats[skip] += 1
+                continue
         if strict_free:
             if lot.free_dm is not True:
                 if lot.free_dm is False:
@@ -1058,12 +1085,16 @@ class PostQueue:
                     strict_ru=self._cfg.strict_ru,
                     strict_free=self._cfg.strict_free,
                     max_account_level=self._cfg.max_account_level,
+                    noob_mode=self._cfg.noob_mode,
+                    max_gifts_count=self._cfg.max_gifts_count,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
+                self._runtime.last_skip_premium = fstats["premium"]
+                self._runtime.last_skip_pro = fstats["pro"]
                 if not to_post:
                     if lot.seller_key:
                         self._seen[lot.id] = now
@@ -1092,7 +1123,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.4"
+TRACKER_VERSION = "3.5"
 
 
 @dataclass
@@ -1108,6 +1139,8 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    last_skip_premium: int = 0
+    last_skip_pro: int = 0
     scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0
@@ -1299,10 +1332,13 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · parallel≤%s · batch=%s",
+        "✅ Трекер v%s · %s · RU=%s · нубы=%s · lvl≤%s · gifts≤%s · parallel≤%s · batch=%s",
         TRACKER_VERSION,
         me.username or me.first_name,
         "да" if cfg.strict_ru else "нет",
+        "да" if cfg.noob_mode else "нет",
+        cfg.max_account_level,
+        cfg.max_gifts_count if cfg.noob_mode else "—",
         cfg.parallel,
         cfg.scan_batch or "все",
     )

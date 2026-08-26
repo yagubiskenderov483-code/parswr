@@ -292,10 +292,14 @@ def build_router(
             lines.append(
                 f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
             )
+            noob = getattr(cfg, "noob_mode", True)
+            max_gifts = getattr(cfg, "max_gifts_count", 5)
             lines.append(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
+                f"нубы={'да' if noob else 'нет'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)}"
+                + (f" · gifts≤{max_gifts}" if noob else "")
             )
         if rt:
             lines.extend(
@@ -310,7 +314,8 @@ def build_router(
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
-                    f"lvl−{rt.last_skip_level}",
+                    f"lvl−{rt.last_skip_level} premium−{rt.last_skip_premium} "
+                    f"pro−{rt.last_skip_pro}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )

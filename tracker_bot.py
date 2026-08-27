@@ -280,7 +280,8 @@ def build_router(
         ]
         if cfg:
             lines.append(
-                f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
+                f"Диапазон: {cfg.min_ton:g}–{cfg.max_ton:g} TON "
+                f"({int(cfg.min_stars)}–{int(cfg.max_stars)}⭐)"
             )
             lines.append(
                 f"Фильтры: девушки по имени/нику/аве/каналу/сторис/подаркам"

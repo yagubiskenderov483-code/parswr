@@ -2,7 +2,7 @@
 Гифт-трекер внутреннего маркета Telegram.
 
 Ловит только что выставленные на перепродажу NFT-подарки (за Stars),
-фильтрует по цене MIN_STARS..MAX_STARS и постит карточки в канал.
+фильтрует по цене 5–15 TON (дешёвые лоты) и постит карточки в канал.
 
 Запуск:  python3 tracker.py
 Настройки берутся из .env (см. .env.example) или переменных окружения.
@@ -14,6 +14,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -57,6 +58,46 @@ DEFAULT_CHANNEL_ID = -1004384888475
 FIXED_CHANNEL_ID = -1004384888475
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
+
+# Дешёвые подарки: 5–15 TON. Stars считаются через TON_RATE.
+DEFAULT_TON_RATE = 0.0102
+DEFAULT_MIN_TON = 5.0
+DEFAULT_MAX_TON = 15.0
+
+
+def stars_from_ton(ton: float, rate: float = DEFAULT_TON_RATE) -> float:
+    """Stars за N TON при курсе TON за 1 Star."""
+    r = float(rate) if rate else DEFAULT_TON_RATE
+    if r <= 0:
+        r = DEFAULT_TON_RATE
+    return float(ton) / r
+
+
+def star_window_from_ton(min_ton: float, max_ton: float, rate: float) -> tuple[float, float]:
+    """Целые ⭐ на краях TON-окна: 5 TON → 490⭐, 15 TON → 1471⭐."""
+    lo = math.floor(stars_from_ton(min_ton, rate))
+    hi = math.ceil(stars_from_ton(max_ton, rate))
+    return float(lo), float(hi)
+
+
+DEFAULT_MIN_STARS, DEFAULT_MAX_STARS = star_window_from_ton(
+    DEFAULT_MIN_TON, DEFAULT_MAX_TON, DEFAULT_TON_RATE
+)
+
+
+def lot_ton(stars: float, rate: float = DEFAULT_TON_RATE) -> float:
+    r = float(rate) if rate else DEFAULT_TON_RATE
+    return float(stars) * r
+
+
+def in_cheap_ton_window(stars: float, cfg: "Config") -> bool:
+    """Только лоты 5–15 TON (или MIN_TON..MAX_TON из конфига)."""
+    price = float(stars)
+    if not (cfg.min_stars <= price <= cfg.max_stars):
+        return False
+    ton = lot_ton(price, cfg.ton_rate)
+    slack = max(float(cfg.ton_rate) or DEFAULT_TON_RATE, 0.01)
+    return (cfg.min_ton - slack) <= ton <= (cfg.max_ton + slack)
 
 
 def data_dir() -> Path:
@@ -172,8 +213,10 @@ class Config:
     session_string: str
     bot_token: str
     target_channel: str
-    min_stars: float = 500.0
-    max_stars: float = 2000.0  # только совсем дешёвые
+    min_ton: float = DEFAULT_MIN_TON
+    max_ton: float = DEFAULT_MAX_TON  # дороже 15 TON не постим
+    min_stars: float = DEFAULT_MIN_STARS  # ~490⭐ ≈ 5 TON
+    max_stars: float = DEFAULT_MAX_STARS  # ~1471⭐ ≈ 15 TON
     poll_interval: float = 0.4  # турбо-скан
     page_limit: int = 2  # API: только верх resale
     parallel: int = 6
@@ -197,7 +240,7 @@ class Config:
     fast_scan: bool = True
     turbo_scan: bool = True
     post_interval: float = 0.3
-    ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
+    ton_rate: float = DEFAULT_TON_RATE  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
     state_file: str = ""
@@ -238,14 +281,30 @@ class Config:
         target = (
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
+        ton_rate = _f("TON_RATE", DEFAULT_TON_RATE) or DEFAULT_TON_RATE
+        min_ton = _f("MIN_TON", DEFAULT_MIN_TON)
+        max_ton = _f("MAX_TON", DEFAULT_MAX_TON)
+        if min_ton > max_ton:
+            min_ton, max_ton = max_ton, min_ton
+        derived_min, derived_max = star_window_from_ton(min_ton, max_ton, ton_rate)
+        # MIN_STARS/MAX_STARS из старого .env принимаем, но режем по TON-окну:
+        # leftover MAX_STARS=2000 (~20 TON) не должен пускать дорогие подарки.
+        min_stars = _f("MIN_STARS", derived_min)
+        max_stars = _f("MAX_STARS", derived_max)
+        min_stars = max(min_stars, derived_min)
+        max_stars = min(max_stars, derived_max)
+        if min_stars > max_stars:
+            min_stars, max_stars = derived_min, derived_max
         return cls(
             api_id=api_id,
             api_hash=api_hash,
             session_string=os.environ.get("SESSION_STRING", "").strip(),
             bot_token=bot_token,
             target_channel=target,
-            min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 2000),
+            min_ton=min_ton,
+            max_ton=max_ton,
+            min_stars=min_stars,
+            max_stars=max_stars,
             poll_interval=_f("POLL_INTERVAL", 0.12),
             page_limit=int(_f("PAGE_LIMIT", 2)),
             parallel=min(6, int(_f("PARALLEL", 6))),
@@ -269,7 +328,7 @@ class Config:
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
             post_interval=_f("POST_INTERVAL", 0.3),
-            ton_rate=_f("TON_RATE", 0.0102),
+            ton_rate=ton_rate,
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
             state_file=state_file,
@@ -739,7 +798,7 @@ def _collect_fresh_lot(
         return None
 
     prev_head = collection_heads.get(head_key)
-    in_range = cfg.min_stars <= lot.stars <= cfg.max_stars
+    in_range = in_cheap_ton_window(lot.stars, cfg)
 
     # Первый раз видим коллекцию в кольце — запомнить #1, НЕ постить (может висеть час)
     if prev_head is None:
@@ -1383,7 +1442,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.6"
+TRACKER_VERSION = "4.7"
 
 
 @dataclass
@@ -1764,8 +1823,10 @@ async def run() -> None:
 
     chat_id = pin_fixed_channel(store, state, state_path)
     logger.info(
-        "Канал: %s (постоянно) · %s–%s⭐ · %s задач на NFT",
+        "Канал: %s (постоянно) · %.0f–%.0f TON (%s–%s⭐) · %s задач на NFT",
         chat_id,
+        cfg.min_ton,
+        cfg.max_ton,
         int(cfg.min_stars),
         int(cfg.max_stars),
         cfg.watchers,

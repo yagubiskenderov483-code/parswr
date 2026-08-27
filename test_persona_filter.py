@@ -1,4 +1,4 @@
-"""Тесты персон: девочки + тупые пацаны."""
+"""Только девушки: обычные имена + позорный/кринж профиль."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from market import Lot
 from tracker import (
     _looks_female,
     _looks_male,
+    is_ordinary_girl_name,
     passes_persona_filter,
     seller_persona,
 )
@@ -30,34 +31,35 @@ def _lot(**kw) -> Lot:
     return Lot(**base)
 
 
-def test_female() -> None:
-    lot = _lot(first_name="Аня", seller="anya_girl")
+def test_ordinary_names() -> None:
+    for name in ("Лера", "Катя", "Настюха", "Маша", "Даша", "Юля"):
+        lot = _lot(first_name=name)
+        assert is_ordinary_girl_name(lot), name
+        assert _looks_female(lot), name
+        assert passes_persona_filter(lot) is None, name
+
+
+def test_cringe_girl() -> None:
+    lot = _lot(first_name="Аня", seller="princess_xxx", has_photo=False)
     assert _looks_female(lot)
-    assert seller_persona(lot) == "female"
     assert passes_persona_filter(lot) is None
 
 
-def test_male() -> None:
+def test_male_skip() -> None:
     lot = _lot(first_name="Вася", seller="biker99", about="мото")
     assert _looks_male(lot)
-    assert seller_persona(lot) == "male"
-    assert passes_persona_filter(lot) is None
+    assert passes_persona_filter(lot) == "persona"
 
 
-def test_unknown_persona_skip() -> None:
+def test_unknown_skip() -> None:
     lot = _lot(first_name="Xy", seller="crypto_king")
     assert seller_persona(lot) is None
     assert passes_persona_filter(lot) == "persona"
 
 
-def test_premium_skip() -> None:
-    lot = _lot(first_name="Аня", is_premium=True)
-    assert passes_persona_filter(lot) == "premium"
-
-
 if __name__ == "__main__":
-    test_female()
-    test_male()
-    test_unknown_persona_skip()
-    test_premium_skip()
+    test_ordinary_names()
+    test_cringe_girl()
+    test_male_skip()
+    test_unknown_skip()
     print("all ok")

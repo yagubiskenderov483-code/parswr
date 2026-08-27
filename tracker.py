@@ -198,15 +198,16 @@ class Config:
     scan_batch: int = 36  # legacy; вотчеры не используют кольцо
     hot_limit: int = 1  # только #1 на resale = только что выставили
     watchers: int = 40  # задач после логина, каждая сидит на своих NFT
-    watch_parallel: int = 12  # одновременных GetResale (не кикаем сессию)
+    watch_parallel: int = 16  # одновременных GetResale
     max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
     loh_mode: bool = True
     max_gifts_count: int = 1  # 0–1 подарок у продавца
-    persona_mode: bool = True  # в основном девочки + тупые пацаны
-    female_mix_target: float = 0.70  # ~70% постов — девушки
+    persona_mode: bool = True  # только девушки
+    women_only: bool = True
+    female_mix_target: float = 1.0
     fast_scan: bool = True  # без fallback на non-resale (быстрее)
-    turbo_scan: bool = True  # почти без паузы, если есть свежие
-    post_interval: float = 4.0  # сек между постами (как просил)
+    turbo_scan: bool = True
+    post_interval: float = 1.0  # быстрее в канал; детектор — в ту же секунду
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -259,24 +260,25 @@ class Config:
             poll_interval=_f("POLL_INTERVAL", 0.12),
             page_limit=int(_f("PAGE_LIMIT", 2)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.04),
-            timeout=_f("REQUEST_TIMEOUT", 4.0),
+            gap=_f("REQUEST_GAP", 0.02),
+            timeout=_f("REQUEST_TIMEOUT", 2.5),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 36)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
             watchers=max(1, min(60, int(_f("WATCHERS", 40)))),
-            watch_parallel=max(2, min(16, int(_f("WATCH_PARALLEL", 12)))),
+            watch_parallel=max(2, min(20, int(_f("WATCH_PARALLEL", 16)))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
             loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
             or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
             persona_mode=os.environ.get("TRACKER_PERSONA_MODE", "1") == "1",
-            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 0.70))),
+            women_only=os.environ.get("TRACKER_WOMEN_ONLY", "1") == "1",
+            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 1.0))),
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
-            post_interval=_f("POST_INTERVAL", 4.0),
+            post_interval=_f("POST_INTERVAL", 1.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -851,7 +853,7 @@ async def poll_once(
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     """Быстрый enrich: resolve → profile+DM параллельно."""
-    t = 1.2
+    t = 0.75
     if not lot.seller or lot.seller_id is None:
         try:
             await m.resolve_owner(lot, timeout=t)
@@ -861,20 +863,17 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         return
     need_profile = (
         lot.account_level is None
-        or lot.free_dm is None
         or lot.is_premium is None
         or lot.has_photo is None
         or lot.has_personal_channel is None
         or (cfg.loh_mode and lot.gifts_count is None)
         or (cfg.strict_ru and not lot.lang_code)
     )
-    tasks: list[Any] = []
     if need_profile:
-        tasks.append(m.enrich_profiles([lot], timeout=t, parallel=1))
-    if lot.free_dm is None:
-        tasks.append(m.check_free_dm([lot], timeout=t))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await m.enrich_profiles([lot], timeout=t, parallel=1)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot], cfg: Config) -> None:
@@ -928,10 +927,180 @@ def passes_account_level(
     return lvl <= max_level
 
 
+_FEMALE_NAMES = frozenset(
+    """
+    аня анна анюта анечка ангелина ангелина
+    катя катюша катюха екатерина катерина катька
+    лера валерия лерочка
+    настя настюха настенька анастасия настюша
+    маша мария машка машенька маруся mashka
+    даша дарья дашуля дашенька
+    юля юлия юлька юлечка
+    оля ольга олечка олька
+    вика виктория викуся
+    ира ирина ирочка
+    таня татьяна танюша танька
+    лена елена алена алёна леночка
+    света светлана светик
+    надя надежда
+    вера вероника верочка ника
+    люба любовь
+    нина
+    соня софия софья
+    ксюша ксения ксеня
+    диана дианочка
+    милана мила
+    арина ариша
+    ева
+    камила
+    варя варвара
+    полина поля
+    алина лина
+    карина
+    дарина даша
+    кира
+    лиза елизавета лизка
+    наташа наталья наталия
+    галя галина
+    валя валентина
+    жанна
+    рита маргарита
+    оксана ксюха
+    яна яночка
+    ульяна уля
+    снежана
+    кристина кристя
+    каролина
+    василиса
+    тася таисия
+    зоя
+    инна
+    алла
+    лариса лара
+    лилия лиля
+    марина мариша
+    олеся леся
+    милаша милашка
+    lera katya katyusha nastya nastyuha masha dasha yulya olya vika
+    ira tanya lena sveta nina sonya ksusha diana milana arina eva
+    polina alina karina liza natasha yana ulyana
+    """.split()
+)
+_FEMALE_HINT_RE = re.compile(
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby|"
+    r"солныш|зайка|киса|милая|няшка|няш|dummy|lolita)",
+    re.IGNORECASE,
+)
+_CRINGE_RE = re.compile(
+    r"(💕|🌸|✨|🎀|🌷|💋|👑|🐱|princess|queen|baby|kitty|xxx|ххх|"
+    r"милаш|зайка|киса|солныш|няша|няшка|lolita|angel|sweet|love|"
+    r"[_\.]{2,}|[0-9]{3,})",
+    re.IGNORECASE,
+)
+_MALE_HINT_RE = re.compile(
+    r"(пацан|братан|bro|man|boy|муж|парень|мото|motor|bike|biker|drive|тачк)",
+    re.IGNORECASE,
+)
+_MALE_NAME_ENDINGS = ("ий", "ей", "ёр", "ор", "ур", "им", "ом", "ан", "ен", "ин", "он", "ун")
+_MALE_NAME_EXCEPTIONS = ("ася", "ося", "илья")
+_NAME_CLEAN_RE = re.compile(r"[^a-zа-яё]+", re.IGNORECASE)
+
+
+def _name_tokens(*parts: str) -> list[str]:
+    out: list[str] = []
+    for p in parts:
+        raw = (p or "").strip().lower().replace("ё", "е")
+        if not raw:
+            continue
+        out.append(raw)
+        tok = _NAME_CLEAN_RE.sub(" ", raw)
+        out.extend(x for x in tok.split() if x)
+    return out
+
+
+def is_ordinary_girl_name(lot: Lot) -> bool:
+    """Лера, Катя, Настюха и т.п. — обычные женские имена/ники."""
+    for tok in _name_tokens(lot.first_name or "", lot.seller or ""):
+        if tok in _FEMALE_NAMES:
+            return True
+        if tok.endswith("уха") and len(tok) >= 5:  # настюха, катюха
+            stem = tok[:-3]
+            if stem in _FEMALE_NAMES or stem + "я" in _FEMALE_NAMES:
+                return True
+    return False
+
+
+def is_cringe_girl_profile(lot: Lot) -> bool:
+    blob = f"{lot.seller or ''} {lot.first_name or ''} {lot.about or ''}"
+    return bool(_CRINGE_RE.search(blob))
+
+
+def _looks_female(lot: Lot) -> bool:
+    if is_ordinary_girl_name(lot):
+        return True
+    blob = " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+            lot.seller or "",
+        )
+        if x
+    ).lower()
+    if _FEMALE_HINT_RE.search(blob):
+        return True
+    if is_cringe_girl_profile(lot) and not _looks_male_name_only(lot):
+        return True
+    fn = (lot.first_name or "").strip().lower().replace("ё", "е")
+    if len(fn) >= 3:
+        if fn.endswith(
+            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша", "ая")
+        ):
+            if not fn.endswith(_MALE_NAME_EXCEPTIONS):
+                return True
+        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")):
+            return True
+    return False
+
+
+def _looks_male_name_only(lot: Lot) -> bool:
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3 and fn.endswith(_MALE_NAME_EXCEPTIONS):
+        return True
+    if len(fn) >= 3 and fn.endswith(_MALE_NAME_ENDINGS):
+        return True
+    return False
+
+
+def _looks_male(lot: Lot) -> bool:
+    if is_ordinary_girl_name(lot) or _looks_female(lot):
+        return False
+    blob = " ".join(
+        x
+        for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
+        if x
+    ).lower()
+    if _MALE_HINT_RE.search(blob):
+        return True
+    return _looks_male_name_only(lot)
+
+
+def seller_persona(lot: Lot) -> str | None:
+    """female | male | None."""
+    if _looks_female(lot):
+        return "female"
+    if _looks_male(lot):
+        return "male"
+    return None
+
+
 def passes_loh_filter(
     lot: Lot, *, max_gifts: int, max_level: int
 ) -> str | None:
-    """Ультра-лохи: lvl 0, 0–1 gift, пустая ава, без био/канала/TGP."""
+    """Лохи: без TGP, низкий lvl, мало gifts, без канала.
+    Обычные женские имена (Катя/Лера) — ава/короткое био ок.
+    Позорный профиль — пустая ава / кринж-ник."""
     if lot.is_premium is True:
         return "premium"
     lvl = lot.account_level
@@ -946,92 +1115,29 @@ def passes_loh_filter(
         return "pro"
     if lot.has_personal_channel is True:
         return "pro"
+    ordinary = is_ordinary_girl_name(lot)
+    cringe = is_cringe_girl_profile(lot)
+    about = (lot.about or "").strip()
+    if ordinary or cringe:
+        if len(about) > 80:
+            return "pro"
+        return None
     if lot.has_photo is True:
         return "pro"
-    if (lot.about or "").strip():
+    if about:
         return "pro"
-    return None
-
-
-_FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby|"
-    r"солныш|зайка|киса|милая)",
-    re.IGNORECASE,
-)
-_MALE_HINT_RE = re.compile(
-    r"(пацан|братан|bro|man|boy|муж|парень|мото|motor|bike|biker|drive|тачк)",
-    re.IGNORECASE,
-)
-_MALE_NAME_ENDINGS = ("ий", "ей", "ёр", "ор", "ур", "им", "ом", "ан", "ен", "ин", "он", "ун")
-_MALE_NAME_EXCEPTIONS = ("ася", "ося", "илья")
-
-
-def _looks_female(lot: Lot) -> bool:
-    blob = " ".join(
-        x
-        for x in (
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        )
-        if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
-        return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
-        if fn.endswith(
-            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша", "ая")
-        ):
-            if not fn.endswith(_MALE_NAME_EXCEPTIONS):
-                return True
-        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")):
-            return True
-    return False
-
-
-def _looks_male(lot: Lot) -> bool:
-    if _looks_female(lot):
-        return False
-    blob = " ".join(
-        x
-        for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
-        if x
-    ).lower()
-    if _MALE_HINT_RE.search(blob):
-        return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
-        if fn.endswith(_MALE_NAME_EXCEPTIONS):
-            return True
-        if fn.endswith(_MALE_NAME_ENDINGS):
-            return True
-    sn = (lot.seller or "").strip().lower()
-    if len(sn) >= 4 and sn.endswith(_MALE_NAME_ENDINGS):
-        return True
-    return False
-
-
-def seller_persona(lot: Lot) -> str | None:
-    """female | male | None (непонятно — не постим)."""
-    if _looks_female(lot):
-        return "female"
-    if _looks_male(lot):
-        return "male"
     return None
 
 
 def passes_persona_filter(lot: Lot) -> str | None:
-    """Девочки без TGP (loh) + тупые пацаны; остальное — скип."""
+    """Только девушки: позорный/кринж профиль или обычное имя (Лера, Катя…)."""
     if lot.is_premium is True:
         return "premium"
-    persona = seller_persona(lot)
-    if persona == "female":
-        return None
-    if persona == "male":
-        return None
-    return "persona"
+    if _looks_male(lot) and not _looks_female(lot):
+        return "persona"
+    if not _looks_female(lot):
+        return "persona"
+    return None
 
 
 def filter_for_post(
@@ -1107,18 +1213,8 @@ def filter_for_post(
 
 
 def _queue_priority(lot: Lot, cfg: Config, runtime: "TrackerRuntime") -> float:
-    """Свежее первым; ~70% очереди — девочки."""
-    prio = -float(lot.discovered_at or lot.listed_at or time.time())
-    if seller_persona(lot) != "female":
-        return prio
-    total = max(runtime.posted_total, 1)
-    ratio = runtime.posted_female / total
-    target = cfg.female_mix_target
-    if ratio < target:
-        prio -= 600.0
-    elif ratio > target + 0.15:
-        prio += 350.0
-    return prio
+    """Свежее = выше. Девушки всегда первые."""
+    return -float(lot.listed_at or lot.discovered_at or time.time())
 
 
 class PostQueue:
@@ -1246,7 +1342,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.2"
+TRACKER_VERSION = "4.3"
 
 
 @dataclass
@@ -1405,6 +1501,9 @@ async def _watch_one_collection(
         )
         if accepted is None:
             continue
+        if _looks_male(accepted) and not _looks_female(accepted):
+            seen[accepted.id] = now
+            continue
         post_queue.enqueue([accepted])
         fresh_n += 1
     return int(stats.get("parsed", 0) or len(lots)), fresh_n
@@ -1433,13 +1532,13 @@ async def collection_watcher(
                 await _watch_one_collection(
                     m, gid, cfg, seen, collection_heads, post_queue, baseline=True
                 )
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.002)
 
         pass_no = 0
         while True:
             mine = watcher_slice(gift_ids, worker_id, cfg.watchers)
             if not mine:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.2)
                 continue
             started = time.monotonic()
             parsed = 0
@@ -1461,7 +1560,6 @@ async def collection_watcher(
                         fresh += f
                     except Exception:  # noqa: BLE001
                         errors += 1
-                await asyncio.sleep(0.005)
             pass_no += 1
             runtime.passes += 1
             runtime.seen_lots = len(seen)
@@ -1487,7 +1585,7 @@ async def collection_watcher(
                     len(gift_ids),
                     post_queue.pending,
                 )
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.0)
     finally:
         runtime.watchers_alive = max(0, runtime.watchers_alive - 1)
 

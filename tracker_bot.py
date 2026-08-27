@@ -282,13 +282,9 @@ def build_router(
             lines.append(
                 f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
             )
-            mix = int(getattr(cfg, "female_mix_target", 0.70) * 100)
             lines.append(
-                f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
-                f"free={'строго' if cfg.strict_free else 'не платные'} · "
-                f"лохи lvl≤{getattr(cfg, 'max_account_level', 0)} · "
-                f"персоны={'да' if getattr(cfg, 'persona_mode', True) else 'нет'} · "
-                f"дев≈{mix}%"
+                f"Фильтры: только девушки · лохи lvl≤{getattr(cfg, 'max_account_level', 0)} · "
+                f"без TGP · RU={'да' if cfg.strict_ru else 'нет'}"
             )
         if rt:
             lines.extend(

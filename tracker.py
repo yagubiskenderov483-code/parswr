@@ -199,6 +199,8 @@ class Config:
     max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
     loh_mode: bool = True
     max_gifts_count: int = 1  # 0–1 подарок у продавца
+    persona_mode: bool = True  # в основном девочки + тупые пацаны
+    female_mix_target: float = 0.70  # ~70% постов — девушки
     fast_scan: bool = True  # без fallback на non-resale (быстрее)
     turbo_scan: bool = True  # почти без паузы, если есть свежие
     post_interval: float = 4.0  # сек между постами (как просил)
@@ -269,6 +271,8 @@ class Config:
             loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
             or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
+            persona_mode=os.environ.get("TRACKER_PERSONA_MODE", "1") == "1",
+            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 0.70))),
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
             post_interval=_f("POST_INTERVAL", 4.0),
@@ -980,6 +984,87 @@ def passes_loh_filter(
     return None
 
 
+_FEMALE_HINT_RE = re.compile(
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby|"
+    r"солныш|зайка|киса|милая)",
+    re.IGNORECASE,
+)
+_MALE_HINT_RE = re.compile(
+    r"(пацан|братан|bro|man|boy|муж|парень|мото|motor|bike|biker|drive|тачк)",
+    re.IGNORECASE,
+)
+_MALE_NAME_ENDINGS = ("ий", "ей", "ёр", "ор", "ур", "им", "ом", "ан", "ен", "ин", "он", "ун")
+_MALE_NAME_EXCEPTIONS = ("ася", "ося", "илья")
+
+
+def _looks_female(lot: Lot) -> bool:
+    blob = " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+            lot.seller or "",
+        )
+        if x
+    ).lower()
+    if _FEMALE_HINT_RE.search(blob):
+        return True
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3:
+        if fn.endswith(
+            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша", "ая")
+        ):
+            if not fn.endswith(_MALE_NAME_EXCEPTIONS):
+                return True
+        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")):
+            return True
+    return False
+
+
+def _looks_male(lot: Lot) -> bool:
+    if _looks_female(lot):
+        return False
+    blob = " ".join(
+        x
+        for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
+        if x
+    ).lower()
+    if _MALE_HINT_RE.search(blob):
+        return True
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3:
+        if fn.endswith(_MALE_NAME_EXCEPTIONS):
+            return True
+        if fn.endswith(_MALE_NAME_ENDINGS):
+            return True
+    sn = (lot.seller or "").strip().lower()
+    if len(sn) >= 4 and sn.endswith(_MALE_NAME_ENDINGS):
+        return True
+    return False
+
+
+def seller_persona(lot: Lot) -> str | None:
+    """female | male | None (непонятно — не постим)."""
+    if _looks_female(lot):
+        return "female"
+    if _looks_male(lot):
+        return "male"
+    return None
+
+
+def passes_persona_filter(lot: Lot) -> str | None:
+    """Девочки без TGP (loh) + тупые пацаны; остальное — скип."""
+    if lot.is_premium is True:
+        return "premium"
+    persona = seller_persona(lot)
+    if persona == "female":
+        return None
+    if persona == "male":
+        return None
+    return "persona"
+
+
 def filter_for_post(
     lots: list[Lot],
     seen_sellers: dict[str, float],
@@ -990,8 +1075,9 @@ def filter_for_post(
     max_account_level: int = 2,
     loh_mode: bool = True,
     max_gifts_count: int = 1,
+    persona_mode: bool = True,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """RU + лох-фильтр + бесплатные ЛС + один раз на продавца."""
+    """RU + лох + персоны + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
     stats = {
@@ -1003,6 +1089,7 @@ def filter_for_post(
         "level": 0,
         "premium": 0,
         "pro": 0,
+        "persona": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -1030,6 +1117,11 @@ def filter_for_post(
             if skip:
                 stats[skip] += 1
                 continue
+        if persona_mode:
+            skip = passes_persona_filter(lot)
+            if skip:
+                stats[skip] += 1
+                continue
         if strict_free:
             if lot.free_dm is not True:
                 if lot.free_dm is False:
@@ -1045,9 +1137,19 @@ def filter_for_post(
     return out, stats
 
 
-def _queue_priority(lot: Lot) -> float:
-    """Свежее = выше в очереди (отрицательный timestamp)."""
-    return -float(lot.discovered_at or time.time())
+def _queue_priority(lot: Lot, cfg: Config, runtime: "TrackerRuntime") -> float:
+    """Свежее первым; ~70% очереди — девочки."""
+    prio = -float(lot.discovered_at or lot.listed_at or time.time())
+    if seller_persona(lot) != "female":
+        return prio
+    total = max(runtime.posted_total, 1)
+    ratio = runtime.posted_female / total
+    target = cfg.female_mix_target
+    if ratio < target:
+        prio -= 600.0
+    elif ratio > target + 0.15:
+        prio += 350.0
+    return prio
 
 
 class PostQueue:
@@ -1106,7 +1208,7 @@ class PostQueue:
             return 0
         for lot in lots:
             self._seq += 1
-            prio = _queue_priority(lot)
+            prio = _queue_priority(lot, self._cfg, self._runtime)
             self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
@@ -1132,6 +1234,7 @@ class PostQueue:
                     max_account_level=self._cfg.max_account_level,
                     loh_mode=self._cfg.loh_mode,
                     max_gifts_count=self._cfg.max_gifts_count,
+                    persona_mode=self._cfg.persona_mode,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
@@ -1140,6 +1243,7 @@ class PostQueue:
                 self._runtime.last_skip_level = fstats["level"]
                 self._runtime.last_skip_premium = fstats["premium"]
                 self._runtime.last_skip_pro = fstats["pro"]
+                self._runtime.last_skip_persona = fstats["persona"]
                 if not to_post:
                     if lot.seller_key:
                         self._seen[lot.id] = now
@@ -1153,12 +1257,16 @@ class PostQueue:
                 self._state["seen_sellers"] = self._seen_sellers
                 save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
+                if seller_persona(lot) == "female":
+                    self._runtime.posted_female += 1
                 self._runtime.queue_pending = self.pending
+                persona = seller_persona(lot) or "?"
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · +%.2fs · очередь %s · lvl %s",
+                    "Отправил: %s за %s⭐ (%s) · %s · +%.2fs · очередь %s · lvl %s",
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
+                    persona,
                     time.time() - float(lot.discovered_at or time.time()),
                     self.pending,
                     format_account_level(lot),
@@ -1169,7 +1277,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.0"
+TRACKER_VERSION = "4.1"
 
 
 @dataclass
@@ -1178,6 +1286,7 @@ class TrackerRuntime:
 
     passes: int = 0
     posted_total: int = 0
+    posted_female: int = 0
     last_fresh: int = 0
     last_posted: int = 0
     last_skip_ru: int = 0
@@ -1187,6 +1296,7 @@ class TrackerRuntime:
     last_skip_level: int = 0
     last_skip_premium: int = 0
     last_skip_pro: int = 0
+    last_skip_persona: int = 0
     scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0

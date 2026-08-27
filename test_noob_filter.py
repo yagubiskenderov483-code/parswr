@@ -43,7 +43,7 @@ def test_passes_loh_filter_ultra() -> None:
 def test_filter_for_post_loh_mode() -> None:
     now = time.time()
     lots = [
-        _lot(id="ok", seller="a"),
+        _lot(id="ok", seller="a", first_name="Аня"),
         _lot(id="prem", seller="b", is_premium=True),
         _lot(id="pro", seller="c", gifts_count=5),
         _lot(id="lvl", seller="d", account_level=2),
@@ -54,6 +54,7 @@ def test_filter_for_post_loh_mode() -> None:
         now=now,
         strict_ru=False,
         loh_mode=True,
+        persona_mode=False,
         max_gifts_count=1,
         max_account_level=0,
     )

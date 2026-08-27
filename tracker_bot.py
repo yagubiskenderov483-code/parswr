@@ -292,12 +292,13 @@ def build_router(
             lines.append(
                 f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
             )
-            max_gifts = getattr(cfg, "max_gifts_count", 1)
+            mix = int(getattr(cfg, "female_mix_target", 0.70) * 100)
             lines.append(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"лохи lvl≤{getattr(cfg, 'max_account_level', 0)} · "
-                f"gifts≤{max_gifts} · турбо={'да' if getattr(cfg, 'turbo_scan', True) else 'нет'}"
+                f"персоны={'да' if getattr(cfg, 'persona_mode', True) else 'нет'} · "
+                f"дев≈{mix}%"
             )
         if rt:
             lines.extend(
@@ -307,13 +308,18 @@ def build_router(
                     f"(parallel {rt.scan_parallel or 8})",
                     f"Последний скан: {rt.last_scan_batch} колл · "
                     f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
-                    f"Всего отправлено: {rt.posted_total}",
+                    f"Всего отправлено: {rt.posted_total}"
+                    + (
+                        f" (дев≈{int(100 * rt.posted_female / max(rt.posted_total, 1))}%)"
+                        if rt.posted_total
+                        else ""
+                    ),
                     f"В очереди: {rt.queue_pending}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
                     f"lvl−{rt.last_skip_level} premium−{rt.last_skip_premium} "
-                    f"pro−{rt.last_skip_pro}",
+                    f"pro−{rt.last_skip_pro} persona−{rt.last_skip_persona}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )

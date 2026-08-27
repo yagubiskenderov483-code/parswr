@@ -1,4 +1,4 @@
-"""@markskskdbot — вход, /setchannel, /channels, /status (всегда онлайн)."""
+"""@jsjeigiejwhnewbot — вход, /status, /test (всегда онлайн)."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
-from telethon.utils import get_peer_id
 
 logger = logging.getLogger("tracker_bot")
 
@@ -42,7 +41,7 @@ def channel_file_path(data_dir: Path) -> Path:
 
 
 class ChannelStore:
-    """Персистентный id канала + ожидание /setchannel."""
+    """Персистентный id канала."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -156,30 +155,6 @@ class AuthFlow:
         logger.info("Сессия сохранена в %s", path)
 
 
-async def parse_channel_arg(client: TelegramClient, raw: str) -> int:
-    text = (raw or "").strip()
-    if not text:
-        raise ValueError("Пусто")
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})$", text)
-    handle = m.group(1) if m else text.lstrip("@").strip()
-    if not handle or handle.startswith("+"):
-        raise ValueError("Формат: @channel или -100…")
-    entity = await client.get_entity(handle)
-    return get_peer_id(entity)
-
-
-async def list_user_channels(client: TelegramClient, limit: int = 30) -> list[tuple[str, int]]:
-    out: list[tuple[str, int]] = []
-    async for dlg in client.iter_dialogs(limit=limit):
-        if not getattr(dlg, "is_channel", False):
-            continue
-        name = (dlg.name or "").strip() or "?"
-        out.append((name, get_peer_id(dlg.entity)))
-    return out
-
-
 def build_router(
     client: TelegramClient,
     auth: AuthFlow,
@@ -201,15 +176,12 @@ def build_router(
     async def cmd_start(message: Message, state: FSMContext) -> None:
         if await _authorized():
             cid = store.get() or store.load()
-            ch = f"<code>{cid}</code>" if cid else "не задан"
+            ch = f"<code>{cid}</code>" if cid else "—"
             await message.answer(
                 f"🤖 <b>Гифт-трекер</b> v{tracker_version}\n"
                 f"Аккаунт: подключён ✅\n"
                 f"Канал: {ch}\n\n"
                 "<b>Команды:</b>\n"
-                "/setchannel @username — канал для постов\n"
-                "/setchannel -100… — id канала\n"
-                "/channels — список твоих каналов\n"
                 "/status — статус\n"
                 "/test — тестовая карточка в канал\n"
                 "/resetseen — сбросить seen (тест)",
@@ -222,55 +194,8 @@ def build_router(
         await message.answer(
             "🔐 <b>Вход для гифт-трекера</b>\n"
             "Отправь номер телефона:\n"
-            "<code>+79991234567</code>\n\n"
-            "После входа: /setchannel @имя_канала",
+            "<code>+79991234567</code>",
             reply_markup=ReplyKeyboardRemove(),
-        )
-
-    @router.message(Command("setchannel"))
-    async def cmd_setchannel(message: Message) -> None:
-        if not await _authorized():
-            await message.answer("Сначала /start и войди в аккаунт.")
-            return
-        arg = (message.text or "").split(maxsplit=1)
-        if len(arg) < 2:
-            await message.answer(
-                "Использование:\n"
-                "<code>/setchannel @mychannel</code>\n"
-                "<code>/setchannel -100123456789</code>"
-            )
-            return
-        try:
-            cid = await parse_channel_arg(client, arg[1])
-        except Exception as exc:  # noqa: BLE001
-            await message.answer(f"⚠️ Не нашёл канал: {exc}")
-            return
-        store.save(cid)
-        if control:
-            if control.runtime is not None:
-                control.runtime.channel_id = cid
-            if control.sender is not None:
-                control.sender.chat_id = cid
-        await message.answer(f"✅ Канал задан: <code>{cid}</code>")
-
-    @router.message(Command("channels"))
-    async def cmd_channels(message: Message) -> None:
-        if not await _authorized():
-            await message.answer("Сначала /start")
-            return
-        try:
-            rows = await list_user_channels(client)
-        except Exception as exc:  # noqa: BLE001
-            await message.answer(f"⚠️ {exc}")
-            return
-        if not rows:
-            await message.answer(
-                "Каналов в диалогах нет. Добавь аккаунт в канал и /channels снова."
-            )
-            return
-        lines = [f"• <b>{n}</b> → <code>{cid}</code>" for n, cid in rows[:25]]
-        await message.answer(
-            "Твои каналы (скопируй id или /setchannel @name):\n" + "\n".join(lines)
         )
 
     @router.message(Command("status"))
@@ -286,7 +211,7 @@ def build_router(
         lines = [
             f"✅ Трекер v{tracker_version}",
             f"Аккаунт: {name}",
-            f"Канал: <code>{cid or 'не задан'}</code>",
+            f"Канал: <code>{cid or '—'}</code>",
         ]
         if cfg:
             lines.append(
@@ -326,8 +251,10 @@ def build_router(
         if not await _authorized():
             await message.answer("Сначала /start")
             return
+        from tracker import DEFAULT_BOT_USERNAME
+
         if not control or not control.sender or not control.sender.chat_id:
-            await message.answer("Канал не задан — /setchannel @channel")
+            await message.answer("Канал ещё не готов — подожди запуска трекера.")
             return
         from market import Lot
 
@@ -352,7 +279,7 @@ def build_router(
         except Exception as exc:  # noqa: BLE001
             await message.answer(
                 f"❌ Не отправилось: {_esc(str(exc)[:200])}\n"
-                "Проверь: @markskskdbot — админ канала с правом публикации."
+                f"Проверь: @{DEFAULT_BOT_USERNAME} — админ канала с правом публикации."
             )
 
     @router.message(Command("resetseen"))
@@ -401,12 +328,7 @@ def build_router(
         await state.clear()
         me = await client.get_me()
         name = f"@{me.username}" if me.username else (me.first_name or str(me.id))
-        await message.answer(
-            f"✅ Вход: {name}\n"
-            "Теперь задай канал:\n"
-            "<code>/setchannel @имя_канала</code>\n"
-            "или <code>/channels</code> — список"
-        )
+        await message.answer(f"✅ Вход: {name}\nТрекер запускается…")
         if login_done:
             login_done.set()
 
@@ -418,10 +340,7 @@ def build_router(
             await message.answer(f"⚠️ {exc}")
             return
         await state.clear()
-        await message.answer(
-            "✅ Вход выполнен.\n"
-            "Задай канал: <code>/setchannel @имя</code> или /channels"
-        )
+        await message.answer("✅ Вход выполнен.\nТрекер запускается…")
         if login_done:
             login_done.set()
 
@@ -455,6 +374,10 @@ class ControlBot:
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
+        from tracker import DEFAULT_CHANNEL_ID
+
+        if self.store.load() is None:
+            self.store.save(DEFAULT_CHANNEL_ID)
         self._bot = Bot(
             token=self.token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),

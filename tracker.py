@@ -51,8 +51,9 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
-# Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
-DEFAULT_CHANNEL_ID = -1004384888475
+DEFAULT_BOT_USERNAME = "jsjeigiejwhnewbot"
+# Канал для постов — можно переопределить CHANNEL_ID в env Bothost
+DEFAULT_CHANNEL_ID = -1003784435307
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
@@ -155,8 +156,9 @@ async def wait_for_gift_ids(m: TelegramMarket) -> list[int]:
             return ids
         logger.error(
             "Коллекций 0 (попытка %s) — жду 30с. "
-            "Проверь: /start в @markskskdbot, сессия жива, аккаунт не в бане",
+            "Проверь: /start в @%s, сессия жива, аккаунт не в бане",
             attempt,
+            DEFAULT_BOT_USERNAME,
         )
         await asyncio.sleep(30)
     return []
@@ -541,57 +543,13 @@ async def obtain_channel_id(
     state_path: Path,
     store: Any,
 ) -> int:
-    """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
-    if cfg.channel_id:
-        cid = int(cfg.channel_id)
-        store.save(cid)
-        state["channel_id"] = cid
-        save_state(state_path, state)
-        logger.info("Канал из CHANNEL_ID: %s", cid)
-        return cid
-
-    saved = store.load()
-    if saved is not None:
-        state["channel_id"] = saved
-        save_state(state_path, state)
-        logger.info("Канал из файла: %s", saved)
-        return saved
-
-    if state.get("channel_id"):
-        cid = int(state["channel_id"])
-        store.save(cid)
-        logger.info("Канал из state: %s", cid)
-        return cid
-
-    while True:
-        if cfg.target_channel.strip():
-            try:
-                cid = await resolve_channel(client, cfg.target_channel)
-                store.save(cid)
-                state["channel_id"] = cid
-                save_state(state_path, state)
-                return cid
-            except SystemExit as exc:
-                logger.warning("resolve_channel: %s", exc)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("resolve_channel: %s", exc)
-
-        found = await find_channel_in_dialogs(client)
-        if found is not None:
-            store.save(found)
-            state["channel_id"] = found
-            save_state(state_path, state)
-            return found
-
-        logger.warning(
-            "Канал не задан. Открой @markskskdbot → /channels или "
-            "/setchannel @имя_канала (жду 60с…)"
-        )
-        waited = await store.wait(timeout=60.0)
-        if waited is not None:
-            state["channel_id"] = waited
-            save_state(state_path, state)
-            return waited
+    """Канал: CHANNEL_ID из env или DEFAULT_CHANNEL_ID."""
+    cid = int(cfg.channel_id or DEFAULT_CHANNEL_ID)
+    store.save(cid)
+    state["channel_id"] = cid
+    save_state(state_path, state)
+    logger.info("Канал для постинга: %s", cid)
+    return cid
 
 
 async def resolve_channel(client: TelegramClient, raw: str) -> int:
@@ -601,7 +559,7 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
         found = await find_channel_in_dialogs(client)
         if found is not None:
             return found
-        raise SystemExit("Канал не задан — /setchannel в @markskskdbot")
+        raise SystemExit("Канал не задан — задай CHANNEL_ID в env")
     if re.fullmatch(r"-?\d+", raw):
         return int(raw)
 
@@ -1190,8 +1148,9 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
 
     if not await client.is_user_authorized():
         logger.warning(
-            "⚠️ Трекер v%s: нет сессии — войди через @markskskdbot /start",
+            "⚠️ Трекер v%s: нет сессии — войди через @%s /start",
             TRACKER_VERSION,
+            DEFAULT_BOT_USERNAME,
         )
         await bot.wait_login()
 

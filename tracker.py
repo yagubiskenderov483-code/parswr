@@ -980,9 +980,9 @@ _FEMALE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _CRINGE_RE = re.compile(
-    r"(💕|🌸|✨|🎀|🌷|💋|👑|🐱|princess|queen|baby|kitty|xxx|ххх|"
-    r"милаш|зайка|киса|солныш|няша|няшка|lolita|angel|sweet|love|"
-    r"[_\.]{2,}|[0-9]{3,})",
+    r"(💕|🌸|✨|🎀|🌷|💋|👑|🐱|💅|👩|princess|queen|baby|kitty|xxx|ххх|"
+    r"милаш|зайка|киса|солныш|няша|няшка|lolita|angel|sweet|"
+    r"девоч|девуш|girl|woman|she/her)",
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
@@ -1011,9 +1011,9 @@ def is_ordinary_girl_name(lot: Lot) -> bool:
     for tok in _name_tokens(lot.first_name or "", lot.seller or ""):
         if tok in _FEMALE_NAMES:
             return True
-        if tok.endswith("уха") and len(tok) >= 5:  # настюха, катюха
+        if tok.endswith("уха") and len(tok) >= 5:
             stem = tok[:-3]
-            if stem in _FEMALE_NAMES or stem + "я" in _FEMALE_NAMES:
+            if stem in _FEMALE_NAMES or (stem + "я") in _FEMALE_NAMES:
                 return True
     return False
 
@@ -1023,33 +1023,20 @@ def is_cringe_girl_profile(lot: Lot) -> bool:
     return bool(_CRINGE_RE.search(blob))
 
 
-def _looks_female(lot: Lot) -> bool:
+def matches_girl_criteria(lot: Lot) -> bool:
+    """Только твои критерии: обычное женское имя ИЛИ позорный/кринж профиль.
+    Пацанов и рандомные ники с цифрами — нет."""
+    if _looks_male_name_only(lot) and not is_ordinary_girl_name(lot):
+        return False
     if is_ordinary_girl_name(lot):
         return True
-    blob = " ".join(
-        x
-        for x in (
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        )
-        if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
+    if is_cringe_girl_profile(lot):
         return True
-    if is_cringe_girl_profile(lot) and not _looks_male_name_only(lot):
-        return True
-    fn = (lot.first_name or "").strip().lower().replace("ё", "е")
-    if len(fn) >= 3:
-        if fn.endswith(
-            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша", "ая")
-        ):
-            if not fn.endswith(_MALE_NAME_EXCEPTIONS):
-                return True
-        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")):
-            return True
     return False
+
+
+def _looks_female(lot: Lot) -> bool:
+    return matches_girl_criteria(lot)
 
 
 def _looks_male_name_only(lot: Lot) -> bool:
@@ -1062,7 +1049,7 @@ def _looks_male_name_only(lot: Lot) -> bool:
 
 
 def _looks_male(lot: Lot) -> bool:
-    if is_ordinary_girl_name(lot) or _looks_female(lot):
+    if is_ordinary_girl_name(lot):
         return False
     blob = " ".join(
         x
@@ -1075,11 +1062,19 @@ def _looks_male(lot: Lot) -> bool:
 
 
 def seller_persona(lot: Lot) -> str | None:
-    """female | male | None."""
-    if _looks_female(lot):
+    if matches_girl_criteria(lot):
         return "female"
     if _looks_male(lot):
         return "male"
+    return None
+
+
+def passes_persona_filter(lot: Lot) -> str | None:
+    """Только девушки по критериям: Катя/Лера/Настюха или позорный профиль."""
+    if lot.is_premium is True:
+        return "premium"
+    if not matches_girl_criteria(lot):
+        return "persona"
     return None
 
 
@@ -1180,11 +1175,10 @@ def filter_for_post(
             if skip:
                 stats[skip] += 1
                 continue
-        if persona_mode:
-            skip = passes_persona_filter(lot)
-            if skip:
-                stats[skip] += 1
-                continue
+        skip = passes_persona_filter(lot)
+        if skip:
+            stats[skip] += 1
+            continue
         if strict_free:
             if lot.free_dm is not True:
                 if lot.free_dm is False:
@@ -1286,7 +1280,7 @@ class PostQueue:
                     max_account_level=self._cfg.max_account_level,
                     loh_mode=self._cfg.loh_mode and not self._cfg.skip_enrich,
                     max_gifts_count=self._cfg.max_gifts_count,
-                    persona_mode=self._cfg.persona_mode,
+                    persona_mode=True,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
@@ -1321,7 +1315,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.4"
+TRACKER_VERSION = "4.5"
 
 
 @dataclass
@@ -1480,7 +1474,7 @@ async def _watch_one_collection(
         )
         if accepted is None:
             continue
-        if _looks_male(accepted) and not _looks_female(accepted):
+        if not matches_girl_criteria(accepted):
             seen[accepted.id] = now
             continue
         post_queue.enqueue([accepted])

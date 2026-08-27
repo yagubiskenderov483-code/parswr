@@ -1,14 +1,12 @@
-"""Только девушки: обычные имена + позорный/кринж профиль."""
+"""Только девушки по критериям: имена + позорный профиль. Пацанов нет."""
 
 from __future__ import annotations
 
 from market import Lot
 from tracker import (
-    _looks_female,
-    _looks_male,
     is_ordinary_girl_name,
+    matches_girl_criteria,
     passes_persona_filter,
-    seller_persona,
 )
 
 
@@ -32,34 +30,40 @@ def _lot(**kw) -> Lot:
 
 
 def test_ordinary_names() -> None:
-    for name in ("Лера", "Катя", "Настюха", "Маша", "Даша", "Юля"):
+    for name in ("Лера", "Катя", "Настюха", "Маша", "Даша", "Юля", "Настя"):
         lot = _lot(first_name=name)
         assert is_ordinary_girl_name(lot), name
-        assert _looks_female(lot), name
+        assert matches_girl_criteria(lot), name
         assert passes_persona_filter(lot) is None, name
 
 
 def test_cringe_girl() -> None:
-    lot = _lot(first_name="Аня", seller="princess_xxx", has_photo=False)
-    assert _looks_female(lot)
+    lot = _lot(first_name="", seller="зайка_princess")
+    assert matches_girl_criteria(lot)
     assert passes_persona_filter(lot) is None
 
 
 def test_male_skip() -> None:
     lot = _lot(first_name="Вася", seller="biker99", about="мото")
-    assert _looks_male(lot)
+    assert not matches_girl_criteria(lot)
     assert passes_persona_filter(lot) == "persona"
 
 
-def test_unknown_skip() -> None:
-    lot = _lot(first_name="Xy", seller="crypto_king")
-    assert seller_persona(lot) is None
+def test_random_digits_not_girl() -> None:
+    lot = _lot(first_name="Xy", seller="crypto_king99")
+    assert not matches_girl_criteria(lot)
     assert passes_persona_filter(lot) == "persona"
+
+
+def test_nikita_not_girl() -> None:
+    lot = _lot(first_name="Никита", seller="nikita")
+    assert not matches_girl_criteria(lot)
 
 
 if __name__ == "__main__":
     test_ordinary_names()
     test_cringe_girl()
     test_male_skip()
-    test_unknown_skip()
+    test_random_digits_not_girl()
+    test_nikita_not_girl()
     print("all ok")

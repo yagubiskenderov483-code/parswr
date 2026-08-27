@@ -283,7 +283,7 @@ def build_router(
                 f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
             )
             lines.append(
-                f"Фильтры: девушки по имени · сразу в канал · без БД юзов"
+                f"Фильтры: только девушки (Катя/Лера/Настюха или позорный профиль)"
             )
         if rt:
             lines.extend(

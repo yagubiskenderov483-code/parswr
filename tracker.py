@@ -218,7 +218,7 @@ class Config:
     min_stars: float = DEFAULT_MIN_STARS  # ~490⭐ ≈ 5 TON
     max_stars: float = DEFAULT_MAX_STARS  # ~1471⭐ ≈ 15 TON
     poll_interval: float = 0.4  # турбо-скан
-    page_limit: int = 2  # API: только верх resale
+    page_limit: int = 12  # верх resale, все id на странице = seen
     parallel: int = 6
     gap: float = 0.08
     timeout: float = 4.0
@@ -306,7 +306,7 @@ class Config:
             min_stars=min_stars,
             max_stars=max_stars,
             poll_interval=_f("POLL_INTERVAL", 0.12),
-            page_limit=int(_f("PAGE_LIMIT", 2)),
+            page_limit=max(8, min(20, int(_f("PAGE_LIMIT", 12)))),
             parallel=min(6, int(_f("PARALLEL", 6))),
             gap=_f("REQUEST_GAP", 0.02),
             timeout=_f("REQUEST_TIMEOUT", 2.5),
@@ -739,8 +739,8 @@ async def _fetch_collection_pages(
     gid: int,
     cfg: Config,
     stats: dict[str, int],
-) -> list[Lot]:
-    """Только page1 resale; fallback без двойного счёта ошибок."""
+) -> list[Lot] | None:
+    """Только page1 resale по свежести (без sort_by_price). None = ошибка API."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
     result = await m._request(
         gid,
@@ -762,7 +762,7 @@ async def _fetch_collection_pages(
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
-        return []
+        return None
     parsed = market_mod._parse_result(result)
     if parsed:
         stats["parsed"] += len(parsed)
@@ -781,11 +781,10 @@ def _collect_fresh_lot(
     baseline: bool,
     now: float,
 ) -> Lot | None:
-    """Постим ТОЛЬКО при смене #1 resale — не то, что уже час висит наверху."""
+    """Пост только если #1 — id, которого мы никогда не видели. Сдвиг очереди ≠ новый лот."""
     head_key = str(gid)
     if i >= cfg.hot_limit:
-        if lot.id not in seen:
-            seen[lot.id] = now
+        seen[lot.id] = now
         return None
 
     if baseline:
@@ -795,12 +794,13 @@ def _collect_fresh_lot(
         return None
 
     if i != 0:
+        seen[lot.id] = now
         return None
 
     prev_head = collection_heads.get(head_key)
     in_range = in_cheap_ton_window(lot.stars, cfg)
 
-    # Первый раз видим коллекцию в кольце — запомнить #1, НЕ постить (может висеть час)
+    # Ещё не было успешного скана этой коллекции — запомнить, не постить
     if prev_head is None:
         collection_heads[head_key] = lot.id
         seen[lot.id] = now
@@ -809,17 +809,18 @@ def _collect_fresh_lot(
     if prev_head == lot.id:
         return None
 
-    # Смена головы: пусто→лот или старый #1→новый #1 = только что выставили
+    # Смена #1: продан верх / новый листинг / смена цены
     collection_heads[head_key] = lot.id
 
     if lot.id in seen:
+        # Это старый лот, который всплыл наверх — не «только что выставили»
         return None
     if not in_range:
         seen[lot.id] = now
         return None
 
     lot.discovered_at = now
-    lot.listed_at = now  # наш момент детекта смены #1
+    lot.listed_at = now
     return lot
 
 
@@ -856,25 +857,29 @@ async def poll_once(
             logger.warning("коллекция %s: %s", gid, result)
             continue
         now = time.time()
-        if not result:
-            collection_heads[str(gid)] = HEAD_EMPTY
+        if result is None:
             continue
-        for i, lot in enumerate(result):
-            accepted = _collect_fresh_lot(
-                lot,
-                i,
-                gid,
-                seen,
-                collection_heads,
-                cfg,
-                baseline=baseline,
-                now=now,
-            )
-            if accepted is None:
-                continue
-            fresh.append(accepted)
-            if on_lot is not None:
-                on_lot(accepted)
+        if not result:
+            if baseline or str(gid) in collection_heads:
+                collection_heads[str(gid)] = HEAD_EMPTY
+            continue
+        for extra in result[1:]:
+            seen[extra.id] = now
+        accepted = _collect_fresh_lot(
+            result[0],
+            0,
+            gid,
+            seen,
+            collection_heads,
+            cfg,
+            baseline=baseline,
+            now=now,
+        )
+        if accepted is None:
+            continue
+        fresh.append(accepted)
+        if on_lot is not None:
+            on_lot(accepted)
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
         "parsed": api_stats.get("parsed", 0),
@@ -976,28 +981,33 @@ def passes_account_level(
     return lvl <= max_level
 
 
-# Не имена: слишком часто у пацанов в никах (xxx_queen, baby_ton, darkangel).
+# Не имена: слишком часто у пацанов в никах.
 _GENERIC_NICK_WORDS = frozenset(
     """
     baby kitty queen angel princess sweety cutie babe babygirl
     princessa kittycat angelbaby dummy lolita sweet xxx
     """.split()
 )
+# Короткий латин в нике (tom/max/alex) — не повод резать девушку; в first_name — да.
+_AMBIGUOUS_MALE = frozenset(
+    """
+    tom dan bob max alex john jake paul chris david andrew peter
+    mark vlad mike paul
+    """.split()
+)
 _CRINGE_RE = re.compile(
-    r"(💕|🌸|✨|🎀|🌷|💋|👑|💅|👩|💄|🐱|"
-    r"милаш|зайка|зайчик|киса|киска|солныш|няша|няшка|лапочка|крошка|"
-    r"принцесс|куколк|малышк|девоч|девуш|girl|woman|she/her|lolita)",
+    r"(💕|🎀|💅|👩|💄|"
+    r"милаш|зайка|зайчик|киса|киска|солныш|няша|няшка|лапочка|"
+    r"принцесс|куколк|малышк|девоч|девуш|she/her|lolita)",
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
-    r"(пацан|братан|bro\b|boy\b|\bman\b|муж|парень|мото|motor|bike|biker|"
-    r"тачк|батя|мужик|качок)",
+    r"(пацан|братан|\bbro\b|\bboy\b|мужик|батя|качок|мотоцик|байкер)",
     re.IGNORECASE,
 )
 _MALE_NAME_ENDINGS = (
     "ий", "ей", "ёр", "ор", "ур", "им", "ом", "ен", "он", "ун",
 )
-# Дима/Рома/Саша и транслит — раньше проходили как «женское окончание а/я».
 _MALE_NAMES = frozenset(
     """
     никита никитка илья ильюха фома кузьма савва данила данил даниил лука
@@ -1006,9 +1016,9 @@ _MALE_NAMES = frozenset(
     коля колька николай
     вова вован володя вовка владимир
     саша сашка шура александр
-    паша пашка пашук павел
+    паша пашка павел
     миша мишка михаил
-    ваня ванек ванюша иван
+    ваня ванюша иван
     женя евгений
     леша леха алеша алексей
     юра юрка юрий
@@ -1034,12 +1044,12 @@ _MALE_NAMES = frozenset(
     dima dimka dimon dmitry dmitri dmitrii
     roma roman romka
     kolya kolyan nikolay nikolai
-    vova vovan volodya vladimir vlad
-    sasha sashka alexander alexandr alex
+    vova vovan volodya vladimir
+    sasha sashka alexander alexandr
     pasha pashka pavel
-    misha mishka mikhail michael mike
+    misha mishka mikhail
     vanya ivan
-    zhenya evgeny evgeniy eugene
+    zhenya evgeny evgeniy
     lesha lyosha alexey alexei
     yura yuriy yuri
     stepa stepan
@@ -1048,17 +1058,16 @@ _MALE_NAMES = frozenset(
     borya boris
     gosha grisha
     slava
-    tima timofey timothy
+    tima timofey
     fedya
-    petya petr peter
+    petya petr
     kostya
     vasya vasiliy
-    max maxim maksim
+    maxim maksim
     kirill egor yegor oleg denis igor artem andrey andrei sergey sergei
-    matvey mark timur ruslan bogdan gleb anton
-    danila danil daniel dan
+    matvey timur ruslan bogdan gleb anton
+    danila danil
     nikita ilya
-    john jake tom bob paul chris david andrew
     """.split()
 )
 _NAME_CLEAN_RE = re.compile(r"[^a-zа-яё]+", re.IGNORECASE)
@@ -1073,7 +1082,15 @@ def _name_tokens(*parts: str) -> list[str]:
         out.append(raw)
         tok = _NAME_CLEAN_RE.sub(" ", raw)
         out.extend(x for x in tok.split() if x)
-    return out
+    # уникальные, короткие служебные выкидываем
+    seen: set[str] = set()
+    clean: list[str] = []
+    for t in out:
+        if t in seen or len(t) < 2:
+            continue
+        seen.add(t)
+        clean.append(t)
+    return clean
 
 
 def _token_is_girl_name(tok: str) -> bool:
@@ -1090,12 +1107,16 @@ def _token_is_girl_name(tok: str) -> bool:
     return False
 
 
-def _token_is_male(tok: str) -> bool:
+def _token_is_male(tok: str, *, username: bool = False) -> bool:
     if not tok or len(tok) < 2:
+        return False
+    if username and (tok in _AMBIGUOUS_MALE or len(tok) <= 3):
         return False
     if tok in _MALE_NAMES:
         return True
     if tok in GIRL_NAMES or tok in _GENERIC_NICK_WORDS:
+        return False
+    if username:
         return False
     if len(tok) >= 4 and tok.endswith(_MALE_NAME_ENDINGS):
         return True
@@ -1110,33 +1131,49 @@ def _other_name_tokens(lot: Lot) -> list[str]:
     return [t for t in _name_tokens(lot.seller or "", lot.last_name or "") if t]
 
 
+def _feminine_first_name(lot: Lot) -> bool:
+    """Катя/Лера и неизвестные женские на а/я. Не Дима/Саша."""
+    words = [
+        t
+        for t in _NAME_CLEAN_RE.sub(
+            " ", (lot.first_name or "").strip().lower().replace("ё", "е")
+        ).split()
+        if len(t) >= 3
+    ]
+    if not words:
+        return False
+    name = words[0]
+    if _token_is_male(name) or name in _MALE_NAMES:
+        return False
+    if _token_is_girl_name(name):
+        return True
+    return name.endswith(("а", "я", "ия", "ья", "ша", "ня"))
+
+
 def _is_male_seller(lot: Lot) -> bool:
-    """Пацан: мужское имя в first_name или, если имени нет, в нике."""
     fn = _first_name_tokens(lot)
     if any(_token_is_male(t) for t in fn):
         return True
-    if any(_token_is_girl_name(t) for t in fn):
+    if any(_token_is_girl_name(t) for t in fn) or _feminine_first_name(lot):
         return False
-    if fn:
-        return False
-    if any(_token_is_male(t) for t in _other_name_tokens(lot)):
+    if any(_token_is_male(t, username=True) for t in _other_name_tokens(lot)):
         return True
-    blob = " ".join(
-        x
-        for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
-        if x
+    blob = f"{lot.about or ''} {lot.seller or ''}"
+    return bool(_MALE_HINT_RE.search(blob)) and not any(
+        _token_is_girl_name(t) for t in _other_name_tokens(lot)
     )
-    return bool(_MALE_HINT_RE.search(blob))
 
 
 def is_ordinary_girl_name(lot: Lot) -> bool:
-    """Лера, Катя, Настюха — не Дима/Саша и не baby/queen в нике."""
-    if _is_male_seller(lot):
-        return False
+    """Женское имя в карточке или в нике. Мужское first_name — нет."""
     fn = _first_name_tokens(lot)
+    if any(_token_is_male(t) for t in fn):
+        return False
     if any(_token_is_girl_name(t) for t in fn):
         return True
-    if fn:
+    if _feminine_first_name(lot):
+        return True
+    if any(_token_is_male(t, username=True) for t in _other_name_tokens(lot)):
         return False
     return any(_token_is_girl_name(t) for t in _other_name_tokens(lot))
 
@@ -1149,7 +1186,7 @@ def is_cringe_girl_profile(lot: Lot) -> bool:
 
 
 def matches_girl_criteria(lot: Lot) -> bool:
-    """Только девушки: женское имя/ник или явно девчачий ник. Ава/канал/сторис не считаются."""
+    """Девушка: имя/женское окончание/девчачий ник. Не ава и не ✨ в био."""
     if _is_male_seller(lot):
         return False
     return is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot)
@@ -1406,7 +1443,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.8"
+TRACKER_VERSION = "4.9"
 
 
 @dataclass
@@ -1545,32 +1582,32 @@ async def _watch_one_collection(
         logger.warning("NFT %s: %s", gid, exc)
         return 0, 0
     now = time.time()
+    if lots is None:
+        return int(stats.get("parsed", 0)), 0
     if not lots:
-        if not baseline:
-            collection_heads.setdefault(str(gid), HEAD_EMPTY)
-        else:
+        if baseline or str(gid) in collection_heads:
             collection_heads[str(gid)] = HEAD_EMPTY
         return int(stats.get("parsed", 0)), 0
-    fresh_n = 0
-    for i, lot in enumerate(lots):
-        accepted = _collect_fresh_lot(
-            lot,
-            i,
-            gid,
-            seen,
-            collection_heads,
-            cfg,
-            baseline=baseline,
-            now=now,
-        )
-        if accepted is None:
-            continue
-        if _is_male_seller(accepted):
-            seen[accepted.id] = now
-            continue
-        post_queue.enqueue([accepted])
-        fresh_n += 1
-    return int(stats.get("parsed", 0) or len(lots)), fresh_n
+    for extra in lots[1:]:
+        seen[extra.id] = now
+    accepted = _collect_fresh_lot(
+        lots[0],
+        0,
+        gid,
+        seen,
+        collection_heads,
+        cfg,
+        baseline=baseline,
+        now=now,
+    )
+    if accepted is None:
+        return int(stats.get("parsed", 0) or len(lots)), 0
+    fn = _first_name_tokens(accepted)
+    if fn and any(_token_is_male(t) for t in fn):
+        seen[accepted.id] = now
+        return int(stats.get("parsed", 0) or len(lots)), 0
+    post_queue.enqueue([accepted])
+    return int(stats.get("parsed", 0) or len(lots)), 1
 
 
 async def collection_watcher(

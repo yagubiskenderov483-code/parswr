@@ -1115,6 +1115,7 @@ class TelegramMarket:
                             gift_id=gift_id,
                             offset=offset or "",
                             limit=min(limit, 50),
+                            # без sort_by_price/num = по времени смены цены (новые листинги сверху)
                             stars_only=True if stars_only else None,
                         )
                     ),

@@ -77,8 +77,42 @@ def test_post_empty_to_new() -> None:
     assert out.id == "n"
 
 
+def test_old_lot_rising_to_head_is_not_new() -> None:
+    """#2 стал #1 после продажи верха — это не новый листинг."""
+    seen: dict[str, float] = {"old2": time.time()}
+    heads: dict[str, str] = {"4": "old1"}
+    cfg = _cfg()
+    now = time.time()
+    assert (
+        _collect_fresh_lot(_lot("old2"), 0, 4, seen, heads, cfg, baseline=False, now=now)
+        is None
+    )
+    assert heads["4"] == "old2"
+
+
+def test_error_must_not_look_like_empty_then_post() -> None:
+    """После первого успешного скана неизвестный #1 без prev не постим."""
+    seen: dict[str, float] = {}
+    heads: dict[str, str] = {}
+    cfg = _cfg()
+    now = time.time()
+    # нет prev_head (ошибка API не записала empty) — только запомнить
+    assert (
+        _collect_fresh_lot(_lot("stale"), 0, 5, seen, heads, cfg, baseline=False, now=now)
+        is None
+    )
+    assert heads["5"] == "stale"
+    # тот же лот
+    assert (
+        _collect_fresh_lot(_lot("stale"), 0, 5, seen, heads, cfg, baseline=False, now=now)
+        is None
+    )
+
+
 if __name__ == "__main__":
     test_no_post_on_first_scan()
     test_post_on_head_change()
     test_post_empty_to_new()
+    test_old_lot_rising_to_head_is_not_new()
+    test_error_must_not_look_like_empty_then_post()
     print("all ok")

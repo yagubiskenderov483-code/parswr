@@ -120,6 +120,22 @@ def test_girl_name_beats_male_nick() -> None:
     assert passes_persona_filter(lot) is None
 
 
+def test_username_checked_if_first_name_unknown() -> None:
+    lot = _lot(first_name="Hi", seller="katya_228")
+    assert is_ordinary_girl_name(lot)
+    assert passes_persona_filter(lot) is None
+
+
+def test_sparkles_do_not_make_a_boy_a_girl() -> None:
+    lot = _lot(first_name="", seller="nft_king", about="✨ trading")
+    assert not matches_girl_criteria(lot)
+
+
+def test_kate_is_girl() -> None:
+    lot = _lot(first_name="Kate", seller="x")
+    assert matches_girl_criteria(lot)
+
+
 def test_profile_signals_with_girl_name() -> None:
     lot = _lot(
         first_name="Тома",
@@ -144,5 +160,8 @@ if __name__ == "__main__":
     test_random_digits_not_girl()
     test_nikita_not_girl()
     test_girl_name_beats_male_nick()
+    test_username_checked_if_first_name_unknown()
+    test_sparkles_do_not_make_a_boy_a_girl()
+    test_kate_is_girl()
     test_profile_signals_with_girl_name()
     print("all ok")

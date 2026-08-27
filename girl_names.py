@@ -37,6 +37,7 @@ _LATIN = """
 anya anyuta anna anechka angelina alina alisa alla alyona alena
 arina asya bella daria darya dasha dashenka diana dina eva
 ekaterina katya katyusha katusha katerina karina karolina kira
+kate kathy katherine alexandra
 ksenia ksusha lada larisa lera lerochka lena lenochka liza lilia
 lina lolita lyuba lyubov margo margarita marina masha mashka
 mashenka maria marusya mila milana milena nadya nastya nastena

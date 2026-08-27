@@ -51,8 +51,9 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
-# Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
+# Постоянная привязка — tracker market, не переопределяется
 DEFAULT_CHANNEL_ID = -1004384888475
+FIXED_CHANNEL_ID = -1004384888475
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
@@ -194,8 +195,10 @@ class Config:
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1
-    scan_batch: int = 36  # кольцо: N коллекций за проход (~4с полный круг)
+    scan_batch: int = 36  # legacy; вотчеры не используют кольцо
     hot_limit: int = 1  # только #1 на resale = только что выставили
+    watchers: int = 40  # задач после логина, каждая сидит на своих NFT
+    watch_parallel: int = 12  # одновременных GetResale (не кикаем сессию)
     max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
     loh_mode: bool = True
     max_gifts_count: int = 1  # 0–1 подарок у продавца
@@ -245,10 +248,6 @@ class Config:
         target = (
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
-        channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
-        channel_id: int | None = DEFAULT_CHANNEL_ID
-        if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
-            channel_id = int(channel_id_raw)
         return cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -260,13 +259,15 @@ class Config:
             poll_interval=_f("POLL_INTERVAL", 0.12),
             page_limit=int(_f("PAGE_LIMIT", 2)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.08),
+            gap=_f("REQUEST_GAP", 0.04),
             timeout=_f("REQUEST_TIMEOUT", 4.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 36)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
+            watchers=max(1, min(60, int(_f("WATCHERS", 40)))),
+            watch_parallel=max(2, min(16, int(_f("WATCH_PARALLEL", 12)))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
             loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
             or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
@@ -281,7 +282,7 @@ class Config:
             session_file=session_file,
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
-            channel_id=channel_id,
+            channel_id=FIXED_CHANNEL_ID,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
         )
@@ -549,6 +550,23 @@ async def find_channel_in_dialogs(client: TelegramClient) -> int | None:
     return None
 
 
+def pin_fixed_channel(
+    store: Any,
+    state: dict,
+    state_path: Path,
+    sender: Any | None = None,
+) -> int:
+    """Всегда канал tracker market — не зависит от env/файла/setchannel."""
+    cid = int(FIXED_CHANNEL_ID)
+    store.save(cid)
+    state["channel_id"] = cid
+    save_state(state_path, state)
+    if sender is not None:
+        sender.chat_id = cid
+    logger.info("Канал привязан навсегда: %s", cid)
+    return cid
+
+
 async def obtain_channel_id(
     client: TelegramClient,
     cfg: Config,
@@ -556,57 +574,8 @@ async def obtain_channel_id(
     state_path: Path,
     store: Any,
 ) -> int:
-    """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
-    if cfg.channel_id:
-        cid = int(cfg.channel_id)
-        store.save(cid)
-        state["channel_id"] = cid
-        save_state(state_path, state)
-        logger.info("Канал из CHANNEL_ID: %s", cid)
-        return cid
-
-    saved = store.load()
-    if saved is not None:
-        state["channel_id"] = saved
-        save_state(state_path, state)
-        logger.info("Канал из файла: %s", saved)
-        return saved
-
-    if state.get("channel_id"):
-        cid = int(state["channel_id"])
-        store.save(cid)
-        logger.info("Канал из state: %s", cid)
-        return cid
-
-    while True:
-        if cfg.target_channel.strip():
-            try:
-                cid = await resolve_channel(client, cfg.target_channel)
-                store.save(cid)
-                state["channel_id"] = cid
-                save_state(state_path, state)
-                return cid
-            except SystemExit as exc:
-                logger.warning("resolve_channel: %s", exc)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("resolve_channel: %s", exc)
-
-        found = await find_channel_in_dialogs(client)
-        if found is not None:
-            store.save(found)
-            state["channel_id"] = found
-            save_state(state_path, state)
-            return found
-
-        logger.warning(
-            "Канал не задан. Открой @markskskdbot → /channels или "
-            "/setchannel @имя_канала (жду 60с…)"
-        )
-        waited = await store.wait(timeout=60.0)
-        if waited is not None:
-            state["channel_id"] = waited
-            save_state(state_path, state)
-            return waited
+    """Всегда FIXED_CHANNEL_ID (-1004384888475)."""
+    return pin_fixed_channel(store, state, state_path)
 
 
 async def resolve_channel(client: TelegramClient, raw: str) -> int:
@@ -1277,7 +1246,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.1"
+TRACKER_VERSION = "4.2"
 
 
 @dataclass
@@ -1306,6 +1275,7 @@ class TrackerRuntime:
     last_scan_errors: int = 0
     last_scan_elapsed: float = 0.0
     last_api_error: str = ""
+    watchers_alive: int = 0
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -1390,6 +1360,216 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
     return client, bot
 
 
+def watcher_slice(gift_ids: list[int], worker_id: int, watchers: int) -> list[int]:
+    """NFT, на которых сидит задача worker_id из watchers."""
+    if watchers <= 0:
+        return list(gift_ids)
+    return list(gift_ids[worker_id::watchers])
+
+
+async def _watch_one_collection(
+    m: TelegramMarket,
+    gid: int,
+    cfg: Config,
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    post_queue: PostQueue,
+    *,
+    baseline: bool,
+) -> tuple[int, int]:
+    """Один запрос resale #1. Возвращает (parsed, fresh)."""
+    stats: dict[str, int] = {"errors": 0, "floods": 0, "parsed": 0, "ok": 0}
+    try:
+        lots = await _fetch_collection_pages(m, gid, cfg, stats)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("NFT %s: %s", gid, exc)
+        return 0, 0
+    now = time.time()
+    if not lots:
+        if not baseline:
+            collection_heads.setdefault(str(gid), HEAD_EMPTY)
+        else:
+            collection_heads[str(gid)] = HEAD_EMPTY
+        return int(stats.get("parsed", 0)), 0
+    fresh_n = 0
+    for i, lot in enumerate(lots):
+        accepted = _collect_fresh_lot(
+            lot,
+            i,
+            gid,
+            seen,
+            collection_heads,
+            cfg,
+            baseline=baseline,
+            now=now,
+        )
+        if accepted is None:
+            continue
+        post_queue.enqueue([accepted])
+        fresh_n += 1
+    return int(stats.get("parsed", 0) or len(lots)), fresh_n
+
+
+async def collection_watcher(
+    worker_id: int,
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    cfg: Config,
+    post_queue: PostQueue,
+    runtime: TrackerRuntime,
+    api_sem: asyncio.Semaphore,
+) -> None:
+    """После логина: запомнить #1, потом сидеть на своих NFT и ловить смену головы."""
+    mine = watcher_slice(gift_ids, worker_id, cfg.watchers)
+    if not mine:
+        return
+    logger.info("Задача %s/%s: сижу на %s NFT", worker_id + 1, cfg.watchers, len(mine))
+    runtime.watchers_alive += 1
+    try:
+        for gid in mine:
+            async with api_sem:
+                await _watch_one_collection(
+                    m, gid, cfg, seen, collection_heads, post_queue, baseline=True
+                )
+            await asyncio.sleep(0.01)
+
+        pass_no = 0
+        while True:
+            mine = watcher_slice(gift_ids, worker_id, cfg.watchers)
+            if not mine:
+                await asyncio.sleep(1.0)
+                continue
+            started = time.monotonic()
+            parsed = 0
+            fresh = 0
+            errors = 0
+            for gid in mine:
+                async with api_sem:
+                    try:
+                        p, f = await _watch_one_collection(
+                            m,
+                            gid,
+                            cfg,
+                            seen,
+                            collection_heads,
+                            post_queue,
+                            baseline=False,
+                        )
+                        parsed += p
+                        fresh += f
+                    except Exception:  # noqa: BLE001
+                        errors += 1
+                await asyncio.sleep(0.005)
+            pass_no += 1
+            runtime.passes += 1
+            runtime.seen_lots = len(seen)
+            runtime.last_scan_parsed = parsed
+            runtime.last_scan_errors = errors
+            runtime.last_scan_elapsed = round(time.monotonic() - started, 2)
+            runtime.last_scan_batch = len(mine)
+            runtime.queue_pending = post_queue.pending
+            if fresh:
+                runtime.last_fresh = fresh
+                runtime.last_posted = fresh
+                logger.info(
+                    "Задача %s: +%s новых → канал сразу · очередь %s · %ss",
+                    worker_id + 1,
+                    fresh,
+                    post_queue.pending,
+                    runtime.last_scan_elapsed,
+                )
+            elif pass_no % 40 == 0 and worker_id == 0:
+                logger.info(
+                    "Вотчеры живы %s · колл %s · очередь %s",
+                    runtime.watchers_alive,
+                    len(gift_ids),
+                    post_queue.pending,
+                )
+            await asyncio.sleep(0.02)
+    finally:
+        runtime.watchers_alive = max(0, runtime.watchers_alive - 1)
+
+
+async def watch_supervisor(
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    cfg: Config,
+    post_queue: PostQueue,
+    runtime: TrackerRuntime,
+    state_path: Path,
+    state: dict,
+) -> None:
+    """40 задач на NFT + периодический сейв state и обновление каталога."""
+    runtime.scan_parallel = cfg.watch_parallel
+    api_sem = asyncio.Semaphore(cfg.watch_parallel)
+    workers = [
+        asyncio.create_task(
+            collection_watcher(
+                i,
+                m,
+                gift_ids,
+                seen,
+                collection_heads,
+                cfg,
+                post_queue,
+                runtime,
+                api_sem,
+            ),
+            name=f"nft-watch-{i}",
+        )
+        for i in range(cfg.watchers)
+    ]
+    logger.info(
+        "Стартовал %s задач на %s NFT (parallel≤%s) — жду новые лоты",
+        cfg.watchers,
+        len(gift_ids),
+        cfg.watch_parallel,
+    )
+    catalog_refreshed = time.monotonic()
+    last_save = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(4.0)
+            if time.monotonic() - last_save > 8.0:
+                save_state(state_path, state)
+                last_save = time.monotonic()
+            if time.monotonic() - catalog_refreshed > 600:
+                try:
+                    gift_ids[:] = await m.load_collections(force=True)
+                    runtime.collections_total = len(gift_ids)
+                    catalog_refreshed = time.monotonic()
+                except Exception:  # noqa: BLE001
+                    pass
+            dead = [t for t in workers if t.done()]
+            for t in dead:
+                exc = t.exception() if not t.cancelled() else None
+                if exc:
+                    logger.error("Вотчер упал: %s", exc)
+                idx = workers.index(t)
+                workers[idx] = asyncio.create_task(
+                    collection_watcher(
+                        idx,
+                        m,
+                        gift_ids,
+                        seen,
+                        collection_heads,
+                        cfg,
+                        post_queue,
+                        runtime,
+                        api_sem,
+                    ),
+                    name=f"nft-watch-{idx}",
+                )
+    finally:
+        for t in workers:
+            t.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
 async def scanner_loop(
     m: TelegramMarket,
     gift_ids: list[int],
@@ -1401,97 +1581,18 @@ async def scanner_loop(
     state_path: Path,
     state: dict,
 ) -> None:
-    """Скан коллекций — лот в очередь сразу при нахождении (не ждём весь batch)."""
-    catalog_refreshed = time.monotonic()
-    pass_no = 0
-
-    def _on_fresh(lot: Lot) -> None:
-        post_queue.enqueue([lot])
-
-    while True:
-        started = time.monotonic()
-        pass_no += 1
-        runtime.passes = pass_no
-        runtime.seen_lots = len(seen)
-        try:
-            fresh, scan = await poll_once(
-                m,
-                gift_ids,
-                seen,
-                collection_heads,
-                cfg,
-                baseline=False,
-                on_lot=_on_fresh,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Проход упал: %s", exc)
-            await asyncio.sleep(2)
-            continue
-
-        runtime.last_scan_batch = int(scan.get("batch_size", 0))
-        runtime.last_scan_parsed = int(scan.get("parsed", 0))
-        runtime.last_scan_errors = int(scan.get("errors", 0))
-        runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
-        if runtime.last_scan_errors:
-            runtime.last_api_error = m.last_error or ""
-
-        runtime.last_fresh = len(fresh)
-        if fresh:
-            runtime.queue_pending = post_queue.pending
-            runtime.last_posted = len(fresh)
-            logger.info(
-                "Проход #%s: +%s свежих → очередь %s (ждут %s · %ss)",
-                pass_no,
-                len(fresh),
-                post_queue.pending,
-                post_queue.pending,
-                scan.get("elapsed", "?"),
-            )
-        elif pass_no % 10 == 0:
-            logger.info(
-                "Проход #%s: скан %s/%s колл · %s лотов · +0 "
-                "(err=%s · %ss)",
-                pass_no,
-                scan.get("batch_size", "?"),
-                scan.get("collections_total", "?"),
-                scan.get("parsed", 0),
-                scan.get("errors", 0),
-                scan.get("elapsed", "?"),
-            )
-
-        save_state(state_path, state)
-
-        if time.monotonic() - catalog_refreshed > 600:
-            try:
-                gift_ids[:] = await m.load_collections(force=True)
-                runtime.collections_total = len(gift_ids)
-                catalog_refreshed = time.monotonic()
-            except Exception:  # noqa: BLE001
-                pass
-
-        spent = time.monotonic() - started
-        scanned = int(scan.get("scanned", 0) or 0)
-        errors = int(scan.get("errors", 0) or 0)
-        if scanned > 0:
-            ratio = errors / scanned
-            if ratio > 0.35 and runtime.scan_parallel > 4:
-                runtime.scan_parallel -= 1
-                cfg.parallel = runtime.scan_parallel
-                logger.warning(
-                    "Много ошибок API (%s/%s) — parallel=%s",
-                    errors,
-                    scanned,
-                    runtime.scan_parallel,
-                )
-            elif ratio < 0.12 and runtime.scan_parallel < 6:
-                runtime.scan_parallel += 1
-                cfg.parallel = runtime.scan_parallel
-
-        await asyncio.sleep(
-            0.02
-            if cfg.turbo_scan
-            else max(cfg.poll_interval - spent, 0.04)
-        )
+    """Совместимость: теперь это пул вотчеров, не кольцевой скан."""
+    await watch_supervisor(
+        m,
+        gift_ids,
+        seen,
+        collection_heads,
+        cfg,
+        post_queue,
+        runtime,
+        state_path,
+        state,
+    )
 
 
 async def run() -> None:
@@ -1504,11 +1605,11 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Парсер лохов v%s · %s · кольцо %s · hot=#%s · /%ss",
+        "✅ Парсер v%s · %s · %s вотчеров · канал %s · пост /%ss",
         TRACKER_VERSION,
         me.username or me.first_name,
-        cfg.scan_batch or "all",
-        cfg.hot_limit,
+        cfg.watchers,
+        FIXED_CHANNEL_ID,
         int(cfg.post_interval),
     )
     logger.warning(
@@ -1522,14 +1623,13 @@ async def run() -> None:
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
     collection_heads: dict[str, str] = state.setdefault("collection_heads", {})
 
-    chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
+    chat_id = pin_fixed_channel(store, state, state_path)
     logger.info(
-        "Канал для постинга: %s · диапазон %s–%s⭐ · пост /%ss · RU=%s",
+        "Канал: %s (постоянно) · %s–%s⭐ · %s задач на NFT",
         chat_id,
         int(cfg.min_stars),
         int(cfg.max_stars),
-        cfg.post_interval,
-        "строго" if cfg.strict_ru else "нет",
+        cfg.watchers,
     )
 
     runtime = TrackerRuntime(
@@ -1572,37 +1672,19 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
-        "Коллекций: %s · кольцо %s/проход · hot=#%s · пост /%ss · lvl≤%s",
+        "Коллекций: %s · вотчеров %s · каждый сидит на ~%s NFT · пост /%ss",
         len(gift_ids),
-        cfg.scan_batch or "all",
-        cfg.hot_limit,
+        cfg.watchers,
+        max(1, (len(gift_ids) + cfg.watchers - 1) // cfg.watchers),
         int(cfg.post_interval),
-        cfg.max_account_level,
     )
 
     runtime.collections_total = len(gift_ids)
+    pin_fixed_channel(store, state, state_path, sender)
 
-    if not cfg.post_on_first_run:
-        logger.info(
-            "Синхрон #1 resale по всем коллекциям — старые лоты не постим…"
-        )
-        _, baseline_stats = await poll_once(
-            m,
-            gift_ids,
-            seen,
-            collection_heads,
-            cfg,
-            baseline=True,
-        )
-        save_state(state_path, state)
-        logger.info(
-            "Голов коллекций: %s · seen %s · %ss",
-            len(collection_heads),
-            len(seen),
-            baseline_stats.get("elapsed", "?"),
-        )
+    logger.info("Логин ок — копирую %s задач, запоминаю текущие #1, потом жду новые", cfg.watchers)
     scan_task = asyncio.create_task(
-        scanner_loop(
+        watch_supervisor(
             m,
             gift_ids,
             seen,
@@ -1613,7 +1695,7 @@ async def run() -> None:
             state_path,
             state,
         ),
-        name="scanner",
+        name="watch-pool",
     )
     try:
         await scan_task

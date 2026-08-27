@@ -232,26 +232,16 @@ def build_router(
         if not await _authorized():
             await message.answer("Сначала /start и войди в аккаунт.")
             return
-        arg = (message.text or "").split(maxsplit=1)
-        if len(arg) < 2:
-            await message.answer(
-                "Использование:\n"
-                "<code>/setchannel @mychannel</code>\n"
-                "<code>/setchannel -100123456789</code>"
-            )
-            return
-        try:
-            cid = await parse_channel_arg(client, arg[1])
-        except Exception as exc:  # noqa: BLE001
-            await message.answer(f"⚠️ Не нашёл канал: {exc}")
-            return
+        cid = -1004384888475
         store.save(cid)
         if control:
             if control.runtime is not None:
                 control.runtime.channel_id = cid
             if control.sender is not None:
                 control.sender.chat_id = cid
-        await message.answer(f"✅ Канал задан: <code>{cid}</code>")
+        await message.answer(
+            f"Канал привязан навсегда: <code>{cid}</code>"
+        )
 
     @router.message(Command("channels"))
     async def cmd_channels(message: Message) -> None:
@@ -286,7 +276,7 @@ def build_router(
         lines = [
             f"✅ Трекер v{tracker_version}",
             f"Аккаунт: {name}",
-            f"Канал: <code>{cid or 'не задан'}</code>",
+            f"Канал: <code>{cid or -1004384888475}</code>",
         ]
         if cfg:
             lines.append(
@@ -304,8 +294,10 @@ def build_router(
             lines.extend(
                 [
                     f"Проходов: {rt.passes}",
-                    f"Коллекций: {rt.collections_total or '—'} "
-                    f"(parallel {rt.scan_parallel or 8})",
+                    f"Коллекций: {rt.collections_total or '—'} · "
+                    f"вотчеров {getattr(rt, 'watchers_alive', 0)}/"
+                    f"{getattr(cfg, 'watchers', 40) if cfg else 40} "
+                    f"(api≤{rt.scan_parallel or 12})",
                     f"Последний скан: {rt.last_scan_batch} колл · "
                     f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
                     f"Всего отправлено: {rt.posted_total}"

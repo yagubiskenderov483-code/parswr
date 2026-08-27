@@ -185,22 +185,21 @@ class Config:
     bot_token: str
     target_channel: str
     min_stars: float = 500.0
-    max_stars: float = 5000.0
-    poll_interval: float = 2.0
-    page_limit: int = 12  # только верх resale-листа
-    parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.25
-    timeout: float = 10.0
+    max_stars: float = 2500.0  # дешёвые лоты (лохи не держат дорогие NFT)
+    poll_interval: float = 1.0  # чаще скан = быстрее ловим выставление
+    page_limit: int = 10  # верх resale-листа
+    parallel: int = 6  # быстрее обход коллекций (не выше 6)
+    gap: float = 0.2
+    timeout: float = 8.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 50  # ротация: не долбим все 149 колл за раз
-    hot_limit: int = 4  # топ-N = только что выставленные
-    max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    noob_mode: bool = True  # низкий lvl, мало gifts; TGP ок для девочек
-    max_gifts_count: int = 5  # gifts_count > N → профи (кроме женских)
-    female_mix_target: float = 0.30  # ~30% постов — «богатые» женские профили
-    post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
+    scan_batch: int = 0  # 0 = все коллекции каждый проход (мгновенный лов)
+    hot_limit: int = 3  # только самые свежие на странице
+    max_account_level: int = 2  # level <= 2
+    loh_mode: bool = True  # только лохи: без TGP/профи/канала/высокого lvl
+    max_gifts_count: int = 3  # много NFT у продавца = профи, не лох
+    post_interval: float = 3.0  # сек между постами (не копим очередь)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -253,22 +252,22 @@ class Config:
             bot_token=bot_token,
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 5000),
-            poll_interval=_f("POLL_INTERVAL", 2.0),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
-            parallel=min(6, int(_f("PARALLEL", 4))),
-            gap=_f("REQUEST_GAP", 0.25),
-            timeout=_f("REQUEST_TIMEOUT", 10.0),
+            max_stars=_f("MAX_STARS", 2500),
+            poll_interval=_f("POLL_INTERVAL", 1.0),
+            page_limit=int(_f("PAGE_LIMIT", 10)),
+            parallel=min(6, int(_f("PARALLEL", 6))),
+            gap=_f("REQUEST_GAP", 0.2),
+            timeout=_f("REQUEST_TIMEOUT", 8.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 50)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
+            scan_batch=int(_f("SCAN_BATCH", 0)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            noob_mode=os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
-            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 5))),
-            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 0.30))),
-            post_interval=_f("POST_INTERVAL", 4.0),
+            loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
+            or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
+            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 3))),
+            post_interval=_f("POST_INTERVAL", 3.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -846,7 +845,7 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         or lot.is_premium is None
         or lot.has_photo is None
         or lot.has_personal_channel is None
-        or (cfg.noob_mode and lot.gifts_count is None)
+        or (cfg.loh_mode and lot.gifts_count is None)
         or (cfg.strict_ru and not lot.lang_code)
     )
     if need_profile:
@@ -912,31 +911,25 @@ def passes_account_level(
     return lvl <= max_level
 
 
-def passes_persona_filter(lot: Lot, *, max_gifts: int) -> str | None:
-    """Персоны: девочки (TGP ок) · пустые мужики без TGP · остальные нубы."""
-    female = _looks_female(lot)
+def passes_loh_filter(
+    lot: Lot, *, max_gifts: int, max_level: int
+) -> str | None:
+    """Только лохи: без TGP, без высокого lvl, без профи с NFT/каналом."""
+    if lot.is_premium is True:
+        return "premium"
+    lvl = lot.account_level
+    if lvl is None:
+        return "level"
+    if lvl >= 0 and lvl > max_level:
+        return "level"
     gifts = lot.gifts_count
     if gifts is not None and gifts > max_gifts:
-        cap = max_gifts * 3 if female else max_gifts
-        if gifts > cap:
-            return "pro"
-
-    if female:
-        return None
-
-    if lot.is_premium is True:
-        about = (lot.about or "").strip()
-        sparse = (
-            lot.has_photo is not True
-            and not lot.has_personal_channel
-            and len(about) < 24
-        )
-        if sparse or _matches_male_empty(lot):
-            return "premium"
-
-    if _matches_male_empty(lot):
-        return None
-
+        return "pro"
+    if lot.has_personal_channel is True:
+        return "pro"
+    about = (lot.about or "").strip()
+    if len(about) > 80:
+        return "pro"
     return None
 
 
@@ -948,10 +941,10 @@ def filter_for_post(
     strict_ru: bool = True,
     strict_free: bool = False,
     max_account_level: int = 2,
-    noob_mode: bool = True,
-    max_gifts_count: int = 5,
+    loh_mode: bool = True,
+    max_gifts_count: int = 3,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """RU + level + бесплатные ЛС + один раз на продавца."""
+    """RU + лох-фильтр + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
     stats = {
@@ -979,12 +972,14 @@ def filter_for_post(
             stats["non_ru"] += 1
             continue
         if not passes_account_level(
-            lot, max_account_level, require_known=noob_mode
+            lot, max_account_level, require_known=loh_mode
         ):
             stats["level"] += 1
             continue
-        if noob_mode:
-            skip = passes_persona_filter(lot, max_gifts=max_gifts_count)
+        if loh_mode:
+            skip = passes_loh_filter(
+                lot, max_gifts=max_gifts_count, max_level=max_account_level
+            )
             if skip:
                 stats[skip] += 1
                 continue
@@ -1003,139 +998,9 @@ def filter_for_post(
     return out, stats
 
 
-_FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby)",
-    re.IGNORECASE,
-)
-_MOTO_RE = re.compile(
-    r"(мото|motor|bike|biker|байк|квадро|drive|тачк|авто|yamaha|kawasaki|harley)",
-    re.IGNORECASE,
-)
-_CRINGE_NICK_RE = re.compile(
-    r"(💕|🌸|✨|🎀|🌷|💋|kitty|angel|babe|xxx|ххх|милаш|princess|queen|baby|"
-    r"солныш|зайка|киса|милая|душа|love|sweet)",
-    re.IGNORECASE,
-)
-
-
-def _looks_female(lot: Lot) -> bool:
-    blob = " ".join(
-        x
-        for x in (
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        )
-        if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
-        return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
-        if fn.endswith(
-            ("ия", "ья", "ина", "ена", "ана", "юля", "уля", "оля", "еля", "ня", "ша")
-        ):
-            return True
-        if fn.endswith(("та", "са", "ка", "ла", "ра", "ва")) and not fn.endswith(
-            ("ася", "ося")
-        ):
-            return True
-        if fn.endswith("ая"):
-            return True
-    return False
-
-
-def _cringe_nick(lot: Lot) -> bool:
-    blob = f"{lot.seller or ''} {lot.first_name or ''}".strip()
-    if not blob:
-        return False
-    if _CRINGE_NICK_RE.search(blob):
-        return True
-    if re.search(r"[_\.]{2,}|[0-9]{3,}", blob):
-        return True
-    if any(ch in blob for ch in "💕🌸✨🎀🌷💋👑"):
-        return True
-    return False
-
-
-def _matches_male_empty(lot: Lot) -> bool:
-    """Пустой мужской акк: без авы, без TGP, мото/пустое био."""
-    if _looks_female(lot):
-        return False
-    if lot.is_premium is True:
-        return False
-    if lot.has_photo is True:
-        return False
-    if lot.gifts_count is not None and lot.gifts_count > 3:
-        return False
-    if lot.has_personal_channel is True:
-        return False
-    about = (lot.about or "").strip()
-    if _MOTO_RE.search(about):
-        return True
-    if about:
-        return len(about) < 48
-    return True
-
-
-def _female_rich_score(lot: Lot) -> float:
-    if not _looks_female(lot):
-        return 0.0
-    score = 0.0
-    if lot.has_photo:
-        score += 2.5
-    if (lot.about or "").strip():
-        score += 1.5
-    if lot.has_personal_channel:
-        score += 2.0
-    if lot.gifts_count and lot.gifts_count > 0:
-        score += 1.0
-    if _cringe_nick(lot):
-        score += 2.0
-    if lot.is_premium:
-        score += 1.0
-    return score
-
-
-def is_female_rich(lot: Lot, *, threshold: float = 4.0) -> bool:
-    return _female_rich_score(lot) >= threshold
-
-
-def _queue_priority(lot: Lot, cfg: Config, runtime: "TrackerRuntime") -> float:
-    """Свежее первым; ~30% очереди — женские «кринж»-профили."""
-    prio = -float(lot.discovered_at or time.time())
-    if not is_female_rich(lot):
-        return prio
-    total = max(runtime.posted_total, 1)
-    ratio = runtime.posted_female_rich / total
-    target = cfg.female_mix_target
-    if ratio < target:
-        prio -= 800.0
-    elif ratio > target + 0.12:
-        prio += 400.0
-    return prio
-
-
-def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
-    """Выше = раньше в очереди. Без TGP в приоритете, девочки — иногда."""
-    score = random.random() * 0.3
-    if lot.is_premium is False:
-        score += 4.0
-    elif lot.is_premium is True:
-        score -= 3.0
-    if lot.free_dm is True:
-        score += 1.5
-    elif lot.free_dm is False:
-        score -= 5.0
-    if boost_female and _looks_female(lot):
-        score += 2.5
-    return score
-
-
-def rank_for_queue(lots: list[Lot]) -> list[Lot]:
-    """Сначала самые свежие (только что увидели на маркете)."""
-    return sorted(lots, key=lambda lot: -float(lot.discovered_at or 0))
+def _queue_priority(lot: Lot) -> float:
+    """Свежее = выше в очереди (отрицательный timestamp)."""
+    return -float(lot.discovered_at or time.time())
 
 
 class PostQueue:
@@ -1194,7 +1059,7 @@ class PostQueue:
             return 0
         for lot in lots:
             self._seq += 1
-            prio = _queue_priority(lot, self._cfg, self._runtime)
+            prio = _queue_priority(lot)
             self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
@@ -1218,7 +1083,7 @@ class PostQueue:
                     strict_ru=self._cfg.strict_ru,
                     strict_free=self._cfg.strict_free,
                     max_account_level=self._cfg.max_account_level,
-                    noob_mode=self._cfg.noob_mode,
+                    loh_mode=self._cfg.loh_mode,
                     max_gifts_count=self._cfg.max_gifts_count,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
@@ -1241,8 +1106,6 @@ class PostQueue:
                 self._state["seen_sellers"] = self._seen_sellers
                 save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
-                if is_female_rich(lot):
-                    self._runtime.posted_female_rich += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
                     "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
@@ -1258,7 +1121,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6"
+TRACKER_VERSION = "3.7"
 
 
 @dataclass
@@ -1267,7 +1130,6 @@ class TrackerRuntime:
 
     passes: int = 0
     posted_total: int = 0
-    posted_female_rich: int = 0
     last_fresh: int = 0
     last_posted: int = 0
     last_skip_ru: int = 0
@@ -1478,13 +1340,15 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · персоны · mix≈%s%% жен · lvl≤%s · parallel≤%s",
+        "✅ Парсер лохов v%s · %s · RU=%s · %s–%s⭐ · lvl≤%s · gifts≤%s · scan=all · /%ss",
         TRACKER_VERSION,
         me.username or me.first_name,
         "да" if cfg.strict_ru else "нет",
-        int(cfg.female_mix_target * 100),
+        int(cfg.min_stars),
+        int(cfg.max_stars),
         cfg.max_account_level,
-        cfg.parallel,
+        cfg.max_gifts_count,
+        int(cfg.post_interval),
     )
     logger.warning(
         "Сессия: один инстанс Bothost; не жми /start повторно; "

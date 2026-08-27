@@ -50,9 +50,9 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
+DEFAULT_BOT_TOKEN = "8825465611:AAFRXxRV7jT9Fy0zVVNn9WfmLreFtPgJ7M8"
 # Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
-DEFAULT_CHANNEL_ID = -1004384888475
+DEFAULT_CHANNEL_ID = -1003784435307
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
@@ -155,7 +155,7 @@ async def wait_for_gift_ids(m: TelegramMarket) -> list[int]:
             return ids
         logger.error(
             "Коллекций 0 (попытка %s) — жду 30с. "
-            "Проверь: /start в @markskskdbot, сессия жива, аккаунт не в бане",
+            "Проверь: /start в @jsjeigiejwhnewbot, сессия жива, аккаунт не в бане",
             attempt,
         )
         await asyncio.sleep(30)
@@ -584,7 +584,7 @@ async def obtain_channel_id(
             return found
 
         logger.warning(
-            "Канал не задан. Открой @markskskdbot → /channels или "
+            "Канал не задан. Открой @jsjeigiejwhnewbot → /channels или "
             "/setchannel @имя_канала (жду 60с…)"
         )
         waited = await store.wait(timeout=60.0)
@@ -601,7 +601,7 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
         found = await find_channel_in_dialogs(client)
         if found is not None:
             return found
-        raise SystemExit("Канал не задан — /setchannel в @markskskdbot")
+        raise SystemExit("Канал не задан — /setchannel в @jsjeigiejwhnewbot")
     if re.fullmatch(r"-?\d+", raw):
         return int(raw)
 
@@ -1190,7 +1190,7 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
 
     if not await client.is_user_authorized():
         logger.warning(
-            "⚠️ Трекер v%s: нет сессии — войди через @markskskdbot /start",
+            "⚠️ Трекер v%s: нет сессии — войди через @jsjeigiejwhnewbot /start",
             TRACKER_VERSION,
         )
         await bot.wait_login()

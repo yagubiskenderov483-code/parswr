@@ -187,21 +187,21 @@ class Config:
     min_stars: float = 500.0
     max_stars: float = 2000.0  # только совсем дешёвые
     poll_interval: float = 0.4  # турбо-скан
-    page_limit: int = 6  # меньше ответ API = быстрее
+    page_limit: int = 2  # API: только верх resale
     parallel: int = 6
-    gap: float = 0.12
-    timeout: float = 5.0
+    gap: float = 0.08
+    timeout: float = 4.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1
-    scan_batch: int = 0  # все коллекции каждый проход
-    hot_limit: int = 2  # только #1–#2 на resale = только что выставили
+    scan_batch: int = 36  # кольцо: N коллекций за проход (~4с полный круг)
+    hot_limit: int = 1  # только #1 на resale = только что выставили
     max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
     loh_mode: bool = True
     max_gifts_count: int = 1  # 0–1 подарок у продавца
     fast_scan: bool = True  # без fallback на non-resale (быстрее)
     turbo_scan: bool = True  # почти без паузы, если есть свежие
-    post_interval: float = 2.0
+    post_interval: float = 1.5
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -255,23 +255,23 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
             max_stars=_f("MAX_STARS", 2000),
-            poll_interval=_f("POLL_INTERVAL", 0.4),
-            page_limit=int(_f("PAGE_LIMIT", 6)),
+            poll_interval=_f("POLL_INTERVAL", 0.12),
+            page_limit=int(_f("PAGE_LIMIT", 2)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.12),
-            timeout=_f("REQUEST_TIMEOUT", 5.0),
+            gap=_f("REQUEST_GAP", 0.08),
+            timeout=_f("REQUEST_TIMEOUT", 4.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 2))),
+            scan_batch=int(_f("SCAN_BATCH", 36)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
             loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
             or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
-            post_interval=_f("POST_INTERVAL", 2.0),
+            post_interval=_f("POST_INTERVAL", 1.5),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -296,10 +296,11 @@ def load_state(path: Path) -> dict:
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
             data.setdefault("channel_id", None)
+            data.setdefault("collection_heads", {})
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "seen_sellers": {}, "channel_id": None}
+    return {"seen": {}, "seen_sellers": {}, "channel_id": None, "collection_heads": {}}
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -705,7 +706,7 @@ def _select_scan_batch(
     take = min(n, cfg.scan_batch)
     batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
     m._cursor = (m._cursor + take) % n
-    return batch
+    return batch  # кольцо без shuffle — быстрый круг
 
 
 async def _fetch_collection_pages(
@@ -748,25 +749,38 @@ async def _fetch_collection_pages(
 def _collect_fresh_lot(
     lot: Lot,
     i: int,
+    gid: int,
     seen: dict[str, float],
+    collection_heads: dict[str, str],
     cfg: Config,
     *,
     baseline: bool,
     now: float,
 ) -> Lot | None:
-    """Проверка одного лота со страницы resale; None = не в очередь."""
+    """Только #1 resale и только если голова коллекции сменилась = новый листинг."""
+    head_key = str(gid)
     if i >= cfg.hot_limit:
         if lot.id not in seen:
             seen[lot.id] = now
         return None
     if lot.id in seen:
+        if i == 0:
+            collection_heads[head_key] = lot.id
         return None
     if baseline:
+        if i == 0:
+            collection_heads[head_key] = lot.id
         seen[lot.id] = now
+        return None
+    if i == 0 and collection_heads.get(head_key) == lot.id:
         return None
     if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
+        if i == 0:
+            collection_heads[head_key] = lot.id
         seen[lot.id] = now
         return None
+    if i == 0:
+        collection_heads[head_key] = lot.id
     lot.discovered_at = now
     return lot
 
@@ -775,6 +789,7 @@ async def poll_once(
     m: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
+    collection_heads: dict[str, str],
     cfg: Config,
     *,
     baseline: bool,
@@ -805,7 +820,14 @@ async def poll_once(
         now = time.time()
         for i, lot in enumerate(result):
             accepted = _collect_fresh_lot(
-                lot, i, seen, cfg, baseline=baseline, now=now
+                lot,
+                i,
+                gid,
+                seen,
+                collection_heads,
+                cfg,
+                baseline=baseline,
+                now=now,
             )
             if accepted is None:
                 continue
@@ -837,14 +859,16 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Быстрый enrich одного лота (короткие таймауты)."""
-    t = 1.8
+    """Быстрый enrich: resolve → profile+DM параллельно."""
+    t = 1.2
     if not lot.seller or lot.seller_id is None:
         try:
             await m.resolve_owner(lot, timeout=t)
         except Exception:  # noqa: BLE001
             pass
-    need_profile = lot.seller_id is not None and (
+    if not lot.seller_id:
+        return
+    need_profile = (
         lot.account_level is None
         or lot.free_dm is None
         or lot.is_premium is None
@@ -853,16 +877,13 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         or (cfg.loh_mode and lot.gifts_count is None)
         or (cfg.strict_ru and not lot.lang_code)
     )
+    tasks: list[Any] = []
     if need_profile:
-        try:
-            await m.enrich_profiles([lot], timeout=t, parallel=1)
-        except Exception:  # noqa: BLE001
-            pass
-    if lot.free_dm is None and lot.seller_id is not None:
-        try:
-            await m.check_free_dm([lot], timeout=t)
-        except Exception:  # noqa: BLE001
-            pass
+        tasks.append(m.enrich_profiles([lot], timeout=t, parallel=1))
+    if lot.free_dm is None:
+        tasks.append(m.check_free_dm([lot], timeout=t))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def enrich(m: TelegramMarket, lots: list[Lot], cfg: Config) -> None:
@@ -1116,10 +1137,11 @@ class PostQueue:
                 self._runtime.posted_total += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
+                    "Отправил: %s за %s⭐ (%s) · +%.2fs · очередь %s · lvl %s",
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
+                    time.time() - float(lot.discovered_at or time.time()),
                     self.pending,
                     format_account_level(lot),
                 )
@@ -1129,7 +1151,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8"
+TRACKER_VERSION = "3.9"
 
 
 @dataclass
@@ -1244,6 +1266,7 @@ async def scanner_loop(
     m: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
+    collection_heads: dict[str, str],
     cfg: Config,
     post_queue: PostQueue,
     runtime: TrackerRuntime,
@@ -1267,6 +1290,7 @@ async def scanner_loop(
                 m,
                 gift_ids,
                 seen,
+                collection_heads,
                 cfg,
                 baseline=False,
                 on_lot=_on_fresh,
@@ -1336,8 +1360,8 @@ async def scanner_loop(
                 cfg.parallel = runtime.scan_parallel
 
         await asyncio.sleep(
-            0.03
-            if cfg.turbo_scan and fresh
+            0.02
+            if cfg.turbo_scan
             else max(cfg.poll_interval - spent, 0.04)
         )
 
@@ -1352,16 +1376,11 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Парсер лохов v%s · %s · %s–%s⭐ · lvl≤%s · gifts≤%s · "
-        "турбо=%s · fast=%s · /%ss",
+        "✅ Парсер лохов v%s · %s · кольцо %s · hot=#%s · /%ss",
         TRACKER_VERSION,
         me.username or me.first_name,
-        int(cfg.min_stars),
-        int(cfg.max_stars),
-        cfg.max_account_level,
-        cfg.max_gifts_count,
-        "да" if cfg.turbo_scan else "нет",
-        "да" if cfg.fast_scan else "нет",
+        cfg.scan_batch or "all",
+        cfg.hot_limit,
         int(cfg.post_interval),
     )
     logger.warning(
@@ -1373,6 +1392,7 @@ async def run() -> None:
     state = load_state(state_path)
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
+    collection_heads: dict[str, str] = state.setdefault("collection_heads", {})
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
     logger.info(
@@ -1424,8 +1444,9 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
-        "Коллекций: %s · scan page1 hot=%s · все колл/проход · drip %ss · lvl≤%s",
+        "Коллекций: %s · кольцо %s/проход · hot=#%s · пост /%ss · lvl≤%s",
         len(gift_ids),
+        cfg.scan_batch or "all",
         cfg.hot_limit,
         int(cfg.post_interval),
         cfg.max_account_level,
@@ -1433,11 +1454,20 @@ async def run() -> None:
 
     runtime.collections_total = len(gift_ids)
 
-    baseline = not seen and not cfg.post_on_first_run
+    need_head_sync = not collection_heads and bool(seen)
+    baseline = (not seen and not cfg.post_on_first_run) or need_head_sync
     if baseline:
-        logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
+        if need_head_sync:
+            logger.info("Синхрон голов коллекций (без постинга)…")
+        else:
+            logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
         _, baseline_stats = await poll_once(
-            m, gift_ids, seen, cfg, baseline=True
+            m,
+            gift_ids,
+            seen,
+            collection_heads,
+            cfg,
+            baseline=True,
         )
         save_state(state_path, state)
         logger.info(
@@ -1449,7 +1479,15 @@ async def run() -> None:
 
     scan_task = asyncio.create_task(
         scanner_loop(
-            m, gift_ids, seen, cfg, post_queue, runtime, state_path, state
+            m,
+            gift_ids,
+            seen,
+            collection_heads,
+            cfg,
+            post_queue,
+            runtime,
+            state_path,
+            state,
         ),
         name="scanner",
     )

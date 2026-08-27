@@ -201,7 +201,7 @@ class Config:
     max_gifts_count: int = 1  # 0–1 подарок у продавца
     fast_scan: bool = True  # без fallback на non-resale (быстрее)
     turbo_scan: bool = True  # почти без паузы, если есть свежие
-    post_interval: float = 1.5
+    post_interval: float = 4.0  # сек между постами (как просил)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -271,7 +271,7 @@ class Config:
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
-            post_interval=_f("POST_INTERVAL", 1.5),
+            post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -287,6 +287,7 @@ class Config:
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
 SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
+HEAD_EMPTY = "__empty__"  # коллекция без лотов на resale
 
 
 def load_state(path: Path) -> dict:
@@ -757,31 +758,45 @@ def _collect_fresh_lot(
     baseline: bool,
     now: float,
 ) -> Lot | None:
-    """Только #1 resale и только если голова коллекции сменилась = новый листинг."""
+    """Постим ТОЛЬКО при смене #1 resale — не то, что уже час висит наверху."""
     head_key = str(gid)
     if i >= cfg.hot_limit:
         if lot.id not in seen:
             seen[lot.id] = now
         return None
-    if lot.id in seen:
-        if i == 0:
-            collection_heads[head_key] = lot.id
-        return None
+
     if baseline:
         if i == 0:
             collection_heads[head_key] = lot.id
         seen[lot.id] = now
         return None
-    if i == 0 and collection_heads.get(head_key) == lot.id:
+
+    if i != 0:
         return None
-    if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
-        if i == 0:
-            collection_heads[head_key] = lot.id
+
+    prev_head = collection_heads.get(head_key)
+    in_range = cfg.min_stars <= lot.stars <= cfg.max_stars
+
+    # Первый раз видим коллекцию в кольце — запомнить #1, НЕ постить (может висеть час)
+    if prev_head is None:
+        collection_heads[head_key] = lot.id
         seen[lot.id] = now
         return None
-    if i == 0:
-        collection_heads[head_key] = lot.id
+
+    if prev_head == lot.id:
+        return None
+
+    # Смена головы: пусто→лот или старый #1→новый #1 = только что выставили
+    collection_heads[head_key] = lot.id
+
+    if lot.id in seen:
+        return None
+    if not in_range:
+        seen[lot.id] = now
+        return None
+
     lot.discovered_at = now
+    lot.listed_at = now  # наш момент детекта смены #1
     return lot
 
 
@@ -818,6 +833,9 @@ async def poll_once(
             logger.warning("коллекция %s: %s", gid, result)
             continue
         now = time.time()
+        if not result:
+            collection_heads[str(gid)] = HEAD_EMPTY
+            continue
         for i, lot in enumerate(result):
             accepted = _collect_fresh_lot(
                 lot,
@@ -1151,7 +1169,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9"
+TRACKER_VERSION = "4.0"
 
 
 @dataclass
@@ -1454,13 +1472,10 @@ async def run() -> None:
 
     runtime.collections_total = len(gift_ids)
 
-    need_head_sync = not collection_heads and bool(seen)
-    baseline = (not seen and not cfg.post_on_first_run) or need_head_sync
-    if baseline:
-        if need_head_sync:
-            logger.info("Синхрон голов коллекций (без постинга)…")
-        else:
-            logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
+    if not cfg.post_on_first_run:
+        logger.info(
+            "Синхрон #1 resale по всем коллекциям — старые лоты не постим…"
+        )
         _, baseline_stats = await poll_once(
             m,
             gift_ids,
@@ -1471,12 +1486,11 @@ async def run() -> None:
         )
         save_state(state_path, state)
         logger.info(
-            "Запомнено %s лотов (скан %s колл · %ss). Слежу за новыми.",
+            "Голов коллекций: %s · seen %s · %ss",
+            len(collection_heads),
             len(seen),
-            baseline_stats.get("scanned", "?"),
             baseline_stats.get("elapsed", "?"),
         )
-
     scan_task = asyncio.create_task(
         scanner_loop(
             m,

@@ -88,6 +88,7 @@ class Lot:
     has_personal_channel: bool | None = None
     seen_at: float = field(default_factory=time.time)
     discovered_at: float = 0.0  # когда трекер впервые увидел лот
+    listed_at: float = 0.0  # когда сменился #1 resale (детект «только что»)
 
     @property
     def model_key(self) -> str:

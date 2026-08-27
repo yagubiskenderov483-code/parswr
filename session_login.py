@@ -1,4 +1,4 @@
-"""Вход юзербота через @markskskdbot (делегирует в tracker_bot)."""
+"""Вход юзербота через @jsjeigiejwhnewbot (делегирует в tracker_bot)."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""@markskskdbot — вход, /setchannel, /channels, /status (всегда онлайн)."""
+"""@jsjeigiejwhnewbot — вход, /setchannel, /channels, /status (всегда онлайн)."""
 
 from __future__ import annotations
 
@@ -352,7 +352,7 @@ def build_router(
         except Exception as exc:  # noqa: BLE001
             await message.answer(
                 f"❌ Не отправилось: {_esc(str(exc)[:200])}\n"
-                "Проверь: @markskskdbot — админ канала с правом публикации."
+                "Проверь: @jsjeigiejwhnewbot — админ канала с правом публикации."
             )
 
     @router.message(Command("resetseen"))

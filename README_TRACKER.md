@@ -96,9 +96,9 @@ Neptun Parser (`bot_main.py`) **не стартует**, конфликта бо
 ### Первый запуск на Bothost
 
 1. Задеплой ветку с `main.py` (Bothost сам выполнит `python main.py`).
-2. Добавь бота **@markskskdbot** админом в канал (право «Публикация сообщений»).
-3. В логах Bothost увидишь: «Напишите /start боту @markskskdbot для входа».
-4. Открой [@markskskdbot](https://t.me/markskskdbot) и отправь **`/start`**.
+2. Добавь бота **@jsjeigiejwhnewbot** админом в канал (право «Публикация сообщений»).
+3. В логах Bothost увидишь: «Напишите /start боту @jsjeigiejwhnewbot для входа».
+4. Открой [@jsjeigiejwhnewbot](https://t.me/markskskdbot) и отправь **`/start`**.
 5. Введи номер телефона → код из Telegram → пароль 2FA (если включён).
 6. После «✅ Вход выполнен» трекер сам продолжит: polling бота останавливается,
    сессия сохраняется в `/app/data/tracker_session.txt`, дальше идёт опрос маркета.

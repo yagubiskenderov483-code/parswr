@@ -1,4 +1,4 @@
-"""Только девушки по критериям: имена + позорный профиль. Пацанов нет."""
+"""Только девушки по имени/нику. Пацанов (Дима/Саша/ава+канал) нет."""
 
 from __future__ import annotations
 
@@ -30,11 +30,17 @@ def _lot(**kw) -> Lot:
 
 
 def test_ordinary_names() -> None:
-    for name in ("Лера", "Катя", "Настюха", "Маша", "Даша", "Юля", "Настя"):
+    for name in ("Лера", "Катя", "Настюха", "Маша", "Даша", "Юля", "Настя", "Тома"):
         lot = _lot(first_name=name)
         assert is_ordinary_girl_name(lot), name
         assert matches_girl_criteria(lot), name
         assert passes_persona_filter(lot) is None, name
+
+
+def test_girl_username() -> None:
+    lot = _lot(first_name="", seller="katya_228")
+    assert is_ordinary_girl_name(lot)
+    assert passes_persona_filter(lot) is None
 
 
 def test_cringe_girl() -> None:
@@ -49,6 +55,54 @@ def test_male_skip() -> None:
     assert passes_persona_filter(lot) == "persona"
 
 
+def test_male_diminutives_not_girls() -> None:
+    for name, nick in (
+        ("Дима", "dima_nft"),
+        ("Рома", "roma88"),
+        ("Коля", "kolyan"),
+        ("Вова", "vovan"),
+        ("Саша", "sasha_bro"),
+        ("Паша", "pashka"),
+        ("Миша", "misha"),
+        ("Ваня", "vanya"),
+        ("Женя", "zhenya"),
+        ("Лёша", "lyosha"),
+        ("Юра", "yura"),
+        ("Стёпа", "stepa"),
+        ("Толя", "tolik"),
+        ("Витя", "vitya"),
+        ("Костя", "kostya"),
+        ("Макс", "max_trade"),
+        ("Никита", "nikita"),
+        ("Кирилл", "kirill"),
+        ("Алексей", "alexey"),
+    ):
+        lot = _lot(first_name=name, seller=nick)
+        assert not matches_girl_criteria(lot), name
+        assert passes_persona_filter(lot) == "persona", name
+
+
+def test_profile_alone_not_girl() -> None:
+    """Ава+канал+сторис без женского имени — это не девушка (часто пацан)."""
+    lot = _lot(
+        first_name="",
+        seller="nft_king",
+        has_photo=True,
+        has_personal_channel=True,
+        has_stories=True,
+        gifts_count=4,
+    )
+    assert not matches_girl_criteria(lot)
+    assert passes_persona_filter(lot) == "persona"
+
+
+def test_generic_nicks_not_girl() -> None:
+    for seller in ("xxx_crypto", "darkangel", "baby_ton", "queen_trade", "sweet_xxx"):
+        lot = _lot(first_name="", seller=seller)
+        assert not matches_girl_criteria(lot), seller
+        assert passes_persona_filter(lot) == "persona", seller
+
+
 def test_random_digits_not_girl() -> None:
     lot = _lot(first_name="Xy", seller="crypto_king99")
     assert not matches_girl_criteria(lot)
@@ -60,7 +114,13 @@ def test_nikita_not_girl() -> None:
     assert not matches_girl_criteria(lot)
 
 
-def test_profile_signals() -> None:
+def test_girl_name_beats_male_nick() -> None:
+    lot = _lot(first_name="Катя", seller="dima_nft")
+    assert is_ordinary_girl_name(lot)
+    assert passes_persona_filter(lot) is None
+
+
+def test_profile_signals_with_girl_name() -> None:
     lot = _lot(
         first_name="Тома",
         has_photo=True,
@@ -70,13 +130,19 @@ def test_profile_signals() -> None:
         about="🎀",
     )
     assert matches_girl_criteria(lot)
+    assert passes_persona_filter(lot) is None
 
 
 if __name__ == "__main__":
     test_ordinary_names()
+    test_girl_username()
     test_cringe_girl()
     test_male_skip()
+    test_male_diminutives_not_girls()
+    test_profile_alone_not_girl()
+    test_generic_nicks_not_girl()
     test_random_digits_not_girl()
     test_nikita_not_girl()
-    test_profile_signals()
+    test_girl_name_beats_male_nick()
+    test_profile_signals_with_girl_name()
     print("all ok")

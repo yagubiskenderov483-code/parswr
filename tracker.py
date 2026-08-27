@@ -910,7 +910,8 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     if not lot.seller_id:
         return
     need_profile = (
-        lot.account_level is None
+        not (lot.first_name or "").strip()
+        or lot.account_level is None
         or lot.is_premium is None
         or lot.has_photo is None
         or lot.has_personal_channel is None
@@ -975,95 +976,90 @@ def passes_account_level(
     return lvl <= max_level
 
 
-_FEMALE_NAMES = frozenset(
+# Не имена: слишком часто у пацанов в никах (xxx_queen, baby_ton, darkangel).
+_GENERIC_NICK_WORDS = frozenset(
     """
-    аня анна анюта анечка ангелина ангелина
-    катя катюша катюха екатерина катерина катька
-    лера валерия лерочка
-    настя настюха настенька анастасия настюша
-    маша мария машка машенька маруся mashka
-    даша дарья дашуля дашенька
-    юля юлия юлька юлечка
-    оля ольга олечка олька
-    вика виктория викуся
-    ира ирина ирочка
-    таня татьяна танюша танька
-    лена елена алена алёна леночка
-    света светлана светик
-    надя надежда
-    вера вероника верочка ника
-    люба любовь
-    нина
-    соня софия софья
-    ксюша ксения ксеня
-    диана дианочка
-    милана мила
-    арина ариша
-    ева
-    камила
-    варя варвара
-    полина поля
-    алина лина
-    карина
-    дарина даша
-    кира
-    лиза елизавета лизка
-    наташа наталья наталия
-    галя галина
-    валя валентина
-    жанна
-    рита маргарита
-    оксана ксюха
-    яна яночка
-    ульяна уля
-    снежана
-    кристина кристя
-    каролина
-    василиса
-    тася таисия
-    зоя
-    инна
-    алла
-    лариса лара
-    лилия лиля
-    марина мариша
-    олеся леся
-    милаша милашка
-    lera katya katyusha nastya nastyuha masha dasha yulya olya vika
-    ira tanya lena sveta nina sonya ksusha diana milana arina eva
-    polina alina karina liza natasha yana ulyana
+    baby kitty queen angel princess sweety cutie babe babygirl
+    princessa kittycat angelbaby dummy lolita sweet xxx
     """.split()
 )
-_FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|милаш|princess|queen|baby|"
-    r"солныш|зайка|киса|милая|няшка|няш|dummy|lolita)",
-    re.IGNORECASE,
-)
 _CRINGE_RE = re.compile(
-    r"(💕|🌸|✨|🎀|🌷|💋|👑|🐱|💅|👩|princess|queen|baby|kitty|xxx|ххх|"
-    r"милаш|зайка|киса|солныш|няша|няшка|lolita|angel|sweet|"
-    r"девоч|девуш|girl|woman|she/her)",
+    r"(💕|🌸|✨|🎀|🌷|💋|👑|💅|👩|💄|🐱|"
+    r"милаш|зайка|зайчик|киса|киска|солныш|няша|няшка|лапочка|крошка|"
+    r"принцесс|куколк|малышк|девоч|девуш|girl|woman|she/her|lolita)",
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
-    r"(пацан|братан|bro|man|boy|муж|парень|мото|motor|bike|biker|drive|тачк)",
+    r"(пацан|братан|bro\b|boy\b|\bman\b|муж|парень|мото|motor|bike|biker|"
+    r"тачк|батя|мужик|качок)",
     re.IGNORECASE,
 )
-_MALE_NAME_ENDINGS = ("ий", "ей", "ёр", "ор", "ур", "им", "ом", "ан", "ен", "ин", "он", "ун")
-_MALE_NAME_EXCEPTIONS = ("ася", "ося", "илья")
-_MALE_A_NAMES = frozenset(
-    {
-        "никита",
-        "илья",
-        "фома",
-        "кузьма",
-        "савва",
-        "данила",
-        "лука",
-        "никитка",
-        "илья",
-        "доброслав",
-    }
+_MALE_NAME_ENDINGS = (
+    "ий", "ей", "ёр", "ор", "ур", "им", "ом", "ен", "он", "ун",
+)
+# Дима/Рома/Саша и транслит — раньше проходили как «женское окончание а/я».
+_MALE_NAMES = frozenset(
+    """
+    никита никитка илья ильюха фома кузьма савва данила данил даниил лука
+    дима димка димон димуля дмитрий
+    рома ромка роман
+    коля колька николай
+    вова вован володя вовка владимир
+    саша сашка шура александр
+    паша пашка пашук павел
+    миша мишка михаил
+    ваня ванек ванюша иван
+    женя евгений
+    леша леха алеша алексей
+    юра юрка юрий
+    степа степка степан
+    толя толик анатолий
+    витя витек виктор
+    боря борис
+    гоша гриша григорий
+    слава вячеслав
+    жора георгий
+    лева лев
+    тима тимофей
+    федя федор
+    петя петр
+    сеня семен
+    костя константин
+    вася васек василий
+    макс максим
+    кирилл егор олег денис игорь артем андрей сергей
+    матвей марк тимур руслан богдан ярослав глеб захар платон
+    антон арсений владислав гордей
+    семен серафим ростислав святослав доброслав
+    dima dimka dimon dmitry dmitri dmitrii
+    roma roman romka
+    kolya kolyan nikolay nikolai
+    vova vovan volodya vladimir vlad
+    sasha sashka alexander alexandr alex
+    pasha pashka pavel
+    misha mishka mikhail michael mike
+    vanya ivan
+    zhenya evgeny evgeniy eugene
+    lesha lyosha alexey alexei
+    yura yuriy yuri
+    stepa stepan
+    tolya tolik
+    vitya viktor victor
+    borya boris
+    gosha grisha
+    slava
+    tima timofey timothy
+    fedya
+    petya petr peter
+    kostya
+    vasya vasiliy
+    max maxim maksim
+    kirill egor yegor oleg denis igor artem andrey andrei sergey sergei
+    matvey mark timur ruslan bogdan gleb anton
+    danila danil daniel dan
+    nikita ilya
+    john jake tom bob paul chris david andrew
+    """.split()
 )
 _NAME_CLEAN_RE = re.compile(r"[^a-zа-яё]+", re.IGNORECASE)
 
@@ -1080,113 +1076,91 @@ def _name_tokens(*parts: str) -> list[str]:
     return out
 
 
-def is_ordinary_girl_name(lot: Lot) -> bool:
-    """Лера, Катя, Настюха и ещё сотни имён/ников/транслита."""
-    for tok in _name_tokens(lot.first_name or "", lot.seller or "", lot.last_name or ""):
-        if tok in GIRL_NAMES:
+def _token_is_girl_name(tok: str) -> bool:
+    if not tok or tok in _GENERIC_NICK_WORDS or tok in _MALE_NAMES:
+        return False
+    if tok in GIRL_NAMES:
+        return True
+    if tok.endswith("уха") and len(tok) >= 5:
+        stem = tok[:-3]
+        if stem in _MALE_NAMES:
+            return False
+        if stem in GIRL_NAMES or (stem + "я") in GIRL_NAMES:
             return True
-        if tok.endswith("уха") and len(tok) >= 5:
-            stem = tok[:-3]
-            if stem in GIRL_NAMES or (stem + "я") in GIRL_NAMES:
-                return True
     return False
 
 
-def is_cringe_girl_profile(lot: Lot) -> bool:
-    blob = f"{lot.seller or ''} {lot.first_name or ''} {lot.about or ''}"
-    return bool(_CRINGE_RE.search(blob))
+def _token_is_male(tok: str) -> bool:
+    if not tok or len(tok) < 2:
+        return False
+    if tok in _MALE_NAMES:
+        return True
+    if tok in GIRL_NAMES or tok in _GENERIC_NICK_WORDS:
+        return False
+    if len(tok) >= 4 and tok.endswith(_MALE_NAME_ENDINGS):
+        return True
+    return False
 
 
-def girl_score(lot: Lot) -> float:
-    """Сумма сигналов: ник, имя, био, ава, канал, подарки, сторис."""
-    if _looks_male_name_only(lot) and not is_ordinary_girl_name(lot):
-        return 0.0
-    score = 0.0
-    if is_ordinary_girl_name(lot):
-        score += 6.0
-    if _feminine_ending(lot):
-        score += 3.2
-    if is_cringe_girl_profile(lot):
-        score += 4.5
+def _first_name_tokens(lot: Lot) -> list[str]:
+    return [t for t in _name_tokens(lot.first_name or "") if t]
+
+
+def _other_name_tokens(lot: Lot) -> list[str]:
+    return [t for t in _name_tokens(lot.seller or "", lot.last_name or "") if t]
+
+
+def _is_male_seller(lot: Lot) -> bool:
+    """Пацан: мужское имя в first_name или, если имени нет, в нике."""
+    fn = _first_name_tokens(lot)
+    if any(_token_is_male(t) for t in fn):
+        return True
+    if any(_token_is_girl_name(t) for t in fn):
+        return False
+    if fn:
+        return False
+    if any(_token_is_male(t) for t in _other_name_tokens(lot)):
+        return True
     blob = " ".join(
         x
         for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
         if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
-        score += 3.0
-    if lot.has_photo is True:
-        score += 1.2
-    if lot.has_personal_channel is True:
-        score += 2.0
-    if lot.has_stories is True:
-        score += 2.2
-    gifts = lot.gifts_count
-    if gifts is not None:
-        if 1 <= gifts <= 12:
-            score += 1.4
-        elif gifts == 0:
-            score += 0.4
-    about = (lot.about or "").strip()
-    if about and _FEMALE_HINT_RE.search(about):
-        score += 1.5
-    if about and any(ch in about for ch in "💕🌸✨🎀🌷💋👑💅👩"):
-        score += 1.8
-    return score
+    )
+    return bool(_MALE_HINT_RE.search(blob))
+
+
+def is_ordinary_girl_name(lot: Lot) -> bool:
+    """Лера, Катя, Настюха — не Дима/Саша и не baby/queen в нике."""
+    if _is_male_seller(lot):
+        return False
+    fn = _first_name_tokens(lot)
+    if any(_token_is_girl_name(t) for t in fn):
+        return True
+    if fn:
+        return False
+    return any(_token_is_girl_name(t) for t in _other_name_tokens(lot))
+
+
+def is_cringe_girl_profile(lot: Lot) -> bool:
+    if _is_male_seller(lot):
+        return False
+    blob = f"{lot.seller or ''} {lot.first_name or ''} {lot.about or ''}"
+    return bool(_CRINGE_RE.search(blob))
 
 
 def matches_girl_criteria(lot: Lot) -> bool:
-    """Девушка: сильное имя/кринж ИЛИ набор сигналов профиля ≥ 4."""
-    if _looks_male_name_only(lot) and not is_ordinary_girl_name(lot):
+    """Только девушки: женское имя/ник или явно девчачий ник. Ава/канал/сторис не считаются."""
+    if _is_male_seller(lot):
         return False
-    if is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot):
-        return True
-    if _feminine_ending(lot) and girl_score(lot) >= 3.5:
-        return True
-    return girl_score(lot) >= 5.0
+    return is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot)
 
 
 def _looks_female(lot: Lot) -> bool:
     return matches_girl_criteria(lot)
 
 
-def _feminine_ending(lot: Lot) -> bool:
-    fn = (lot.first_name or "").strip().lower().replace("ё", "е")
-    if len(fn) < 3:
-        return False
-    if fn in _MALE_A_NAMES:
-        return False
-    if fn.endswith(_MALE_NAME_EXCEPTIONS):
-        return False
-    if fn.endswith(("ия", "ья", "ая", "ея", "ша", "ня")):
-        return True
-    if fn.endswith(("а", "я")):
-        return fn not in _MALE_A_NAMES
-    return False
-
-
-def _looks_male_name_only(lot: Lot) -> bool:
-    fn = (lot.first_name or "").strip().lower().replace("ё", "е")
-    if len(fn) >= 3 and fn.endswith(_MALE_NAME_EXCEPTIONS):
-        return True
-    if fn in _MALE_A_NAMES:
-        return True
-    if len(fn) >= 3 and fn.endswith(_MALE_NAME_ENDINGS):
-        return True
-    return False
-
-
 def _looks_male(lot: Lot) -> bool:
-    if is_ordinary_girl_name(lot):
-        return False
-    blob = " ".join(
-        x
-        for x in (lot.first_name or "", lot.last_name or "", lot.about or "", lot.seller or "")
-        if x
-    ).lower()
-    if _MALE_HINT_RE.search(blob):
-        return True
-    return _looks_male_name_only(lot)
+    return _is_male_seller(lot)
 
 
 def seller_persona(lot: Lot) -> str | None:
@@ -1198,7 +1172,7 @@ def seller_persona(lot: Lot) -> str | None:
 
 
 def passes_persona_filter(lot: Lot) -> str | None:
-    """Только девушки по критериям: Катя/Лера/Настюха или позорный профиль."""
+    """Только девушки: Катя/Лера/Настюха или девчачий ник. Пацанов нет."""
     if lot.is_premium is True:
         return "premium"
     if not matches_girl_criteria(lot):
@@ -1237,17 +1211,6 @@ def passes_loh_filter(
         return "pro"
     if about:
         return "pro"
-    return None
-
-
-def passes_persona_filter(lot: Lot) -> str | None:
-    """Только девушки: позорный/кринж профиль или обычное имя (Лера, Катя…)."""
-    if lot.is_premium is True:
-        return "premium"
-    if _looks_male(lot) and not _looks_female(lot):
-        return "persona"
-    if not _looks_female(lot):
-        return "persona"
     return None
 
 
@@ -1303,10 +1266,11 @@ def filter_for_post(
             if skip:
                 stats[skip] += 1
                 continue
-        skip = passes_persona_filter(lot)
-        if skip:
-            stats[skip] += 1
-            continue
+        if persona_mode:
+            skip = passes_persona_filter(lot)
+            if skip:
+                stats[skip] += 1
+                continue
         if strict_free:
             if lot.free_dm is not True:
                 if lot.free_dm is False:
@@ -1442,7 +1406,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.7"
+TRACKER_VERSION = "4.8"
 
 
 @dataclass
@@ -1601,7 +1565,7 @@ async def _watch_one_collection(
         )
         if accepted is None:
             continue
-        if _looks_male(accepted) and not is_ordinary_girl_name(accepted):
+        if _is_male_seller(accepted):
             seen[accepted.id] = now
             continue
         post_queue.enqueue([accepted])

@@ -51,6 +51,7 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
+DEFAULT_BOT_USERNAME = "jsjeigiejwhnewbot"
 # Канал для постов — можно переопределить CHANNEL_ID в env Bothost
 DEFAULT_CHANNEL_ID = -1003784435307
 DEFAULT_TARGET_CHANNEL = ""
@@ -155,8 +156,9 @@ async def wait_for_gift_ids(m: TelegramMarket) -> list[int]:
             return ids
         logger.error(
             "Коллекций 0 (попытка %s) — жду 30с. "
-            "Проверь: /start в @markskskdbot, сессия жива, аккаунт не в бане",
+            "Проверь: /start в @%s, сессия жива, аккаунт не в бане",
             attempt,
+            DEFAULT_BOT_USERNAME,
         )
         await asyncio.sleep(30)
     return []
@@ -1146,8 +1148,9 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
 
     if not await client.is_user_authorized():
         logger.warning(
-            "⚠️ Трекер v%s: нет сессии — войди через @markskskdbot /start",
+            "⚠️ Трекер v%s: нет сессии — войди через @%s /start",
             TRACKER_VERSION,
+            DEFAULT_BOT_USERNAME,
         )
         await bot.wait_login()
 

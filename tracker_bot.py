@@ -1,4 +1,4 @@
-"""@markskskdbot — вход, /status, /test (всегда онлайн)."""
+"""@jsjeigiejwhnewbot — вход, /status, /test (всегда онлайн)."""
 
 from __future__ import annotations
 
@@ -251,6 +251,8 @@ def build_router(
         if not await _authorized():
             await message.answer("Сначала /start")
             return
+        from tracker import DEFAULT_BOT_USERNAME
+
         if not control or not control.sender or not control.sender.chat_id:
             await message.answer("Канал ещё не готов — подожди запуска трекера.")
             return
@@ -277,7 +279,7 @@ def build_router(
         except Exception as exc:  # noqa: BLE001
             await message.answer(
                 f"❌ Не отправилось: {_esc(str(exc)[:200])}\n"
-                "Проверь: @markskskdbot — админ канала с правом публикации."
+                f"Проверь: @{DEFAULT_BOT_USERNAME} — админ канала с правом публикации."
             )
 
     @router.message(Command("resetseen"))

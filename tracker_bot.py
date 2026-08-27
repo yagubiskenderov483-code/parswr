@@ -292,13 +292,12 @@ def build_router(
             lines.append(
                 f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
             )
-            loh = getattr(cfg, "loh_mode", True)
-            max_gifts = getattr(cfg, "max_gifts_count", 3)
+            max_gifts = getattr(cfg, "max_gifts_count", 1)
             lines.append(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
-                f"лохи={'да' if loh else 'нет'} · "
-                f"lvl≤{getattr(cfg, 'max_account_level', 2)} · gifts≤{max_gifts}"
+                f"лохи lvl≤{getattr(cfg, 'max_account_level', 0)} · "
+                f"gifts≤{max_gifts} · турбо={'да' if getattr(cfg, 'turbo_scan', True) else 'нет'}"
             )
         if rt:
             lines.extend(

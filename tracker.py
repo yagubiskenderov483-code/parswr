@@ -185,21 +185,23 @@ class Config:
     bot_token: str
     target_channel: str
     min_stars: float = 500.0
-    max_stars: float = 2500.0  # дешёвые лоты (лохи не держат дорогие NFT)
-    poll_interval: float = 1.0  # чаще скан = быстрее ловим выставление
-    page_limit: int = 10  # верх resale-листа
-    parallel: int = 6  # быстрее обход коллекций (не выше 6)
-    gap: float = 0.2
-    timeout: float = 8.0
+    max_stars: float = 2000.0  # только совсем дешёвые
+    poll_interval: float = 0.4  # турбо-скан
+    page_limit: int = 6  # меньше ответ API = быстрее
+    parallel: int = 6
+    gap: float = 0.12
+    timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
-    scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 0  # 0 = все коллекции каждый проход (мгновенный лов)
-    hot_limit: int = 3  # только самые свежие на странице
-    max_account_level: int = 2  # level <= 2
-    loh_mode: bool = True  # только лохи: без TGP/профи/канала/высокого lvl
-    max_gifts_count: int = 3  # много NFT у продавца = профи, не лох
-    post_interval: float = 3.0  # сек между постами (не копим очередь)
+    scan_pages: int = 1
+    scan_batch: int = 0  # все коллекции каждый проход
+    hot_limit: int = 2  # только #1–#2 на resale = только что выставили
+    max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
+    loh_mode: bool = True
+    max_gifts_count: int = 1  # 0–1 подарок у продавца
+    fast_scan: bool = True  # без fallback на non-resale (быстрее)
+    turbo_scan: bool = True  # почти без паузы, если есть свежие
+    post_interval: float = 2.0
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -252,22 +254,24 @@ class Config:
             bot_token=bot_token,
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 2500),
-            poll_interval=_f("POLL_INTERVAL", 1.0),
-            page_limit=int(_f("PAGE_LIMIT", 10)),
+            max_stars=_f("MAX_STARS", 2000),
+            poll_interval=_f("POLL_INTERVAL", 0.4),
+            page_limit=int(_f("PAGE_LIMIT", 6)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.2),
-            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            gap=_f("REQUEST_GAP", 0.12),
+            timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
-            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 2))),
+            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
             loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
             or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
-            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 3))),
-            post_interval=_f("POST_INTERVAL", 3.0),
+            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
+            fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
+            turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
+            post_interval=_f("POST_INTERVAL", 2.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -386,7 +390,7 @@ class PostRateLimiter:
     def __init__(
         self, interval: float, lock_path: Path, timestamp_path: Path
     ) -> None:
-        self._interval = max(1.0, float(interval))
+        self._interval = max(0.5, float(interval))
         self._lock_path = lock_path
         self._ts_path = timestamp_path
         self._async_lock = asyncio.Lock()
@@ -720,7 +724,7 @@ async def _fetch_collection_pages(
         cfg.gap,
         cfg.timeout,
     )
-    if result is None:
+    if result is None and not cfg.fast_scan:
         result = await m._request(
             gid,
             cfg.page_limit,
@@ -833,10 +837,11 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Быстрый enrich одного лота (только недостающие поля)."""
+    """Быстрый enrich одного лота (короткие таймауты)."""
+    t = 1.8
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=2.5)
+            await m.resolve_owner(lot, timeout=t)
         except Exception:  # noqa: BLE001
             pass
     need_profile = lot.seller_id is not None and (
@@ -850,12 +855,12 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     )
     if need_profile:
         try:
-            await m.enrich_profiles([lot], timeout=2.5, parallel=1)
+            await m.enrich_profiles([lot], timeout=t, parallel=1)
         except Exception:  # noqa: BLE001
             pass
     if lot.free_dm is None and lot.seller_id is not None:
         try:
-            await m.check_free_dm([lot], timeout=2.5)
+            await m.check_free_dm([lot], timeout=t)
         except Exception:  # noqa: BLE001
             pass
 
@@ -914,7 +919,7 @@ def passes_account_level(
 def passes_loh_filter(
     lot: Lot, *, max_gifts: int, max_level: int
 ) -> str | None:
-    """Только лохи: без TGP, без высокого lvl, без профи с NFT/каналом."""
+    """Ультра-лохи: lvl 0, 0–1 gift, пустая ава, без био/канала/TGP."""
     if lot.is_premium is True:
         return "premium"
     lvl = lot.account_level
@@ -923,12 +928,15 @@ def passes_loh_filter(
     if lvl >= 0 and lvl > max_level:
         return "level"
     gifts = lot.gifts_count
-    if gifts is not None and gifts > max_gifts:
+    if gifts is None:
+        return "pro"
+    if gifts > max_gifts:
         return "pro"
     if lot.has_personal_channel is True:
         return "pro"
-    about = (lot.about or "").strip()
-    if len(about) > 80:
+    if lot.has_photo is True:
+        return "pro"
+    if (lot.about or "").strip():
         return "pro"
     return None
 
@@ -942,7 +950,7 @@ def filter_for_post(
     strict_free: bool = False,
     max_account_level: int = 2,
     loh_mode: bool = True,
-    max_gifts_count: int = 3,
+    max_gifts_count: int = 1,
 ) -> tuple[list[Lot], dict[str, int]]:
     """RU + лох-фильтр + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
@@ -1026,7 +1034,7 @@ class PostQueue:
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
-        self._interval = max(1.0, float(post_interval))
+        self._interval = max(0.5, float(post_interval))
         self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
             asyncio.PriorityQueue()
         )
@@ -1121,7 +1129,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.7"
+TRACKER_VERSION = "3.8"
 
 
 @dataclass
@@ -1327,7 +1335,11 @@ async def scanner_loop(
                 runtime.scan_parallel += 1
                 cfg.parallel = runtime.scan_parallel
 
-        await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
+        await asyncio.sleep(
+            0.03
+            if cfg.turbo_scan and fresh
+            else max(cfg.poll_interval - spent, 0.04)
+        )
 
 
 async def run() -> None:
@@ -1340,14 +1352,16 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Парсер лохов v%s · %s · RU=%s · %s–%s⭐ · lvl≤%s · gifts≤%s · scan=all · /%ss",
+        "✅ Парсер лохов v%s · %s · %s–%s⭐ · lvl≤%s · gifts≤%s · "
+        "турбо=%s · fast=%s · /%ss",
         TRACKER_VERSION,
         me.username or me.first_name,
-        "да" if cfg.strict_ru else "нет",
         int(cfg.min_stars),
         int(cfg.max_stars),
         cfg.max_account_level,
         cfg.max_gifts_count,
+        "да" if cfg.turbo_scan else "нет",
+        "да" if cfg.fast_scan else "нет",
         int(cfg.post_interval),
     )
     logger.warning(

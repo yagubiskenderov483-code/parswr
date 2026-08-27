@@ -86,6 +86,7 @@ class Lot:
     lang_code: str = ""
     has_photo: bool | None = None
     has_personal_channel: bool | None = None
+    has_stories: bool | None = None
     seen_at: float = field(default_factory=time.time)
     discovered_at: float = 0.0  # когда трекер впервые увидел лот
     listed_at: float = 0.0  # когда сменился #1 resale (детект «только что»)
@@ -804,6 +805,7 @@ class TelegramMarket:
                                 free_dm = False
                 has_photo: bool | None = None
                 has_channel: bool | None = None
+                has_stories: bool | None = None
                 if user_obj is not None:
                     photo = getattr(user_obj, "photo", None)
                     if photo is not None:
@@ -814,6 +816,12 @@ class TelegramMarket:
                         pch = getattr(uf, "personal_channel_message", None)
                     if pch is not None:
                         has_channel = bool(pch)
+                    sid = getattr(uf, "stories_max_id", None)
+                    pinned = getattr(uf, "stories_pinned", None)
+                    if sid or pinned:
+                        has_stories = True
+                    elif getattr(uf, "stories_unavailable", None) is False:
+                        has_stories = False
                 lot.about = about
                 if level is not None:
                     lot.account_level = level
@@ -827,6 +835,8 @@ class TelegramMarket:
                     lot.has_photo = has_photo
                 if has_channel is not None:
                     lot.has_personal_channel = has_channel
+                if has_stories is not None:
+                    lot.has_stories = has_stories
                 info = {
                     "username": lot.seller,
                     "first_name": lot.first_name,
@@ -839,6 +849,7 @@ class TelegramMarket:
                     "paid_dm_stars": paid_stars,
                     "has_photo": has_photo,
                     "has_personal_channel": has_channel,
+                    "has_stories": has_stories,
                 }
                 self._profile_cache[lot.seller_id] = info
 
@@ -1288,6 +1299,8 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
         lot.has_photo = bool(info["has_photo"])
     if info.get("has_personal_channel") is not None:
         lot.has_personal_channel = bool(info["has_personal_channel"])
+    if info.get("has_stories") is not None:
+        lot.has_stories = bool(info["has_stories"])
     if info.get("free_dm") is not None:
         lot.free_dm = bool(info["free_dm"])
     if info.get("paid_dm_stars") is not None:

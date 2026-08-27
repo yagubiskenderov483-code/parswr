@@ -60,10 +60,23 @@ def test_nikita_not_girl() -> None:
     assert not matches_girl_criteria(lot)
 
 
+def test_profile_signals() -> None:
+    lot = _lot(
+        first_name="Тома",
+        has_photo=True,
+        has_personal_channel=True,
+        has_stories=True,
+        gifts_count=2,
+        about="🎀",
+    )
+    assert matches_girl_criteria(lot)
+
+
 if __name__ == "__main__":
     test_ordinary_names()
     test_cringe_girl()
     test_male_skip()
     test_random_digits_not_girl()
     test_nikita_not_girl()
+    test_profile_signals()
     print("all ok")

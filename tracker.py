@@ -2,7 +2,7 @@
 Гифт-трекер внутреннего маркета Telegram.
 
 Ловит только что выставленные на перепродажу NFT-подарки (за Stars),
-фильтрует по цене MIN_STARS..MAX_STARS и постит карточки в канал.
+фильтрует по цене 5–15 TON (дешёвые лоты) и постит карточки в канал.
 
 Запуск:  python3 tracker.py
 Настройки берутся из .env (см. .env.example) или переменных окружения.
@@ -14,14 +14,16 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import random
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -45,16 +47,58 @@ from market import (
     is_russian_lot,
 )
 from tracker_bot import ChannelStore, ControlBot, channel_file_path
+from girl_names import GIRL_NAMES
 
 logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
-# Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
+DEFAULT_BOT_TOKEN = "8807847926:AAE-lxYXhBkuhSfJRQ3WcUFgwrf7P298je4"
+# Постоянная привязка — tracker market, не переопределяется
 DEFAULT_CHANNEL_ID = -1004384888475
+FIXED_CHANNEL_ID = -1004384888475
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
+
+# Дешёвые подарки: 5–15 TON. Stars считаются через TON_RATE.
+DEFAULT_TON_RATE = 0.0102
+DEFAULT_MIN_TON = 5.0
+DEFAULT_MAX_TON = 15.0
+
+
+def stars_from_ton(ton: float, rate: float = DEFAULT_TON_RATE) -> float:
+    """Stars за N TON при курсе TON за 1 Star."""
+    r = float(rate) if rate else DEFAULT_TON_RATE
+    if r <= 0:
+        r = DEFAULT_TON_RATE
+    return float(ton) / r
+
+
+def star_window_from_ton(min_ton: float, max_ton: float, rate: float) -> tuple[float, float]:
+    """Целые ⭐ на краях TON-окна: 5 TON → 490⭐, 15 TON → 1471⭐."""
+    lo = math.floor(stars_from_ton(min_ton, rate))
+    hi = math.ceil(stars_from_ton(max_ton, rate))
+    return float(lo), float(hi)
+
+
+DEFAULT_MIN_STARS, DEFAULT_MAX_STARS = star_window_from_ton(
+    DEFAULT_MIN_TON, DEFAULT_MAX_TON, DEFAULT_TON_RATE
+)
+
+
+def lot_ton(stars: float, rate: float = DEFAULT_TON_RATE) -> float:
+    r = float(rate) if rate else DEFAULT_TON_RATE
+    return float(stars) * r
+
+
+def in_cheap_ton_window(stars: float, cfg: "Config") -> bool:
+    """Только лоты 5–15 TON (или MIN_TON..MAX_TON из конфига)."""
+    price = float(stars)
+    if not (cfg.min_stars <= price <= cfg.max_stars):
+        return False
+    ton = lot_ton(price, cfg.ton_rate)
+    slack = max(float(cfg.ton_rate) or DEFAULT_TON_RATE, 0.01)
+    return (cfg.min_ton - slack) <= ton <= (cfg.max_ton + slack)
 
 
 def data_dir() -> Path:
@@ -115,27 +159,13 @@ def _save_catalog_file(gift_ids: list[int], hash_val: int = 0) -> None:
 
 
 def _setup_catalog_hooks(m: TelegramMarket) -> None:
-    """Кэш коллекций: gifts.db → tracker_catalog.json → сеть."""
+    """Только tracker_catalog.json — в gifts.db юзов не пишем."""
 
     def _load() -> tuple[list[int], int] | None:
-        cached = _load_catalog_file()
-        if cached:
-            return cached
-        try:
-            from db import GiftDB
-
-            return GiftDB().load_gift_catalog()
-        except Exception:  # noqa: BLE001
-            return None
+        return _load_catalog_file()
 
     def _save(ids: list[int], h: int) -> None:
         _save_catalog_file(ids, h)
-        try:
-            from db import GiftDB
-
-            GiftDB().save_gift_catalog(ids, h)
-        except Exception:  # noqa: BLE001
-            pass
 
     m.set_catalog_hooks(load_cb=_load, save_cb=_save)
 
@@ -184,21 +214,34 @@ class Config:
     session_string: str
     bot_token: str
     target_channel: str
-    min_stars: float = 500.0
-    max_stars: float = 5000.0
-    poll_interval: float = 2.0
-    page_limit: int = 12  # только верх resale-листа
-    parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.25
-    timeout: float = 10.0
+    min_ton: float = DEFAULT_MIN_TON
+    max_ton: float = DEFAULT_MAX_TON  # дороже 15 TON не постим
+    min_stars: float = DEFAULT_MIN_STARS  # ~490⭐ ≈ 5 TON
+    max_stars: float = DEFAULT_MAX_STARS  # ~1471⭐ ≈ 15 TON
+    poll_interval: float = 0.4  # турбо-скан
+    page_limit: int = 12  # верх resale, все id на странице = seen
+    parallel: int = 6
+    gap: float = 0.08
+    timeout: float = 4.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
-    scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 50  # ротация: не долбим все 149 колл за раз
-    hot_limit: int = 4  # топ-N = только что выставленные
-    max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
-    ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
+    scan_pages: int = 1
+    scan_batch: int = 36  # legacy; вотчеры не используют кольцо
+    hot_limit: int = 1  # только #1 на resale = только что выставили
+    watchers: int = 40  # задач после логина, каждая сидит на своих NFT
+    watch_parallel: int = 16  # одновременных GetResale
+    max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
+    loh_mode: bool = False  # без GetFullUser / без копилки юзов
+    skip_enrich: bool = False  # GetFullUser только для лота, в БД не пишем
+    persist_sellers: bool = False
+    max_gifts_count: int = 1
+    persona_mode: bool = True  # только девушки по имени из листинга
+    women_only: bool = True
+    female_mix_target: float = 1.0
+    fast_scan: bool = True
+    turbo_scan: bool = True
+    post_interval: float = 0.3
+    ton_rate: float = DEFAULT_TON_RATE  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
     state_file: str = ""
@@ -239,36 +282,59 @@ class Config:
         target = (
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
-        channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
-        channel_id: int | None = DEFAULT_CHANNEL_ID
-        if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
-            channel_id = int(channel_id_raw)
+        ton_rate = _f("TON_RATE", DEFAULT_TON_RATE) or DEFAULT_TON_RATE
+        min_ton = _f("MIN_TON", DEFAULT_MIN_TON)
+        max_ton = _f("MAX_TON", DEFAULT_MAX_TON)
+        if min_ton > max_ton:
+            min_ton, max_ton = max_ton, min_ton
+        derived_min, derived_max = star_window_from_ton(min_ton, max_ton, ton_rate)
+        # MIN_STARS/MAX_STARS из старого .env принимаем, но режем по TON-окну:
+        # leftover MAX_STARS=2000 (~20 TON) не должен пускать дорогие подарки.
+        min_stars = _f("MIN_STARS", derived_min)
+        max_stars = _f("MAX_STARS", derived_max)
+        min_stars = max(min_stars, derived_min)
+        max_stars = min(max_stars, derived_max)
+        if min_stars > max_stars:
+            min_stars, max_stars = derived_min, derived_max
         return cls(
             api_id=api_id,
             api_hash=api_hash,
             session_string=os.environ.get("SESSION_STRING", "").strip(),
             bot_token=bot_token,
             target_channel=target,
-            min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 5000),
-            poll_interval=_f("POLL_INTERVAL", 2.0),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
-            parallel=min(6, int(_f("PARALLEL", 4))),
-            gap=_f("REQUEST_GAP", 0.25),
-            timeout=_f("REQUEST_TIMEOUT", 10.0),
+            min_ton=min_ton,
+            max_ton=max_ton,
+            min_stars=min_stars,
+            max_stars=max_stars,
+            poll_interval=_f("POLL_INTERVAL", 0.12),
+            page_limit=max(8, min(20, int(_f("PAGE_LIMIT", 12)))),
+            parallel=min(6, int(_f("PARALLEL", 6))),
+            gap=_f("REQUEST_GAP", 0.02),
+            timeout=_f("REQUEST_TIMEOUT", 2.5),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 50)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
-            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            post_interval=_f("POST_INTERVAL", 4.0),
-            ton_rate=_f("TON_RATE", 0.0102),
+            scan_batch=int(_f("SCAN_BATCH", 36)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
+            watchers=max(1, min(60, int(_f("WATCHERS", 40)))),
+            watch_parallel=max(2, min(20, int(_f("WATCH_PARALLEL", 16)))),
+            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
+            loh_mode=os.environ.get("TRACKER_LOH_MODE", "0") == "1",
+            skip_enrich=os.environ.get("TRACKER_SKIP_ENRICH", "0") == "1",
+            persist_sellers=os.environ.get("TRACKER_PERSIST_SELLERS", "0") == "1",
+            max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
+            persona_mode=os.environ.get("TRACKER_PERSONA_MODE", "1") == "1",
+            women_only=os.environ.get("TRACKER_WOMEN_ONLY", "1") == "1",
+            female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 1.0))),
+            fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
+            turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
+            post_interval=_f("POST_INTERVAL", 0.3),
+            ton_rate=ton_rate,
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
-            channel_id=channel_id,
+            channel_id=FIXED_CHANNEL_ID,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
         )
@@ -278,6 +344,7 @@ class Config:
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
 SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
+HEAD_EMPTY = "__empty__"  # коллекция без лотов на resale
 
 
 def load_state(path: Path) -> dict:
@@ -287,10 +354,11 @@ def load_state(path: Path) -> dict:
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
             data.setdefault("channel_id", None)
+            data.setdefault("collection_heads", {})
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "seen_sellers": {}, "channel_id": None}
+    return {"seen": {}, "seen_sellers": {}, "channel_id": None, "collection_heads": {}}
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -381,7 +449,7 @@ class PostRateLimiter:
     def __init__(
         self, interval: float, lock_path: Path, timestamp_path: Path
     ) -> None:
-        self._interval = max(1.0, float(interval))
+        self._interval = max(0.15, float(interval))
         self._lock_path = lock_path
         self._ts_path = timestamp_path
         self._async_lock = asyncio.Lock()
@@ -534,6 +602,23 @@ async def find_channel_in_dialogs(client: TelegramClient) -> int | None:
     return None
 
 
+def pin_fixed_channel(
+    store: Any,
+    state: dict,
+    state_path: Path,
+    sender: Any | None = None,
+) -> int:
+    """Всегда канал tracker market — не зависит от env/файла/setchannel."""
+    cid = int(FIXED_CHANNEL_ID)
+    store.save(cid)
+    state["channel_id"] = cid
+    save_state(state_path, state)
+    if sender is not None:
+        sender.chat_id = cid
+    logger.info("Канал привязан навсегда: %s", cid)
+    return cid
+
+
 async def obtain_channel_id(
     client: TelegramClient,
     cfg: Config,
@@ -541,57 +626,8 @@ async def obtain_channel_id(
     state_path: Path,
     store: Any,
 ) -> int:
-    """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
-    if cfg.channel_id:
-        cid = int(cfg.channel_id)
-        store.save(cid)
-        state["channel_id"] = cid
-        save_state(state_path, state)
-        logger.info("Канал из CHANNEL_ID: %s", cid)
-        return cid
-
-    saved = store.load()
-    if saved is not None:
-        state["channel_id"] = saved
-        save_state(state_path, state)
-        logger.info("Канал из файла: %s", saved)
-        return saved
-
-    if state.get("channel_id"):
-        cid = int(state["channel_id"])
-        store.save(cid)
-        logger.info("Канал из state: %s", cid)
-        return cid
-
-    while True:
-        if cfg.target_channel.strip():
-            try:
-                cid = await resolve_channel(client, cfg.target_channel)
-                store.save(cid)
-                state["channel_id"] = cid
-                save_state(state_path, state)
-                return cid
-            except SystemExit as exc:
-                logger.warning("resolve_channel: %s", exc)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("resolve_channel: %s", exc)
-
-        found = await find_channel_in_dialogs(client)
-        if found is not None:
-            store.save(found)
-            state["channel_id"] = found
-            save_state(state_path, state)
-            return found
-
-        logger.warning(
-            "Канал не задан. Открой @markskskdbot → /channels или "
-            "/setchannel @имя_канала (жду 60с…)"
-        )
-        waited = await store.wait(timeout=60.0)
-        if waited is not None:
-            state["channel_id"] = waited
-            save_state(state_path, state)
-            return waited
+    """Всегда FIXED_CHANNEL_ID (-1004384888475)."""
+    return pin_fixed_channel(store, state, state_path)
 
 
 async def resolve_channel(client: TelegramClient, raw: str) -> int:
@@ -696,7 +732,7 @@ def _select_scan_batch(
     take = min(n, cfg.scan_batch)
     batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
     m._cursor = (m._cursor + take) % n
-    return batch
+    return batch  # кольцо без shuffle — быстрый круг
 
 
 async def _fetch_collection_pages(
@@ -704,8 +740,8 @@ async def _fetch_collection_pages(
     gid: int,
     cfg: Config,
     stats: dict[str, int],
-) -> list[Lot]:
-    """Только page1 resale; fallback без двойного счёта ошибок."""
+) -> list[Lot] | None:
+    """Только page1 resale по свежести (без sort_by_price). None = ошибка API."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
     result = await m._request(
         gid,
@@ -715,7 +751,7 @@ async def _fetch_collection_pages(
         cfg.gap,
         cfg.timeout,
     )
-    if result is None:
+    if result is None and not cfg.fast_scan:
         result = await m._request(
             gid,
             cfg.page_limit,
@@ -727,8 +763,7 @@ async def _fetch_collection_pages(
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
-        return []
-    m._remember_users(market_mod._extract_users(result))
+        return None
     parsed = market_mod._parse_result(result)
     if parsed:
         stats["parsed"] += len(parsed)
@@ -736,50 +771,116 @@ async def _fetch_collection_pages(
     return parsed
 
 
+def _collect_fresh_lot(
+    lot: Lot,
+    i: int,
+    gid: int,
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    cfg: Config,
+    *,
+    baseline: bool,
+    now: float,
+) -> Lot | None:
+    """Пост только если #1 — id, которого мы никогда не видели. Сдвиг очереди ≠ новый лот."""
+    head_key = str(gid)
+    if i >= cfg.hot_limit:
+        seen[lot.id] = now
+        return None
+
+    if baseline:
+        if i == 0:
+            collection_heads[head_key] = lot.id
+        seen[lot.id] = now
+        return None
+
+    if i != 0:
+        seen[lot.id] = now
+        return None
+
+    prev_head = collection_heads.get(head_key)
+    in_range = in_cheap_ton_window(lot.stars, cfg)
+
+    # Ещё не было успешного скана этой коллекции — запомнить, не постить
+    if prev_head is None:
+        collection_heads[head_key] = lot.id
+        seen[lot.id] = now
+        return None
+
+    if prev_head == lot.id:
+        return None
+
+    # Смена #1: продан верх / новый листинг / смена цены
+    collection_heads[head_key] = lot.id
+
+    if lot.id in seen:
+        # Это старый лот, который всплыл наверх — не «только что выставили»
+        return None
+    if not in_range:
+        seen[lot.id] = now
+        return None
+
+    lot.discovered_at = now
+    lot.listed_at = now
+    return lot
+
+
 async def poll_once(
     m: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
+    collection_heads: dict[str, str],
     cfg: Config,
     *,
     baseline: bool,
+    on_lot: Callable[[Lot], None] | None = None,
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
-    """Проход по коллекциям (ротация batch) — лоты в диапазоне MIN..MAX."""
+    """Проход по коллекциям — лоты в очередь сразу по мере нахождения."""
     started = time.monotonic()
     api_stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
     batch = _select_scan_batch(gift_ids, m, cfg, baseline=baseline)
     sem = asyncio.Semaphore(cfg.parallel)
 
-    async def one(gid: int) -> list[Lot]:
+    async def one(gid: int) -> tuple[int, list[Lot] | BaseException]:
         async with sem:
-            return await _fetch_collection_pages(m, gid, cfg, api_stats)
+            try:
+                return gid, await _fetch_collection_pages(m, gid, cfg, api_stats)
+            except BaseException as exc:
+                return gid, exc
 
-    chunks = await asyncio.gather(
-        *(one(g) for g in batch), return_exceptions=True
-    )
-    now = time.time()
     fresh: list[Lot] = []
     exc_errors = 0
-    for gid, lots in zip(batch, chunks):
-        if isinstance(lots, BaseException):
+    tasks = [asyncio.create_task(one(g)) for g in batch]
+    for fut in asyncio.as_completed(tasks):
+        gid, result = await fut
+        if isinstance(result, BaseException):
             exc_errors += 1
-            logger.warning("коллекция %s: %s", gid, lots)
+            logger.warning("коллекция %s: %s", gid, result)
             continue
-        for i, lot in enumerate(lots):
-            if i >= cfg.hot_limit:
-                if lot.id not in seen:
-                    seen[lot.id] = now
-                continue
-            if lot.id in seen:
-                continue
-            if baseline:
-                seen[lot.id] = now
-                continue
-            if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
-                seen[lot.id] = now
-                continue
-            lot.discovered_at = now
-            fresh.append(lot)
+        now = time.time()
+        if result is None:
+            continue
+        if not result:
+            if baseline or str(gid) in collection_heads:
+                collection_heads[str(gid)] = HEAD_EMPTY
+            continue
+        for extra in result[1:]:
+            seen[extra.id] = now
+        accepted = _collect_fresh_lot(
+            result[0],
+            0,
+            gid,
+            seen,
+            collection_heads,
+            cfg,
+            baseline=baseline,
+            now=now,
+        )
+        if accepted is None:
+            continue
+        fresh.append(accepted)
+        if on_lot is not None:
+            on_lot(accepted)
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
         "parsed": api_stats.get("parsed", 0),
@@ -805,26 +906,28 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Быстрый enrich одного лота (только недостающие поля)."""
+    """Быстрый enrich: resolve → profile+DM параллельно."""
+    t = 1.0
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=2.5)
+            await m.resolve_owner(lot, timeout=t)
         except Exception:  # noqa: BLE001
             pass
-    need_profile = lot.seller_id is not None and (
-        lot.account_level is None
-        or lot.free_dm is None
+    if not lot.seller_id:
+        return
+    need_profile = (
+        not (lot.first_name or "").strip()
+        or lot.account_level is None
         or lot.is_premium is None
+        or lot.has_photo is None
+        or lot.has_personal_channel is None
+        or lot.has_stories is None
+        or lot.gifts_count is None
         or (cfg.strict_ru and not lot.lang_code)
     )
     if need_profile:
         try:
-            await m.enrich_profiles([lot], timeout=2.5, parallel=1)
-        except Exception:  # noqa: BLE001
-            pass
-    if lot.free_dm is None and lot.seller_id is not None:
-        try:
-            await m.check_free_dm([lot], timeout=2.5)
+            await m.enrich_profiles([lot], timeout=t, parallel=1)
         except Exception:  # noqa: BLE001
             pass
 
@@ -868,14 +971,419 @@ def mark_processed_lots(
     return retry
 
 
-def passes_account_level(lot: Lot, max_level: int) -> bool:
+def passes_account_level(
+    lot: Lot, max_level: int, *, require_known: bool = False
+) -> bool:
     """Level <= max или отрицательный рейтинг (как у Parser Gift)."""
     lvl = lot.account_level
     if lvl is None:
-        return True
+        return not require_known
     if lvl < 0:
         return True
     return lvl <= max_level
+
+
+# Не имена: слишком часто у пацанов в никах.
+_GENERIC_NICK_WORDS = frozenset(
+    """
+    baby kitty queen angel princess sweety cutie babe babygirl
+    princessa kittycat angelbaby dummy lolita sweet xxx
+    """.split()
+)
+# Короткий латин в нике (tom/max/alex) — не повод резать девушку; в first_name — да.
+_AMBIGUOUS_MALE = frozenset(
+    """
+    tom dan bob max alex john jake paul chris david andrew peter
+    mark vlad mike paul
+    """.split()
+)
+_CRINGE_RE = re.compile(
+    r"(💕|🎀|💅|👩|💄|"
+    r"милаш|зайка|зайчик|киса|киска|солныш|няша|няшка|лапочка|"
+    r"принцесс|куколк|малышк|девоч|девуш|she/her|lolita)",
+    re.IGNORECASE,
+)
+_MALE_HINT_RE = re.compile(
+    r"(пацан|братан|\bbro\b|\bboy\b|мужик|батя|качок|мотоцик|байкер)",
+    re.IGNORECASE,
+)
+_MALE_NAME_ENDINGS = (
+    "ий", "ей", "ёр", "ор", "ур", "им", "ом", "ен", "он", "ун",
+)
+_MALE_NAMES = frozenset(
+    """
+    никита никитка илья ильюха фома кузьма савва данила данил даниил лука
+    дима димка димон димуля дмитрий
+    рома ромка роман
+    коля колька николай
+    вова вован володя вовка владимир
+    саша сашка шура александр
+    паша пашка павел
+    миша мишка михаил
+    ваня ванюша иван
+    женя евгений
+    леша леха алеша алексей
+    юра юрка юрий
+    степа степка степан
+    толя толик анатолий
+    витя витек виктор
+    боря борис
+    гоша гриша григорий
+    слава вячеслав
+    жора георгий
+    лева лев
+    тима тимофей
+    федя федор
+    петя петр
+    сеня семен
+    костя константин
+    вася васек василий
+    макс максим
+    кирилл егор олег денис игорь артем андрей сергей
+    матвей марк тимур руслан богдан ярослав глеб захар платон
+    антон арсений владислав гордей
+    семен серафим ростислав святослав доброслав
+    dima dimka dimon dmitry dmitri dmitrii
+    roma roman romka
+    kolya kolyan nikolay nikolai
+    vova vovan volodya vladimir
+    sasha sashka alexander alexandr
+    pasha pashka pavel
+    misha mishka mikhail
+    vanya ivan
+    zhenya evgeny evgeniy
+    lesha lyosha alexey alexei
+    yura yuriy yuri
+    stepa stepan
+    tolya tolik
+    vitya viktor victor
+    borya boris
+    gosha grisha
+    slava
+    tima timofey
+    fedya
+    petya petr
+    kostya
+    vasya vasiliy
+    maxim maksim
+    kirill egor yegor oleg denis igor artem andrey andrei sergey sergei
+    matvey timur ruslan bogdan gleb anton
+    danila danil
+    nikita ilya
+    """.split()
+)
+_NAME_CLEAN_RE = re.compile(r"[^a-zа-яё]+", re.IGNORECASE)
+_FEM_SURNAME_RE = re.compile(
+    r"(ова|ева|ёва|ина|ына|ая|ская|цкая)$", re.IGNORECASE
+)
+_FEM_EMOJI = frozenset("💕🎀💅👩💄🌸🌷💋👑🩷💗💖💞💓😻🌺🦄🩷")
+_STRONG_FEM_EMOJI = frozenset("💅👩💄🎀💕")
+# phonetic small-caps / IPA letters NFKC не раскрывает
+_SMALLCAPS = str.maketrans(
+    {
+        "ᴀ": "a",
+        "ʙ": "b",
+        "ᴄ": "c",
+        "ᴅ": "d",
+        "ᴇ": "e",
+        "ғ": "f",
+        "ɢ": "g",
+        "ʜ": "h",
+        "ɪ": "i",
+        "ᴊ": "j",
+        "ᴋ": "k",
+        "ʟ": "l",
+        "ᴍ": "m",
+        "ɴ": "n",
+        "ᴏ": "o",
+        "ᴘ": "p",
+        "ʀ": "r",
+        "ꜱ": "s",
+        "ᴛ": "t",
+        "ᴜ": "u",
+        "ᴠ": "v",
+        "ᴡ": "w",
+        "ʏ": "y",
+        "ᴢ": "z",
+        "а": "а",
+    }
+)
+
+
+def _map_fancy_char(ch: str) -> str:
+    o = ord(ch)
+    if 0x1F170 <= o <= 0x1F189:  # 🅰🅱…🅹
+        return chr(ord("A") + (o - 0x1F170))
+    if 0x1F130 <= o <= 0x1F149:  # 🄰…
+        return chr(ord("A") + (o - 0x1F130))
+    if 0x24B6 <= o <= 0x24CF:  # Ⓐ-Ⓩ
+        return chr(ord("A") + (o - 0x24B6))
+    if 0x24D0 <= o <= 0x24E9:  # ⓐ-ⓩ
+        return chr(ord("a") + (o - 0x24D0))
+    return ch
+
+
+def unstylize_text(text: str) -> str:
+    """𝒦𝒶𝓉𝓎𝒶 / ᴋᴀᴛʏᴀ / К̸а̸т̸я → обычные буквы."""
+    if not text:
+        return ""
+    raw = unicodedata.normalize("NFKC", text).translate(_SMALLCAPS)
+    out: list[str] = []
+    for ch in raw:
+        cat = unicodedata.category(ch)
+        if cat in {"Mn", "Me", "Cf"}:
+            continue
+        out.append(_map_fancy_char(ch))
+    return "".join(out)
+
+
+def _norm_person_text(text: str) -> str:
+    return unstylize_text(text).strip().lower().replace("ё", "е")
+
+
+def _name_tokens(*parts: str) -> list[str]:
+    out: list[str] = []
+    for p in parts:
+        raw = _norm_person_text(p or "")
+        if not raw:
+            continue
+        out.append(raw)
+        tok = _NAME_CLEAN_RE.sub(" ", raw)
+        out.extend(x for x in tok.split() if x)
+    seen: set[str] = set()
+    clean: list[str] = []
+    for t in out:
+        if t in seen or len(t) < 2:
+            continue
+        seen.add(t)
+        clean.append(t)
+    return clean
+
+
+def _token_is_girl_name(tok: str) -> bool:
+    if not tok or tok in _GENERIC_NICK_WORDS or tok in _MALE_NAMES:
+        return False
+    if tok in GIRL_NAMES:
+        return True
+    if tok.endswith("уха") and len(tok) >= 5:
+        stem = tok[:-3]
+        if stem in _MALE_NAMES:
+            return False
+        if stem in GIRL_NAMES or (stem + "я") in GIRL_NAMES:
+            return True
+    return False
+
+
+def _token_is_male(tok: str, *, username: bool = False) -> bool:
+    if not tok or len(tok) < 2:
+        return False
+    if username and (tok in _AMBIGUOUS_MALE or len(tok) <= 3):
+        return False
+    if tok in _MALE_NAMES:
+        return True
+    if tok in GIRL_NAMES or tok in _GENERIC_NICK_WORDS:
+        return False
+    if username:
+        return False
+    if len(tok) >= 4 and tok.endswith(_MALE_NAME_ENDINGS):
+        return True
+    return False
+
+
+def _first_name_tokens(lot: Lot) -> list[str]:
+    return [t for t in _name_tokens(lot.first_name or "") if t]
+
+
+def _other_name_tokens(lot: Lot) -> list[str]:
+    return [t for t in _name_tokens(lot.seller or "", lot.last_name or "") if t]
+
+
+def _feminine_first_name(lot: Lot) -> bool:
+    """Катя/Лера и неизвестные женские на а/я. Не Дима/Саша."""
+    words = [
+        t
+        for t in _NAME_CLEAN_RE.sub(
+            " ", _norm_person_text(lot.first_name or "")
+        ).split()
+        if len(t) >= 3
+    ]
+    if not words:
+        return False
+    name = words[0]
+    if _token_is_male(name) or name in _MALE_NAMES:
+        return False
+    if _token_is_girl_name(name):
+        return True
+    return name.endswith(("а", "я", "ия", "ья", "ша", "ня"))
+
+
+def _feminine_surname(lot: Lot) -> bool:
+    ln = _NAME_CLEAN_RE.sub("", _norm_person_text(lot.last_name or ""))
+    if len(ln) < 4:
+        return False
+    if _token_is_male(ln):
+        return False
+    return bool(_FEM_SURNAME_RE.search(ln))
+
+
+def _lot_text_blob(lot: Lot) -> str:
+    return " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.seller or "",
+            lot.about or "",
+        )
+        if x
+    )
+
+
+def girl_profile_score(lot: Lot) -> tuple[float, int]:
+    """Очки по аве/био/каналу/сторис/TGP/эмодзи. strong — явно девчачьи маркеры."""
+    blob = unstylize_text(_lot_text_blob(lot))
+    score = 0.0
+    strong = 0
+    emojis = [ch for ch in blob if ch in _FEM_EMOJI]
+    if any(ch in _STRONG_FEM_EMOJI for ch in emojis):
+        strong += 1
+        score += 3.0 + min(1.6, 0.4 * max(0, len(emojis) - 1))
+    elif len(emojis) >= 2:
+        strong += 1
+        score += 2.4
+    elif len(emojis) == 1:
+        score += 1.0
+    if _CRINGE_RE.search(blob):
+        strong += 1
+        score += 3.2
+    if _feminine_surname(lot):
+        strong += 1
+        score += 3.0
+    if lot.has_photo is True:
+        score += 1.2
+    if lot.has_personal_channel is True:
+        score += 1.8
+    if lot.has_stories is True:
+        score += 1.4
+    gifts = lot.gifts_count
+    if gifts is not None and 1 <= gifts <= 24:
+        score += 1.6
+    return score, strong
+
+
+def _profile_looks_girl(lot: Lot) -> bool:
+    """Ник не женский — смотрим аву, био, канал, TGP, эмодзи. Без дев.маркера не пускаем."""
+    score, strong = girl_profile_score(lot)
+    if strong >= 1 and score >= 4.0:
+        return True
+    if strong >= 1 and len([ch for ch in unstylize_text(_lot_text_blob(lot)) if ch in _FEM_EMOJI]) >= 2:
+        return True
+    return False
+
+
+def _is_male_seller(lot: Lot) -> bool:
+    fn = _first_name_tokens(lot)
+    if any(_token_is_male(t) for t in fn):
+        return True
+    if any(_token_is_girl_name(t) for t in fn) or _feminine_first_name(lot):
+        return False
+    if any(_token_is_male(t, username=True) for t in _other_name_tokens(lot)):
+        return True
+    blob = f"{lot.about or ''} {lot.seller or ''}"
+    return bool(_MALE_HINT_RE.search(blob)) and not any(
+        _token_is_girl_name(t) for t in _other_name_tokens(lot)
+    )
+
+
+def is_ordinary_girl_name(lot: Lot) -> bool:
+    """Женское имя в карточке или в нике. Мужское first_name — нет."""
+    fn = _first_name_tokens(lot)
+    if any(_token_is_male(t) for t in fn):
+        return False
+    if any(_token_is_girl_name(t) for t in fn):
+        return True
+    if _feminine_first_name(lot):
+        return True
+    if any(_token_is_male(t, username=True) for t in _other_name_tokens(lot)):
+        return False
+    return any(_token_is_girl_name(t) for t in _other_name_tokens(lot))
+
+
+def is_cringe_girl_profile(lot: Lot) -> bool:
+    if _is_male_seller(lot):
+        return False
+    blob = unstylize_text(_lot_text_blob(lot))
+    return bool(_CRINGE_RE.search(blob))
+
+
+def matches_girl_criteria(lot: Lot) -> bool:
+    """Девушка: имя (в т.ч. шрифтом), ник, либо ава+био+канал+TGP+эмодзи."""
+    if _is_male_seller(lot):
+        return False
+    if is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot):
+        return True
+    if _feminine_surname(lot):
+        return True
+    return _profile_looks_girl(lot)
+
+
+def _looks_female(lot: Lot) -> bool:
+    return matches_girl_criteria(lot)
+
+
+def _looks_male(lot: Lot) -> bool:
+    return _is_male_seller(lot)
+
+
+def seller_persona(lot: Lot) -> str | None:
+    if matches_girl_criteria(lot):
+        return "female"
+    if _looks_male(lot):
+        return "male"
+    return None
+
+
+def passes_persona_filter(lot: Lot) -> str | None:
+    """Только девушки: Катя/Лера/Настюха или девчачий ник. Пацанов нет."""
+    if lot.is_premium is True:
+        return "premium"
+    if not matches_girl_criteria(lot):
+        return "persona"
+    return None
+
+
+def passes_loh_filter(
+    lot: Lot, *, max_gifts: int, max_level: int
+) -> str | None:
+    """Лохи: без TGP, низкий lvl, мало gifts, без канала.
+    Обычные женские имена (Катя/Лера) — ава/короткое био ок.
+    Позорный профиль — пустая ава / кринж-ник."""
+    if lot.is_premium is True:
+        return "premium"
+    lvl = lot.account_level
+    if lvl is None:
+        return "level"
+    if lvl >= 0 and lvl > max_level:
+        return "level"
+    gifts = lot.gifts_count
+    if gifts is None:
+        return "pro"
+    if gifts > max_gifts:
+        return "pro"
+    if lot.has_personal_channel is True:
+        return "pro"
+    ordinary = is_ordinary_girl_name(lot)
+    cringe = is_cringe_girl_profile(lot)
+    about = (lot.about or "").strip()
+    if ordinary or cringe:
+        if len(about) > 80:
+            return "pro"
+        return None
+    if lot.has_photo is True:
+        return "pro"
+    if about:
+        return "pro"
+    return None
 
 
 def filter_for_post(
@@ -886,8 +1394,11 @@ def filter_for_post(
     strict_ru: bool = True,
     strict_free: bool = False,
     max_account_level: int = 2,
+    loh_mode: bool = True,
+    max_gifts_count: int = 1,
+    persona_mode: bool = True,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """RU + level + бесплатные ЛС + один раз на продавца."""
+    """RU + лох + персоны + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
     stats = {
@@ -897,6 +1408,9 @@ def filter_for_post(
         "paid": 0,
         "unknown_dm": 0,
         "level": 0,
+        "premium": 0,
+        "pro": 0,
+        "persona": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -905,16 +1419,30 @@ def filter_for_post(
             continue
         if key in used:
             continue
-        prev = seen_sellers.get(key)
+        prev = seen_sellers.get(key) if seen_sellers else None
         if prev is not None and now - float(prev) < SELLER_TTL:
             stats["dup"] += 1
             continue
-        if strict_ru and not is_russian_lot(lot):
+        if strict_ru and not is_russian_lot(lot) and not _looks_female(lot):
             stats["non_ru"] += 1
             continue
-        if not passes_account_level(lot, max_account_level):
-            stats["level"] += 1
-            continue
+        if loh_mode:
+            if not passes_account_level(
+                lot, max_account_level, require_known=True
+            ):
+                stats["level"] += 1
+                continue
+            skip = passes_loh_filter(
+                lot, max_gifts=max_gifts_count, max_level=max_account_level
+            )
+            if skip:
+                stats[skip] += 1
+                continue
+        if persona_mode:
+            skip = passes_persona_filter(lot)
+            if skip:
+                stats[skip] += 1
+                continue
         if strict_free:
             if lot.free_dm is not True:
                 if lot.free_dm is False:
@@ -930,52 +1458,9 @@ def filter_for_post(
     return out, stats
 
 
-_FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀)",
-    re.IGNORECASE,
-)
-
-def _looks_female(lot: Lot) -> bool:
-    blob = " ".join(
-        x
-        for x in (
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        )
-        if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
-        return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
-        if fn.endswith(("ия", "ья", "на", "та", "са", "ка", "ла", "ра", "ва", "ша")):
-            return True
-        if fn[-1] in "ая":
-            return True
-    return False
-
-
-def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
-    """Выше = раньше в очереди. Без TGP в приоритете, девочки — иногда."""
-    score = random.random() * 0.3
-    if lot.is_premium is False:
-        score += 4.0
-    elif lot.is_premium is True:
-        score -= 3.0
-    if lot.free_dm is True:
-        score += 1.5
-    elif lot.free_dm is False:
-        score -= 5.0
-    if boost_female and _looks_female(lot):
-        score += 2.5
-    return score
-
-
-def rank_for_queue(lots: list[Lot]) -> list[Lot]:
-    """Сначала самые свежие (только что увидели на маркете)."""
-    return sorted(lots, key=lambda lot: -float(lot.discovered_at or 0))
+def _queue_priority(lot: Lot, cfg: Config, runtime: "TrackerRuntime") -> float:
+    """Свежее = выше. Девушки всегда первые."""
+    return -float(lot.listed_at or lot.discovered_at or time.time())
 
 
 class PostQueue:
@@ -1001,7 +1486,7 @@ class PostQueue:
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
-        self._interval = max(1.0, float(post_interval))
+        self._interval = max(0.15, float(post_interval))
         self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
             asyncio.PriorityQueue()
         )
@@ -1032,18 +1517,15 @@ class PostQueue:
     def enqueue(self, lots: list[Lot]) -> int:
         if not lots:
             return 0
-        for lot in rank_for_queue(lots):
+        for lot in lots:
             self._seq += 1
-            prio = -float(lot.discovered_at or time.time())
+            prio = _queue_priority(lot, self._cfg, self._runtime)
             self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
 
     async def _drip_worker(self) -> None:
-        logger.info(
-            "Drip: свежие первые · enrich+send /%ss (сканер параллельно)",
-            int(self._interval),
-        )
+        logger.info("Drip: сразу в канал, без БД/профилей · /%.1fs", self._interval)
         while not self._closed:
             _, _, lot = await self._pq.get()
             if lot is None:
@@ -1051,19 +1533,26 @@ class PostQueue:
             try:
                 await enrich_one(self._m, lot, self._cfg)
                 now = time.time()
+                sellers = self._seen_sellers if self._cfg.persist_sellers else {}
                 to_post, fstats = filter_for_post(
                     [lot],
-                    self._seen_sellers,
+                    sellers,
                     now=now,
                     strict_ru=self._cfg.strict_ru,
-                    strict_free=self._cfg.strict_free,
+                    strict_free=False,
                     max_account_level=self._cfg.max_account_level,
+                    loh_mode=self._cfg.loh_mode and not self._cfg.skip_enrich,
+                    max_gifts_count=self._cfg.max_gifts_count,
+                    persona_mode=True,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
+                self._runtime.last_skip_premium = fstats["premium"]
+                self._runtime.last_skip_pro = fstats["pro"]
+                self._runtime.last_skip_persona = fstats["persona"]
                 if not to_post:
                     if lot.seller_key:
                         self._seen[lot.id] = now
@@ -1071,20 +1560,17 @@ class PostQueue:
                 lot = to_post[0]
                 await self._sender.send(lot)
                 self._seen[lot.id] = now
-                key = lot.seller_key
-                if key:
-                    self._seen_sellers[key] = now
-                self._state["seen_sellers"] = self._seen_sellers
-                save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
+                if seller_persona(lot) == "female":
+                    self._runtime.posted_female += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
+                    "В канал: %s за %s⭐ (%s) · +%.2fs · очередь %s",
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
+                    time.time() - float(lot.discovered_at or time.time()),
                     self.pending,
-                    format_account_level(lot),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
@@ -1092,7 +1578,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.4"
+TRACKER_VERSION = "5.0"
 
 
 @dataclass
@@ -1101,6 +1587,7 @@ class TrackerRuntime:
 
     passes: int = 0
     posted_total: int = 0
+    posted_female: int = 0
     last_fresh: int = 0
     last_posted: int = 0
     last_skip_ru: int = 0
@@ -1108,6 +1595,9 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    last_skip_premium: int = 0
+    last_skip_pro: int = 0
+    last_skip_persona: int = 0
     scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0
@@ -1117,6 +1607,7 @@ class TrackerRuntime:
     last_scan_errors: int = 0
     last_scan_elapsed: float = 0.0
     last_api_error: str = ""
+    watchers_alive: int = 0
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -1201,92 +1692,241 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
     return client, bot
 
 
-async def scanner_loop(
+def watcher_slice(gift_ids: list[int], worker_id: int, watchers: int) -> list[int]:
+    """NFT, на которых сидит задача worker_id из watchers."""
+    if watchers <= 0:
+        return list(gift_ids)
+    return list(gift_ids[worker_id::watchers])
+
+
+async def _watch_one_collection(
+    m: TelegramMarket,
+    gid: int,
+    cfg: Config,
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    post_queue: PostQueue,
+    *,
+    baseline: bool,
+) -> tuple[int, int]:
+    """Один запрос resale #1. Возвращает (parsed, fresh)."""
+    stats: dict[str, int] = {"errors": 0, "floods": 0, "parsed": 0, "ok": 0}
+    try:
+        lots = await _fetch_collection_pages(m, gid, cfg, stats)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("NFT %s: %s", gid, exc)
+        return 0, 0
+    now = time.time()
+    if lots is None:
+        return int(stats.get("parsed", 0)), 0
+    if not lots:
+        if baseline or str(gid) in collection_heads:
+            collection_heads[str(gid)] = HEAD_EMPTY
+        return int(stats.get("parsed", 0)), 0
+    for extra in lots[1:]:
+        seen[extra.id] = now
+    accepted = _collect_fresh_lot(
+        lots[0],
+        0,
+        gid,
+        seen,
+        collection_heads,
+        cfg,
+        baseline=baseline,
+        now=now,
+    )
+    if accepted is None:
+        return int(stats.get("parsed", 0) or len(lots)), 0
+    fn = _first_name_tokens(accepted)
+    if fn and any(_token_is_male(t) for t in fn):
+        seen[accepted.id] = now
+        return int(stats.get("parsed", 0) or len(lots)), 0
+    post_queue.enqueue([accepted])
+    return int(stats.get("parsed", 0) or len(lots)), 1
+
+
+async def collection_watcher(
+    worker_id: int,
     m: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
+    collection_heads: dict[str, str],
+    cfg: Config,
+    post_queue: PostQueue,
+    runtime: TrackerRuntime,
+    api_sem: asyncio.Semaphore,
+) -> None:
+    """После логина: запомнить #1, потом сидеть на своих NFT и ловить смену головы."""
+    mine = watcher_slice(gift_ids, worker_id, cfg.watchers)
+    if not mine:
+        return
+    logger.info("Задача %s/%s: сижу на %s NFT", worker_id + 1, cfg.watchers, len(mine))
+    runtime.watchers_alive += 1
+    try:
+        for gid in mine:
+            async with api_sem:
+                await _watch_one_collection(
+                    m, gid, cfg, seen, collection_heads, post_queue, baseline=True
+                )
+            await asyncio.sleep(0.002)
+
+        pass_no = 0
+        while True:
+            mine = watcher_slice(gift_ids, worker_id, cfg.watchers)
+            if not mine:
+                await asyncio.sleep(0.2)
+                continue
+            started = time.monotonic()
+            parsed = 0
+            fresh = 0
+            errors = 0
+            for gid in mine:
+                async with api_sem:
+                    try:
+                        p, f = await _watch_one_collection(
+                            m,
+                            gid,
+                            cfg,
+                            seen,
+                            collection_heads,
+                            post_queue,
+                            baseline=False,
+                        )
+                        parsed += p
+                        fresh += f
+                    except Exception:  # noqa: BLE001
+                        errors += 1
+            pass_no += 1
+            runtime.passes += 1
+            runtime.seen_lots = len(seen)
+            runtime.last_scan_parsed = parsed
+            runtime.last_scan_errors = errors
+            runtime.last_scan_elapsed = round(time.monotonic() - started, 2)
+            runtime.last_scan_batch = len(mine)
+            runtime.queue_pending = post_queue.pending
+            if fresh:
+                runtime.last_fresh = fresh
+                runtime.last_posted = fresh
+                logger.info(
+                    "Задача %s: +%s новых → канал сразу · очередь %s · %ss",
+                    worker_id + 1,
+                    fresh,
+                    post_queue.pending,
+                    runtime.last_scan_elapsed,
+                )
+            elif pass_no % 40 == 0 and worker_id == 0:
+                logger.info(
+                    "Вотчеры живы %s · колл %s · очередь %s",
+                    runtime.watchers_alive,
+                    len(gift_ids),
+                    post_queue.pending,
+                )
+            await asyncio.sleep(0.0)
+    finally:
+        runtime.watchers_alive = max(0, runtime.watchers_alive - 1)
+
+
+async def watch_supervisor(
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
     cfg: Config,
     post_queue: PostQueue,
     runtime: TrackerRuntime,
     state_path: Path,
     state: dict,
 ) -> None:
-    """Быстрый скан всех коллекций (page1, hot_limit) — сразу в очередь без enrich."""
+    """40 задач на NFT + периодический сейв state и обновление каталога."""
+    runtime.scan_parallel = cfg.watch_parallel
+    api_sem = asyncio.Semaphore(cfg.watch_parallel)
+    workers = [
+        asyncio.create_task(
+            collection_watcher(
+                i,
+                m,
+                gift_ids,
+                seen,
+                collection_heads,
+                cfg,
+                post_queue,
+                runtime,
+                api_sem,
+            ),
+            name=f"nft-watch-{i}",
+        )
+        for i in range(cfg.watchers)
+    ]
+    logger.info(
+        "Стартовал %s задач на %s NFT (parallel≤%s) — жду новые лоты",
+        cfg.watchers,
+        len(gift_ids),
+        cfg.watch_parallel,
+    )
     catalog_refreshed = time.monotonic()
-    pass_no = 0
-    while True:
-        started = time.monotonic()
-        pass_no += 1
-        runtime.passes = pass_no
-        runtime.seen_lots = len(seen)
-        try:
-            fresh, scan = await poll_once(m, gift_ids, seen, cfg, baseline=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Проход упал: %s", exc)
-            await asyncio.sleep(2)
-            continue
-
-        runtime.last_scan_batch = int(scan.get("batch_size", 0))
-        runtime.last_scan_parsed = int(scan.get("parsed", 0))
-        runtime.last_scan_errors = int(scan.get("errors", 0))
-        runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
-        if runtime.last_scan_errors:
-            runtime.last_api_error = m.last_error or ""
-
-        runtime.last_fresh = len(fresh)
-        if fresh:
-            n = post_queue.enqueue(fresh)
-            runtime.queue_pending = post_queue.pending
-            runtime.last_posted = n
-            logger.info(
-                "Проход #%s: +%s свежих → очередь +%s (ждут %s · %ss)",
-                pass_no,
-                len(fresh),
-                n,
-                post_queue.pending,
-                scan.get("elapsed", "?"),
-            )
-        elif pass_no % 10 == 0:
-            logger.info(
-                "Проход #%s: скан %s/%s колл · %s лотов · +0 "
-                "(err=%s · %ss)",
-                pass_no,
-                scan.get("batch_size", "?"),
-                scan.get("collections_total", "?"),
-                scan.get("parsed", 0),
-                scan.get("errors", 0),
-                scan.get("elapsed", "?"),
-            )
-
-        save_state(state_path, state)
-
-        if time.monotonic() - catalog_refreshed > 600:
-            try:
-                gift_ids[:] = await m.load_collections(force=True)
-                runtime.collections_total = len(gift_ids)
-                catalog_refreshed = time.monotonic()
-            except Exception:  # noqa: BLE001
-                pass
-
-        spent = time.monotonic() - started
-        scanned = int(scan.get("scanned", 0) or 0)
-        errors = int(scan.get("errors", 0) or 0)
-        if scanned > 0:
-            ratio = errors / scanned
-            if ratio > 0.35 and runtime.scan_parallel > 4:
-                runtime.scan_parallel -= 1
-                cfg.parallel = runtime.scan_parallel
-                logger.warning(
-                    "Много ошибок API (%s/%s) — parallel=%s",
-                    errors,
-                    scanned,
-                    runtime.scan_parallel,
+    last_save = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(4.0)
+            if time.monotonic() - last_save > 8.0:
+                save_state(state_path, state)
+                last_save = time.monotonic()
+            if time.monotonic() - catalog_refreshed > 600:
+                try:
+                    gift_ids[:] = await m.load_collections(force=True)
+                    runtime.collections_total = len(gift_ids)
+                    catalog_refreshed = time.monotonic()
+                except Exception:  # noqa: BLE001
+                    pass
+            dead = [t for t in workers if t.done()]
+            for t in dead:
+                exc = t.exception() if not t.cancelled() else None
+                if exc:
+                    logger.error("Вотчер упал: %s", exc)
+                idx = workers.index(t)
+                workers[idx] = asyncio.create_task(
+                    collection_watcher(
+                        idx,
+                        m,
+                        gift_ids,
+                        seen,
+                        collection_heads,
+                        cfg,
+                        post_queue,
+                        runtime,
+                        api_sem,
+                    ),
+                    name=f"nft-watch-{idx}",
                 )
-            elif ratio < 0.12 and runtime.scan_parallel < 6:
-                runtime.scan_parallel += 1
-                cfg.parallel = runtime.scan_parallel
+    finally:
+        for t in workers:
+            t.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
-        await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
+
+async def scanner_loop(
+    m: TelegramMarket,
+    gift_ids: list[int],
+    seen: dict[str, float],
+    collection_heads: dict[str, str],
+    cfg: Config,
+    post_queue: PostQueue,
+    runtime: TrackerRuntime,
+    state_path: Path,
+    state: dict,
+) -> None:
+    """Совместимость: теперь это пул вотчеров, не кольцевой скан."""
+    await watch_supervisor(
+        m,
+        gift_ids,
+        seen,
+        collection_heads,
+        cfg,
+        post_queue,
+        runtime,
+        state_path,
+        state,
+    )
 
 
 async def run() -> None:
@@ -1299,12 +1939,12 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · parallel≤%s · batch=%s",
+        "✅ Парсер v%s · %s · %s вотчеров · канал %s · пост /%ss",
         TRACKER_VERSION,
         me.username or me.first_name,
-        "да" if cfg.strict_ru else "нет",
-        cfg.parallel,
-        cfg.scan_batch or "все",
+        cfg.watchers,
+        FIXED_CHANNEL_ID,
+        int(cfg.post_interval),
     )
     logger.warning(
         "Сессия: один инстанс Bothost; не жми /start повторно; "
@@ -1315,15 +1955,17 @@ async def run() -> None:
     state = load_state(state_path)
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
+    collection_heads: dict[str, str] = state.setdefault("collection_heads", {})
 
-    chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
+    chat_id = pin_fixed_channel(store, state, state_path)
     logger.info(
-        "Канал для постинга: %s · диапазон %s–%s⭐ · пост /%ss · RU=%s",
+        "Канал: %s (постоянно) · %.0f–%.0f TON (%s–%s⭐) · %s задач на NFT",
         chat_id,
+        cfg.min_ton,
+        cfg.max_ton,
         int(cfg.min_stars),
         int(cfg.max_stars),
-        cfg.post_interval,
-        "строго" if cfg.strict_ru else "нет",
+        cfg.watchers,
     )
 
     runtime = TrackerRuntime(
@@ -1366,34 +2008,30 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
-        "Коллекций: %s · scan page1 hot=%s · все колл/проход · drip %ss · lvl≤%s",
+        "Коллекций: %s · вотчеров %s · каждый сидит на ~%s NFT · пост /%ss",
         len(gift_ids),
-        cfg.hot_limit,
+        cfg.watchers,
+        max(1, (len(gift_ids) + cfg.watchers - 1) // cfg.watchers),
         int(cfg.post_interval),
-        cfg.max_account_level,
     )
 
     runtime.collections_total = len(gift_ids)
+    pin_fixed_channel(store, state, state_path, sender)
 
-    baseline = not seen and not cfg.post_on_first_run
-    if baseline:
-        logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
-        _, baseline_stats = await poll_once(
-            m, gift_ids, seen, cfg, baseline=True
-        )
-        save_state(state_path, state)
-        logger.info(
-            "Запомнено %s лотов (скан %s колл · %ss). Слежу за новыми.",
-            len(seen),
-            baseline_stats.get("scanned", "?"),
-            baseline_stats.get("elapsed", "?"),
-        )
-
+    logger.info("Логин ок — копирую %s задач, запоминаю текущие #1, потом жду новые", cfg.watchers)
     scan_task = asyncio.create_task(
-        scanner_loop(
-            m, gift_ids, seen, cfg, post_queue, runtime, state_path, state
+        watch_supervisor(
+            m,
+            gift_ids,
+            seen,
+            collection_heads,
+            cfg,
+            post_queue,
+            runtime,
+            state_path,
+            state,
         ),
-        name="scanner",
+        name="watch-pool",
     )
     try:
         await scan_task

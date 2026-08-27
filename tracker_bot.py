@@ -232,26 +232,16 @@ def build_router(
         if not await _authorized():
             await message.answer("Сначала /start и войди в аккаунт.")
             return
-        arg = (message.text or "").split(maxsplit=1)
-        if len(arg) < 2:
-            await message.answer(
-                "Использование:\n"
-                "<code>/setchannel @mychannel</code>\n"
-                "<code>/setchannel -100123456789</code>"
-            )
-            return
-        try:
-            cid = await parse_channel_arg(client, arg[1])
-        except Exception as exc:  # noqa: BLE001
-            await message.answer(f"⚠️ Не нашёл канал: {exc}")
-            return
+        cid = -1004384888475
         store.save(cid)
         if control:
             if control.runtime is not None:
                 control.runtime.channel_id = cid
             if control.sender is not None:
                 control.sender.chat_id = cid
-        await message.answer(f"✅ Канал задан: <code>{cid}</code>")
+        await message.answer(
+            f"Канал привязан навсегда: <code>{cid}</code>"
+        )
 
     @router.message(Command("channels"))
     async def cmd_channels(message: Message) -> None:
@@ -286,31 +276,38 @@ def build_router(
         lines = [
             f"✅ Трекер v{tracker_version}",
             f"Аккаунт: {name}",
-            f"Канал: <code>{cid or 'не задан'}</code>",
+            f"Канал: <code>{cid or -1004384888475}</code>",
         ]
         if cfg:
             lines.append(
-                f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
+                f"Диапазон: {cfg.min_ton:g}–{cfg.max_ton:g} TON "
+                f"({int(cfg.min_stars)}–{int(cfg.max_stars)}⭐)"
             )
             lines.append(
-                f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
-                f"free={'строго' if cfg.strict_free else 'не платные'} · "
-                f"lvl≤{getattr(cfg, 'max_account_level', 2)}"
+                f"Фильтры: девушки по имени/шрифту/аве/био/каналу/TGP/эмодзи"
             )
         if rt:
             lines.extend(
                 [
                     f"Проходов: {rt.passes}",
-                    f"Коллекций: {rt.collections_total or '—'} "
-                    f"(parallel {rt.scan_parallel or 8})",
+                    f"Коллекций: {rt.collections_total or '—'} · "
+                    f"вотчеров {getattr(rt, 'watchers_alive', 0)}/"
+                    f"{getattr(cfg, 'watchers', 40) if cfg else 40} "
+                    f"(api≤{rt.scan_parallel or 12})",
                     f"Последний скан: {rt.last_scan_batch} колл · "
                     f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
-                    f"Всего отправлено: {rt.posted_total}",
+                    f"Всего отправлено: {rt.posted_total}"
+                    + (
+                        f" (дев≈{int(100 * rt.posted_female / max(rt.posted_total, 1))}%)"
+                        if rt.posted_total
+                        else ""
+                    ),
                     f"В очереди: {rt.queue_pending}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
-                    f"lvl−{rt.last_skip_level}",
+                    f"lvl−{rt.last_skip_level} premium−{rt.last_skip_premium} "
+                    f"pro−{rt.last_skip_pro} persona−{rt.last_skip_persona}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )

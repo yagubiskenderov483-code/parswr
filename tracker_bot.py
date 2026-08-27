@@ -284,7 +284,7 @@ def build_router(
                 f"({int(cfg.min_stars)}–{int(cfg.max_stars)}⭐)"
             )
             lines.append(
-                f"Фильтры: только девушки по имени/нику; лоты только что выставленные"
+                f"Фильтры: девушки по имени/шрифту/аве/био/каналу/TGP/эмодзи"
             )
         if rt:
             lines.extend(

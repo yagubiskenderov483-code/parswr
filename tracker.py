@@ -19,6 +19,7 @@ import os
 import random
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -906,7 +907,7 @@ async def poll_once(
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     """Быстрый enrich: resolve → profile+DM параллельно."""
-    t = 0.75
+    t = 1.0
     if not lot.seller or lot.seller_id is None:
         try:
             await m.resolve_owner(lot, timeout=t)
@@ -920,7 +921,8 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         or lot.is_premium is None
         or lot.has_photo is None
         or lot.has_personal_channel is None
-        or (cfg.loh_mode and lot.gifts_count is None)
+        or lot.has_stories is None
+        or lot.gifts_count is None
         or (cfg.strict_ru and not lot.lang_code)
     )
     if need_profile:
@@ -1071,18 +1073,83 @@ _MALE_NAMES = frozenset(
     """.split()
 )
 _NAME_CLEAN_RE = re.compile(r"[^a-zа-яё]+", re.IGNORECASE)
+_FEM_SURNAME_RE = re.compile(
+    r"(ова|ева|ёва|ина|ына|ая|ская|цкая)$", re.IGNORECASE
+)
+_FEM_EMOJI = frozenset("💕🎀💅👩💄🌸🌷💋👑🩷💗💖💞💓😻🌺🦄🩷")
+_STRONG_FEM_EMOJI = frozenset("💅👩💄🎀💕")
+# phonetic small-caps / IPA letters NFKC не раскрывает
+_SMALLCAPS = str.maketrans(
+    {
+        "ᴀ": "a",
+        "ʙ": "b",
+        "ᴄ": "c",
+        "ᴅ": "d",
+        "ᴇ": "e",
+        "ғ": "f",
+        "ɢ": "g",
+        "ʜ": "h",
+        "ɪ": "i",
+        "ᴊ": "j",
+        "ᴋ": "k",
+        "ʟ": "l",
+        "ᴍ": "m",
+        "ɴ": "n",
+        "ᴏ": "o",
+        "ᴘ": "p",
+        "ʀ": "r",
+        "ꜱ": "s",
+        "ᴛ": "t",
+        "ᴜ": "u",
+        "ᴠ": "v",
+        "ᴡ": "w",
+        "ʏ": "y",
+        "ᴢ": "z",
+        "а": "а",
+    }
+)
+
+
+def _map_fancy_char(ch: str) -> str:
+    o = ord(ch)
+    if 0x1F170 <= o <= 0x1F189:  # 🅰🅱…🅹
+        return chr(ord("A") + (o - 0x1F170))
+    if 0x1F130 <= o <= 0x1F149:  # 🄰…
+        return chr(ord("A") + (o - 0x1F130))
+    if 0x24B6 <= o <= 0x24CF:  # Ⓐ-Ⓩ
+        return chr(ord("A") + (o - 0x24B6))
+    if 0x24D0 <= o <= 0x24E9:  # ⓐ-ⓩ
+        return chr(ord("a") + (o - 0x24D0))
+    return ch
+
+
+def unstylize_text(text: str) -> str:
+    """𝒦𝒶𝓉𝓎𝒶 / ᴋᴀᴛʏᴀ / К̸а̸т̸я → обычные буквы."""
+    if not text:
+        return ""
+    raw = unicodedata.normalize("NFKC", text).translate(_SMALLCAPS)
+    out: list[str] = []
+    for ch in raw:
+        cat = unicodedata.category(ch)
+        if cat in {"Mn", "Me", "Cf"}:
+            continue
+        out.append(_map_fancy_char(ch))
+    return "".join(out)
+
+
+def _norm_person_text(text: str) -> str:
+    return unstylize_text(text).strip().lower().replace("ё", "е")
 
 
 def _name_tokens(*parts: str) -> list[str]:
     out: list[str] = []
     for p in parts:
-        raw = (p or "").strip().lower().replace("ё", "е")
+        raw = _norm_person_text(p or "")
         if not raw:
             continue
         out.append(raw)
         tok = _NAME_CLEAN_RE.sub(" ", raw)
         out.extend(x for x in tok.split() if x)
-    # уникальные, короткие служебные выкидываем
     seen: set[str] = set()
     clean: list[str] = []
     for t in out:
@@ -1136,7 +1203,7 @@ def _feminine_first_name(lot: Lot) -> bool:
     words = [
         t
         for t in _NAME_CLEAN_RE.sub(
-            " ", (lot.first_name or "").strip().lower().replace("ё", "е")
+            " ", _norm_person_text(lot.first_name or "")
         ).split()
         if len(t) >= 3
     ]
@@ -1148,6 +1215,70 @@ def _feminine_first_name(lot: Lot) -> bool:
     if _token_is_girl_name(name):
         return True
     return name.endswith(("а", "я", "ия", "ья", "ша", "ня"))
+
+
+def _feminine_surname(lot: Lot) -> bool:
+    ln = _NAME_CLEAN_RE.sub("", _norm_person_text(lot.last_name or ""))
+    if len(ln) < 4:
+        return False
+    if _token_is_male(ln):
+        return False
+    return bool(_FEM_SURNAME_RE.search(ln))
+
+
+def _lot_text_blob(lot: Lot) -> str:
+    return " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.seller or "",
+            lot.about or "",
+        )
+        if x
+    )
+
+
+def girl_profile_score(lot: Lot) -> tuple[float, int]:
+    """Очки по аве/био/каналу/сторис/TGP/эмодзи. strong — явно девчачьи маркеры."""
+    blob = unstylize_text(_lot_text_blob(lot))
+    score = 0.0
+    strong = 0
+    emojis = [ch for ch in blob if ch in _FEM_EMOJI]
+    if any(ch in _STRONG_FEM_EMOJI for ch in emojis):
+        strong += 1
+        score += 3.0 + min(1.6, 0.4 * max(0, len(emojis) - 1))
+    elif len(emojis) >= 2:
+        strong += 1
+        score += 2.4
+    elif len(emojis) == 1:
+        score += 1.0
+    if _CRINGE_RE.search(blob):
+        strong += 1
+        score += 3.2
+    if _feminine_surname(lot):
+        strong += 1
+        score += 3.0
+    if lot.has_photo is True:
+        score += 1.2
+    if lot.has_personal_channel is True:
+        score += 1.8
+    if lot.has_stories is True:
+        score += 1.4
+    gifts = lot.gifts_count
+    if gifts is not None and 1 <= gifts <= 24:
+        score += 1.6
+    return score, strong
+
+
+def _profile_looks_girl(lot: Lot) -> bool:
+    """Ник не женский — смотрим аву, био, канал, TGP, эмодзи. Без дев.маркера не пускаем."""
+    score, strong = girl_profile_score(lot)
+    if strong >= 1 and score >= 4.0:
+        return True
+    if strong >= 1 and len([ch for ch in unstylize_text(_lot_text_blob(lot)) if ch in _FEM_EMOJI]) >= 2:
+        return True
+    return False
 
 
 def _is_male_seller(lot: Lot) -> bool:
@@ -1181,15 +1312,19 @@ def is_ordinary_girl_name(lot: Lot) -> bool:
 def is_cringe_girl_profile(lot: Lot) -> bool:
     if _is_male_seller(lot):
         return False
-    blob = f"{lot.seller or ''} {lot.first_name or ''} {lot.about or ''}"
+    blob = unstylize_text(_lot_text_blob(lot))
     return bool(_CRINGE_RE.search(blob))
 
 
 def matches_girl_criteria(lot: Lot) -> bool:
-    """Девушка: имя/женское окончание/девчачий ник. Не ава и не ✨ в био."""
+    """Девушка: имя (в т.ч. шрифтом), ник, либо ава+био+канал+TGP+эмодзи."""
     if _is_male_seller(lot):
         return False
-    return is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot)
+    if is_ordinary_girl_name(lot) or is_cringe_girl_profile(lot):
+        return True
+    if _feminine_surname(lot):
+        return True
+    return _profile_looks_girl(lot)
 
 
 def _looks_female(lot: Lot) -> bool:
@@ -1443,7 +1578,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.9"
+TRACKER_VERSION = "5.0"
 
 
 @dataclass

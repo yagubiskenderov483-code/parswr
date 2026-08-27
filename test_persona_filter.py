@@ -7,6 +7,7 @@ from tracker import (
     is_ordinary_girl_name,
     matches_girl_criteria,
     passes_persona_filter,
+    unstylize_text,
 )
 
 
@@ -136,6 +137,44 @@ def test_kate_is_girl() -> None:
     assert matches_girl_criteria(lot)
 
 
+def test_stylized_fonts() -> None:
+    assert unstylize_text("𝒦𝒶𝓉𝓎𝒶") == "Katya"
+    assert unstylize_text("𝕃𝕖𝕣𝕒") == "Lera"
+    assert "Катя" in unstylize_text("К̸а̸т̸я̸")
+    lot = _lot(first_name="𝒦𝒶𝓉𝓎𝒶", seller="qwe123")
+    assert is_ordinary_girl_name(lot)
+    assert passes_persona_filter(lot) is None
+    lot2 = _lot(first_name="", seller="ᴋᴀᴛʏᴀ")
+    assert is_ordinary_girl_name(lot2)
+    lot3 = _lot(first_name="🅺🅰🆃🆈🅰", seller="x")
+    assert is_ordinary_girl_name(lot3)
+
+
+def test_stylized_male_still_blocked() -> None:
+    lot = _lot(first_name="𝒟𝒾𝓂𝒶", seller="x")
+    assert not matches_girl_criteria(lot)
+
+
+def test_profile_bundle_without_girl_nick() -> None:
+    """Ник не женский, но ава+канал+TGP+эмодзи — девушка."""
+    lot = _lot(
+        first_name="",
+        seller="qwe12345",
+        has_photo=True,
+        has_personal_channel=True,
+        has_stories=True,
+        gifts_count=3,
+        about="💅",
+    )
+    assert matches_girl_criteria(lot)
+    assert passes_persona_filter(lot) is None
+
+
+def test_surname_ova() -> None:
+    lot = _lot(first_name="", last_name="Иванова", seller="user99")
+    assert matches_girl_criteria(lot)
+
+
 def test_profile_signals_with_girl_name() -> None:
     lot = _lot(
         first_name="Тома",
@@ -163,5 +202,9 @@ if __name__ == "__main__":
     test_username_checked_if_first_name_unknown()
     test_sparkles_do_not_make_a_boy_a_girl()
     test_kate_is_girl()
+    test_stylized_fonts()
+    test_stylized_male_still_blocked()
+    test_profile_bundle_without_girl_nick()
+    test_surname_ova()
     test_profile_signals_with_girl_name()
     print("all ok")

@@ -116,27 +116,13 @@ def _save_catalog_file(gift_ids: list[int], hash_val: int = 0) -> None:
 
 
 def _setup_catalog_hooks(m: TelegramMarket) -> None:
-    """Кэш коллекций: gifts.db → tracker_catalog.json → сеть."""
+    """Только tracker_catalog.json — в gifts.db юзов не пишем."""
 
     def _load() -> tuple[list[int], int] | None:
-        cached = _load_catalog_file()
-        if cached:
-            return cached
-        try:
-            from db import GiftDB
-
-            return GiftDB().load_gift_catalog()
-        except Exception:  # noqa: BLE001
-            return None
+        return _load_catalog_file()
 
     def _save(ids: list[int], h: int) -> None:
         _save_catalog_file(ids, h)
-        try:
-            from db import GiftDB
-
-            GiftDB().save_gift_catalog(ids, h)
-        except Exception:  # noqa: BLE001
-            pass
 
     m.set_catalog_hooks(load_cb=_load, save_cb=_save)
 
@@ -200,14 +186,16 @@ class Config:
     watchers: int = 40  # задач после логина, каждая сидит на своих NFT
     watch_parallel: int = 16  # одновременных GetResale
     max_account_level: int = 0  # lvl 0 или минус; lvl 1+ = уже не лох
-    loh_mode: bool = True
-    max_gifts_count: int = 1  # 0–1 подарок у продавца
-    persona_mode: bool = True  # только девушки
+    loh_mode: bool = False  # без GetFullUser / без копилки юзов
+    skip_enrich: bool = True  # лот сразу в канал, профили не качаем
+    persist_sellers: bool = False
+    max_gifts_count: int = 1
+    persona_mode: bool = True  # только девушки по имени из листинга
     women_only: bool = True
     female_mix_target: float = 1.0
-    fast_scan: bool = True  # без fallback на non-resale (быстрее)
+    fast_scan: bool = True
     turbo_scan: bool = True
-    post_interval: float = 1.0  # быстрее в канал; детектор — в ту же секунду
+    post_interval: float = 0.3
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -270,15 +258,16 @@ class Config:
             watchers=max(1, min(60, int(_f("WATCHERS", 40)))),
             watch_parallel=max(2, min(20, int(_f("WATCH_PARALLEL", 16)))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 0)),
-            loh_mode=os.environ.get("TRACKER_LOH_MODE", "1") == "1"
-            or os.environ.get("TRACKER_NOOB_MODE", "1") == "1",
+            loh_mode=os.environ.get("TRACKER_LOH_MODE", "0") == "1",
+            skip_enrich=os.environ.get("TRACKER_SKIP_ENRICH", "1") != "0",
+            persist_sellers=os.environ.get("TRACKER_PERSIST_SELLERS", "0") == "1",
             max_gifts_count=max(0, int(_f("MAX_GIFTS_COUNT", 1))),
             persona_mode=os.environ.get("TRACKER_PERSONA_MODE", "1") == "1",
             women_only=os.environ.get("TRACKER_WOMEN_ONLY", "1") == "1",
             female_mix_target=min(1.0, max(0.0, _f("FEMALE_MIX_TARGET", 1.0))),
             fast_scan=os.environ.get("TRACKER_FAST_SCAN", "1") == "1",
             turbo_scan=os.environ.get("TRACKER_TURBO_SCAN", "1") == "1",
-            post_interval=_f("POST_INTERVAL", 1.0),
+            post_interval=_f("POST_INTERVAL", 0.3),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -399,7 +388,7 @@ class PostRateLimiter:
     def __init__(
         self, interval: float, lock_path: Path, timestamp_path: Path
     ) -> None:
-        self._interval = max(0.5, float(interval))
+        self._interval = max(0.15, float(interval))
         self._lock_path = lock_path
         self._ts_path = timestamp_path
         self._async_lock = asyncio.Lock()
@@ -714,7 +703,6 @@ async def _fetch_collection_pages(
     if result is None:
         stats["errors"] += 1
         return []
-    m._remember_users(market_mod._extract_users(result))
     parsed = market_mod._parse_result(result)
     if parsed:
         stats["parsed"] += len(parsed)
@@ -1173,19 +1161,19 @@ def filter_for_post(
             continue
         if key in used:
             continue
-        prev = seen_sellers.get(key)
+        prev = seen_sellers.get(key) if seen_sellers else None
         if prev is not None and now - float(prev) < SELLER_TTL:
             stats["dup"] += 1
             continue
-        if strict_ru and not is_russian_lot(lot):
+        if strict_ru and not is_russian_lot(lot) and not _looks_female(lot):
             stats["non_ru"] += 1
             continue
-        if not passes_account_level(
-            lot, max_account_level, require_known=loh_mode
-        ):
-            stats["level"] += 1
-            continue
         if loh_mode:
+            if not passes_account_level(
+                lot, max_account_level, require_known=True
+            ):
+                stats["level"] += 1
+                continue
             skip = passes_loh_filter(
                 lot, max_gifts=max_gifts_count, max_level=max_account_level
             )
@@ -1240,7 +1228,7 @@ class PostQueue:
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
-        self._interval = max(0.5, float(post_interval))
+        self._interval = max(0.15, float(post_interval))
         self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
             asyncio.PriorityQueue()
         )
@@ -1279,25 +1267,24 @@ class PostQueue:
         return len(lots)
 
     async def _drip_worker(self) -> None:
-        logger.info(
-            "Drip: свежие первые · enrich+send /%ss (сканер параллельно)",
-            int(self._interval),
-        )
+        logger.info("Drip: сразу в канал, без БД/профилей · /%.1fs", self._interval)
         while not self._closed:
             _, _, lot = await self._pq.get()
             if lot is None:
                 break
             try:
-                await enrich_one(self._m, lot, self._cfg)
+                if not self._cfg.skip_enrich:
+                    await enrich_one(self._m, lot, self._cfg)
                 now = time.time()
+                sellers = self._seen_sellers if self._cfg.persist_sellers else {}
                 to_post, fstats = filter_for_post(
                     [lot],
-                    self._seen_sellers,
+                    sellers,
                     now=now,
                     strict_ru=self._cfg.strict_ru,
-                    strict_free=self._cfg.strict_free,
+                    strict_free=False,
                     max_account_level=self._cfg.max_account_level,
-                    loh_mode=self._cfg.loh_mode,
+                    loh_mode=self._cfg.loh_mode and not self._cfg.skip_enrich,
                     max_gifts_count=self._cfg.max_gifts_count,
                     persona_mode=self._cfg.persona_mode,
                 )
@@ -1316,25 +1303,17 @@ class PostQueue:
                 lot = to_post[0]
                 await self._sender.send(lot)
                 self._seen[lot.id] = now
-                key = lot.seller_key
-                if key:
-                    self._seen_sellers[key] = now
-                self._state["seen_sellers"] = self._seen_sellers
-                save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
                 if seller_persona(lot) == "female":
                     self._runtime.posted_female += 1
                 self._runtime.queue_pending = self.pending
-                persona = seller_persona(lot) or "?"
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · %s · +%.2fs · очередь %s · lvl %s",
+                    "В канал: %s за %s⭐ (%s) · +%.2fs · очередь %s",
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
-                    persona,
                     time.time() - float(lot.discovered_at or time.time()),
                     self.pending,
-                    format_account_level(lot),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
@@ -1342,7 +1321,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "4.3"
+TRACKER_VERSION = "4.4"
 
 
 @dataclass

@@ -50,7 +50,7 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
+DEFAULT_BOT_TOKEN = "8807847926:AAE-lxYXhBkuhSfJRQ3WcUFgwrf7P298je4"
 # Постоянная привязка — tracker market, не переопределяется
 DEFAULT_CHANNEL_ID = -1004384888475
 FIXED_CHANNEL_ID = -1004384888475

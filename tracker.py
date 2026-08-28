@@ -50,9 +50,50 @@ logger = logging.getLogger("tracker")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
+
+
+def control_bot_username() -> str:
+    try:
+        import credentials as creds
+
+        return str(getattr(creds, "CONTROL_BOT_USERNAME", "") or "").strip()
+    except ImportError:
+        return ""
+
+
+def control_bot_handle() -> str:
+    name = control_bot_username()
+    return f"@{name}" if name else "бота"
+
+
+def _resolve_bot_token() -> str:
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        import credentials as creds
+
+        token = str(getattr(creds, "BOT_TOKEN", "") or "").strip()
+    except ImportError:
+        pass
+    if token:
+        return token
+    handle = control_bot_handle()
+    raise SystemExit(
+        f"BOT_TOKEN не задан. Создай токен для {handle} в @BotFather "
+        "и пропиши в env Bothost: BOT_TOKEN=..."
+    )
+
+
+def normalize_channel_id(chat_id: int) -> int:
+    """Bot API: -100xxxxxxxxxx. Чинит -378… и голый id без префикса."""
+    cid = int(chat_id)
+    s = str(cid)
+    if s.startswith("-100") and len(s) > 4:
+        return cid
+    return int(f"-100{abs(cid)}")
 
 
 def data_dir() -> Path:
@@ -153,7 +194,7 @@ async def wait_for_gift_ids(m: TelegramMarket) -> list[int]:
             return ids
         logger.error(
             "Коллекций 0 (попытка %s) — жду 30с. "
-            "Проверь: /start в @markskskdbot, сессия жива, аккаунт не в бане",
+            f"Проверь: /start в {control_bot_handle()}, сессия жива, аккаунт не в бане",
             attempt,
         )
         await asyncio.sleep(30)
@@ -233,7 +274,7 @@ class Config:
         state_file = os.environ.get(
             "STATE_FILE", str(dd / "tracker_state.json")
         ).strip()
-        bot_token = os.environ.get("BOT_TOKEN", "").strip() or DEFAULT_BOT_TOKEN
+        bot_token = _resolve_bot_token()
         target = (
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
@@ -427,12 +468,12 @@ class PostRateLimiter:
                     pass
                 self._lock_handle = None
 
-    async def gated(self, action: Any) -> None:
+    async def gated(self, action: Any) -> Any:
         """Ждёт слот (между процессами), выполняет action, фиксирует время."""
         async with self._async_lock:
             await asyncio.to_thread(self._acquire_and_wait)
             try:
-                await action()
+                return await action()
             finally:
                 await asyncio.to_thread(self._release_after_send)
 
@@ -452,12 +493,13 @@ class Sender:
         self.chat_id: int | None = None
         self._bot = None
         self._rate_limiter = rate_limiter
+        self.last_via: str = ""
         if cfg.bot_token:
             from aiogram import Bot
 
             self._bot = Bot(token=cfg.bot_token)
 
-    def _keyboard(self, lot: Lot):
+    def _keyboard_aiogram(self, lot: Lot):
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         rows = [[InlineKeyboardButton(text="✓ Занять", url=lot.nft_url)]]
@@ -471,32 +513,78 @@ class Sender:
         rows.append(second)
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def _do_send(self, lot: Lot, text: str) -> None:
+    def _keyboard_telethon(self, lot: Lot) -> list[list[Any]]:
+        from telethon import Button
+
+        row2 = [Button.url("🎁 Открыть лот", lot.nft_url)]
+        if lot.seller:
+            row2.append(Button.url("👤 Продавец", f"https://t.me/{lot.seller}"))
+        return [
+            [Button.url("✓ Занять", lot.nft_url)],
+            row2,
+        ]
+
+    async def _send_via_bot(self, lot: Lot, text: str) -> None:
+        from aiogram.types import LinkPreviewOptions
+
+        await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=self._keyboard_aiogram(lot),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+    async def _send_via_user(self, lot: Lot, text: str) -> None:
+        await self.client.send_message(
+            self.chat_id,
+            text,
+            parse_mode="html",
+            link_preview=False,
+            buttons=self._keyboard_telethon(lot),
+        )
+
+    def _bot_post_error(self, exc: BaseException) -> bool:
+        err = str(exc).lower()
+        return any(
+            x in err
+            for x in (
+                "chat not found",
+                "bot is not a member",
+                "not enough rights",
+                "have no rights",
+                "forbidden",
+                "group chat was upgraded",
+            )
+        )
+
+    async def _do_send(self, lot: Lot, text: str) -> str:
         if self._bot is not None:
-            from aiogram.types import LinkPreviewOptions
+            try:
+                await self._send_via_bot(lot, text)
+                self.last_via = "bot"
+                return "bot"
+            except Exception as exc:  # noqa: BLE001
+                if not self._bot_post_error(exc):
+                    raise
+                logger.warning(
+                    "Бот не может постить в %s (%s) — отправляю от аккаунта",
+                    self.chat_id,
+                    exc,
+                )
+        await self._send_via_user(lot, text)
+        self.last_via = "user"
+        return "user"
 
-            await self._bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=self._keyboard(lot),
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
-        else:
-            await self.client.send_message(
-                self.chat_id, text, parse_mode="html", link_preview=False
-            )
-
-    async def send(self, lot: Lot) -> None:
+    async def send(self, lot: Lot) -> str:
         text = format_lot(lot, self.cfg)
 
-        async def _send() -> None:
-            await self._do_send(lot, text)
+        async def _send() -> str:
+            return await self._do_send(lot, text)
 
         if self._rate_limiter is not None:
-            await self._rate_limiter.gated(_send)
-        else:
-            await _send()
+            return await self._rate_limiter.gated(_send)
+        return await _send()
 
     async def close(self) -> None:
         if self._bot is not None:
@@ -541,7 +629,7 @@ async def obtain_channel_id(
 ) -> int:
     """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
     if cfg.channel_id:
-        cid = int(cfg.channel_id)
+        cid = normalize_channel_id(int(cfg.channel_id))
         store.save(cid)
         state["channel_id"] = cid
         save_state(state_path, state)
@@ -550,13 +638,15 @@ async def obtain_channel_id(
 
     saved = store.load()
     if saved is not None:
-        state["channel_id"] = saved
+        cid = normalize_channel_id(int(saved))
+        store.save(cid)
+        state["channel_id"] = cid
         save_state(state_path, state)
-        logger.info("Канал из файла: %s", saved)
-        return saved
+        logger.info("Канал из файла: %s", cid)
+        return cid
 
     if state.get("channel_id"):
-        cid = int(state["channel_id"])
+        cid = normalize_channel_id(int(state["channel_id"]))
         store.save(cid)
         logger.info("Канал из state: %s", cid)
         return cid
@@ -582,7 +672,7 @@ async def obtain_channel_id(
             return found
 
         logger.warning(
-            "Канал не задан. Открой @markskskdbot → /channels или "
+            f"Канал не задан. Открой {control_bot_handle()} → /channels или "
             "/setchannel @имя_канала (жду 60с…)"
         )
         waited = await store.wait(timeout=60.0)
@@ -599,7 +689,7 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
         found = await find_channel_in_dialogs(client)
         if found is not None:
             return found
-        raise SystemExit("Канал не задан — /setchannel в @markskskdbot")
+        raise SystemExit(f"Канал не задан — /setchannel в {control_bot_handle()}")
     if re.fullmatch(r"-?\d+", raw):
         return int(raw)
 
@@ -1104,7 +1194,8 @@ class PostQueue:
                         )
                     continue
                 lot = to_post[0]
-                await self._sender.send(lot)
+                via = await self._sender.send(lot)
+                self._runtime.post_via = via
                 self._seen[lot.id] = now
                 key = lot.seller_key
                 if key:
@@ -1156,6 +1247,7 @@ class TrackerRuntime:
     queue_processed: int = 0
     send_errors_total: int = 0
     last_send_error: str = ""
+    post_via: str = ""
     scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0
@@ -1238,8 +1330,9 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
 
     if not await client.is_user_authorized():
         logger.warning(
-            "⚠️ Трекер v%s: нет сессии — войди через @markskskdbot /start",
+            "⚠️ Трекер v%s: нет сессии — войди через %s /start",
             TRACKER_VERSION,
+            control_bot_handle(),
         )
         await bot.wait_login()
 

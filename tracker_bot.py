@@ -1,4 +1,4 @@
-"""@markskskdbot — вход, /setchannel, /channels, /status (всегда онлайн)."""
+"""@jsjeigiejwhnewbot — вход, /setchannel, /channels, /status (всегда онлайн)."""
 
 from __future__ import annotations
 
@@ -157,17 +157,29 @@ class AuthFlow:
 
 
 async def parse_channel_arg(client: TelegramClient, raw: str) -> int:
+    from tracker import normalize_channel_id
+
     text = (raw or "").strip()
     if not text:
         raise ValueError("Пусто")
     if re.fullmatch(r"-?\d+", text):
-        return int(text)
+        return normalize_channel_id(int(text))
     m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})$", text)
     handle = m.group(1) if m else text.lstrip("@").strip()
     if not handle or handle.startswith("+"):
         raise ValueError("Формат: @channel или -100…")
     entity = await client.get_entity(handle)
-    return get_peer_id(entity)
+    return normalize_channel_id(get_peer_id(entity))
+
+
+async def verify_bot_channel(bot: Bot, chat_id: int) -> tuple[bool, str]:
+    """Проверяем, видит ли бот канал (иначе chat not found при посте)."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        title = getattr(chat, "title", None) or getattr(chat, "username", None) or chat_id
+        return True, str(title)
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
 
 
 async def list_user_channels(client: TelegramClient, limit: int = 30) -> list[tuple[str, int]]:
@@ -196,6 +208,13 @@ def build_router(
             return await client.is_user_authorized()
         except Exception:  # noqa: BLE001
             return False
+
+    def _bot_handle() -> str:
+        if control and control.bot_username:
+            return f"@{control.bot_username}"
+        from tracker import control_bot_handle
+
+        return control_bot_handle()
 
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
@@ -251,6 +270,24 @@ def build_router(
                 control.runtime.channel_id = cid
             if control.sender is not None:
                 control.sender.chat_id = cid
+        bot_handle = _bot_handle()
+        if control and control._bot:
+            ok, detail = await verify_bot_channel(control._bot, cid)
+            if ok:
+                await message.answer(
+                    f"✅ Канал задан: <code>{cid}</code>\n"
+                    f"Бот {bot_handle} видит канал: {_esc(str(detail))}"
+                )
+            else:
+                await message.answer(
+                    f"⚠️ Канал сохранён: <code>{cid}</code>\n"
+                    f"Но {bot_handle} его <b>не видит</b>: {_esc(detail)}\n\n"
+                    f"1. Добавь {bot_handle} в канал админом\n"
+                    "2. Включи право «Публикация сообщений»\n"
+                    "3. /test — проверка\n\n"
+                    "<i>Пока бот не в канале — посты пойдут от твоего аккаунта.</i>"
+                )
+            return
         await message.answer(f"✅ Канал задан: <code>{cid}</code>")
 
     @router.message(Command("channels"))
@@ -297,6 +334,11 @@ def build_router(
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)}"
             )
+        bot_handle = _bot_handle()
+        lines.append(f"Бот: {bot_handle}")
+        if rt and rt.post_via:
+            via = "бот" if rt.post_via == "bot" else "аккаунт"
+            lines.append(f"Последний пост: через {via}")
         if rt:
             lines.extend(
                 [
@@ -358,14 +400,21 @@ def build_router(
             is_premium=False,
         )
         try:
-            await control.sender.send(lot)
+            via = await control.sender.send(lot)
+            via_label = "бот" if via == "bot" else "аккаунт"
             await message.answer(
-                f"✅ Тест отправлен в канал <code>{control.sender.chat_id}</code>"
+                f"✅ Тест отправлен в канал <code>{control.sender.chat_id}</code>\n"
+                f"Через: {via_label}"
             )
         except Exception as exc:  # noqa: BLE001
+            bot_handle = _bot_handle()
             await message.answer(
-                f"❌ Не отправилось: {_esc(str(exc)[:200])}\n"
-                "Проверь: @markskskdbot — админ канала с правом публикации."
+                f"❌ Не отправилось: {_esc(str(exc)[:200])}\n\n"
+                f"Канал: <code>{control.sender.chat_id}</code>\n"
+                f"Бот: {bot_handle}\n\n"
+                f"• Добавь {bot_handle} админом канала (право «Публикация»)\n"
+                "• Или убедись, что твой аккаунт — админ канала\n"
+                "• Проверь BOT_TOKEN в env Bothost — токен именно этого бота"
             )
 
     @router.message(Command("resetseen"))
@@ -461,6 +510,7 @@ class ControlBot:
         self._task: asyncio.Task | None = None
         self._login_done = asyncio.Event()
         self._auth = AuthFlow(client, session_file)
+        self.bot_username: str = ""
         self.runtime: Any | None = None
         self.sender: Any | None = None
         self.post_queue: Any | None = None
@@ -483,7 +533,17 @@ class ControlBot:
         )
         self._dp.include_router(router)
         info = await self._bot.get_me()
-        logger.info("Control bot @%s запущен", info.username)
+        self.bot_username = str(info.username or "")
+        logger.info("Control bot @%s запущен", self.bot_username or info.id)
+        from tracker import control_bot_username
+
+        expected = control_bot_username()
+        if expected and self.bot_username and self.bot_username != expected:
+            logger.error(
+                "BOT_TOKEN указывает на @%s, нужен @%s — смени BOT_TOKEN в env Bothost",
+                self.bot_username,
+                expected,
+            )
         self._task = asyncio.create_task(
             self._dp.start_polling(self._bot, handle_signals=False),
             name="tracker-control-bot",

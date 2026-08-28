@@ -2,7 +2,9 @@
 
 import os
 
-BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
+# Трекер: @jsjeigiejwhnewbot — токен задаётся в env Bothost (BOT_TOKEN=...)
+CONTROL_BOT_USERNAME = "jsjeigiejwhnewbot"
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 

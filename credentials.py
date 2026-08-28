@@ -2,7 +2,13 @@
 
 import os
 
-BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
+# Трекер: @jsjeigiejwhnewbot (отображается как Trsjjsjsbot)
+CONTROL_BOT_USERNAME = "jsjeigiejwhnewbot"
+DEFAULT_CHANNEL_ID = -1003784435307
+BOT_TOKEN = (
+    os.environ.get("BOT_TOKEN")
+    or "8825465611:AAFH6-vClgDLYbUqe1G_CWiiykvT0yO7uNI"
+).strip()
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 

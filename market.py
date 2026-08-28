@@ -1156,8 +1156,8 @@ def _normalize_level(raw: Any) -> int | None:
         return None
 
 
-def is_russian_lot(lot: Lot) -> bool:
-    """Только RU: lang ru, кириллица; арабский/восточные lang — нет."""
+def is_russian_lot(lot: Lot) -> bool | None:
+    """RU-фильтр: True/False если уверены; None — нет данных (не отбрасываем)."""
     lc = (getattr(lot, "lang_code", "") or "").lower().strip()
     if lc:
         if lc.startswith("ru"):
@@ -1172,7 +1172,7 @@ def is_russian_lot(lot: Lot) -> bool:
     ]
     blob = " ".join(p for p in parts if p).strip()
     if not blob:
-        return False
+        return None
     if _ARAB_RE.search(blob):
         return False
     for flag in ("🇸🇦", "🇦🇪", "🇪🇬", "🇮🇶", "🇶🇦", "🇰🇼", "🇧🇭", "🇴🇲", "🇾🇪", "🇵🇸"):

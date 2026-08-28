@@ -51,8 +51,6 @@ logger = logging.getLogger("tracker")
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_BOT_TOKEN = "8807847926:AAF5Ej4HyZNhCh76cIUKvoJCuis9q1fi-nM"
-# Канал tracker market — можно переопределить CHANNEL_ID в env Bothost
-DEFAULT_CHANNEL_ID = -1004384888475
 DEFAULT_TARGET_CHANNEL = ""
 CHANNEL_NAME_HINTS = ("tracker market", "tracker", "market")
 
@@ -240,7 +238,7 @@ class Config:
             os.environ.get("TARGET_CHANNEL", "").strip() or DEFAULT_TARGET_CHANNEL
         )
         channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
-        channel_id: int | None = DEFAULT_CHANNEL_ID
+        channel_id: int | None = None
         if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
             channel_id = int(channel_id_raw)
         return cls(
@@ -896,6 +894,7 @@ def filter_for_post(
         "non_ru": 0,
         "paid": 0,
         "unknown_dm": 0,
+        "unknown_ru": 0,
         "level": 0,
     }
     for lot in lots:
@@ -909,9 +908,13 @@ def filter_for_post(
         if prev is not None and now - float(prev) < SELLER_TTL:
             stats["dup"] += 1
             continue
-        if strict_ru and not is_russian_lot(lot):
-            stats["non_ru"] += 1
-            continue
+        if strict_ru:
+            ru = is_russian_lot(lot)
+            if ru is False:
+                stats["non_ru"] += 1
+                continue
+            if ru is None:
+                stats["unknown_ru"] += 1
         if not passes_account_level(lot, max_account_level):
             stats["level"] += 1
             continue
@@ -971,6 +974,23 @@ def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
     if boost_female and _looks_female(lot):
         score += 2.5
     return score
+
+
+def _skip_reason(stats: dict[str, int]) -> str:
+    parts: list[str] = []
+    if stats.get("no_seller"):
+        parts.append("нет продавца")
+    if stats.get("dup"):
+        parts.append("дубль продавца")
+    if stats.get("non_ru"):
+        parts.append("не RU")
+    if stats.get("level"):
+        parts.append("level")
+    if stats.get("paid"):
+        parts.append("платные ЛС")
+    if stats.get("unknown_dm"):
+        parts.append("ЛС неизвестно")
+    return ", ".join(parts)
 
 
 def rank_for_queue(lots: list[Lot]) -> list[Lot]:
@@ -1064,9 +1084,24 @@ class PostQueue:
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
+                self._runtime.skip_ru_total += fstats["non_ru"]
+                self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
+                self._runtime.skip_dup_total += fstats["dup"]
+                self._runtime.skip_noseller_total += fstats["no_seller"]
+                self._runtime.skip_level_total += fstats["level"]
+                self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
+                self._runtime.queue_processed += 1
                 if not to_post:
                     if lot.seller_key:
                         self._seen[lot.id] = now
+                    reason = _skip_reason(fstats)
+                    if reason:
+                        logger.info(
+                            "Пропуск %s (%s⭐): %s",
+                            lot_slug(lot),
+                            int(lot.stars),
+                            reason,
+                        )
                     continue
                 lot = to_post[0]
                 await self._sender.send(lot)
@@ -1087,12 +1122,16 @@ class PostQueue:
                     format_account_level(lot),
                 )
             except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self._runtime.last_send_error = err
+                self._runtime.send_errors_total += 1
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
             finally:
+                self._runtime.queue_pending = self.pending
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.4"
+TRACKER_VERSION = "3.5"
 
 
 @dataclass
@@ -1108,6 +1147,15 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    skip_ru_total: int = 0
+    skip_dm_total: int = 0
+    skip_dup_total: int = 0
+    skip_noseller_total: int = 0
+    skip_level_total: int = 0
+    skip_unknown_ru_total: int = 0
+    queue_processed: int = 0
+    send_errors_total: int = 0
+    last_send_error: str = ""
     scan_parallel: int = 8
     seen_lots: int = 0
     queue_pending: int = 0

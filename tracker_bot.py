@@ -307,13 +307,26 @@ def build_router(
                     f"{rt.last_scan_parsed} лотов · {rt.last_scan_elapsed}s",
                     f"Всего отправлено: {rt.posted_total}",
                     f"В очереди: {rt.queue_pending}",
+                    f"Обработано из очереди: {rt.queue_processed}",
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
-                    f"Отсев: ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
+                    f"Отсев (посл.): ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
                     f"lvl−{rt.last_skip_level}",
+                    f"Отсев (всего): ru−{rt.skip_ru_total} dm−{rt.skip_dm_total} "
+                    f"dup−{rt.skip_dup_total} noseller−{rt.skip_noseller_total} "
+                    f"lvl−{rt.skip_level_total} ru?{rt.skip_unknown_ru_total}",
                     f"Seen лотов: {rt.seen_lots}",
                 ]
             )
+            if rt.send_errors_total:
+                lines.append(
+                    f"⚠️ Ошибки отправки: {rt.send_errors_total}"
+                    + (
+                        f" — {rt.last_send_error[:120]}"
+                        if rt.last_send_error
+                        else ""
+                    )
+                )
             if rt.last_scan_errors:
                 lines.append(
                     f"⚠️ Ошибки API: {rt.last_scan_errors}"

@@ -96,6 +96,31 @@ def normalize_channel_id(chat_id: int) -> int:
     return int(f"-100{abs(cid)}")
 
 
+LEGACY_CHANNEL_IDS = frozenset({-1004384888475})
+
+
+def default_channel_id() -> int | None:
+    try:
+        import credentials as creds
+
+        raw = getattr(creds, "DEFAULT_CHANNEL_ID", None)
+        if raw is not None:
+            return normalize_channel_id(int(raw))
+    except (ImportError, TypeError, ValueError):
+        pass
+    return None
+
+
+def migrate_channel_id(chat_id: int | None) -> int | None:
+    """Старый дефолтный канал → актуальный из credentials."""
+    if chat_id is None:
+        return default_channel_id()
+    cid = normalize_channel_id(int(chat_id))
+    if cid in LEGACY_CHANNEL_IDS:
+        return default_channel_id() or cid
+    return cid
+
+
 def data_dir() -> Path:
     """Bothost хранит данные в /app/data; локально — рядом со скриптом."""
     bothost = Path("/app/data")
@@ -283,14 +308,7 @@ class Config:
         if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
             channel_id = normalize_channel_id(int(channel_id_raw))
         else:
-            try:
-                import credentials as creds
-
-                default_cid = getattr(creds, "DEFAULT_CHANNEL_ID", None)
-                if default_cid is not None:
-                    channel_id = normalize_channel_id(int(default_cid))
-            except ImportError:
-                pass
+            channel_id = default_channel_id()
         return cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -638,7 +656,9 @@ async def obtain_channel_id(
 ) -> int:
     """Канал: env → файл → state → target → диалоги → ждём /setchannel."""
     if cfg.channel_id:
-        cid = normalize_channel_id(int(cfg.channel_id))
+        cid = migrate_channel_id(int(cfg.channel_id)) or normalize_channel_id(
+            int(cfg.channel_id)
+        )
         store.save(cid)
         state["channel_id"] = cid
         save_state(state_path, state)
@@ -647,7 +667,9 @@ async def obtain_channel_id(
 
     saved = store.load()
     if saved is not None:
-        cid = normalize_channel_id(int(saved))
+        cid = migrate_channel_id(int(saved)) or normalize_channel_id(int(saved))
+        if cid != saved:
+            logger.warning("Миграция канала %s → %s", saved, cid)
         store.save(cid)
         state["channel_id"] = cid
         save_state(state_path, state)
@@ -655,7 +677,9 @@ async def obtain_channel_id(
         return cid
 
     if state.get("channel_id"):
-        cid = normalize_channel_id(int(state["channel_id"]))
+        cid = migrate_channel_id(int(state["channel_id"])) or normalize_channel_id(
+            int(state["channel_id"])
+        )
         store.save(cid)
         logger.info("Канал из state: %s", cid)
         return cid
@@ -1231,7 +1255,7 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.5"
+TRACKER_VERSION = "3.5.1"
 
 
 @dataclass

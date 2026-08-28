@@ -51,15 +51,29 @@ class ChannelStore:
 
     def load(self) -> int | None:
         if self._id is not None:
-            return self._id
+            migrated = self._migrate(self._id)
+            if migrated != self._id:
+                self.save(migrated)
+            return migrated
         try:
             raw = self.path.read_text(encoding="utf-8").strip()
             if raw and re.fullmatch(r"-?\d+", raw):
                 self._id = int(raw)
-                self._ready.set()
+                migrated = self._migrate(self._id)
+                if migrated != self._id:
+                    self.save(migrated)
+                else:
+                    self._ready.set()
+                return migrated
         except OSError:
             pass
         return self._id
+
+    @staticmethod
+    def _migrate(chat_id: int) -> int:
+        from tracker import migrate_channel_id
+
+        return migrate_channel_id(chat_id) or int(chat_id)
 
     def get(self) -> int | None:
         return self._id
@@ -219,12 +233,29 @@ def build_router(
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
         if await _authorized():
-            cid = store.get() or store.load()
+            from tracker import migrate_channel_id
+
+            cid: int | None = None
+            if control and control.sender and control.sender.chat_id:
+                cid = int(control.sender.chat_id)
+            elif control and control.runtime and control.runtime.channel_id:
+                cid = int(control.runtime.channel_id)
+            else:
+                cid = store.get() or store.load()
+            cid = migrate_channel_id(cid)
+            if cid is not None and store.get() != cid:
+                store.save(cid)
+                if control and control.sender:
+                    control.sender.chat_id = cid
+                if control and control.runtime:
+                    control.runtime.channel_id = cid
             ch = f"<code>{cid}</code>" if cid else "не задан"
+            bot_handle = _bot_handle()
             await message.answer(
                 f"🤖 <b>Гифт-трекер</b> v{tracker_version}\n"
                 f"Аккаунт: подключён ✅\n"
-                f"Канал: {ch}\n\n"
+                f"Канал: {ch}\n"
+                f"Бот: {bot_handle}\n\n"
                 "<b>Команды:</b>\n"
                 "/setchannel @username — канал для постов\n"
                 "/setchannel -100… — id канала\n"

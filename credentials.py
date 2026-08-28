@@ -4,6 +4,7 @@ import os
 
 # Трекер: @jsjeigiejwhnewbot — токен задаётся в env Bothost (BOT_TOKEN=...)
 CONTROL_BOT_USERNAME = "jsjeigiejwhnewbot"
+DEFAULT_CHANNEL_ID = -1003784435307
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"

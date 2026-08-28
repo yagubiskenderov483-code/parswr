@@ -281,7 +281,16 @@ class Config:
         channel_id_raw = os.environ.get("CHANNEL_ID", "").strip()
         channel_id: int | None = None
         if channel_id_raw and re.fullmatch(r"-?\d+", channel_id_raw):
-            channel_id = int(channel_id_raw)
+            channel_id = normalize_channel_id(int(channel_id_raw))
+        else:
+            try:
+                import credentials as creds
+
+                default_cid = getattr(creds, "DEFAULT_CHANNEL_ID", None)
+                if default_cid is not None:
+                    channel_id = normalize_channel_id(int(default_cid))
+            except ImportError:
+                pass
         return cls(
             api_id=api_id,
             api_hash=api_hash,

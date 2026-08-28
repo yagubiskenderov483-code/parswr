@@ -76,10 +76,15 @@ class ChannelStore:
         return migrate_channel_id(chat_id) or int(chat_id)
 
     def get(self) -> int | None:
-        return self._id
+        if self._id is not None:
+            migrated = self._migrate(self._id)
+            if migrated != self._id:
+                self.save(migrated)
+            return migrated
+        return self.load()
 
     def save(self, chat_id: int) -> None:
-        self._id = int(chat_id)
+        self._id = self._migrate(int(chat_id))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(str(self._id), encoding="utf-8")
         self._ready.set()
@@ -233,17 +238,12 @@ def build_router(
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
         if await _authorized():
-            from tracker import migrate_channel_id
+            from tracker import BUILD_TAG, default_channel_id, migrate_channel_id
 
-            cid: int | None = None
-            if control and control.sender and control.sender.chat_id:
-                cid = int(control.sender.chat_id)
-            elif control and control.runtime and control.runtime.channel_id:
-                cid = int(control.runtime.channel_id)
-            else:
-                cid = store.get() or store.load()
-            cid = migrate_channel_id(cid)
-            if cid is not None and store.get() != cid:
+            cid = store.load()
+            if cid is None:
+                cid = migrate_channel_id(default_channel_id())
+            if cid is not None:
                 store.save(cid)
                 if control and control.sender:
                     control.sender.chat_id = cid
@@ -252,7 +252,7 @@ def build_router(
             ch = f"<code>{cid}</code>" if cid else "не задан"
             bot_handle = _bot_handle()
             await message.answer(
-                f"🤖 <b>Гифт-трекер</b> v{tracker_version}\n"
+                f"🤖 <b>Гифт-трекер</b> v{tracker_version} <code>{BUILD_TAG}</code>\n"
                 f"Аккаунт: подключён ✅\n"
                 f"Канал: {ch}\n"
                 f"Бот: {bot_handle}\n\n"
@@ -563,6 +563,10 @@ class ControlBot:
             control=self,
         )
         self._dp.include_router(router)
+        # Сразу чиним старый channel id в /app/data/tracker_channel_id.txt
+        boot_cid = self.store.load()
+        if boot_cid:
+            logger.info("Канал при старте бота: %s", boot_cid)
         info = await self._bot.get_me()
         self.bot_username = str(info.username or "")
         logger.info("Control bot @%s запущен", self.bot_username or info.id)

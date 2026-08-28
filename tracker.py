@@ -69,21 +69,22 @@ def control_bot_handle() -> str:
 
 
 def _resolve_bot_token() -> str:
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    if token:
-        return token
+    """Токен из credentials.py важнее env — на Bothost часто висит старый BOT_TOKEN."""
     try:
         import credentials as creds
 
         token = str(getattr(creds, "BOT_TOKEN", "") or "").strip()
+        if token:
+            return token
     except ImportError:
         pass
+    token = os.environ.get("BOT_TOKEN", "").strip()
     if token:
         return token
     handle = control_bot_handle()
     raise SystemExit(
         f"BOT_TOKEN не задан. Создай токен для {handle} в @BotFather "
-        "и пропиши в env Bothost: BOT_TOKEN=..."
+        "и пропиши в credentials.py или env Bothost."
     )
 
 
@@ -1255,7 +1256,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.5.1"
+TRACKER_VERSION = "3.5.2"
+BUILD_TAG = "main-jsjeigiej"
 
 
 @dataclass
@@ -1466,6 +1468,13 @@ async def scanner_loop(
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
+    logger.warning(
+        "=== Трекер v%s %s · бот %s · канал %s ===",
+        TRACKER_VERSION,
+        BUILD_TAG,
+        control_bot_handle(),
+        cfg.channel_id,
+    )
     _singleton_lock = acquire_singleton_lock()
     store = ChannelStore(channel_file_path(data_dir()))
     control_bot: ControlBot | None = None

@@ -2153,7 +2153,7 @@ class App:
         )
 
     async def run_filter_search(self, chat_id: int) -> None:
-        """Фильтр-поиск: большая БД → ~30 уникальных, free DM."""
+        """Фильтр-поиск: только live с маркета → ~30 уникальных, free DM."""
         if self.filter_search_running:
             await self._say_to(chat_id, f"{screen('Фильтры')}\nуже идёт")
             return
@@ -2171,11 +2171,6 @@ class App:
         self._filter_seen_sellers = set(self._delivered_sellers)
         self._seen_sellers |= set(self._delivered_sellers)
         try:
-            db_n = 0
-            try:
-                db_n = self.db.count_in_range(min_stars=mn, max_stars=mx)
-            except Exception:  # noqa: BLE001
-                db_n = self.db.count()
             notes = []
             if f.online_only:
                 notes.append("🟢 в сети")
@@ -2192,53 +2187,11 @@ class App:
             if f.strict_free:
                 notes.append("free✓")
             extra = (" · " + " · ".join(notes)) if notes else ""
-            total_db = self.db.count()
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n{label}{extra}{spice_note}\n"
-                f"БД всего: <b>{total_db}</b> · в диапазоне: <b>{db_n}</b>",
+                f"только live с маркета · цель <b>{target_n}</b>",
             )
-
-            def _db_pool() -> list[Lot]:
-                hours = 48.0 if f.fresh_only else (
-                    96.0 if f.spice_fresh_boost else 0.0
-                )
-                # почти вся БД в диапазоне — не 2–3 тысячи
-                lim = min(max(db_n, 500), 12000)
-                lim = max(lim, int(getattr(creds, "FILTER_DB_LIMIT", 800)) * 10)
-                lim = min(lim, 12000)
-                try:
-                    return self.db.fetch_for_filters(
-                        min_stars=mn,
-                        max_stars=mx,
-                        limit=lim,
-                        hours=hours if hours > 0 else 0.0,
-                        require_seller=True,
-                        prefer_rare=bool(f.rare_types or f.random_mix),
-                        fresh_only=bool(f.fresh_only),
-                        exclude_sellers=set(self._delivered_sellers),
-                        exclude_titles=set(),
-                        short_username=bool(f.short_username),
-                        short_user_max=int(f.short_user_max),
-                        long_username=bool(f.long_username),
-                        long_user_min=int(f.long_user_min),
-                        no_premium=bool(f.no_premium),
-                        with_model=bool(f.with_model),
-                        no_digits_user=bool(f.no_digits_user),
-                        few_gifts=bool(f.few_gifts),
-                        max_gifts=int(f.max_gifts),
-                        low_level=bool(f.low_level),
-                        max_level=int(f.max_level),
-                        with_bio=bool(f.with_bio),
-                        exclude_seen=True,
-                    )
-                except Exception:  # noqa: BLE001
-                    return self.db.fetch_random_lots(
-                        min_stars=mn,
-                        max_stars=mx,
-                        limit=lim,
-                        require_seller=True,
-                    )
 
             async def _live_pool() -> list[Lot]:
                 try:
@@ -2329,83 +2282,70 @@ class App:
                         break
                 return clean
 
-            # 1) всегда сначала live с маркета, потом добор из БД
+            # Только live: если мало — ждём новые с маркета, БД не трогаем
             shown: list[Lot] = []
-            live_ids: set[str] = set()
-            await self._say_to(
-                chat_id,
-                f"{screen('Фильтры')}\nсначала live с маркета…",
-            )
-            live0 = await _live_pool()
-            live_ids = {lot.id for lot in live0}
-            self._ingest_always(live0)
-            old = _db_pool()
-            merged0 = sort_lots_fresh_first(
-                _dedupe_lots(live0 + old),
-                live_ids=live_ids,
-            )
-            await self._say_to(
-                chat_id,
-                f"{screen('Фильтры')}\nlive <b>{len(live0)}</b> · "
-                f"БД <b>{len(old)}</b> · пул <b>{len(merged0)}</b>",
-            )
-            shown = await self._prepare_show(
-                merged0,
-                limit=target_n,
-                apply_extra=True,
-                track_seen=False,
-                need_full=True,
-                channel="filter",
-            )
-            shown = _finalize(shown)
+            live_pool: list[Lot] = []
+            wait_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 8.0))
+            attempt = 0
 
-            # 2) мало — ещё live + БД (live в приоритете)
-            if len(shown) < target_n:
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\nсканирую маркет…",
+            )
+
+            while self.filter_search_running and len(shown) < target_n:
+                attempt += 1
                 live = await _live_pool()
-                live_ids |= {lot.id for lot in live}
-                old2 = _db_pool()
-                merged = sort_lots_fresh_first(
-                    _dedupe_lots(old + old2 + live),
-                    live_ids=live_ids,
-                )
-                self._ingest_always(merged)
+                if live:
+                    live_pool = _dedupe_lots(live_pool + live)
+                    self._ingest_always(live)
+                    pool = sort_lots_fresh_first(
+                        live_pool,
+                        live_ids={lot.id for lot in live},
+                    )
+                    batch = await self._prepare_show(
+                        pool,
+                        limit=target_n,
+                        apply_extra=True,
+                        track_seen=False,
+                        need_full=True,
+                        channel="filter",
+                    )
+                    shown = _finalize(_merge_unique(shown, batch, cap=target_n))
+
+                if len(shown) >= target_n:
+                    break
+
                 await self._say_to(
                     chat_id,
-                    f"{screen('Фильтры')}\nдобор · live {len(live)} · БД {len(old2)}",
+                    f"{screen('Фильтры')}\n"
+                    f"нашёл <b>{len(shown)}</b> / {target_n} · "
+                    f"жду новые с маркета… (#{attempt})",
                 )
-                more = await self._prepare_show(
-                    merged,
-                    limit=target_n,
-                    apply_extra=True,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
-                shown = _finalize(_merge_unique(shown, more, cap=target_n))
-
-            # 3) всё ещё мало — без spice, НЕ сбрасываем seen (иначе те же TG)
-            if len(shown) < 20:
-                f.spice_no_model = False
-                f.spice_mid_user = False
-                f.spice_has_bio = False
-                f.spice_low_stars = False
-                old3 = _db_pool()
-                more = await self._prepare_show(
-                    old3,
-                    limit=target_n,
-                    apply_extra=False,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
-                shown = _finalize(_merge_unique(shown, more, cap=target_n))
+                for _ in range(max(1, int(wait_sec * 2))):
+                    if not self.filter_search_running:
+                        break
+                    await asyncio.sleep(0.5)
 
             shown = _finalize(shown)[:target_n]
             if not shown:
+                if not self.filter_search_running:
+                    await self._say_to(
+                        chat_id,
+                        f"{screen('Фильтры')}\nостановлено · без выдачи",
+                        reply_markup=filters_inline(),
+                    )
+                else:
+                    await self._say_to(
+                        chat_id,
+                        f"{screen('Фильтры')}\nпусто · смени сложность / фильтры",
+                        reply_markup=filters_inline(),
+                    )
+                return
+            if len(shown) < target_n and not self.filter_search_running:
                 await self._say_to(
                     chat_id,
-                    f"{screen('Фильтры')}\nпусто · БД {db_n} · "
-                    f"сними онлайн / смени сложность",
+                    f"{screen('Фильтры')}\nостановлено до набора {target_n}",
                     reply_markup=filters_inline(),
                 )
                 return
@@ -2414,7 +2354,7 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> / {target_n} · "
-                f"из БД {db_n} · без повторов TG",
+                f"только live · без повторов TG",
                 reply_markup=filters_inline(),
             )
         finally:

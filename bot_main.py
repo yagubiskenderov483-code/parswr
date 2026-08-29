@@ -16,6 +16,7 @@ import logging
 import random
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -2162,6 +2163,33 @@ class App:
             strict_russian=True,
         )
 
+    async def _deliver_one_filter(self, chat_id: int, lot: Lot) -> bool:
+        """Один лот в чат + сразу в seen навсегда."""
+        if not lot.seller or self._bad_username_len(lot.seller):
+            return False
+        if self._is_delivered_seller(lot):
+            return False
+        if not self._is_russian(lot) or not self._is_clean_female(lot):
+            return False
+        if lot.free_dm is False:
+            return False
+        if self._filters_active() and not self._passes_extra_filters(lot):
+            return False
+        try:
+            self._mark_delivered([lot], channel="filter")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mark one filter: %s", exc)
+            try:
+                self.db.purge_delivered_lots([lot])
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("purge one filter: %s", exc2)
+        await self._say_to(chat_id, self._format_lot_line(lot))
+        try:
+            self.db.bump_daily(lots_shown=1)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
     async def run_filter_search(self, chat_id: int) -> None:
         """Фильтр-поиск: только live с маркета → ~30 уникальных, free DM."""
         if self.filter_search_running:
@@ -2279,14 +2307,75 @@ class App:
                         break
                 return clean
 
-            # Снимок маркета → ждём только НОВЫЕ листинги (не то что уже висит)
-            shown: list[Lot] = []
+            # Снимок → очередь → по 1 лоту каждые N сек (ждём новые листинги)
+            pending: deque[Lot] = deque()
+            pending_keys: set[str] = set()
+            delivered_n = 0
             handled_new_ids: set[str] = set()
             market_snapshot_ids: set[str] = set()
-            wait_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 35.0))
+            drip_sec = float(getattr(creds, "FILTER_DRIP_INTERVAL", 4.0))
+            scan_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 35.0))
+            next_tick = time.monotonic()
+            last_scan = 0.0
             attempt = 0
-            last_status_n = -1
-            last_status_at = 0.0
+
+            def _queue_lots(lots: list[Lot]) -> int:
+                added = 0
+                block = (
+                    pending_keys
+                    | set(self._delivered_sellers)
+                    | set(self._filter_seen_sellers)
+                )
+                for lot in _dedupe_by_seller(_finalize(lots)):
+                    if seller_keys_overlap(lot, block):
+                        continue
+                    tk = self._title_key(lot)
+                    if tk and tk in set(self._filter_recent_titles[-300:]):
+                        continue
+                    pending.append(lot)
+                    pending_keys |= seller_identity_keys(lot)
+                    block |= seller_identity_keys(lot)
+                    if tk:
+                        self._filter_recent_titles.append(tk)
+                    self._reserve_sellers([lot])
+                    added += 1
+                return added
+
+            async def _scan_new_into_queue() -> int:
+                nonlocal attempt, last_scan
+                now = time.monotonic()
+                if now - last_scan < scan_sec:
+                    return 0
+                last_scan = now
+                attempt += 1
+                live = await _live_pool()
+                if not live:
+                    return 0
+                stamp_live_lots(live)
+                new_listings = [
+                    lot
+                    for lot in live
+                    if lot.id not in market_snapshot_ids
+                    and lot.id not in handled_new_ids
+                ]
+                for lot in new_listings:
+                    handled_new_ids.add(lot.id)
+                if not new_listings:
+                    return 0
+                self._ingest_always(new_listings)
+                pool = sort_lots_fresh_first(
+                    _dedupe_lots(new_listings),
+                    live_ids={lot.id for lot in new_listings},
+                )
+                batch = await self._prepare_show(
+                    pool,
+                    limit=target_n,
+                    apply_extra=True,
+                    track_seen=False,
+                    need_full=True,
+                    channel="filter",
+                )
+                return _queue_lots(batch)
 
             await self._say_to(
                 chat_id,
@@ -2312,87 +2401,42 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n"
-                f"на маркете сейчас <b>{len(market_snapshot_ids)}</b> лотов · "
-                f"жду <b>новые</b> (проверка каждые {int(wait_sec)}с)…",
+                f"на маркете <b>{len(market_snapshot_ids)}</b> лотов · "
+                f"выдача <b>1</b> / {int(drip_sec)}с · цель <b>{target_n}</b> · "
+                f"жду новые…",
             )
+            last_scan = time.monotonic()  # первый скан через scan_sec
 
-            while self.filter_search_running and len(shown) < target_n:
-                # сначала пауза — не спамим сканами подряд
-                for _ in range(max(1, int(wait_sec * 2))):
-                    if not self.filter_search_running:
-                        break
-                    await asyncio.sleep(0.5)
-                if not self.filter_search_running:
-                    break
+            while self.filter_search_running and delivered_n < target_n:
+                now = time.monotonic()
+                if now < next_tick:
+                    await asyncio.sleep(min(0.2, next_tick - now))
+                    continue
 
-                attempt += 1
-                live = await _live_pool()
-                if not live:
-                    now = time.monotonic()
-                    if now - last_status_at >= wait_sec:
+                next_tick = now + drip_sec
+
+                if not pending:
+                    added = await _scan_new_into_queue()
+                    if added:
                         await self._say_to(
                             chat_id,
                             f"{screen('Фильтры')}\n"
-                            f"жду новые… <b>{len(shown)}</b> / {target_n} (#{attempt})",
+                            f"+<b>{added}</b> в очереди · выдано <b>{delivered_n}</b> / {target_n}",
                         )
-                        last_status_at = now
-                    continue
-
-                stamp_live_lots(live)
-                new_listings = [
-                    lot
-                    for lot in live
-                    if lot.id not in market_snapshot_ids
-                    and lot.id not in handled_new_ids
-                ]
-                for lot in new_listings:
-                    handled_new_ids.add(lot.id)
-
-                if not new_listings:
-                    now = time.monotonic()
-                    if now - last_status_at >= wait_sec:
+                    elif attempt > 0 and attempt % 3 == 0:
                         await self._say_to(
                             chat_id,
                             f"{screen('Фильтры')}\n"
-                            f"новых пока нет · <b>{len(shown)}</b> / {target_n} (#{attempt})",
+                            f"жду новый лот… <b>{delivered_n}</b> / {target_n}",
                         )
-                        last_status_at = now
-                    continue
 
-                self._ingest_always(new_listings)
-                pool = sort_lots_fresh_first(
-                    _dedupe_lots(new_listings),
-                    live_ids={lot.id for lot in new_listings},
-                )
-                batch = await self._prepare_show(
-                    pool,
-                    limit=target_n,
-                    apply_extra=True,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
-                prev_n = len(shown)
-                shown = _finalize(_merge_unique(shown, batch, cap=target_n))
-                self._reserve_sellers(shown)
+                if pending and delivered_n < target_n:
+                    lot = pending.popleft()
+                    pending_keys -= seller_identity_keys(lot)
+                    if await self._deliver_one_filter(chat_id, lot):
+                        delivered_n += 1
 
-                if len(shown) > prev_n:
-                    await self._say_to(
-                        chat_id,
-                        f"{screen('Фильтры')}\n"
-                        f"новых на маркете: <b>{len(new_listings)}</b> · "
-                        f"готово <b>{len(shown)}</b> / {target_n}",
-                    )
-                    last_status_n = len(shown)
-                    last_status_at = time.monotonic()
-                elif len(shown) != last_status_n:
-                    last_status_n = len(shown)
-
-                if len(shown) >= target_n:
-                    break
-
-            shown = _finalize(shown)[:target_n]
-            if not shown:
+            if delivered_n <= 0:
                 if not self.filter_search_running:
                     await self._say_to(
                         chat_id,
@@ -2406,19 +2450,10 @@ class App:
                         reply_markup=filters_inline(),
                     )
                 return
-            if len(shown) < target_n and not self.filter_search_running:
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\nостановлено до набора {target_n}",
-                    reply_markup=filters_inline(),
-                )
-                return
-            # выдача → сразу purge из БД навсегда (повторно не вернётся)
-            await self._say_lot_list_to(chat_id, shown, channel="filter")
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nготово · <b>{len(shown)}</b> / {target_n} · "
-                f"только live · без повторов TG",
+                f"{screen('Фильтры')}\nготово · <b>{delivered_n}</b> / {target_n} · "
+                f"1 лот / {int(drip_sec)}с · только новые с маркета",
                 reply_markup=filters_inline(),
             )
         finally:

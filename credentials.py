@@ -76,6 +76,7 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_DB_LIMIT": 800,
         "FILTER_EARLY_SHOW_AT": 25,
         "FILTER_LIVE_WAIT_SEC": 40.0,
+        "FILTER_DRIP_INTERVAL": 4.0,
         "AFK_PAGE_LIMIT": 50,
         "AFK_GAP": 0.2,
         "AFK_PARALLEL": 6,
@@ -103,6 +104,7 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_DB_LIMIT": 1200,
         "FILTER_EARLY_SHOW_AT": 18,
         "FILTER_LIVE_WAIT_SEC": 35.0,
+        "FILTER_DRIP_INTERVAL": 4.0,
         "AFK_PAGE_LIMIT": 60,
         "AFK_GAP": 0.08,
         "AFK_PARALLEL": 8,
@@ -129,6 +131,8 @@ SPEED_PROFILES: dict[str, dict] = {
         "FILTER_LIMIT": 60,
         "FILTER_DB_LIMIT": 2000,
         "FILTER_EARLY_SHOW_AT": 14,
+        "FILTER_LIVE_WAIT_SEC": 25.0,
+        "FILTER_DRIP_INTERVAL": 4.0,
         "AFK_PAGE_LIMIT": 80,
         "AFK_GAP": 0.02,
         "AFK_PARALLEL": 12,
@@ -146,6 +150,7 @@ def apply_speed(name: str) -> str:
     global OWNER_TIMEOUT, ENRICH_PARALLEL
     global FILTER_BURST_PARALLEL, FILTER_BURST_PER_COLLECTION, FILTER_BURST_MAX_COLLECTIONS
     global FILTER_BURST_GAP, FILTER_LIMIT, FILTER_DB_LIMIT, FILTER_EARLY_SHOW_AT
+    global FILTER_LIVE_WAIT_SEC, FILTER_DRIP_INTERVAL
     global AFK_PAGE_LIMIT, AFK_GAP, AFK_PARALLEL
 
     key = name if name in SPEED_PROFILES else DEFAULT_SPEED
@@ -170,6 +175,8 @@ def apply_speed(name: str) -> str:
     FILTER_LIMIT = p["FILTER_LIMIT"]
     FILTER_DB_LIMIT = p["FILTER_DB_LIMIT"]
     FILTER_EARLY_SHOW_AT = p["FILTER_EARLY_SHOW_AT"]
+    FILTER_LIVE_WAIT_SEC = float(p.get("FILTER_LIVE_WAIT_SEC", 35.0))
+    FILTER_DRIP_INTERVAL = float(p.get("FILTER_DRIP_INTERVAL", 4.0))
     AFK_PAGE_LIMIT = p["AFK_PAGE_LIMIT"]
     AFK_GAP = p["AFK_GAP"]
     AFK_PARALLEL = p["AFK_PARALLEL"]

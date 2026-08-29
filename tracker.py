@@ -44,6 +44,8 @@ from market import (
     is_clean_female_profile,
     is_free_dm_lot,
     is_russian_lot,
+    seller_keys_overlap,
+    seller_identity_keys,
 )
 from tracker_bot import ChannelStore, ControlBot, channel_file_path
 
@@ -1028,10 +1030,17 @@ def filter_for_post(
         if not key:
             stats["no_seller"] += 1
             continue
-        if key in used:
+        if seller_keys_overlap(lot, used):
             continue
         prev = seen_sellers.get(key)
         if prev is not None and now - float(prev) < SELLER_TTL:
+            stats["dup"] += 1
+            continue
+        if any(
+            seen_sellers.get(k) is not None
+            and now - float(seen_sellers[k]) < SELLER_TTL
+            for k in seller_identity_keys(lot)
+        ):
             stats["dup"] += 1
             continue
         if not is_clean_female_profile(lot):
@@ -1057,7 +1066,7 @@ def filter_for_post(
         elif lot.free_dm is False:
             stats["paid"] += 1
             continue
-        used.add(key)
+        used |= seller_identity_keys(lot)
         out.append(lot)
     return out, stats
 
@@ -1224,7 +1233,8 @@ class PostQueue:
                 self._seen[lot.id] = now
                 key = lot.seller_key
                 if key:
-                    self._seen_sellers[key] = now
+                    for k in seller_identity_keys(lot):
+                        self._seen_sellers[k] = now
                 self._state["seen_sellers"] = self._seen_sellers
                 save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1

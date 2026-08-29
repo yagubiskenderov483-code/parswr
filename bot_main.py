@@ -54,7 +54,11 @@ from market import (
     TelegramMarket,
     is_ad_profile,
     is_clean_female_profile,
+    is_fresh_market_lot,
+    seller_identity_keys,
+    seller_keys_overlap,
     sort_lots_fresh_first,
+    stamp_live_lots,
 )
 
 logging.basicConfig(
@@ -839,13 +843,10 @@ class App:
             return
         for lot in lots:
             tk = self._title_key(lot)
-            self._seen_sellers.add(lot.owner_key)
-            self._filter_seen_sellers.add(lot.owner_key)
-            self._delivered_sellers.add(lot.owner_key)
-            if lot.seller:
-                self._delivered_sellers.add(lot.seller.lower())
-            if lot.seller_id is not None:
-                self._delivered_sellers.add(f"id:{int(lot.seller_id)}")
+            for key in seller_identity_keys(lot):
+                self._seen_sellers.add(key)
+                self._filter_seen_sellers.add(key)
+                self._delivered_sellers.add(key)
             if tk:
                 self._seen_titles.add(tk)
                 self._recent_titles.append(tk)
@@ -891,13 +892,7 @@ class App:
         return out
 
     def _is_delivered_seller(self, lot: Lot) -> bool:
-        if lot.owner_key in self._delivered_sellers:
-            return True
-        if lot.seller and lot.seller.lower() in self._delivered_sellers:
-            return True
-        if lot.seller_id is not None and (
-            f"id:{int(lot.seller_id)}" in self._delivered_sellers
-        ):
+        if seller_keys_overlap(lot, self._delivered_sellers):
             return True
         try:
             return self.db.is_seen_seller(
@@ -905,6 +900,21 @@ class App:
             )
         except Exception:  # noqa: BLE001
             return False
+
+    def _reserve_sellers(self, lots: list[Lot]) -> None:
+        """Зарезервировать владельцев в рамках поиска (до финальной выдачи)."""
+        for lot in lots:
+            for key in seller_identity_keys(lot):
+                self._filter_seen_sellers.add(key)
+                self._seen_sellers.add(key)
+
+    def _reload_delivered_sellers(self) -> None:
+        loaded = self._load_delivered_sellers()
+        if not loaded:
+            return
+        self._delivered_sellers |= loaded
+        self._seen_sellers |= loaded
+        self._filter_seen_sellers |= loaded
 
     def _reload_persist_seen(self, *, blocklist_only: bool = False) -> None:
         """Подтянуть блоклист (+ опционально seen). Парсер не грузит вечный seen —
@@ -1172,6 +1182,7 @@ class App:
         self._seen.clear()
         self._seen_models.clear()
         self._reload_persist_seen(blocklist_only=True)
+        self._reload_delivered_sellers()
         self.lots_notified = 0
         self.checks = 0
         self.last_check_lots = 0
@@ -1503,11 +1514,11 @@ class App:
             # выданные / seen — навсегда мимо (и по нику, и по id)
             if self._is_delivered_seller(lot):
                 continue
-            if lot.owner_key in always_block_sellers:
+            if seller_keys_overlap(lot, always_block_sellers):
                 continue
-            if (not ignore_seen) and lot.owner_key in seen_sellers:
+            if (not ignore_seen) and seller_keys_overlap(lot, seen_sellers):
                 continue
-            if lot.owner_key in local_sellers:
+            if seller_keys_overlap(lot, local_sellers):
                 continue
             tk = self._title_key(lot)
             if not tk:
@@ -1523,7 +1534,7 @@ class App:
                 buckets[tk] = []
                 keys.append(tk)
             buckets[tk].append(lot)
-            local_sellers.add(lot.owner_key)
+            local_sellers |= seller_identity_keys(lot)
             local_models.add(lot.model_key)
             local_titles.add(tk)
 
@@ -1543,11 +1554,11 @@ class App:
                 lot = bucket.pop(0)
                 if self._is_delivered_seller(lot):
                     continue
-                if lot.owner_key in always_block_sellers:
+                if seller_keys_overlap(lot, always_block_sellers):
                     continue
-                if lot.owner_key in marked_sellers:
+                if seller_keys_overlap(lot, marked_sellers):
                     continue
-                if (not ignore_seen) and lot.owner_key in seen_sellers:
+                if (not ignore_seen) and seller_keys_overlap(lot, seen_sellers):
                     continue
                 if lot.model_key in marked_models:
                     continue
@@ -1574,7 +1585,7 @@ class App:
         marked_titles: set[str] = set()
 
         def _mark(lot: Lot) -> None:
-            marked_sellers.add(lot.owner_key)
+            marked_sellers |= seller_identity_keys(lot)
             marked_models.add(lot.model_key)
             tk = self._title_key(lot)
             if tk:
@@ -1850,8 +1861,8 @@ class App:
             candidates = [
                 lot
                 for lot in candidates
-                if lot.owner_key not in self._seen_sellers
-                and lot.owner_key not in self._delivered_sellers
+                if not seller_keys_overlap(lot, self._seen_sellers)
+                and not self._is_delivered_seller(lot)
                 and self._title_key(lot) not in blocked_t
             ]
         elif channel == "filter":
@@ -1859,8 +1870,8 @@ class App:
             candidates = [
                 lot
                 for lot in candidates
-                if lot.owner_key not in self._filter_seen_sellers
-                and lot.owner_key not in self._delivered_sellers
+                if not seller_keys_overlap(lot, self._filter_seen_sellers)
+                and not self._is_delivered_seller(lot)
                 and self._title_key(lot) not in blocked_t
             ]
 
@@ -2170,6 +2181,7 @@ class App:
         self._delivered_sellers |= self._load_delivered_sellers()
         self._filter_seen_sellers = set(self._delivered_sellers)
         self._seen_sellers |= set(self._delivered_sellers)
+        self._reload_delivered_sellers()
         try:
             notes = []
             if f.online_only:
@@ -2222,25 +2234,15 @@ class App:
                 base: list[Lot], more: list[Lot], *, cap: int
             ) -> list[Lot]:
                 have_t = {self._title_key(x) for x in base}
-                have_o = {x.owner_key for x in base}
+                have_o: set[str] = set()
                 for x in base:
-                    if x.seller:
-                        have_o.add(x.seller.lstrip("@").strip().lower())
-                    if x.seller_id is not None:
-                        have_o.add(f"id:{int(x.seller_id)}")
+                    have_o |= seller_identity_keys(x)
                 out = list(base)
                 for lot in more:
                     tk = self._title_key(lot)
                     if tk in have_t:
                         continue
-                    sk = lot.owner_key
-                    sid = (
-                        f"id:{int(lot.seller_id)}"
-                        if lot.seller_id is not None
-                        else ""
-                    )
-                    su = (lot.seller or "").lstrip("@").strip().lower()
-                    if sk in have_o or (sid and sid in have_o) or (su and su in have_o):
+                    if seller_keys_overlap(lot, have_o):
                         continue
                     if self._is_delivered_seller(lot):
                         continue
@@ -2254,11 +2256,7 @@ class App:
                         continue
                     out.append(lot)
                     have_t.add(tk)
-                    have_o.add(sk)
-                    if sid:
-                        have_o.add(sid)
-                    if su:
-                        have_o.add(su)
+                    have_o |= seller_identity_keys(lot)
                     if len(out) >= cap:
                         break
                 return _dedupe_by_seller(out)
@@ -2284,8 +2282,9 @@ class App:
 
             # Только live: если мало — ждём новые с маркета, БД не трогаем
             shown: list[Lot] = []
-            live_pool: list[Lot] = []
+            processed_lot_ids: set[str] = set()
             wait_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 8.0))
+            fresh_sec = float(getattr(creds, "FILTER_LIVE_FRESH_SEC", 1200.0))
             attempt = 0
 
             await self._say_to(
@@ -2297,21 +2296,35 @@ class App:
                 attempt += 1
                 live = await _live_pool()
                 if live:
-                    live_pool = _dedupe_lots(live_pool + live)
-                    self._ingest_always(live)
-                    pool = sort_lots_fresh_first(
-                        live_pool,
-                        live_ids={lot.id for lot in live},
-                    )
-                    batch = await self._prepare_show(
-                        pool,
-                        limit=target_n,
-                        apply_extra=True,
-                        track_seen=False,
-                        need_full=True,
-                        channel="filter",
-                    )
-                    shown = _finalize(_merge_unique(shown, batch, cap=target_n))
+                    stamp_live_lots(live)
+                    new_live = [
+                        lot
+                        for lot in live
+                        if lot.id not in processed_lot_ids
+                        and is_fresh_market_lot(
+                            lot, max_age_sec=fresh_sec
+                        )
+                    ]
+                    for lot in live:
+                        processed_lot_ids.add(lot.id)
+                    if new_live:
+                        self._ingest_always(new_live)
+                        pool = sort_lots_fresh_first(
+                            _dedupe_lots(new_live),
+                            live_ids={lot.id for lot in new_live},
+                        )
+                        batch = await self._prepare_show(
+                            pool,
+                            limit=target_n,
+                            apply_extra=True,
+                            track_seen=False,
+                            need_full=True,
+                            channel="filter",
+                        )
+                        shown = _finalize(
+                            _merge_unique(shown, batch, cap=target_n)
+                        )
+                        self._reserve_sellers(shown)
 
                 if len(shown) >= target_n:
                     break
@@ -2972,6 +2985,7 @@ class App:
         self.parse_checked = 0
         self.parse_ready = 0
         self._last_pool = []
+        self._reload_delivered_sellers()
         # подключаем все акки ДО скана
         try:
             markets = await self._build_parse_markets(force=True)
@@ -3324,17 +3338,10 @@ def _dedupe_by_seller(lots: list[Lot]) -> list[Lot]:
     seen: set[str] = set()
     out: list[Lot] = []
     for lot in lots:
-        keys: list[str] = []
-        if lot.seller:
-            keys.append(lot.seller.lstrip("@").strip().lower())
-        if lot.seller_id is not None:
-            keys.append(f"id:{int(lot.seller_id)}")
-        if not keys:
-            keys.append(f"lot:{lot.id}")
-        if any(k in seen for k in keys):
+        keys = seller_identity_keys(lot)
+        if seller_keys_overlap(lot, seen):
             continue
-        for k in keys:
-            seen.add(k)
+        seen |= keys
         out.append(lot)
     return out
 

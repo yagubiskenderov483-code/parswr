@@ -245,6 +245,47 @@ def sort_lots_fresh_first(lots: list[Lot], *, live_ids: set[str] | None = None) 
     return sorted(lots, key=_key)
 
 
+def seller_identity_keys(lot: Lot) -> set[str]:
+    """Все ключи TG-аккаунта — чтобы не дублировать по нику и id."""
+    keys: set[str] = set()
+    if lot.seller:
+        u = lot.seller.lower().lstrip("@").strip()
+        if u:
+            keys.add(u)
+            keys.add(f"u:{u}")
+    if lot.seller_id is not None:
+        keys.add(f"id:{int(lot.seller_id)}")
+    if not keys:
+        keys.add(lot.owner_key)
+    return keys
+
+
+def seller_keys_overlap(lot: Lot, blocked: set[str]) -> bool:
+    return bool(seller_identity_keys(lot) & blocked)
+
+
+def stamp_live_lots(lots: list[Lot], *, now: float | None = None) -> None:
+    """Пометить лоты как только что увиденные на маркете."""
+    ts = float(now if now is not None else time.time())
+    for lot in lots:
+        lot.discovered_at = ts
+        lot.seen_at = ts
+
+
+def is_fresh_market_lot(
+    lot: Lot,
+    *,
+    max_age_sec: float = 1200.0,
+    now: float | None = None,
+) -> bool:
+    """Свежий лот с live-скана (не старый из накопленного пула)."""
+    ts = float(now if now is not None else time.time())
+    seen = float(lot.discovered_at or lot.seen_at or 0)
+    if seen <= 0:
+        return True
+    return (ts - seen) <= max(60.0, float(max_age_sec))
+
+
 @dataclass
 class CheckResult:
     check_no: int
@@ -633,6 +674,9 @@ class TelegramMarket:
             self._cursor = saved_cursor
 
         unique = _dedupe(lots)
+        now = time.time()
+        for lot in unique:
+            lot.discovered_at = now
         random.shuffle(unique)
         matched = [lot for lot in unique if min_stars <= lot.stars <= max_stars]
         random.shuffle(matched)

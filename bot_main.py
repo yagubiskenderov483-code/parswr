@@ -54,7 +54,6 @@ from market import (
     TelegramMarket,
     is_ad_profile,
     is_clean_female_profile,
-    is_fresh_market_lot,
     seller_identity_keys,
     seller_keys_overlap,
     sort_lots_fresh_first,
@@ -2280,65 +2279,117 @@ class App:
                         break
                 return clean
 
-            # Только live: если мало — ждём новые с маркета, БД не трогаем
+            # Снимок маркета → ждём только НОВЫЕ листинги (не то что уже висит)
             shown: list[Lot] = []
-            processed_lot_ids: set[str] = set()
-            wait_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 8.0))
-            fresh_sec = float(getattr(creds, "FILTER_LIVE_FRESH_SEC", 1200.0))
+            handled_new_ids: set[str] = set()
+            market_snapshot_ids: set[str] = set()
+            wait_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 35.0))
             attempt = 0
+            last_status_n = -1
+            last_status_at = 0.0
 
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nсканирую маркет…",
+                f"{screen('Фильтры')}\nснимок маркета…",
+            )
+            for _ in range(6):
+                if not self.filter_search_running:
+                    break
+                snap = await _live_pool()
+                if snap:
+                    market_snapshot_ids = {lot.id for lot in snap}
+                    break
+                await asyncio.sleep(3.0)
+
+            if not market_snapshot_ids:
+                await self._say_to(
+                    chat_id,
+                    f"{screen('Фильтры')}\nмаркет пуст · попробуй позже",
+                    reply_markup=filters_inline(),
+                )
+                return
+
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\n"
+                f"на маркете сейчас <b>{len(market_snapshot_ids)}</b> лотов · "
+                f"жду <b>новые</b> (проверка каждые {int(wait_sec)}с)…",
             )
 
             while self.filter_search_running and len(shown) < target_n:
-                attempt += 1
-                live = await _live_pool()
-                if live:
-                    stamp_live_lots(live)
-                    new_live = [
-                        lot
-                        for lot in live
-                        if lot.id not in processed_lot_ids
-                        and is_fresh_market_lot(
-                            lot, max_age_sec=fresh_sec
-                        )
-                    ]
-                    for lot in live:
-                        processed_lot_ids.add(lot.id)
-                    if new_live:
-                        self._ingest_always(new_live)
-                        pool = sort_lots_fresh_first(
-                            _dedupe_lots(new_live),
-                            live_ids={lot.id for lot in new_live},
-                        )
-                        batch = await self._prepare_show(
-                            pool,
-                            limit=target_n,
-                            apply_extra=True,
-                            track_seen=False,
-                            need_full=True,
-                            channel="filter",
-                        )
-                        shown = _finalize(
-                            _merge_unique(shown, batch, cap=target_n)
-                        )
-                        self._reserve_sellers(shown)
-
-                if len(shown) >= target_n:
-                    break
-
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\n"
-                    f"нашёл <b>{len(shown)}</b> / {target_n} · "
-                    f"жду новые с маркета… (#{attempt})",
-                )
+                # сначала пауза — не спамим сканами подряд
                 for _ in range(max(1, int(wait_sec * 2))):
                     if not self.filter_search_running:
                         break
                     await asyncio.sleep(0.5)
+                if not self.filter_search_running:
+                    break
+
+                attempt += 1
+                live = await _live_pool()
+                if not live:
+                    now = time.monotonic()
+                    if now - last_status_at >= wait_sec:
+                        await self._say_to(
+                            chat_id,
+                            f"{screen('Фильтры')}\n"
+                            f"жду новые… <b>{len(shown)}</b> / {target_n} (#{attempt})",
+                        )
+                        last_status_at = now
+                    continue
+
+                stamp_live_lots(live)
+                new_listings = [
+                    lot
+                    for lot in live
+                    if lot.id not in market_snapshot_ids
+                    and lot.id not in handled_new_ids
+                ]
+                for lot in new_listings:
+                    handled_new_ids.add(lot.id)
+
+                if not new_listings:
+                    now = time.monotonic()
+                    if now - last_status_at >= wait_sec:
+                        await self._say_to(
+                            chat_id,
+                            f"{screen('Фильтры')}\n"
+                            f"новых пока нет · <b>{len(shown)}</b> / {target_n} (#{attempt})",
+                        )
+                        last_status_at = now
+                    continue
+
+                self._ingest_always(new_listings)
+                pool = sort_lots_fresh_first(
+                    _dedupe_lots(new_listings),
+                    live_ids={lot.id for lot in new_listings},
+                )
+                batch = await self._prepare_show(
+                    pool,
+                    limit=target_n,
+                    apply_extra=True,
+                    track_seen=False,
+                    need_full=True,
+                    channel="filter",
+                )
+                prev_n = len(shown)
+                shown = _finalize(_merge_unique(shown, batch, cap=target_n))
+                self._reserve_sellers(shown)
+
+                if len(shown) > prev_n:
+                    await self._say_to(
+                        chat_id,
+                        f"{screen('Фильтры')}\n"
+                        f"новых на маркете: <b>{len(new_listings)}</b> · "
+                        f"готово <b>{len(shown)}</b> / {target_n}",
+                    )
+                    last_status_n = len(shown)
+                    last_status_at = time.monotonic()
+                elif len(shown) != last_status_n:
+                    last_status_n = len(shown)
+
+                if len(shown) >= target_n:
+                    break
 
             shown = _finalize(shown)[:target_n]
             if not shown:

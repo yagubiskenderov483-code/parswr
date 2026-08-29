@@ -128,6 +128,123 @@ class Lot:
         return " ".join(parts)
 
 
+# --- Фильтры профиля: только девочки, без рекламы/отзывов/GiftDouble ---
+
+_FEMALE_HINT_RE = re.compile(
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|💖|💕|💗|🌸)",
+    re.IGNORECASE,
+)
+_MALE_HINT_RE = re.compile(
+    r"(парень|мужчин|boy|man|he/him|👨|🧔)",
+    re.IGNORECASE,
+)
+_AD_PROFILE_RE = re.compile(
+    r"("
+    r"дарю\s*гифт|дарю\s*gift|дарю\s*подар|раздач|"
+    r"бесплатн|free\s*gift|giveaway|акци[яи]|"
+    r"пиши\s*в\s*лс|реклам|продам\s*гифт|купл[юу]\s*гифт|"
+    r"взаимн|nft\s*drop|airdrop|крипт|казино|заработок|инвест|"
+    r"100%\s*profit|ставки|"
+    r"\bbot\b|@\w*bot\b|t\.me/|telegram\.me/|"
+    r"канал|подпис|subscribe|join\s*chat|"
+    r"розыгрыш|промо|скидк|referral|реферал"
+    r")",
+    re.IGNORECASE,
+)
+_GIFTDOUBLE_RE = re.compile(r"giftdouble|@giftdouble", re.IGNORECASE)
+_REVIEW_RE = re.compile(
+    r"("
+    r"отзыв|reviews?|рейтинг|rating|"
+    r"\d+\s*/\s*5|⭐{2,}|"
+    r"довольн\w+\s+клиент|проверенн\w+\s+продав"
+    r")",
+    re.IGNORECASE,
+)
+_FEMALE_NAME_END_RE = re.compile(r"(ия|ья|на|та|са|ка|ла|ра|ва|ша|ая)$")
+
+
+def profile_text_blob(lot: Lot) -> str:
+    return " ".join(
+        x
+        for x in (
+            lot.first_name or "",
+            lot.last_name or "",
+            lot.about or "",
+            lot.seller or "",
+        )
+        if x
+    ).strip()
+
+
+def looks_male(lot: Lot) -> bool:
+    blob = profile_text_blob(lot).lower()
+    if _MALE_HINT_RE.search(blob):
+        return True
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3:
+        if fn.endswith(("ич", "ей", "он", "ил")):
+            return True
+        if fn.endswith(("ан", "ен", "ур", "им", "ий")) and not fn.endswith(
+            ("ия", "ья")
+        ):
+            return True
+    return False
+
+
+def looks_female(lot: Lot) -> bool:
+    if looks_male(lot):
+        return False
+    blob = profile_text_blob(lot).lower()
+    if _FEMALE_HINT_RE.search(blob):
+        return True
+    fn = (lot.first_name or "").strip().lower()
+    if len(fn) >= 3:
+        if _FEMALE_NAME_END_RE.search(fn):
+            return True
+        if fn[-1] in "ая":
+            return True
+    return False
+
+
+def has_review_in_profile(lot: Lot) -> bool:
+    blob = profile_text_blob(lot)
+    return bool(blob and _REVIEW_RE.search(blob))
+
+
+def has_giftdouble(lot: Lot) -> bool:
+    return bool(_GIFTDOUBLE_RE.search(profile_text_blob(lot)))
+
+
+def is_ad_profile(lot: Lot) -> bool:
+    blob = profile_text_blob(lot)
+    return bool(blob and _AD_PROFILE_RE.search(blob))
+
+
+def is_clean_female_profile(lot: Lot) -> bool:
+    """Женский профиль без рекламы, отзывов и GiftDouble."""
+    if not looks_female(lot):
+        return False
+    if is_ad_profile(lot):
+        return False
+    if has_review_in_profile(lot):
+        return False
+    if has_giftdouble(lot):
+        return False
+    return True
+
+
+def sort_lots_fresh_first(lots: list[Lot], *, live_ids: set[str] | None = None) -> list[Lot]:
+    """Сначала live с маркета, внутри группы — по свежести."""
+    live = live_ids or set()
+
+    def _key(lot: Lot) -> tuple[int, float]:
+        is_live = 0 if lot.id in live else 1
+        ts = float(lot.discovered_at or lot.seen_at or 0)
+        return (is_live, -ts)
+
+    return sorted(lots, key=_key)
+
+
 @dataclass
 class CheckResult:
     check_no: int

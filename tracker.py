@@ -41,6 +41,7 @@ from market import (
     Lot,
     TelegramMarket,
     format_account_level,
+    is_clean_female_profile,
     is_free_dm_lot,
     is_russian_lot,
 )
@@ -1020,6 +1021,7 @@ def filter_for_post(
         "unknown_dm": 0,
         "unknown_ru": 0,
         "level": 0,
+        "not_female": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -1031,6 +1033,9 @@ def filter_for_post(
         prev = seen_sellers.get(key)
         if prev is not None and now - float(prev) < SELLER_TTL:
             stats["dup"] += 1
+            continue
+        if not is_clean_female_profile(lot):
+            stats["not_female"] += 1
             continue
         if strict_ru:
             ru = is_russian_lot(lot)
@@ -1063,25 +1068,9 @@ _FEMALE_HINT_RE = re.compile(
 )
 
 def _looks_female(lot: Lot) -> bool:
-    blob = " ".join(
-        x
-        for x in (
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-            lot.seller or "",
-        )
-        if x
-    ).lower()
-    if _FEMALE_HINT_RE.search(blob):
-        return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
-        if fn.endswith(("ия", "ья", "на", "та", "са", "ка", "ла", "ра", "ва", "ша")):
-            return True
-        if fn[-1] in "ая":
-            return True
-    return False
+    from market import looks_female
+
+    return looks_female(lot)
 
 
 def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
@@ -1110,6 +1099,8 @@ def _skip_reason(stats: dict[str, int]) -> str:
         parts.append("не RU")
     if stats.get("level"):
         parts.append("level")
+    if stats.get("not_female"):
+        parts.append("не девочка/реклама")
     if stats.get("paid"):
         parts.append("платные ЛС")
     if stats.get("unknown_dm"):

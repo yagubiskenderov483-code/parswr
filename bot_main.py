@@ -49,7 +49,13 @@ from telethon.sessions import StringSession
 
 import credentials as creds
 from db import GiftDB
-from market import Lot, TelegramMarket
+from market import (
+    Lot,
+    TelegramMarket,
+    is_ad_profile,
+    is_clean_female_profile,
+    sort_lots_fresh_first,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,18 +85,6 @@ PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r30_60", "30k–60k ⭐", 30000, 60000),
     ("r60_100", "60k–100k ⭐", 60000, 100000),
 ]
-
-# Рекламные акки — не показываем
-_AD_RE = re.compile(
-    r"("
-    r"дарю\s*гифт|дарю\s*gift|дарю\s*подар|раздач|"
-    r"бесплатн|free\s*gift|giveaway|акци[яи]|"
-    r"пиши\s*в\s*лс|реклам|продам\s*гифт|купл[юу]\s*гифт|"
-    r"взаимн|nft\s*drop|airdrop|крипт|казино|заработок|инвест|"
-    r"100%\s*profit|ставки"
-    r")",
-    re.IGNORECASE,
-)
 
 # Русские: кириллица в нике/имени/био/описании (просто и достаточно)
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
@@ -1305,8 +1299,10 @@ class App:
         return self.min_stars <= lot.stars <= self.max_stars
 
     def _is_ad(self, lot: Lot) -> bool:
-        blob = " ".join(x for x in (lot.about, lot.first_name, lot.last_name) if x)
-        return bool(blob and _AD_RE.search(blob))
+        return is_ad_profile(lot)
+
+    def _is_clean_female(self, lot: Lot) -> bool:
+        return is_clean_female_profile(lot)
 
     @staticmethod
     def _bad_username_len(seller: str) -> bool:
@@ -1487,6 +1483,8 @@ class App:
                 continue
             if self._is_ad(lot):
                 continue
+            if not self._is_clean_female(lot):
+                continue
             if want_ru and not self._is_russian(lot):
                 continue
             if require_free_dm:
@@ -1556,6 +1554,8 @@ class App:
                 if channel in ("parser", "filter"):
                     if self._title_key(lot) in marked_titles:
                         continue
+                if not self._is_clean_female(lot):
+                    continue
                 if require_free_dm:
                     if strict_free_dm or channel == "parser":
                         if not self._is_free_dm(lot):
@@ -1768,6 +1768,7 @@ class App:
             best = [lot for lot in best if self._is_russian(lot)]
             if channel == "parser":
                 best = [lot for lot in best if self._is_free_dm(lot)]
+            best = [lot for lot in best if self._is_clean_female(lot)]
             best = _dedupe_by_seller(best)
         if best and track_seen and channel in ("parser", "filter", "old"):
             self._mark_delivered(best, channel=channel)
@@ -1841,6 +1842,7 @@ class App:
             for lot in pool
             if lot.seller and not self._bad_username_len(lot.seller)
             and not self._is_delivered_seller(lot)
+            and self._is_clean_female(lot)
         ]
         # без уже выданных юзов/типов — каналы раздельно
         if channel == "parser":
@@ -2252,7 +2254,10 @@ class App:
                     if raw:
                         self._save_models(raw)
                     self._flush_market_users()
-                    return list(burst.lots or raw)
+                    in_range = [
+                        lot for lot in raw if mn <= lot.stars <= mx
+                    ]
+                    return in_range or list(burst.lots or [])
                 except Exception as exc:  # noqa: BLE001
                     await self._say_to(
                         chat_id,
@@ -2290,6 +2295,8 @@ class App:
                         continue
                     if not self._is_russian(lot):
                         continue
+                    if not self._is_clean_female(lot):
+                        continue
                     if self._filters_active() and not self._passes_extra_filters(lot):
                         continue
                     out.append(lot)
@@ -2304,10 +2311,12 @@ class App:
                 return _dedupe_by_seller(out)
 
             def _finalize(cands: list[Lot]) -> list[Lot]:
-                """Строго: RU + не выданные + 1 лот на TG."""
+                """Строго: RU + девочки без рекламы + не выданные + 1 лот на TG."""
                 clean: list[Lot] = []
                 for lot in _dedupe_by_seller(cands):
                     if not self._is_russian(lot):
+                        continue
+                    if not self._is_clean_female(lot):
                         continue
                     if self._is_delivered_seller(lot):
                         continue
@@ -2320,61 +2329,49 @@ class App:
                         break
                 return clean
 
-            # 1) БД пустая/маленькая — сразу live burst (копим + выдаём типы)
-            #    иначе сначала БД (быстро при большом каталоге)
+            # 1) всегда сначала live с маркета, потом добор из БД
             shown: list[Lot] = []
-            old: list[Lot] = []
-            if db_n < 500 or total_db < 500:
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\nБД мала ({total_db}) — live burst…",
-                )
-                live0 = await _live_pool()
-                self._ingest_always(live0)
-                old = _db_pool()
-                merged0 = _dedupe_lots(live0 + old)
-                random.shuffle(merged0)
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\nlive <b>{len(live0)}</b> · "
-                    f"БД <b>{len(old)}</b>",
-                )
-                shown = await self._prepare_show(
-                    merged0,
-                    limit=target_n,
-                    apply_extra=True,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
-            else:
-                old = _db_pool()
-                random.shuffle(old)
-                self._ingest_always(old)
-                await self._say_to(
-                    chat_id,
-                    f"{screen('Фильтры')}\nпул БД: <b>{len(old)}</b> лотов",
-                )
-                shown = await self._prepare_show(
-                    old,
-                    limit=target_n,
-                    apply_extra=True,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
+            live_ids: set[str] = set()
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\nсначала live с маркета…",
+            )
+            live0 = await _live_pool()
+            live_ids = {lot.id for lot in live0}
+            self._ingest_always(live0)
+            old = _db_pool()
+            merged0 = sort_lots_fresh_first(
+                _dedupe_lots(live0 + old),
+                live_ids=live_ids,
+            )
+            await self._say_to(
+                chat_id,
+                f"{screen('Фильтры')}\nlive <b>{len(live0)}</b> · "
+                f"БД <b>{len(old)}</b> · пул <b>{len(merged0)}</b>",
+            )
+            shown = await self._prepare_show(
+                merged0,
+                limit=target_n,
+                apply_extra=True,
+                track_seen=False,
+                need_full=True,
+                channel="filter",
+            )
             shown = _finalize(shown)
 
-            # 2) мало — live + ещё рандом из БД
+            # 2) мало — ещё live + БД (live в приоритете)
             if len(shown) < target_n:
                 live = await _live_pool()
+                live_ids |= {lot.id for lot in live}
                 old2 = _db_pool()
-                merged = _dedupe_lots(old + old2 + live)
-                random.shuffle(merged)
+                merged = sort_lots_fresh_first(
+                    _dedupe_lots(old + old2 + live),
+                    live_ids=live_ids,
+                )
                 self._ingest_always(merged)
                 await self._say_to(
                     chat_id,
-                    f"{screen('Фильтры')}\nдобор · БД {len(old2)} + live {len(live)}",
+                    f"{screen('Фильтры')}\nдобор · live {len(live)} · БД {len(old2)}",
                 )
                 more = await self._prepare_show(
                     merged,
@@ -2540,8 +2537,9 @@ class App:
             if channel in ("parser", "old")
             else lots[: creds.SHOW_LIMIT]
         )
-        # только русские + строго бесплатные ЛС
+        # только русские + девочки без рекламы + строго бесплатные ЛС
         batch = [lot for lot in batch if self._is_russian(lot)]
+        batch = [lot for lot in batch if self._is_clean_female(lot)]
         if channel == "parser":
             batch = [lot for lot in batch if self._is_free_dm(lot)]
         batch = _dedupe_by_seller(batch)

@@ -344,6 +344,7 @@ def build_router(
                 "/status — статус\n"
                 "/filters — цена и фильтры\n"
                 "/setprice 5000 25000 — цена вручную\n"
+                "/resnapshot — сброс снимка маркета\n"
                 "/test — тестовая карточка в канал\n"
                 "/resetseen — сбросить seen (тест)",
             )
@@ -458,8 +459,14 @@ def build_router(
             via = "бот" if rt.post_via == "bot" else "аккаунт"
             lines.append(f"Последний пост: через {via}")
         if rt:
+            snap = (
+                "готов"
+                if rt.snapshot_ready
+                else "строится… (1–3 мин, старые лоты не постим)"
+            )
             lines.extend(
                 [
+                    f"Снимок маркета: {snap} ({len(rt.market_ids) if rt.market_ids else 0} id)",
                     f"Проходов: {rt.passes}",
                     f"Коллекций: {rt.collections_total or '—'} "
                     f"(parallel {rt.scan_parallel or 8})",
@@ -494,7 +501,40 @@ def build_router(
                     f"⚠️ Ошибки API: {rt.last_scan_errors}"
                     + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
                 )
+            if rt.passes == 0 and not rt.snapshot_ready:
+                lines.append(
+                    "⏳ Сканер ждёт снимок маркета — это нормально после старта"
+                )
+            elif rt.passes > 0 and rt.last_scan_parsed == 0:
+                lines.append(
+                    "⚠️ API не отдаёт лоты — проверь сессию (/start) и логи Bothost"
+                )
+            elif rt.passes > 0 and rt.last_fresh == 0 and rt.posted_total == 0:
+                lines.append(
+                    "ℹ️ Скан идёт, но новых лотов в цене нет или фильтр девочек отсекает"
+                )
         await message.answer("\n".join(lines))
+
+    @router.message(Command("resnapshot"))
+    async def cmd_resnapshot(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        rt = control.runtime if control else None
+        if not rt or not rt.state or not rt.state_path:
+            await message.answer("Трекер ещё не запущен.")
+            return
+        from tracker import save_state
+
+        n = len(rt.market_ids) if rt.market_ids else 0
+        rt.state["market_ids"] = []
+        if rt.market_ids is not None:
+            rt.market_ids.clear()
+        save_state(rt.state_path, rt.state)
+        await message.answer(
+            f"✅ Снимок сброшен ({n} id).\n"
+            "Перезапусти бота на Bothost — сделается новый снимок без постинга старых."
+        )
 
     @router.message(Command("filters"))
     async def cmd_filters(message: Message) -> None:

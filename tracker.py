@@ -1280,8 +1280,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6.0"
-BUILD_TAG = "v3.6-filters-2e3a"
+TRACKER_VERSION = "3.6.1"
+BUILD_TAG = "v3.6.1-main-deploy"
 
 
 @dataclass

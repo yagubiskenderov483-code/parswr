@@ -58,7 +58,6 @@ from market import (
     looks_male,
     seller_identity_keys,
     seller_keys_overlap,
-    sort_lots_fresh_first,
 )
 
 logging.basicConfig(
@@ -77,6 +76,7 @@ def screen(where: str) -> str:
 # Сложности парсинга
 DIFFICULTIES: list[tuple[str, str, int, int]] = [
     ("easy", "🟢 Лёгкий · 2k–5k", 2000, 5000),
+    ("wide", "🔵 5k–25k", 5000, 25000),
     ("mid", "🟡 Средний · 5k–15k", 5000, 15000),
     ("hard", "🔴 Сложный · 15k–30k", 15000, 30000),
     ("impos", "💀 Impossible · 30k–60k", 30000, 60000),
@@ -84,6 +84,7 @@ DIFFICULTIES: list[tuple[str, str, int, int]] = [
 
 PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r2_5", "2k–5k ⭐", 2000, 5000),
+    ("r5_25", "5k–25k ⭐", 5000, 25000),
     ("r5_15", "5k–15k ⭐", 5000, 15000),
     ("r15_30", "15k–30k ⭐", 15000, 30000),
     ("r30_60", "30k–60k ⭐", 30000, 60000),
@@ -153,9 +154,9 @@ class App:
         self.max_stars = 5000.0
         self.range_label = "2k–5k ⭐"
         # Отдельная сложность ТОЛЬКО для фильтр-поиска (парсер не трогает)
-        self.filter_min_stars = 2000.0
-        self.filter_max_stars = 5000.0
-        self.filter_range_label = "🟢 Лёгкий · 2k–5k"
+        self.filter_min_stars = 5000.0
+        self.filter_max_stars = 25000.0
+        self.filter_range_label = "🔵 5k–25k"
         self.logged_in = False
         self.account_name = ""
         self.lots_notified = 0
@@ -2202,9 +2203,12 @@ class App:
             )
             self.parse_acc_checks += len(pool)
         allowed_ids = {lot.id for lot in lots}
+        mn_f, mx_f = self.filter_min_stars, self.filter_max_stars
         out: list[Lot] = []
         for lot in pool:
             if lot.id not in allowed_ids:
+                continue
+            if not (mn_f <= lot.stars <= mx_f):
                 continue
             if not lot.seller or self._bad_username_len(lot.seller):
                 continue
@@ -2287,7 +2291,7 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n{label}{extra}{spice_note}\n"
-                f"только live с маркета · цель <b>{target_n}</b>",
+                f"<b>{int(mn):,}–{int(mx):,}</b> ⭐ · цель <b>{target_n}</b>",
             )
 
             async def _live_pool() -> list[Lot]:
@@ -2314,25 +2318,6 @@ class App:
                         f"{screen('Фильтры')}\n⚠️ live {_esc(str(exc)[:100])}",
                     )
                     return []
-
-            def _finalize(cands: list[Lot]) -> list[Lot]:
-                """Строго: RU + девочки без рекламы + не выданные + 1 лот на TG."""
-                clean: list[Lot] = []
-                for lot in _dedupe_by_seller(cands):
-                    if not self._is_russian(lot):
-                        continue
-                    if not self._is_clean_female(lot):
-                        continue
-                    if self._is_delivered_seller(lot):
-                        continue
-                    if lot.free_dm is False:
-                        continue
-                    if self._filters_active() and not self._passes_extra_filters(lot):
-                        continue
-                    clean.append(lot)
-                    if len(clean) >= target_n:
-                        break
-                return clean
 
             # Снимок → очередь → по 1 лоту каждые N сек (только НОВЫЕ листинги)
             pending: deque[Lot] = deque()
@@ -3551,6 +3536,7 @@ def filters_inline() -> InlineKeyboardMarkup:
         )
         for rid, short in (
             ("easy", "🟢"),
+            ("wide", "🔵"),
             ("mid", "🟡"),
             ("hard", "🔴"),
             ("impos", "💀"),

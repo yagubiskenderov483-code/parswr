@@ -250,7 +250,7 @@ class Config:
     bot_token: str
     target_channel: str
     min_stars: float = 500.0
-    max_stars: float = 5000.0
+    max_stars: float = 50000.0
     poll_interval: float = 2.0
     page_limit: int = 12  # только верх resale-листа
     parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
@@ -317,7 +317,7 @@ class Config:
             bot_token=bot_token,
             target_channel=target,
             min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 5000),
+            max_stars=_f("MAX_STARS", 50000),
             poll_interval=_f("POLL_INTERVAL", 2.0),
             page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=min(6, int(_f("PARALLEL", 4))),

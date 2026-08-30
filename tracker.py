@@ -76,7 +76,9 @@ def _resolve_bot_token() -> str:
     try:
         import credentials as creds
 
-        token = str(getattr(creds, "BOT_TOKEN", "") or "").strip()
+        token = str(getattr(creds, "_DEFAULT_BOT_TOKEN", "") or "").strip()
+        if not token:
+            token = str(getattr(creds, "BOT_TOKEN", "") or "").strip()
         if token:
             return token
     except ImportError:
@@ -274,6 +276,7 @@ class Config:
     channel_id: int | None = None
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
+    female_only: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -1043,6 +1046,7 @@ def filter_for_post(
     strict_ru: bool = True,
     strict_free: bool = False,
     max_account_level: int = 2,
+    female_only: bool = True,
 ) -> tuple[list[Lot], dict[str, int]]:
     """RU + level + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
@@ -1075,7 +1079,7 @@ def filter_for_post(
         ):
             stats["dup"] += 1
             continue
-        if not is_clean_female_profile(lot):
+        if female_only and not is_clean_female_profile(lot):
             stats["not_female"] += 1
             continue
         if strict_ru:
@@ -1238,6 +1242,7 @@ class PostQueue:
                     strict_ru=self._cfg.strict_ru,
                     strict_free=self._cfg.strict_free,
                     max_account_level=self._cfg.max_account_level,
+                    female_only=self._cfg.female_only,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
@@ -1254,7 +1259,17 @@ class PostQueue:
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
                 if not to_post:
-                    if lot.seller_key:
+                    skip_permanent = (
+                        fstats["dup"]
+                        or fstats["non_ru"]
+                        or fstats["paid"]
+                        or fstats["level"]
+                        or (
+                            fstats["not_female"]
+                            and (lot.first_name or "").strip()
+                        )
+                    )
+                    if skip_permanent and lot.seller_key:
                         self._seen[lot.id] = now
                     reason = _skip_reason(fstats)
                     if reason:
@@ -1295,8 +1310,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6.2"
-BUILD_TAG = "v3.6.2-parse-fix"
+TRACKER_VERSION = "3.6.3"
+BUILD_TAG = "v3.6.3-run-fix"
 
 
 @dataclass
@@ -1628,8 +1643,12 @@ async def run() -> None:
     snapshot_ready = asyncio.Event()
 
     async def _build_snapshot() -> None:
-        logger.info("Снимок маркета: 2 полных прохода (старые лоты не постим)…")
+        logger.info("Снимок маркета: до 2 проходов (макс 90с)…")
+        deadline = time.monotonic() + 90.0
         for pass_n in range(2):
+            if time.monotonic() >= deadline:
+                logger.warning("Снимок: таймаут 90с — запускаю сканер")
+                break
             try:
                 snap_stats = await poll_once(
                     m,
@@ -1645,9 +1664,12 @@ async def run() -> None:
                     len(market_ids),
                     snap_stats.get("parsed", 0),
                 )
+                if len(market_ids) >= MIN_MARKET_SNAPSHOT_IDS:
+                    logger.info("Снимок достаточный — досрочный старт сканера")
+                    break
             except Exception as exc:  # noqa: BLE001
                 logger.error("Снимок маркета: %s", exc)
-            if pass_n < 1:
+            if pass_n < 1 and time.monotonic() < deadline:
                 await asyncio.sleep(1.5)
         state["market_ids"] = list(market_ids)
         save_state(state_path, state)

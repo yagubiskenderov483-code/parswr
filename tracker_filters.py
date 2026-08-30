@@ -63,6 +63,7 @@ def config_to_filters(cfg: Any) -> dict[str, Any]:
         "strict_free": bool(cfg.strict_free),
         "max_account_level": int(cfg.max_account_level),
         "post_interval": float(cfg.post_interval),
+        "female_only": bool(getattr(cfg, "female_only", True)),
     }
 
 
@@ -81,6 +82,8 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.max_account_level = int(data["max_account_level"])
     if "post_interval" in data:
         cfg.post_interval = max(1.0, float(data["post_interval"]))
+    if "female_only" in data:
+        cfg.female_only = bool(data["female_only"])
 
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
@@ -90,6 +93,7 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "strict_free": False,
     "max_account_level": 2,
     "post_interval": 4.0,
+    "female_only": True,
 }
 
 
@@ -113,11 +117,12 @@ def filters_summary(cfg: Any) -> str:
     rid = current_preset_id(cfg.min_stars, cfg.max_stars)
     preset = _preset_by_id(rid)
     price = preset[1] if preset else f"{int(cfg.min_stars):,}–{int(cfg.max_stars):,}⭐"
+    female = "девочки" if getattr(cfg, "female_only", True) else "все"
     return (
         f"Цена: <b>{price}</b>\n"
         f"RU: <b>{'да' if cfg.strict_ru else 'нет'}</b> · "
         f"ЛС free: <b>{'строго' if cfg.strict_free else 'не платные'}</b>\n"
         f"Level ≤ <b>{int(cfg.max_account_level)}</b> · "
         f"Пост / <b>{int(cfg.post_interval)}</b>с\n"
-        f"Профиль: <b>только девочки</b> · без рекламы"
+        f"Профиль: <b>{female}</b> · без рекламы"
     )

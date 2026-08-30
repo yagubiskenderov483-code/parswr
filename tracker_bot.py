@@ -258,6 +258,7 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
     ]
     ru = "✅" if cfg.strict_ru else "⬜️"
     free = "✅" if cfg.strict_free else "⬜️"
+    female = "✅" if getattr(cfg, "female_only", True) else "⬜️"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             price_row,
@@ -269,9 +270,14 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text=f"{female} Девочки", callback_data="tf:female"
+                ),
+                InlineKeyboardButton(
                     text=f"Level ≤{int(cfg.max_account_level)}",
                     callback_data="tf:lvl",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text=f"Пост {int(cfg.post_interval)}с",
                     callback_data="tf:post",
@@ -612,6 +618,10 @@ def build_router(
         elif action == "free":
             _apply_tracker_filters(control, strict_free=not bool(cfg.strict_free))
             note = "Free ЛС"
+        elif action == "female":
+            cur = bool(getattr(cfg, "female_only", True))
+            _apply_tracker_filters(control, female_only=not cur)
+            note = "девочки" if not cur else "все профили"
         elif action == "lvl":
             nxt = {2: 5, 5: 10, 10: 2}.get(int(cfg.max_account_level), 2)
             _apply_tracker_filters(control, max_account_level=nxt)
@@ -805,6 +815,11 @@ class ControlBot:
             logger.info("Канал при старте бота: %s", boot_cid)
         info = await self._bot.get_me()
         self.bot_username = str(info.username or "")
+        try:
+            await self._bot.delete_webhook(drop_pending_updates=False)
+            logger.info("Webhook сброшен — polling")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete_webhook: %s", exc)
         logger.info("Control bot @%s запущен", self.bot_username or info.id)
         from tracker import control_bot_username
 

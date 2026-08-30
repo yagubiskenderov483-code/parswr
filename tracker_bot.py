@@ -351,6 +351,7 @@ def build_router(
                 "/filters — цена и фильтры\n"
                 "/setprice 5000 25000 — цена вручную\n"
                 "/resnapshot — сброс снимка маркета\n"
+                "/probe — тест API маркета\n"
                 "/test — тестовая карточка в канал\n"
                 "/resetseen — сбросить seen (тест)",
             )
@@ -456,7 +457,8 @@ def build_router(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
-                f"пост/{int(cfg.post_interval)}с · только девочки"
+                f"пост/{int(cfg.post_interval)}с · "
+                f"{'девочки' if getattr(cfg, 'female_only', True) else 'все'}"
             )
             lines.append("Менять: /filters")
         bot_handle = _bot_handle()
@@ -512,14 +514,40 @@ def build_router(
                     "⏳ Сканер ждёт снимок маркета — это нормально после старта"
                 )
             elif rt.passes > 0 and rt.last_scan_parsed == 0:
+                err = (rt.last_api_error or "").strip()
                 lines.append(
-                    "⚠️ API не отдаёт лоты — проверь сессию (/start) и логи Bothost"
+                    "⚠️ API не отдаёт лоты — проверь сессию (/start)"
+                    + (f"\n<code>{_esc(err[:200])}</code>" if err else "")
                 )
+                lines.append("Диагностика: /probe")
             elif rt.passes > 0 and rt.last_fresh == 0 and rt.posted_total == 0:
                 lines.append(
                     "ℹ️ Скан идёт, но новых лотов в цене нет или фильтр девочек отсекает"
                 )
         await message.answer("\n".join(lines))
+
+    @router.message(Command("probe"))
+    async def cmd_probe(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        rt = control.runtime if control else None
+        if not rt or not rt.cfg or not rt.market:
+            await message.answer("Трекер ещё запускается…")
+            return
+        from tracker import probe_market
+
+        gids = list(rt.gift_ids or rt.market._gift_ids or [])
+        probe = await probe_market(rt.market, gids, rt.cfg)
+        err = str(probe.get("error") or rt.last_api_error or "").strip()
+        await message.answer(
+            "🔎 <b>Probe маркета</b>\n"
+            f"Коллекций: <b>{probe.get('collections', 0)}</b>\n"
+            f"Лотов API: <b>{probe.get('parsed', 0)}</b>\n"
+            f"Ошибок: <b>{probe.get('errors', 0)}</b>\n"
+            f"Цена: {int(rt.cfg.min_stars):,}–{int(rt.cfg.max_stars):,}⭐\n"
+            + (f"Ошибка: <code>{_esc(err[:200])}</code>" if err else "Ошибка: нет")
+        )
 
     @router.message(Command("resnapshot"))
     async def cmd_resnapshot(message: Message) -> None:

@@ -835,6 +835,62 @@ def _select_scan_batch(
     return batch
 
 
+async def _reconnect_client(client: TelegramClient, m: TelegramMarket) -> None:
+    """Переподключить Telethon после обрыва сессии / FloodWait."""
+    try:
+        if client.is_connected():
+            await client.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(1.0)
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise RuntimeError("Сессия Telethon недействительна — /start в боте")
+    m.set_client(client)
+    logger.warning("Telethon переподключён")
+
+
+async def _ensure_collection_ids(
+    m: TelegramMarket, gift_ids: list[int], runtime: TrackerRuntime
+) -> int:
+    """Актуальный список коллекций — не теряем ids при фоновом refresh."""
+    if gift_ids:
+        return len(gift_ids)
+    try:
+        fresh = await m.load_collections(force=True)
+        if fresh:
+            gift_ids[:] = list(fresh)
+            runtime.collections_total = len(gift_ids)
+            logger.warning("Коллекции перезагружены: %s", len(gift_ids))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("load_collections: %s", exc)
+    if not gift_ids and m._gift_ids:
+        gift_ids[:] = list(m._gift_ids)
+        runtime.collections_total = len(gift_ids)
+    return len(gift_ids)
+
+
+async def probe_market(
+    m: TelegramMarket, gift_ids: list[int], cfg: Config
+) -> dict[str, int | float | str]:
+    """Тест API: 3 коллекции, сколько лотов вернулось."""
+    sample = list(gift_ids[:3]) if gift_ids else list((m._gift_ids or [])[:3])
+    if not sample:
+        return {"collections": 0, "parsed": 0, "errors": 1, "error": "no collections"}
+    stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
+    for gid in sample:
+        lots = await _fetch_collection_pages(m, gid, cfg, stats)
+        if lots:
+            stats["parsed"] += len(lots)
+    return {
+        "collections": len(sample),
+        "parsed": stats.get("parsed", 0),
+        "errors": stats.get("errors", 0),
+        "floods": stats.get("floods", 0),
+        "error": m.last_error or "",
+    }
+
+
 async def _fetch_collection_pages(
     m: TelegramMarket,
     gid: int,
@@ -1310,8 +1366,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6.3"
-BUILD_TAG = "v3.6.3-run-fix"
+TRACKER_VERSION = "3.6.4"
+BUILD_TAG = "v3.6.4-api-fix"
 
 
 @dataclass
@@ -1349,6 +1405,9 @@ class TrackerRuntime:
     last_scan_elapsed: float = 0.0
     last_api_error: str = ""
     snapshot_ready: bool = False
+    zero_parse_streak: int = 0
+    market: Any | None = None
+    gift_ids: list[int] | None = None
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -1459,17 +1518,28 @@ async def scanner_loop(
     )
     catalog_refreshed = time.monotonic()
     pass_no = 0
+    client = m.client
     while True:
         started = time.monotonic()
         pass_no += 1
         runtime.passes = pass_no
         runtime.seen_lots = len(seen)
+        n_coll = await _ensure_collection_ids(m, gift_ids, runtime)
+        if n_coll <= 0:
+            runtime.last_scan_batch = 0
+            runtime.last_scan_parsed = 0
+            runtime.last_scan_elapsed = 0.0
+            runtime.last_api_error = m.last_error or "коллекций 0"
+            logger.error("Сканер: коллекций 0 — жду 15с")
+            await asyncio.sleep(15)
+            continue
         try:
             fresh, scan = await poll_once(
                 m, gift_ids, seen, cfg, baseline=False, market_ids=market_ids
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
+            runtime.last_api_error = str(exc)
             await asyncio.sleep(2)
             continue
 
@@ -1477,8 +1547,23 @@ async def scanner_loop(
         runtime.last_scan_parsed = int(scan.get("parsed", 0))
         runtime.last_scan_errors = int(scan.get("errors", 0))
         runtime.last_scan_elapsed = float(scan.get("elapsed", 0))
-        if runtime.last_scan_errors:
-            runtime.last_api_error = m.last_error or ""
+        if runtime.last_scan_errors or runtime.last_scan_parsed == 0:
+            runtime.last_api_error = m.last_error or runtime.last_api_error
+
+        parsed = int(scan.get("parsed", 0) or 0)
+        scanned = int(scan.get("scanned", 0) or 0)
+        errors = int(scan.get("errors", 0) or 0)
+        if parsed == 0 and scanned > 0:
+            runtime.zero_parse_streak += 1
+            if runtime.zero_parse_streak >= 2 and client is not None:
+                try:
+                    await _reconnect_client(client, m)
+                    runtime.zero_parse_streak = 0
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("reconnect: %s", exc)
+                    runtime.last_api_error = str(exc)
+        else:
+            runtime.zero_parse_streak = 0
 
         runtime.last_fresh = len(fresh)
         if fresh:
@@ -1511,15 +1596,15 @@ async def scanner_loop(
 
         if time.monotonic() - catalog_refreshed > 600:
             try:
-                gift_ids[:] = await m.load_collections(force=True)
-                runtime.collections_total = len(gift_ids)
+                refreshed = await m.load_collections(force=True)
+                if refreshed:
+                    gift_ids[:] = list(refreshed)
+                    runtime.collections_total = len(gift_ids)
                 catalog_refreshed = time.monotonic()
             except Exception:  # noqa: BLE001
                 pass
 
         spent = time.monotonic() - started
-        scanned = int(scan.get("scanned", 0) or 0)
-        errors = int(scan.get("errors", 0) or 0)
         if scanned > 0:
             ratio = errors / scanned
             if ratio > 0.35 and runtime.scan_parallel > 4:
@@ -1604,6 +1689,7 @@ async def run() -> None:
     )
     m = TelegramMarket(client)
     _setup_catalog_hooks(m)
+    runtime.market = m
     sender = Sender(cfg, client, rate_limiter=rate_limiter)
     sender.chat_id = chat_id
     control_bot.runtime = runtime
@@ -1623,7 +1709,7 @@ async def run() -> None:
     post_queue.start()
     control_bot.post_queue = post_queue
 
-    gift_ids = await wait_for_gift_ids(m)
+    gift_ids = list(await wait_for_gift_ids(m))
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
@@ -1635,6 +1721,7 @@ async def run() -> None:
     )
 
     runtime.collections_total = len(gift_ids)
+    runtime.gift_ids = gift_ids
 
     need_snapshot = (
         len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
@@ -1679,6 +1766,20 @@ async def run() -> None:
             len(seen),
         )
         snapshot_ready.set()
+
+    probe = await probe_market(m, gift_ids, cfg)
+    logger.info(
+        "Probe API: %s колл · %s лотов · err=%s %s",
+        probe.get("collections"),
+        probe.get("parsed"),
+        probe.get("errors"),
+        probe.get("error") or "",
+    )
+    if int(probe.get("parsed", 0) or 0) == 0:
+        logger.error(
+            "Маркет API пустой на старте — сессия мертва? %s",
+            probe.get("error") or m.last_error,
+        )
 
     if need_snapshot:
         snapshot_task = asyncio.create_task(_build_snapshot(), name="snapshot")

@@ -104,9 +104,29 @@ def ensure_default_filters(path: Path) -> None:
     save_filters(path, dict(DEFAULT_FILTER_DATA))
 
 
+def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
+    """Старый пресет 2k–5k на Bothost → 5k–25k."""
+    if not data:
+        return dict(DEFAULT_FILTER_DATA)
+    out = dict(data)
+    try:
+        mn = float(out.get("min_stars", 0))
+        mx = float(out.get("max_stars", 0))
+    except (TypeError, ValueError):
+        return out
+    if abs(mn - 2000) < 1 and abs(mx - 5000) < 1:
+        out["min_stars"] = 5000.0
+        out["max_stars"] = 25000.0
+    return out
+
+
 def load_filters_into_config(cfg: Any, path: Path) -> None:
     ensure_default_filters(path)
-    apply_filters_to_config(cfg, load_filters(path))
+    raw = load_filters(path)
+    migrated = migrate_legacy_filters(raw)
+    if migrated != raw:
+        save_filters(path, migrated)
+    apply_filters_to_config(cfg, migrated or dict(DEFAULT_FILTER_DATA))
 
 
 def persist_config_filters(cfg: Any, path: Path) -> None:

@@ -426,6 +426,8 @@ def build_router(
 
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
+        from tracker import BUILD_TAG
+
         cid = store.get() or store.load()
         if not await _authorized():
             await message.answer("❌ Не авторизован — /start")
@@ -435,7 +437,7 @@ def build_router(
         rt = control.runtime if control else None
         cfg = rt.cfg if rt else None
         lines = [
-            f"✅ Трекер v{tracker_version}",
+            f"✅ Трекер v{tracker_version} <code>{BUILD_TAG}</code>",
             f"Аккаунт: {name}",
             f"Канал: <code>{cid or 'не задан'}</code>",
         ]
@@ -469,11 +471,13 @@ def build_router(
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев (посл.): ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
-                    f"lvl−{rt.last_skip_level}",
+                    f"lvl−{rt.last_skip_level} female−{rt.last_skip_female}",
                     f"Отсев (всего): ru−{rt.skip_ru_total} dm−{rt.skip_dm_total} "
                     f"dup−{rt.skip_dup_total} noseller−{rt.skip_noseller_total} "
-                    f"lvl−{rt.skip_level_total} ru?{rt.skip_unknown_ru_total}",
-                    f"Seen лотов: {rt.seen_lots}",
+                    f"lvl−{rt.skip_level_total} female−{rt.skip_female_total} "
+                    f"ru?{rt.skip_unknown_ru_total}",
+                    f"Seen лотов: {rt.seen_lots} · снимок маркета: "
+                    f"{len(rt.market_ids) if rt.market_ids else 0}",
                 ]
             )
             if rt.send_errors_total:
@@ -647,11 +651,16 @@ def build_router(
         from tracker import save_state
 
         n = len(rt.state.get("seen", {}))
+        m = len(rt.state.get("market_ids", []))
         rt.state["seen"] = {}
+        rt.state["market_ids"] = []
+        if rt.market_ids is not None:
+            rt.market_ids.clear()
         save_state(rt.state_path, rt.state)
         rt.seen_lots = 0
         await message.answer(
-            f"✅ Seen сброшен ({n} лотов). Новые листинги снова будут ловиться."
+            f"✅ Seen и снимок маркета сброшены ({n} seen, {m} market). "
+            "При перезапуске снова сделается снимок — старые лоты не уйдут в канал."
         )
 
     @router.message(StateFilter(LoginStates.phone))

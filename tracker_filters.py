@@ -83,7 +83,25 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.post_interval = max(1.0, float(data["post_interval"]))
 
 
+DEFAULT_FILTER_DATA: dict[str, Any] = {
+    "min_stars": 5000.0,
+    "max_stars": 25000.0,
+    "strict_ru": True,
+    "strict_free": False,
+    "max_account_level": 2,
+    "post_interval": 4.0,
+}
+
+
+def ensure_default_filters(path: Path) -> None:
+    """Первый запуск: 5k–25k и остальные дефолты в data/tracker_filters.json."""
+    if path.exists():
+        return
+    save_filters(path, dict(DEFAULT_FILTER_DATA))
+
+
 def load_filters_into_config(cfg: Any, path: Path) -> None:
+    ensure_default_filters(path)
     apply_filters_to_config(cfg, load_filters(path))
 
 

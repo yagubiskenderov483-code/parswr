@@ -252,8 +252,8 @@ class Config:
     session_string: str
     bot_token: str
     target_channel: str
-    min_stars: float = 500.0
-    max_stars: float = 5000.0
+    min_stars: float = 5000.0
+    max_stars: float = 25000.0
     poll_interval: float = 2.0
     page_limit: int = 12  # только верх resale-листа
     parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
@@ -319,8 +319,8 @@ class Config:
             session_string=os.environ.get("SESSION_STRING", "").strip(),
             bot_token=bot_token,
             target_channel=target,
-            min_stars=_f("MIN_STARS", 500),
-            max_stars=_f("MAX_STARS", 5000),
+            min_stars=_f("MIN_STARS", 5000),
+            max_stars=_f("MAX_STARS", 25000),
             poll_interval=_f("POLL_INTERVAL", 2.0),
             page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=min(6, int(_f("PARALLEL", 4))),
@@ -356,11 +356,12 @@ def load_state(path: Path) -> dict:
         if isinstance(data, dict):
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
+            data.setdefault("market_ids", [])
             data.setdefault("channel_id", None)
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "seen_sellers": {}, "channel_id": None}
+    return {"seen": {}, "seen_sellers": {}, "market_ids": [], "channel_id": None}
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -375,6 +376,9 @@ def save_state(path: Path, state: dict) -> None:
         state["seen_sellers"] = {
             k: v for k, v in sellers.items() if now - float(v) < SELLER_TTL
         }
+    mids = state.get("market_ids", [])
+    if isinstance(mids, list) and len(mids) > 250_000:
+        state["market_ids"] = mids[-250_000:]
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
     tmp.replace(path)
@@ -871,8 +875,9 @@ async def poll_once(
     cfg: Config,
     *,
     baseline: bool,
+    market_ids: set[str],
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
-    """Проход по коллекциям (ротация batch) — лоты в диапазоне MIN..MAX."""
+    """Проход по коллекциям — только лоты, которых ещё не было на маркете (market_ids)."""
     started = time.monotonic()
     api_stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
     batch = _select_scan_batch(gift_ids, m, cfg, baseline=baseline)
@@ -887,6 +892,7 @@ async def poll_once(
     )
     now = time.time()
     fresh: list[Lot] = []
+    batch_market_ids: set[str] = set()
     exc_errors = 0
     for gid, lots in zip(batch, chunks):
         if isinstance(lots, BaseException):
@@ -894,20 +900,24 @@ async def poll_once(
             logger.warning("коллекция %s: %s", gid, lots)
             continue
         for i, lot in enumerate(lots):
+            batch_market_ids.add(lot.id)
             if i >= cfg.hot_limit:
-                if lot.id not in seen:
+                if baseline:
                     seen[lot.id] = now
-                continue
-            if lot.id in seen:
                 continue
             if baseline:
                 seen[lot.id] = now
+                continue
+            if lot.id in market_ids:
+                continue
+            if lot.id in seen:
                 continue
             if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
                 seen[lot.id] = now
                 continue
             lot.discovered_at = now
             fresh.append(lot)
+    market_ids |= batch_market_ids
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
         "parsed": api_stats.get("parsed", 0),
@@ -916,6 +926,8 @@ async def poll_once(
         "floods": api_stats.get("floods", 0),
         "collections_total": len(gift_ids),
         "batch_size": len(batch),
+        "market_ids": len(market_ids),
+        "new_listings": len(fresh),
         "elapsed": round(time.monotonic() - started, 2),
     }
     if stats["floods"]:
@@ -933,21 +945,23 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Быстрый enrich одного лота (только недостающие поля)."""
+    """Enrich одного лота — имя и bio нужны для фильтра «только девочки»."""
     if not lot.seller or lot.seller_id is None:
         try:
             await m.resolve_owner(lot, timeout=2.5)
         except Exception:  # noqa: BLE001
             pass
     need_profile = lot.seller_id is not None and (
-        lot.account_level is None
+        not (lot.first_name or "").strip()
+        or not (lot.about or "").strip()
+        or lot.account_level is None
         or lot.free_dm is None
         or lot.is_premium is None
         or (cfg.strict_ru and not lot.lang_code)
     )
     if need_profile:
         try:
-            await m.enrich_profiles([lot], timeout=2.5, parallel=1)
+            await m.enrich_profiles([lot], timeout=3.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
     if lot.free_dm is None and lot.seller_id is not None:
@@ -1215,11 +1229,13 @@ class PostQueue:
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
+                self._runtime.last_skip_female = fstats["not_female"]
                 self._runtime.skip_ru_total += fstats["non_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.skip_dup_total += fstats["dup"]
                 self._runtime.skip_noseller_total += fstats["no_seller"]
                 self._runtime.skip_level_total += fstats["level"]
+                self._runtime.skip_female_total += fstats["not_female"]
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
                 if not to_post:
@@ -1264,8 +1280,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.5.2"
-BUILD_TAG = "main-jsjeigiej"
+TRACKER_VERSION = "3.6.0"
+BUILD_TAG = "v3.6-filters-2e3a"
 
 
 @dataclass
@@ -1281,11 +1297,13 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    last_skip_female: int = 0
     skip_ru_total: int = 0
     skip_dm_total: int = 0
     skip_dup_total: int = 0
     skip_noseller_total: int = 0
     skip_level_total: int = 0
+    skip_female_total: int = 0
     skip_unknown_ru_total: int = 0
     queue_processed: int = 0
     send_errors_total: int = 0
@@ -1304,6 +1322,7 @@ class TrackerRuntime:
     cfg: Config | None = None
     state_path: Path | None = None
     state: dict | None = None
+    market_ids: set[str] | None = None
 
 
 def _load_session_from_db() -> str:
@@ -1394,8 +1413,9 @@ async def scanner_loop(
     runtime: TrackerRuntime,
     state_path: Path,
     state: dict,
+    market_ids: set[str],
 ) -> None:
-    """Быстрый скан всех коллекций (page1, hot_limit) — сразу в очередь без enrich."""
+    """Быстрый скан всех коллекций (page1, hot_limit) — только новые листинги на маркете."""
     catalog_refreshed = time.monotonic()
     pass_no = 0
     while True:
@@ -1404,7 +1424,9 @@ async def scanner_loop(
         runtime.passes = pass_no
         runtime.seen_lots = len(seen)
         try:
-            fresh, scan = await poll_once(m, gift_ids, seen, cfg, baseline=False)
+            fresh, scan = await poll_once(
+                m, gift_ids, seen, cfg, baseline=False, market_ids=market_ids
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
             await asyncio.sleep(2)
@@ -1442,6 +1464,7 @@ async def scanner_loop(
                 scan.get("elapsed", "?"),
             )
 
+        state["market_ids"] = list(market_ids)
         save_state(state_path, state)
 
         if time.monotonic() - catalog_refreshed > 600:
@@ -1509,6 +1532,7 @@ async def run() -> None:
     state = load_state(state_path)
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
+    market_ids: set[str] = set(state.get("market_ids") or [])
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
     logger.info(
@@ -1527,6 +1551,7 @@ async def run() -> None:
         state=state,
         seen_lots=len(seen),
         scan_parallel=cfg.parallel,
+        market_ids=market_ids,
     )
 
     dd = data_dir()
@@ -1569,23 +1594,44 @@ async def run() -> None:
 
     runtime.collections_total = len(gift_ids)
 
-    baseline = not seen and not cfg.post_on_first_run
-    if baseline:
-        logger.info("Первый запуск: запоминаю текущие лоты без постинга…")
-        _, baseline_stats = await poll_once(
-            m, gift_ids, seen, cfg, baseline=True
+    need_snapshot = not market_ids or (
+        not seen and not cfg.post_on_first_run
+    )
+    if need_snapshot:
+        logger.info(
+            "Снимок маркета (3 прохода) — постим только листинги после снимка…"
         )
+        for pass_n in range(3):
+            _, snap_stats = await poll_once(
+                m,
+                gift_ids,
+                seen,
+                cfg,
+                baseline=True,
+                market_ids=market_ids,
+            )
+            if pass_n < 2:
+                await asyncio.sleep(2.0)
+        state["market_ids"] = list(market_ids)
         save_state(state_path, state)
         logger.info(
-            "Запомнено %s лотов (скан %s колл · %ss). Слежу за новыми.",
+            "Снимок готов: %s лотов на маркете · seen %s · скан %s колл",
+            len(market_ids),
             len(seen),
-            baseline_stats.get("scanned", "?"),
-            baseline_stats.get("elapsed", "?"),
+            snap_stats.get("scanned", "?"),
         )
 
     scan_task = asyncio.create_task(
         scanner_loop(
-            m, gift_ids, seen, cfg, post_queue, runtime, state_path, state
+            m,
+            gift_ids,
+            seen,
+            cfg,
+            post_queue,
+            runtime,
+            state_path,
+            state,
+            market_ids,
         ),
         name="scanner",
     )

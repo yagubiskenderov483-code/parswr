@@ -6,7 +6,7 @@ Telegram Market bot · Stars.
 - сразу (~пару сек) выдача свежих лотов с юзами
 - дальше чеки раз в секунду с номером чека + новые лоты
 
-Цены: 2–5k / 5–15k / 15–30k / 30–60k / 60–100k
+Цены: 2–5k / 2–50k / 5–15k / 15–30k / 30–60k / 60–100k
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from telethon.sessions import StringSession
 
 import credentials as creds
 from db import GiftDB
-from market import Lot, TelegramMarket
+from market import Lot, TelegramMarket, is_russian_lot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +67,7 @@ def screen(where: str) -> str:
 # Сложности парсинга
 DIFFICULTIES: list[tuple[str, str, int, int]] = [
     ("easy", "🟢 Лёгкий · 2k–5k", 2000, 5000),
+    ("wide", "🟢 Широкий · 2k–50k", 2000, 50000),
     ("mid", "🟡 Средний · 5k–15k", 5000, 15000),
     ("hard", "🔴 Сложный · 15k–30k", 15000, 30000),
     ("impos", "💀 Impossible · 30k–60k", 30000, 60000),
@@ -74,6 +75,7 @@ DIFFICULTIES: list[tuple[str, str, int, int]] = [
 
 PRICE_RANGES: list[tuple[str, str, int, int]] = [
     ("r2_5", "2k–5k ⭐", 2000, 5000),
+    ("r2_50", "2k–50k ⭐", 2000, 50000),
     ("r5_15", "5k–15k ⭐", 5000, 15000),
     ("r15_30", "15k–30k ⭐", 15000, 30000),
     ("r30_60", "30k–60k ⭐", 30000, 60000),
@@ -152,12 +154,12 @@ class App:
         self.phone: str | None = None
         self.phone_code_hash: str | None = None
         self.min_stars = 2000.0
-        self.max_stars = 5000.0
-        self.range_label = "2k–5k ⭐"
+        self.max_stars = 50000.0
+        self.range_label = "2k–50k ⭐"
         # Отдельная сложность ТОЛЬКО для фильтр-поиска (парсер не трогает)
         self.filter_min_stars = 2000.0
-        self.filter_max_stars = 5000.0
-        self.filter_range_label = "🟢 Лёгкий · 2k–5k"
+        self.filter_max_stars = 50000.0
+        self.filter_range_label = "🟢 Широкий · 2k–50k"
         self.logged_in = False
         self.account_name = ""
         self.lots_notified = 0
@@ -1203,27 +1205,21 @@ class App:
 
     @staticmethod
     def _is_russian(lot: Lot) -> bool:
-        """Только RU: lang_code ru или кириллица в нике/имени/био."""
-        lc = (getattr(lot, "lang_code", "") or "").lower()
-        if lc.startswith("ru"):
-            return True
-        parts = [
-            lot.seller or "",
-            lot.first_name or "",
-            lot.last_name or "",
-            lot.about or "",
-        ]
-        blob = " ".join(p for p in parts if p).strip()
-        if not blob:
-            return False
-        if "🇷🇺" in blob:
-            return True
-        return bool(_CYR_RE.search(blob))
+        """RU: lang/кириллица; unknown — пропускаем (как в трекере)."""
+        ru = is_russian_lot(lot)
+        return ru is not False
 
     @staticmethod
     def _is_free_dm(lot: Lot) -> bool:
         """Строго бесплатные ЛС — unknown и платные не проходят."""
         return lot.free_dm is True
+
+    @staticmethod
+    def _passes_free_dm(lot: Lot, *, strict: bool = False) -> bool:
+        """Парсер: режем только платные; strict_free — только free_dm=True."""
+        if strict:
+            return lot.free_dm is True
+        return lot.free_dm is not False
 
     @staticmethod
     def _has_hidden_profile(lot: Lot) -> bool:
@@ -1490,7 +1486,7 @@ class App:
             if want_ru and not self._is_russian(lot):
                 continue
             if require_free_dm:
-                if strict_free_dm or channel == "parser":
+                if strict_free_dm:
                     if not self._is_free_dm(lot):
                         continue
                 elif lot.free_dm is False:
@@ -1557,7 +1553,7 @@ class App:
                     if self._title_key(lot) in marked_titles:
                         continue
                 if require_free_dm:
-                    if strict_free_dm or channel == "parser":
+                    if strict_free_dm:
                         if not self._is_free_dm(lot):
                             continue
                     elif lot.free_dm is False:
@@ -1721,7 +1717,7 @@ class App:
             else bool(strict_russian)
         )
         if channel == "parser":
-            # ТОЛЬКО RU + строго бесплатные ЛС
+            # RU + бесплатные ЛС (unknown ок, платные — нет)
             attempts = [
                 (True, True, False, False),
             ]
@@ -1751,7 +1747,7 @@ class App:
                 strict_free_dm=(
                     bool(self.filters.strict_free)
                     if channel == "filter"
-                    else True
+                    else False
                 ),
             )
             if channel == "parser" and out:
@@ -1767,7 +1763,7 @@ class App:
             # железный фильтр: только RU, даже если где-то просочились
             best = [lot for lot in best if self._is_russian(lot)]
             if channel == "parser":
-                best = [lot for lot in best if self._is_free_dm(lot)]
+                best = [lot for lot in best if self._passes_free_dm(lot)]
             best = _dedupe_by_seller(best)
         if best and track_seen and channel in ("parser", "filter", "old"):
             self._mark_delivered(best, channel=channel)
@@ -2093,7 +2089,7 @@ class App:
             ready = [
                 lot
                 for lot in check_pool
-                if self._is_free_dm(lot) and self._is_russian(lot)
+                if self._passes_free_dm(lot) and self._is_russian(lot)
             ]
             titles_ready = {
                 self._title_key(lot) for lot in ready if self._title_key(lot)
@@ -2118,7 +2114,7 @@ class App:
                     self.parse_acc_checks += len(wave) * 2
                     self._ingest_always(wave)
                     for lot in wave:
-                        if self._is_free_dm(lot) and self._is_russian(lot):
+                        if self._passes_free_dm(lot) and self._is_russian(lot):
                             ready.append(lot)
             candidates = _dedupe_lots(ready)
             self._ingest_always(candidates)
@@ -2543,7 +2539,7 @@ class App:
         # только русские + строго бесплатные ЛС
         batch = [lot for lot in batch if self._is_russian(lot)]
         if channel == "parser":
-            batch = [lot for lot in batch if self._is_free_dm(lot)]
+            batch = [lot for lot in batch if self._passes_free_dm(lot)]
         batch = _dedupe_by_seller(batch)
         # повторно выданных TG не шлём
         batch = [lot for lot in batch if not self._is_delivered_seller(lot)]

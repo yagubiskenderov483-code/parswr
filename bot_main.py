@@ -55,10 +55,10 @@ from market import (
     TelegramMarket,
     is_ad_profile,
     is_clean_female_profile,
+    looks_male,
     seller_identity_keys,
     seller_keys_overlap,
     sort_lots_fresh_first,
-    stamp_live_lots,
 )
 
 logging.basicConfig(
@@ -2163,6 +2163,62 @@ class App:
             strict_russian=True,
         )
 
+    async def _prepare_filter_lots(self, lots: list[Lot]) -> list[Lot]:
+        """Обогатить только переданные live-лоты (без добора из БД)."""
+        if not lots:
+            return []
+        pre = list(lots)
+        without = [lot for lot in pre if not lot.seller]
+        with_seller = [lot for lot in pre if lot.seller]
+        if without:
+            await self.market.resolve_owners(
+                without,
+                timeout=max(float(creds.OWNER_TIMEOUT), 1.0),
+                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+            )
+            self.parse_acc_checks += len(without)
+        pool = with_seller + without
+        need_enr = [
+            lot
+            for lot in pool
+            if not (lot.first_name or lot.last_name or lot.about)
+        ]
+        if need_enr:
+            await self.market.enrich_profiles(
+                need_enr,
+                timeout=max(float(creds.OWNER_TIMEOUT), 0.9),
+                parallel=getattr(creds, "ENRICH_PARALLEL", 8),
+            )
+            self.parse_acc_checks += len(need_enr)
+        await self.market.check_free_dm(
+            pool,
+            timeout=max(float(creds.OWNER_TIMEOUT), 1.0),
+        )
+        self.parse_acc_checks += len(pool)
+        if self.filters.online_only:
+            await self.market.refresh_online(
+                pool,
+                timeout=max(float(creds.OWNER_TIMEOUT), 1.0),
+            )
+            self.parse_acc_checks += len(pool)
+        allowed_ids = {lot.id for lot in lots}
+        out: list[Lot] = []
+        for lot in pool:
+            if lot.id not in allowed_ids:
+                continue
+            if not lot.seller or self._bad_username_len(lot.seller):
+                continue
+            if self._is_delivered_seller(lot):
+                continue
+            if not self._is_russian(lot) or not self._is_clean_female(lot):
+                continue
+            if lot.free_dm is False:
+                continue
+            if self._filters_active() and not self._passes_extra_filters(lot):
+                continue
+            out.append(lot)
+        return _dedupe_by_seller(out)
+
     async def _deliver_one_filter(self, chat_id: int, lot: Lot) -> bool:
         """Один лот в чат + сразу в seen навсегда."""
         if not lot.seller or self._bad_username_len(lot.seller):
@@ -2170,6 +2226,8 @@ class App:
         if self._is_delivered_seller(lot):
             return False
         if not self._is_russian(lot) or not self._is_clean_female(lot):
+            return False
+        if looks_male(lot):
             return False
         if lot.free_dm is False:
             return False
@@ -2257,37 +2315,6 @@ class App:
                     )
                     return []
 
-            def _merge_unique(
-                base: list[Lot], more: list[Lot], *, cap: int
-            ) -> list[Lot]:
-                have_t = {self._title_key(x) for x in base}
-                have_o: set[str] = set()
-                for x in base:
-                    have_o |= seller_identity_keys(x)
-                out = list(base)
-                for lot in more:
-                    tk = self._title_key(lot)
-                    if tk in have_t:
-                        continue
-                    if seller_keys_overlap(lot, have_o):
-                        continue
-                    if self._is_delivered_seller(lot):
-                        continue
-                    if lot.free_dm is False:
-                        continue
-                    if not self._is_russian(lot):
-                        continue
-                    if not self._is_clean_female(lot):
-                        continue
-                    if self._filters_active() and not self._passes_extra_filters(lot):
-                        continue
-                    out.append(lot)
-                    have_t.add(tk)
-                    have_o |= seller_identity_keys(lot)
-                    if len(out) >= cap:
-                        break
-                return _dedupe_by_seller(out)
-
             def _finalize(cands: list[Lot]) -> list[Lot]:
                 """Строго: RU + девочки без рекламы + не выданные + 1 лот на TG."""
                 clean: list[Lot] = []
@@ -2307,27 +2334,29 @@ class App:
                         break
                 return clean
 
-            # Снимок → очередь → по 1 лоту каждые N сек (ждём новые листинги)
+            # Снимок → очередь → по 1 лоту каждые N сек (только НОВЫЕ листинги)
             pending: deque[Lot] = deque()
             pending_keys: set[str] = set()
             delivered_n = 0
-            handled_new_ids: set[str] = set()
-            market_snapshot_ids: set[str] = set()
+            market_ids: set[str] = set()
             drip_sec = float(getattr(creds, "FILTER_DRIP_INTERVAL", 4.0))
-            scan_sec = float(getattr(creds, "FILTER_LIVE_WAIT_SEC", 35.0))
             next_tick = time.monotonic()
             last_scan = 0.0
             attempt = 0
 
-            def _queue_lots(lots: list[Lot]) -> int:
+            def _queue_lots(lots: list[Lot], *, allowed_ids: set[str]) -> int:
                 added = 0
                 block = (
                     pending_keys
                     | set(self._delivered_sellers)
                     | set(self._filter_seen_sellers)
                 )
-                for lot in _dedupe_by_seller(_finalize(lots)):
+                for lot in _dedupe_by_seller(lots):
+                    if lot.id not in allowed_ids:
+                        continue
                     if seller_keys_overlap(lot, block):
+                        continue
+                    if not self._is_clean_female(lot) or looks_male(lot):
                         continue
                     tk = self._title_key(lot)
                     if tk and tk in set(self._filter_recent_titles[-300:]):
@@ -2342,55 +2371,41 @@ class App:
                 return added
 
             async def _scan_new_into_queue() -> int:
-                nonlocal attempt, last_scan
+                nonlocal attempt, last_scan, market_ids
                 now = time.monotonic()
-                if now - last_scan < scan_sec:
+                if now - last_scan < drip_sec:
                     return 0
                 last_scan = now
                 attempt += 1
                 live = await _live_pool()
                 if not live:
                     return 0
-                stamp_live_lots(live)
+                current_ids = {lot.id for lot in live}
                 new_listings = [
-                    lot
-                    for lot in live
-                    if lot.id not in market_snapshot_ids
-                    and lot.id not in handled_new_ids
+                    lot for lot in live if lot.id not in market_ids
                 ]
-                for lot in new_listings:
-                    handled_new_ids.add(lot.id)
+                market_ids = current_ids
                 if not new_listings:
                     return 0
+                allowed_ids = {lot.id for lot in new_listings}
                 self._ingest_always(new_listings)
-                pool = sort_lots_fresh_first(
-                    _dedupe_lots(new_listings),
-                    live_ids={lot.id for lot in new_listings},
-                )
-                batch = await self._prepare_show(
-                    pool,
-                    limit=target_n,
-                    apply_extra=True,
-                    track_seen=False,
-                    need_full=True,
-                    channel="filter",
-                )
-                return _queue_lots(batch)
+                batch = await self._prepare_filter_lots(new_listings)
+                return _queue_lots(batch, allowed_ids=allowed_ids)
 
             await self._say_to(
                 chat_id,
-                f"{screen('Фильтры')}\nснимок маркета…",
+                f"{screen('Фильтры')}\nснимок маркета (3 прохода)…",
             )
-            for _ in range(6):
+            for pass_n in range(3):
                 if not self.filter_search_running:
                     break
                 snap = await _live_pool()
                 if snap:
-                    market_snapshot_ids = {lot.id for lot in snap}
-                    break
-                await asyncio.sleep(3.0)
+                    market_ids |= {lot.id for lot in snap}
+                if pass_n < 2:
+                    await asyncio.sleep(2.0)
 
-            if not market_snapshot_ids:
+            if not market_ids:
                 await self._say_to(
                     chat_id,
                     f"{screen('Фильтры')}\nмаркет пуст · попробуй позже",
@@ -2401,11 +2416,11 @@ class App:
             await self._say_to(
                 chat_id,
                 f"{screen('Фильтры')}\n"
-                f"на маркете <b>{len(market_snapshot_ids)}</b> лотов · "
+                f"на маркете <b>{len(market_ids)}</b> лотов · "
                 f"выдача <b>1</b> / {int(drip_sec)}с · цель <b>{target_n}</b> · "
-                f"жду новые…",
+                f"жду <b>новые</b> листинги…",
             )
-            last_scan = time.monotonic()  # первый скан через scan_sec
+            last_scan = time.monotonic()
 
             while self.filter_search_running and delivered_n < target_n:
                 now = time.monotonic()

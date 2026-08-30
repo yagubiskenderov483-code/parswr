@@ -135,7 +135,27 @@ _FEMALE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
-    r"(парень|мужчин|boy|man|he/him|👨|🧔)",
+    r"(парень|мужчин|мальчик|пацан|boy|man|he/him|👨|🧔|брат|бро\b|bro\b)",
+    re.IGNORECASE,
+)
+_MALE_NAMES_RE = re.compile(
+    r"^(?:"
+    r"никита|илья|саша|женя|ваня|петя|петя|коля|вася|дима|миша|паша|фома|лука|савва|"
+    r"валера|слава|вова|лёша|леша|гоша|костя|артём|артем|макс|рома|"
+    r"кирилл|егор|игорь|олег|влад|данил|даниил|андрей|алексей|сергей|павел|"
+    r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
+    r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|andrey|pavel|ilya|vlad"
+    r")$",
+    re.IGNORECASE,
+)
+_STRICT_FEMALE_NAME_RE = re.compile(
+    r"(?:"
+    r"ия|ья|ина|ела|ёна|юна|ита|лия|ея|"
+    r"овна|евна|ична|"
+    r"анна|мария|елена|ольга|наташа|катя|юля|даша|маша|"
+    r"света|лена|ира|вика|настя|полина|алина|диана|вероника|"
+    r"vera|maria|anna|elena|olga|kate|julia|diana"
+    r")$",
     re.IGNORECASE,
 )
 _AD_PROFILE_RE = re.compile(
@@ -160,7 +180,9 @@ _REVIEW_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-_FEMALE_NAME_END_RE = re.compile(r"(ия|ья|на|та|са|ка|ла|ра|ва|ша|ая)$")
+_FEMALE_NAME_END_RE = re.compile(
+    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична)$"
+)
 
 
 def profile_text_blob(lot: Lot) -> str:
@@ -181,28 +203,38 @@ def looks_male(lot: Lot) -> bool:
     if _MALE_HINT_RE.search(blob):
         return True
     fn = (lot.first_name or "").strip().lower()
+    ln = (lot.last_name or "").strip().lower()
+    if fn and _MALE_NAMES_RE.search(fn):
+        return True
     if len(fn) >= 3:
-        if fn.endswith(("ич", "ей", "он", "ил")):
+        if fn.endswith(("ич", "он", "ил", "ём", "ем", "ур", "им")):
+            if not fn.endswith(("ия", "ья")):
+                return True
+        if fn.endswith(("ан", "ен")) and not fn.endswith(("ина", "ена", "ана", "яна")):
             return True
-        if fn.endswith(("ан", "ен", "ур", "им", "ий")) and not fn.endswith(
-            ("ия", "ья")
-        ):
-            return True
+    if ln.endswith(("ович", "евич", "ич")):
+        return True
     return False
 
 
 def looks_female(lot: Lot) -> bool:
+    """Строго: только явные признаки девочки, иначе нет."""
     if looks_male(lot):
+        return False
+    fn = (lot.first_name or "").strip().lower()
+    ln = (lot.last_name or "").strip().lower()
+    if fn and _MALE_NAMES_RE.search(fn):
         return False
     blob = profile_text_blob(lot).lower()
     if _FEMALE_HINT_RE.search(blob):
         return True
-    fn = (lot.first_name or "").strip().lower()
-    if len(fn) >= 3:
+    if fn and len(fn) >= 3:
+        if _STRICT_FEMALE_NAME_RE.search(fn):
+            return True
         if _FEMALE_NAME_END_RE.search(fn):
             return True
-        if fn[-1] in "ая":
-            return True
+    if ln and (ln.endswith("овна") or ln.endswith("евна") or ln.endswith("ична")):
+        return True
     return False
 
 

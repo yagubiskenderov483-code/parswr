@@ -8,14 +8,20 @@ import re
 from pathlib import Path
 from typing import Any
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardRemove,
+)
 from html import escape as _esc
 from telethon import TelegramClient
 from telethon.errors import (
@@ -211,6 +217,81 @@ async def list_user_channels(client: TelegramClient, limit: int = 30) -> list[tu
     return out
 
 
+def _filters_path() -> Path:
+    from tracker import data_dir
+
+    from tracker_filters import filters_file_path
+
+    return filters_file_path(data_dir())
+
+
+def _apply_tracker_filters(
+    control: ControlBot | None, **updates: float | int | bool
+) -> Any | None:
+    from tracker_filters import persist_config_filters
+
+    if not control or not control.runtime or not control.runtime.cfg:
+        return None
+    cfg = control.runtime.cfg
+    for key, value in updates.items():
+        setattr(cfg, key, value)
+    persist_config_filters(cfg, _filters_path())
+    if "post_interval" in updates:
+        interval = max(1.0, float(updates["post_interval"]))
+        if control.post_queue is not None:
+            control.post_queue.set_interval(interval)
+        if control.sender is not None and control.sender._rate_limiter is not None:
+            control.sender._rate_limiter.set_interval(interval)
+    return cfg
+
+
+def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
+    from tracker_filters import PRICE_PRESETS, current_preset_id
+
+    cur = current_preset_id(float(cfg.min_stars), float(cfg.max_stars))
+    price_row = [
+        InlineKeyboardButton(
+            text=("•" if rid == cur else "") + label.split()[0],
+            callback_data=f"tf:price:{rid}",
+        )
+        for rid, label, _mn, _mx in PRICE_PRESETS
+    ]
+    ru = "✅" if cfg.strict_ru else "⬜️"
+    free = "✅" if cfg.strict_free else "⬜️"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            price_row,
+            [
+                InlineKeyboardButton(text=f"{ru} RU", callback_data="tf:ru"),
+                InlineKeyboardButton(
+                    text=f"{free} Free ЛС", callback_data="tf:free"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Level ≤{int(cfg.max_account_level)}",
+                    callback_data="tf:lvl",
+                ),
+                InlineKeyboardButton(
+                    text=f"Пост {int(cfg.post_interval)}с",
+                    callback_data="tf:post",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить", callback_data="tf:refresh"
+                )
+            ],
+        ]
+    )
+
+
+def _filters_screen(cfg: Any) -> str:
+    from tracker_filters import filters_summary
+
+    return "⚙️ <b>Фильтры трекера</b>\n" + filters_summary(cfg)
+
+
 def build_router(
     client: TelegramClient,
     auth: AuthFlow,
@@ -261,6 +342,8 @@ def build_router(
                 "/setchannel -100… — id канала\n"
                 "/channels — список твоих каналов\n"
                 "/status — статус\n"
+                "/filters — цена и фильтры\n"
+                "/setprice 5000 25000 — цена вручную\n"
                 "/test — тестовая карточка в канал\n"
                 "/resetseen — сбросить seen (тест)",
             )
@@ -358,13 +441,15 @@ def build_router(
         ]
         if cfg:
             lines.append(
-                f"Диапазон: {int(cfg.min_stars)}–{int(cfg.max_stars)}⭐"
+                f"Диапазон: {int(cfg.min_stars):,}–{int(cfg.max_stars):,}⭐"
             )
             lines.append(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
-                f"lvl≤{getattr(cfg, 'max_account_level', 2)}"
+                f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
+                f"пост/{int(cfg.post_interval)}с · только девочки"
             )
+            lines.append("Менять: /filters")
         bot_handle = _bot_handle()
         lines.append(f"Бот: {bot_handle}")
         if rt and rt.post_via:
@@ -406,6 +491,108 @@ def build_router(
                     + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
                 )
         await message.answer("\n".join(lines))
+
+    @router.message(Command("filters"))
+    async def cmd_filters(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        cfg = control.runtime.cfg if control and control.runtime else None
+        if cfg is None:
+            await message.answer("Трекер ещё запускается… попробуй через минуту.")
+            return
+        await message.answer(
+            _filters_screen(cfg),
+            reply_markup=tracker_filters_keyboard(cfg),
+        )
+
+    @router.message(Command("setprice"))
+    async def cmd_setprice(message: Message) -> None:
+        if not await _authorized():
+            await message.answer("Сначала /start")
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 3:
+            await message.answer(
+                "Использование:\n"
+                "<code>/setprice 5000 25000</code>\n"
+                "или /filters — кнопками"
+            )
+            return
+        try:
+            mn = int(float(parts[1].replace(",", "").replace("_", "")))
+            mx = int(float(parts[2].replace(",", "").replace("_", "")))
+        except ValueError:
+            await message.answer("Цена должна быть числом, например 5000 25000")
+            return
+        if mn < 1 or mx < mn:
+            await message.answer("Неверный диапазон: min &lt; max, оба &gt; 0")
+            return
+        cfg = _apply_tracker_filters(control, min_stars=float(mn), max_stars=float(mx))
+        if cfg is None:
+            await message.answer("Трекер ещё запускается…")
+            return
+        await message.answer(
+            f"✅ Цена: <b>{mn:,}–{mx:,}</b> ⭐\n" + _filters_screen(cfg),
+            reply_markup=tracker_filters_keyboard(cfg),
+        )
+
+    @router.callback_query(F.data.startswith("tf:"))
+    async def cb_tracker_filters(callback: CallbackQuery) -> None:
+        if not await _authorized():
+            await callback.answer("Сначала /start", show_alert=True)
+            return
+        cfg = control.runtime.cfg if control and control.runtime else None
+        if cfg is None:
+            await callback.answer("Трекер запускается…", show_alert=True)
+            return
+        data = (callback.data or "").split(":")
+        action = data[1] if len(data) > 1 else ""
+        note = ""
+        if action == "price" and len(data) > 2:
+            from tracker_filters import PRICE_PRESETS
+
+            rid = data[2]
+            chosen = next((p for p in PRICE_PRESETS if p[0] == rid), None)
+            if not chosen:
+                await callback.answer("?", show_alert=True)
+                return
+            _rid, label, mn, mx = chosen
+            _apply_tracker_filters(
+                control, min_stars=float(mn), max_stars=float(mx)
+            )
+            note = label
+        elif action == "ru":
+            _apply_tracker_filters(control, strict_ru=not bool(cfg.strict_ru))
+            note = "RU"
+        elif action == "free":
+            _apply_tracker_filters(control, strict_free=not bool(cfg.strict_free))
+            note = "Free ЛС"
+        elif action == "lvl":
+            nxt = {2: 5, 5: 10, 10: 2}.get(int(cfg.max_account_level), 2)
+            _apply_tracker_filters(control, max_account_level=nxt)
+            note = f"level≤{nxt}"
+        elif action == "post":
+            cur = int(cfg.post_interval)
+            nxt = {4: 6, 6: 8, 8: 4}.get(cur, 4)
+            _apply_tracker_filters(control, post_interval=float(nxt))
+            note = f"пост/{nxt}с"
+        elif action == "refresh":
+            note = "обновлено"
+        else:
+            await callback.answer()
+            return
+        cfg = control.runtime.cfg if control and control.runtime else cfg
+        text = _filters_screen(cfg)
+        try:
+            if callback.message:
+                await callback.message.edit_text(
+                    text,
+                    reply_markup=tracker_filters_keyboard(cfg),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        await callback.answer(f"✓ {note}" if note else "OK")
 
     @router.message(Command("test"))
     async def cmd_test(message: Message) -> None:

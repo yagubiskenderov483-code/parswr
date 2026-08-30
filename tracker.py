@@ -508,6 +508,9 @@ class PostRateLimiter:
             finally:
                 await asyncio.to_thread(self._release_after_send)
 
+    def set_interval(self, seconds: float) -> None:
+        self._interval = max(1.0, float(seconds))
+
 
 class Sender:
     """Шлёт карточки: через бота (с кнопками) или от юзер-сессии."""
@@ -1183,6 +1186,10 @@ class PostQueue:
         self._runtime.queue_pending = self.pending
         return len(lots)
 
+    def set_interval(self, seconds: float) -> None:
+        self._interval = max(1.0, float(seconds))
+        self._cfg.post_interval = self._interval
+
     async def _drip_worker(self) -> None:
         logger.info(
             "Drip: свежие первые · enrich+send /%ss (сканер параллельно)",
@@ -1469,6 +1476,9 @@ async def scanner_loop(
 async def run() -> None:
     _load_dotenv()
     cfg = Config.from_env()
+    from tracker_filters import filters_file_path, load_filters_into_config
+
+    load_filters_into_config(cfg, filters_file_path(data_dir()))
     logger.warning(
         "=== Трекер v%s %s · бот %s · канал %s ===",
         TRACKER_VERSION,

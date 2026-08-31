@@ -161,12 +161,12 @@ _STRICT_FEMALE_NAME_RE = re.compile(
 _AD_PROFILE_RE = re.compile(
     r"("
     r"дарю\s*гифт|дарю\s*gift|дарю\s*подар|раздач|"
-    r"бесплатн|free\s*gift|giveaway|акци[яи]|"
+    r"бесплатн\s*гифт|free\s*gift|giveaway|акци[яи]\s|"
     r"пиши\s*в\s*лс|реклам|продам\s*гифт|купл[юу]\s*гифт|"
     r"взаимн|nft\s*drop|airdrop|крипт|казино|заработок|инвест|"
     r"100%\s*profit|ставки|"
-    r"\bbot\b|@\w*bot\b|t\.me/|telegram\.me/|"
-    r"канал|подпис|subscribe|join\s*chat|"
+    r"@\w*bot\b|"
+    r"подпис\w*\s+на\s+канал|subscribe\s+to|join\s+chat|"
     r"розыгрыш|промо|скидк|referral|реферал"
     r")",
     re.IGNORECASE,
@@ -175,8 +175,16 @@ _GIFTDOUBLE_RE = re.compile(r"giftdouble|@giftdouble", re.IGNORECASE)
 _REVIEW_RE = re.compile(
     r"("
     r"отзыв|reviews?|рейтинг|rating|"
-    r"\d+\s*/\s*5|⭐{2,}|"
+    r"\d+\s*/\s*5|"
     r"довольн\w+\s+клиент|проверенн\w+\s+продав"
+    r")",
+    re.IGNORECASE,
+)
+_FEMALE_USER_RE = re.compile(
+    r"(?:"
+    r"girl|woman|lady|queen|princess|devoch|devush|miss|mrs|"
+    r"ann|maria|elena|olga|kate|julia|diana|vika|nastya|polina|alina|"
+    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света"
     r")",
     re.IGNORECASE,
 )
@@ -217,8 +225,28 @@ def looks_male(lot: Lot) -> bool:
     return False
 
 
+def _normalize_handle(text: str) -> str:
+    return re.sub(r"[^a-zа-яё0-9]", "", (text or "").lower().lstrip("@"))
+
+
+def _username_looks_female(username: str) -> bool:
+    """Ник @seller — часто единственный признак на маркете."""
+    u = _normalize_handle(username)
+    if len(u) < 3:
+        return False
+    if _MALE_NAMES_RE.search(u):
+        return False
+    if _FEMALE_USER_RE.search(u):
+        return True
+    if _FEMALE_NAME_END_RE.search(u):
+        return True
+    if u.endswith(("ka", "ya", "na", "sha", "nya", "lia", "iya")):
+        return True
+    return False
+
+
 def looks_female(lot: Lot) -> bool:
-    """Строго: только явные признаки девочки, иначе нет."""
+    """Женский профиль: имя, фамилия, bio или @username."""
     if looks_male(lot):
         return False
     fn = (lot.first_name or "").strip().lower()
@@ -234,6 +262,9 @@ def looks_female(lot: Lot) -> bool:
         if _FEMALE_NAME_END_RE.search(fn):
             return True
     if ln and (ln.endswith("овна") or ln.endswith("евна") or ln.endswith("ична")):
+        return True
+    seller = (lot.seller or "").strip()
+    if seller and _username_looks_female(seller):
         return True
     return False
 
@@ -252,17 +283,24 @@ def is_ad_profile(lot: Lot) -> bool:
     return bool(blob and _AD_PROFILE_RE.search(blob))
 
 
+def female_filter_reason(lot: Lot) -> str:
+    """Почему профиль не прошёл женский фильтр (для логов)."""
+    if looks_male(lot):
+        return "мужской"
+    if not looks_female(lot):
+        return "не девочка"
+    if is_ad_profile(lot):
+        return "реклама"
+    if has_review_in_profile(lot):
+        return "отзывы"
+    if has_giftdouble(lot):
+        return "giftdouble"
+    return ""
+
+
 def is_clean_female_profile(lot: Lot) -> bool:
     """Женский профиль без рекламы, отзывов и GiftDouble."""
-    if not looks_female(lot):
-        return False
-    if is_ad_profile(lot):
-        return False
-    if has_review_in_profile(lot):
-        return False
-    if has_giftdouble(lot):
-        return False
-    return True
+    return not female_filter_reason(lot)
 
 
 def sort_lots_fresh_first(lots: list[Lot], *, live_ids: set[str] | None = None) -> list[Lot]:

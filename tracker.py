@@ -1350,6 +1350,8 @@ class PostQueue:
         self._seq = 0
         self._task: asyncio.Task | None = None
         self._closed = False
+        self._send_retries: dict[str, int] = {}
+        self._max_send_retries = 3
 
     @property
     def pending(self) -> int:
@@ -1466,12 +1468,13 @@ class PostQueue:
                     )
                     if reason:
                         logger.info(
-                            "Пропуск %s (%s⭐ @%s): %s · имя=%s · lvl=%s gifts=%s",
+                            "Пропуск %s (%s⭐ @%s): %s · имя=%s · lang=%s · lvl=%s gifts=%s",
                             lot_slug(lot),
                             int(lot.stars),
                             lot.seller or "?",
                             reason,
                             (lot.first_name or "—")[:24],
+                            (lot.lang_code or "—"),
                             lot.account_level if lot.account_level is not None else "—",
                             lot.gifts_count if lot.gifts_count is not None else "—",
                         )
@@ -1480,6 +1483,7 @@ class PostQueue:
                 via = await self._sender.send(lot)
                 self._runtime.post_via = via
                 self._seen[lot.id] = now
+                self._send_retries.pop(lot.id, None)
                 key = lot.seller_key
                 if key:
                     for k in seller_identity_keys(lot):
@@ -1501,13 +1505,30 @@ class PostQueue:
                 self._runtime.last_send_error = err
                 self._runtime.send_errors_total += 1
                 logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
+                retries = self._send_retries.get(lot.id, 0) + 1
+                self._send_retries[lot.id] = retries
+                if retries <= self._max_send_retries and not self._closed:
+                    logger.warning(
+                        "Повтор отправки %s (%s/%s) через 2с",
+                        getattr(lot, "id", "?"),
+                        retries,
+                        self._max_send_retries,
+                    )
+                    await asyncio.sleep(2.0)
+                    self.enqueue([lot])
+                else:
+                    logger.error(
+                        "Отправка %s сдалась после %s попыток",
+                        getattr(lot, "id", "?"),
+                        retries,
+                    )
             finally:
                 self._runtime.queue_pending = self.pending
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.3"
-BUILD_TAG = "v3.8.3-gifts20"
+TRACKER_VERSION = "3.8.4"
+BUILD_TAG = "v3.8.4-post-ru"
 
 
 @dataclass

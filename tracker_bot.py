@@ -529,9 +529,14 @@ def build_router(
                     + (f"\n<code>{_esc(err[:200])}</code>" if err else "")
                 )
                 lines.append("Диагностика: /probe")
+            elif rt.queue_processed > 0 and rt.posted_total == 0:
+                lines.append(
+                    "⚠️ Очередь крутится, но в канал 0 постов — "
+                    "фильтры отсекают все лоты (см. Отсев) или ошибка отправки"
+                )
             elif rt.passes > 0 and rt.last_fresh == 0 and rt.posted_total == 0:
                 lines.append(
-                    "ℹ️ Скан идёт, но новых лотов в цене нет или фильтр девочек отсекает"
+                    "ℹ️ Скан идёт, но новых лотов в диапазоне цены нет"
                 )
         await message.answer("\n".join(lines))
 

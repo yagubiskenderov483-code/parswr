@@ -57,6 +57,7 @@ def save_filters(path: Path, data: dict[str, Any]) -> None:
 
 def config_to_filters(cfg: Any) -> dict[str, Any]:
     return {
+        "filter_schema": FILTER_SCHEMA,
         "min_stars": float(cfg.min_stars),
         "max_stars": float(cfg.max_stars),
         "strict_ru": bool(cfg.strict_ru),

@@ -1511,7 +1511,9 @@ def is_russian_lot(lot: Lot) -> bool | None:
         return True
     if _CYR_RE.search(blob):
         return True
-    return False
+    # Латинский ник/имя без явных чужих сигналов — неизвестно, не режем.
+    # У русских почти всегда латинский username; lang_code Telegram часто пустой.
+    return None
 
 
 def is_free_dm_lot(lot: Lot) -> bool:

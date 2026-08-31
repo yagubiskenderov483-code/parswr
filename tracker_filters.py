@@ -83,7 +83,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
     if "max_account_level" in data:
         cfg.max_account_level = int(data["max_account_level"])
     if "post_interval" in data:
-        cfg.post_interval = max(1.0, float(data["post_interval"]))
+        cfg.post_interval = max(0.5, float(data["post_interval"]))
     if "female_only" in data:
         cfg.female_only = bool(data["female_only"])
     if "strict_fair_price" in data:
@@ -92,15 +92,18 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
+FILTER_SCHEMA = 2
+
 DEFAULT_FILTER_DATA: dict[str, Any] = {
+    "filter_schema": FILTER_SCHEMA,
     "min_stars": 5000.0,
     "max_stars": 25000.0,
-    "strict_ru": True,
+    "strict_ru": False,
     "strict_free": False,
     "max_account_level": 2,
-    "post_interval": 3.0,
-    "female_only": True,
-    "strict_fair_price": True,
+    "post_interval": 1.5,
+    "female_only": False,
+    "strict_fair_price": False,
     "fair_price_ratio": 1.55,
 }
 
@@ -113,7 +116,7 @@ def ensure_default_filters(path: Path) -> None:
 
 
 def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
-    """Старый пресет 2k–5k на Bothost → 5k–25k."""
+    """Старый пресет 2k–5k → 5k–25k; schema<2 → мягкие фильтры (без female/рынок)."""
     if not data:
         return dict(DEFAULT_FILTER_DATA)
     out = dict(data)
@@ -121,10 +124,17 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
         mn = float(out.get("min_stars", 0))
         mx = float(out.get("max_stars", 0))
     except (TypeError, ValueError):
-        return out
+        mn = mx = 0.0
     if abs(mn - 2000) < 1 and abs(mx - 5000) < 1:
         out["min_stars"] = 5000.0
         out["max_stars"] = 25000.0
+    schema = int(out.get("filter_schema", 0) or 0)
+    if schema < FILTER_SCHEMA:
+        out["filter_schema"] = FILTER_SCHEMA
+        out["strict_ru"] = False
+        out["female_only"] = False
+        out["strict_fair_price"] = False
+        out["post_interval"] = min(float(out.get("post_interval", 3.0) or 3.0), 1.5)
     return out
 
 
@@ -145,8 +155,8 @@ def filters_summary(cfg: Any) -> str:
     rid = current_preset_id(cfg.min_stars, cfg.max_stars)
     preset = _preset_by_id(rid)
     price = preset[1] if preset else f"{int(cfg.min_stars):,}–{int(cfg.max_stars):,}⭐"
-    female = "девочки" if getattr(cfg, "female_only", True) else "все"
-    fair = "да" if getattr(cfg, "strict_fair_price", True) else "нет"
+    female = "девочки" if getattr(cfg, "female_only", False) else "все"
+    fair = "да" if getattr(cfg, "strict_fair_price", False) else "нет"
     return (
         f"Цена: <b>{price}</b>\n"
         f"RU: <b>{'да' if cfg.strict_ru else 'нет'}</b> · "

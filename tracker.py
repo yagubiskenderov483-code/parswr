@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -258,28 +258,28 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 1.0
+    poll_interval: float = 0.3
     page_limit: int = 12  # только верх resale-листа
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.06
-    timeout: float = 7.0
+    gap: float = 0.04
+    timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
     scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
-    hot_limit: int = 8  # топ-N = только что выставленные
+    hot_limit: int = 1  # только самый свежий лот в коллекции
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    post_interval: float = 3.0  # сек между постами в канал (строгий тикер)
+    post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
     state_file: str = ""
     post_on_first_run: bool = False
     channel_id: int | None = None
-    strict_ru: bool = True
+    strict_ru: bool = False
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
-    female_only: bool = True
-    strict_fair_price: bool = True
+    female_only: bool = False
+    strict_fair_price: bool = False
     fair_price_ratio: float = 1.55
 
     @classmethod
@@ -328,26 +328,28 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 1.0),
+            poll_interval=_f("POLL_INTERVAL", 0.3),
             page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.06),
-            timeout=_f("REQUEST_TIMEOUT", 7.0),
+            gap=_f("REQUEST_GAP", 0.04),
+            timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 45)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            post_interval=_f("POST_INTERVAL", 3.0),
+            post_interval=_f("POST_INTERVAL", 1.5),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
             channel_id=channel_id,
-            strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
+            strict_ru=os.environ.get("TRACKER_STRICT_RU", "0") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
+            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
+            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
         )
 
 
@@ -470,7 +472,7 @@ class PostRateLimiter:
     def __init__(
         self, interval: float, lock_path: Path, timestamp_path: Path
     ) -> None:
-        self._interval = max(1.0, float(interval))
+        self._interval = max(0.5, float(interval))
         self._lock_path = lock_path
         self._ts_path = timestamp_path
         self._async_lock = asyncio.Lock()
@@ -528,7 +530,7 @@ class PostRateLimiter:
                 await asyncio.to_thread(self._release_after_send)
 
     def set_interval(self, seconds: float) -> None:
-        self._interval = max(1.0, float(seconds))
+        self._interval = max(0.5, float(seconds))
 
 
 class Sender:
@@ -939,6 +941,57 @@ async def _fetch_collection_pages(
     return parsed
 
 
+def _extract_fresh_from_collection(
+    lots: list[Lot],
+    *,
+    cfg: Config,
+    seen: dict[str, float],
+    snapshot_ids: set[str],
+    batch_market_ids: set[str],
+    baseline: bool,
+    now: float,
+    price_book: MarketPriceBook | None,
+) -> tuple[list[Lot], dict[str, int]]:
+    """Один ответ API → только что появившиеся лоты (топ hot_limit)."""
+    fresh: list[Lot] = []
+    stats = {
+        "skipped_market": 0,
+        "skipped_seen": 0,
+        "skipped_price": 0,
+        "skipped_overprice": 0,
+    }
+    for i, lot in enumerate(lots):
+        batch_market_ids.add(lot.id)
+        if i >= cfg.hot_limit:
+            if baseline:
+                seen[lot.id] = now
+            continue
+        if baseline:
+            seen[lot.id] = now
+            continue
+        if lot.id in snapshot_ids:
+            stats["skipped_market"] += 1
+            continue
+        if lot.id in seen:
+            stats["skipped_seen"] += 1
+            continue
+        if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
+            seen[lot.id] = now
+            stats["skipped_price"] += 1
+            continue
+        if (
+            cfg.strict_fair_price
+            and price_book is not None
+            and not price_book.is_fair_price(lot, max_ratio=cfg.fair_price_ratio)
+        ):
+            seen[lot.id] = now
+            stats["skipped_overprice"] += 1
+            continue
+        lot.discovered_at = now
+        fresh.append(lot)
+    return fresh, stats
+
+
 async def poll_once(
     m: TelegramMarket,
     gift_ids: list[int],
@@ -948,21 +1001,15 @@ async def poll_once(
     baseline: bool,
     market_ids: set[str],
     price_book: MarketPriceBook | None = None,
+    on_fresh: Callable[[list[Lot]], Awaitable[None] | None] | None = None,
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
-    """Проход по коллекциям — только лоты, которых ещё не было на маркете (market_ids)."""
+    """Проход по коллекциям — стриминг: новые лоты в очередь сразу по мере ответа API."""
     started = time.monotonic()
     api_stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
     batch = _select_scan_batch(gift_ids, m, cfg, baseline=baseline)
     sem = asyncio.Semaphore(cfg.parallel)
-
-    async def one(gid: int) -> list[Lot]:
-        async with sem:
-            return await _fetch_collection_pages(m, gid, cfg, api_stats)
-
-    chunks = await asyncio.gather(
-        *(one(g) for g in batch), return_exceptions=True
-    )
     now = time.time()
+    snapshot_ids = set(market_ids)
     fresh: list[Lot] = []
     batch_market_ids: set[str] = set()
     skipped_market = 0
@@ -970,51 +1017,45 @@ async def poll_once(
     skipped_price = 0
     skipped_overprice = 0
     exc_errors = 0
-    parsed_rows: list[tuple[int, list[Lot]]] = []
-    ingest_lots: list[Lot] = []
-    for gid, lots in zip(batch, chunks):
-        if isinstance(lots, BaseException):
+
+    async def one(gid: int) -> tuple[int, list[Lot] | BaseException]:
+        async with sem:
+            try:
+                return gid, await _fetch_collection_pages(m, gid, cfg, api_stats)
+            except BaseException as exc:
+                return gid, exc
+
+    tasks = [asyncio.create_task(one(g)) for g in batch]
+    for done in asyncio.as_completed(tasks):
+        gid, result = await done
+        if isinstance(result, BaseException):
             exc_errors += 1
-            logger.warning("коллекция %s: %s", gid, lots)
+            logger.warning("коллекция %s: %s", gid, result)
             continue
-        parsed_rows.append((gid, lots))
-        ingest_lots.extend(lots)
+        lots = result
+        if price_book is not None and lots:
+            price_book.ingest(lots)
+        batch_fresh, part = _extract_fresh_from_collection(
+            lots,
+            cfg=cfg,
+            seen=seen,
+            snapshot_ids=snapshot_ids,
+            batch_market_ids=batch_market_ids,
+            baseline=baseline,
+            now=now,
+            price_book=price_book,
+        )
+        skipped_market += part["skipped_market"]
+        skipped_seen += part["skipped_seen"]
+        skipped_price += part["skipped_price"]
+        skipped_overprice += part["skipped_overprice"]
+        if batch_fresh:
+            fresh.extend(batch_fresh)
+            if on_fresh is not None:
+                cb = on_fresh(batch_fresh)
+                if asyncio.iscoroutine(cb):
+                    await cb
 
-    if price_book is not None and ingest_lots:
-        price_book.ingest(ingest_lots)
-
-    for _gid, lots in parsed_rows:
-        for i, lot in enumerate(lots):
-            batch_market_ids.add(lot.id)
-            if i >= cfg.hot_limit:
-                if baseline:
-                    seen[lot.id] = now
-                continue
-            if baseline:
-                seen[lot.id] = now
-                continue
-            if lot.id in market_ids:
-                skipped_market += 1
-                continue
-            if lot.id in seen:
-                skipped_seen += 1
-                continue
-            if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
-                seen[lot.id] = now
-                skipped_price += 1
-                continue
-            if (
-                cfg.strict_fair_price
-                and price_book is not None
-                and not price_book.is_fair_price(
-                    lot, max_ratio=cfg.fair_price_ratio
-                )
-            ):
-                seen[lot.id] = now
-                skipped_overprice += 1
-                continue
-            lot.discovered_at = now
-            fresh.append(lot)
     market_ids |= batch_market_ids
     stats: dict[str, int | float | str] = {
         "scanned": len(batch),
@@ -1046,32 +1087,45 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Enrich одного лота — имя нужно для фильтра «только девочки»."""
+    """Минимальный enrich: тяжёлый профиль только если включены строгие фильтры."""
+    need_name = bool(cfg.female_only)
+    need_ru = bool(cfg.strict_ru)
+    need_level = cfg.max_account_level < 99
+    need_dm = True  # всегда отсекаем платные ЛС
+    light = not (need_name or need_ru)
+
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=4.0)
+            await m.resolve_owner(lot, timeout=3.0 if light else 4.0)
         except Exception:  # noqa: BLE001
             pass
-    if lot.seller_id is not None:
-        for attempt in range(2):
-            need_profile = (
-                not (lot.first_name or "").strip()
-                or lot.account_level is None
-                or lot.free_dm is None
-                or lot.is_premium is None
-                or (cfg.strict_ru and not lot.lang_code)
-            )
-            if not need_profile:
-                break
+    if lot.seller_id is None:
+        return
+    if light:
+        if need_dm and lot.free_dm is None:
             try:
-                await m.enrich_profiles([lot], timeout=4.0, parallel=1)
+                await m.check_free_dm([lot], timeout=2.5)
             except Exception:  # noqa: BLE001
                 pass
-            if (lot.first_name or "").strip():
-                break
-            if attempt == 0:
-                await asyncio.sleep(0.3)
-    if lot.free_dm is None and lot.seller_id is not None:
+        return
+    for attempt in range(2):
+        need_profile = (
+            (need_name and not (lot.first_name or "").strip())
+            or (need_level and lot.account_level is None)
+            or (need_dm and lot.free_dm is None)
+            or lot.is_premium is None
+            or (need_ru and not lot.lang_code)
+        )
+        if not need_profile:
+            break
+        try:
+            await m.enrich_profiles([lot], timeout=4.0, parallel=1)
+        except Exception:  # noqa: BLE001
+            pass
+        if (lot.first_name or "").strip() or attempt == 1:
+            break
+        await asyncio.sleep(0.2)
+    if need_dm and lot.free_dm is None:
         try:
             await m.check_free_dm([lot], timeout=3.0)
         except Exception:  # noqa: BLE001
@@ -1273,7 +1327,7 @@ class PostQueue:
         state: dict,
         state_path: Path,
         runtime: TrackerRuntime,
-        post_interval: float = 4.0,
+        post_interval: float = 1.5,
     ) -> None:
         self._sender = sender
         self._m = market
@@ -1283,7 +1337,7 @@ class PostQueue:
         self._state = state
         self._state_path = state_path
         self._runtime = runtime
-        self._interval = max(1.0, float(post_interval))
+        self._interval = max(0.5, float(post_interval))
         self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
             asyncio.PriorityQueue()
         )
@@ -1322,7 +1376,7 @@ class PostQueue:
         return len(lots)
 
     def set_interval(self, seconds: float) -> None:
-        self._interval = max(1.0, float(seconds))
+        self._interval = max(0.5, float(seconds))
         self._cfg.post_interval = self._interval
 
     async def _drip_worker(self) -> None:
@@ -1434,8 +1488,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.7.0"
-BUILD_TAG = "v3.7.0-fair-fast"
+TRACKER_VERSION = "3.8.0"
+BUILD_TAG = "v3.8.0-turbo-instant"
 
 
 @dataclass
@@ -1606,6 +1660,16 @@ async def scanner_loop(
             await asyncio.sleep(15)
             continue
         try:
+            def _stream_enqueue(batch: list[Lot]) -> None:
+                n = post_queue.enqueue(batch)
+                runtime.queue_pending = post_queue.pending
+                if n:
+                    logger.info(
+                        "⚡ +%s свежих → очередь (ждут %s)",
+                        n,
+                        post_queue.pending,
+                    )
+
             fresh, scan = await poll_once(
                 m,
                 gift_ids,
@@ -1614,6 +1678,7 @@ async def scanner_loop(
                 baseline=False,
                 market_ids=market_ids,
                 price_book=price_book,
+                on_fresh=_stream_enqueue,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
@@ -1645,14 +1710,11 @@ async def scanner_loop(
 
         runtime.last_fresh = len(fresh)
         if fresh:
-            n = post_queue.enqueue(fresh)
-            runtime.queue_pending = post_queue.pending
-            runtime.last_posted = n
+            runtime.last_posted = post_queue.pending
             logger.info(
-                "Проход #%s: +%s новых → очередь +%s (ждут %s · %ss)",
+                "Проход #%s: +%s новых · очередь %s · %ss",
                 pass_no,
                 len(fresh),
-                n,
                 post_queue.pending,
                 scan.get("elapsed", "?"),
             )

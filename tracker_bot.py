@@ -237,7 +237,7 @@ def _apply_tracker_filters(
         setattr(cfg, key, value)
     persist_config_filters(cfg, _filters_path())
     if "post_interval" in updates:
-        interval = max(1.0, float(updates["post_interval"]))
+        interval = max(0.5, float(updates["post_interval"]))
         if control.post_queue is not None:
             control.post_queue.set_interval(interval)
         if control.sender is not None and control.sender._rate_limiter is not None:
@@ -258,8 +258,8 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
     ]
     ru = "✅" if cfg.strict_ru else "⬜️"
     free = "✅" if cfg.strict_free else "⬜️"
-    female = "✅" if getattr(cfg, "female_only", True) else "⬜️"
-    fair = "✅" if getattr(cfg, "strict_fair_price", True) else "⬜️"
+    female = "✅" if getattr(cfg, "female_only", False) else "⬜️"
+    fair = "✅" if getattr(cfg, "strict_fair_price", False) else "⬜️"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             price_row,
@@ -462,8 +462,8 @@ def build_router(
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
                 f"пост/{int(cfg.post_interval)}с · "
-                f"{'девочки' if getattr(cfg, 'female_only', True) else 'все'} · "
-                f"рынок={'да' if getattr(cfg, 'strict_fair_price', True) else 'нет'}"
+                f"{'девочки' if getattr(cfg, 'female_only', False) else 'все'} · "
+                f"рынок={'да' if getattr(cfg, 'strict_fair_price', False) else 'нет'}"
             )
             lines.append("Менять: /filters")
         bot_handle = _bot_handle()
@@ -653,11 +653,11 @@ def build_router(
             _apply_tracker_filters(control, strict_free=not bool(cfg.strict_free))
             note = "Free ЛС"
         elif action == "female":
-            cur = bool(getattr(cfg, "female_only", True))
+            cur = bool(getattr(cfg, "female_only", False))
             _apply_tracker_filters(control, female_only=not cur)
             note = "девочки" if not cur else "все профили"
         elif action == "fair":
-            cur = bool(getattr(cfg, "strict_fair_price", True))
+            cur = bool(getattr(cfg, "strict_fair_price", False))
             _apply_tracker_filters(control, strict_fair_price=not cur)
             note = "честная цена" if not cur else "без проверки рынка"
         elif action == "lvl":

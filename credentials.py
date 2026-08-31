@@ -5,10 +5,9 @@ import os
 # Трекер: @jsjeigiejwhnewbot (отображается как Trsjjsjsbot)
 CONTROL_BOT_USERNAME = "jsjeigiejwhnewbot"
 DEFAULT_CHANNEL_ID = -1003784435307
-BOT_TOKEN = (
-    os.environ.get("BOT_TOKEN")
-    or "8825465611:AAGq5ksS5BGjPpfp4GYuL_jZ8ddxTQxhiD4"
-).strip()
+_DEFAULT_BOT_TOKEN = "8825465611:AAEBffGpPJ2Gou_Ah2nnrVoFLpsT6kBhOhs"
+# hardcoded важнее env Bothost — иначе там часто висит старый BOT_TOKEN
+BOT_TOKEN = (_DEFAULT_BOT_TOKEN or os.environ.get("BOT_TOKEN") or "").strip()
 API_ID = 36101343
 API_HASH = "116195fa5e0459d25a9a6266b40807d7"
 

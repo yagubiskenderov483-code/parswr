@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import time
 
-from market import Lot, is_russian_lot
+from market import Lot, MarketPriceBook, is_clean_female_profile, is_russian_lot
 from tracker import filter_for_post
+from tracker_filters import FILTER_SCHEMA, migrate_legacy_filters
 
 
 def _lot(**kwargs) -> Lot:
@@ -125,6 +126,90 @@ def test_filter_allows_unknown_level() -> None:
     assert len(out) == 1
 
 
+def _filter_strict(lots: list[Lot], book: MarketPriceBook | None = None):
+    return filter_for_post(
+        lots,
+        {},
+        now=time.time(),
+        strict_ru=True,
+        strict_free=False,
+        max_account_level=2,
+        max_gifts=20,
+        female_only=True,
+        strict_fair_price=True,
+        price_book=book,
+    )
+
+
+def test_overprice_300_listed_at_10k() -> None:
+    """Нищий гифт коллекции ~300⭐, выставили за 10к — не постим."""
+    book = MarketPriceBook()
+    book.set_floor(["desk calendar", "cid:99"], 300.0)
+    lot = _lot(
+        stars=10000.0,
+        title="Desk Calendar",
+        collection_id=99,
+        first_name="Мария",
+        seller="mariagifts",
+    )
+    assert book.is_fair_price(lot) is False
+    out, stats = _filter_strict([lot], book)
+    assert stats["overprice"] == 1
+    assert out == []
+
+
+def test_fair_listing_near_collection_floor() -> None:
+    book = MarketPriceBook()
+    book.set_floor(["desk calendar"], 8000.0)
+    lot = _lot(
+        stars=9000.0,
+        title="Desk Calendar",
+        first_name="Мария",
+        seller="mariagifts",
+    )
+    assert book.is_fair_price(lot) is True
+    out, stats = _filter_strict([lot], book)
+    assert stats["overprice"] == 0
+    assert len(out) == 1
+
+
+def test_telegram_value_blocks_dump() -> None:
+    book = MarketPriceBook()
+    lot = _lot(stars=10000.0, telegram_value=320.0, title="Cheap Gift")
+    assert book.is_fair_price(lot) is False
+
+
+def test_female_skips_boys() -> None:
+    lot = _lot(first_name="Alex", seller="alexgifts")
+    assert is_clean_female_profile(lot) is False
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 1
+    assert out == []
+
+
+def test_female_keeps_maria() -> None:
+    lot = _lot(first_name="Мария", seller="mariagifts")
+    assert is_clean_female_profile(lot) is True
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 0
+    assert len(out) == 1
+
+
+def test_migrate_schema5_enables_girls_and_market() -> None:
+    out = migrate_legacy_filters(
+        {
+            "filter_schema": 4,
+            "female_only": False,
+            "strict_fair_price": False,
+            "min_stars": 5000,
+            "max_stars": 25000,
+        }
+    )
+    assert out["filter_schema"] == FILTER_SCHEMA
+    assert out["female_only"] is True
+    assert out["strict_fair_price"] is True
+
+
 def main() -> None:
     tests = [
         test_latin_username_is_unknown_not_foreign,
@@ -141,6 +226,12 @@ def main() -> None:
         test_filter_skips_paid_dm,
         test_filter_skips_high_level,
         test_filter_allows_unknown_level,
+        test_overprice_300_listed_at_10k,
+        test_fair_listing_near_collection_floor,
+        test_telegram_value_blocks_dump,
+        test_female_skips_boys,
+        test_female_keeps_maria,
+        test_migrate_schema5_enables_girls_and_market,
     ]
     for fn in tests:
         fn()

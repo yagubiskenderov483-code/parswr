@@ -259,14 +259,14 @@ class Config:
     min_stars: float = 5000.0
     max_stars: float = 25000.0
     poll_interval: float = 0.3
-    page_limit: int = 12  # только верх resale-листа
+    page_limit: int = 8  # верх resale-листа (свежие)
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.04
-    timeout: float = 8.0
+    gap: float = 0.02
+    timeout: float = 3.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
+    scan_batch: int = 24  # ротация: быстрее полный круг по 150 коллекциям
     hot_limit: int = 3  # топ свежих в коллекции (1 часто фермер)
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
@@ -279,8 +279,8 @@ class Config:
     channel_id: int | None = None
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
-    female_only: bool = False
-    strict_fair_price: bool = False
+    female_only: bool = True
+    strict_fair_price: bool = True
     fair_price_ratio: float = 1.55
 
     @classmethod
@@ -330,14 +330,14 @@ class Config:
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
             poll_interval=_f("POLL_INTERVAL", 0.3),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
+            page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.04),
-            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            gap=_f("REQUEST_GAP", 0.02),
+            timeout=_f("REQUEST_TIMEOUT", 3.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 45)),
+            scan_batch=int(_f("SCAN_BATCH", 24)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
@@ -350,8 +350,8 @@ class Config:
             channel_id=channel_id,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
-            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
-            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
+            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") == "1",
+            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "1") == "1",
         )
 
 
@@ -448,12 +448,16 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
     else:
         status = "—"
 
-    return "\n".join(
+    lines = [
+        "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
+        "",
+        f"🎁 Гифт: <b>{_esc(lot.title)}</b>",
+        f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
+    ]
+    if lot.market_floor and lot.market_floor > 0:
+        lines.append(f"📊 Рынок коллекции: ~{int(lot.market_floor)}⭐")
+    lines.extend(
         [
-            "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
-            "",
-            f"🎁 Гифт: <b>{_esc(lot.title)}</b>",
-            f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
             f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
             f"👤 Продавец: {seller}",
             f"📶 Level: {format_account_level(lot)}",
@@ -463,6 +467,7 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
             f"🕒 {when}",
         ]
     )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- sending
@@ -912,7 +917,7 @@ async def _fetch_collection_pages(
     cfg: Config,
     stats: dict[str, int],
 ) -> list[Lot]:
-    """Только page1 resale; fallback без двойного счёта ошибок."""
+    """Только page1 resale по дате; без второго запроса — он удваивал таймауты."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
     result = await m._request(
         gid,
@@ -923,22 +928,14 @@ async def _fetch_collection_pages(
         cfg.timeout,
         max_attempts=1,
     )
-    if result is None:
-        result = await m._request(
-            gid,
-            cfg.page_limit,
-            False,
-            local,
-            cfg.gap,
-            min(cfg.timeout, 4.0),
-            max_attempts=1,
-        )
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
         return []
     m._remember_users(market_mod._extract_users(result))
     parsed = market_mod._parse_result(result)
+    for lot in parsed:
+        lot.collection_id = int(gid)
     if parsed:
         stats["parsed"] += len(parsed)
         stats["ok"] += 1
@@ -1037,8 +1034,6 @@ async def poll_once(
             logger.warning("коллекция %s: %s", gid, result)
             continue
         lots = result
-        if price_book is not None and lots:
-            price_book.ingest(lots)
         batch_fresh, part = _extract_fresh_from_collection(
             lots,
             cfg=cfg,
@@ -1099,7 +1094,7 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
             pass
     if lot.seller_id is None:
         return
-    delays = (0.0, 0.35, 0.9, 1.8)
+    delays = (0.0, 0.3, 0.8)
     for attempt, delay in enumerate(delays):
         if delay:
             await asyncio.sleep(delay)
@@ -1115,14 +1110,14 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         if not need_profile:
             break
         try:
-            await m.enrich_profiles([lot], timeout=5.0, parallel=1)
+            await m.enrich_profiles([lot], timeout=3.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
         if attempt == len(delays) - 1:
             break
     if lot.free_dm is None:
         try:
-            await m.check_free_dm([lot], timeout=4.0)
+            await m.check_free_dm([lot], timeout=2.5)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1164,6 +1159,65 @@ def mark_processed_lots(
             continue
         seen[lot.id] = now
     return retry
+
+
+async def ensure_market_floor(
+    m: TelegramMarket,
+    lot: Lot,
+    book: MarketPriceBook | None,
+    cfg: Config,
+) -> float | None:
+    """Пол коллекции: sort_by_price, кэш 3 мин. 300⭐ гифт за 10к не пройдёт."""
+    if book is None:
+        return lot.market_floor
+    cached = book.live_floor(lot)
+    if cached and cached > 0:
+        lot.market_floor = cached
+        return cached
+    cid = lot.collection_id
+    if cid is None:
+        fair = book.fair_price(lot)
+        if fair:
+            lot.market_floor = fair
+        return fair
+    try:
+        cheap = await m.fetch_cheapest(
+            int(cid),
+            limit=15,
+            timeout=min(3.0, float(cfg.timeout) or 3.0),
+            gap=cfg.gap,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("пол рынка %s: %s", cid, exc)
+        cheap = []
+    if not cheap:
+        fair = book.fair_price(lot)
+        if fair:
+            lot.market_floor = fair
+        return fair
+    book.ingest(cheap)
+    prices = sorted(float(x.stars) for x in cheap if x.stars and x.stars > 0)
+    k = min(3, len(prices))
+    floor = sum(prices[:k]) / k if k else None
+    if floor:
+        keys = [f"cid:{int(cid)}"]
+        title = (lot.title or "").strip().lower()
+        if title:
+            keys.append(title)
+        book.set_floor(keys, floor)
+        by_model: dict[str, list[float]] = {}
+        for item in cheap:
+            mk = (item.model_key or "").strip()
+            if mk:
+                by_model.setdefault(mk, []).append(float(item.stars))
+        for mk, arr in by_model.items():
+            if len(arr) >= 2:
+                arr.sort()
+                n = min(3, len(arr))
+                book.set_floor([mk], sum(arr[:n]) / n)
+        lot.market_floor = book.live_floor(lot) or floor
+        return lot.market_floor
+    return None
 
 
 def passes_account_level(lot: Lot, max_level: int) -> bool:
@@ -1398,6 +1452,13 @@ class PostQueue:
                 break
             try:
                 await enrich_one(self._m, lot, self._cfg)
+                if self._cfg.strict_fair_price:
+                    try:
+                        await ensure_market_floor(
+                            self._m, lot, self._runtime.price_book, self._cfg
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ensure_market_floor: %s", exc)
                 now = time.time()
                 to_post, fstats = filter_for_post(
                     [lot],
@@ -1527,8 +1588,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.4"
-BUILD_TAG = "v3.8.4-post-ru"
+TRACKER_VERSION = "3.9.0"
+BUILD_TAG = "v3.9.0-floor-girls"
 
 
 @dataclass
@@ -1788,20 +1849,18 @@ async def scanner_loop(
                 pass
 
         spent = time.monotonic() - started
-        if scanned > 0:
-            ratio = errors / scanned
-            if ratio > 0.35 and runtime.scan_parallel > 4:
-                runtime.scan_parallel -= 1
-                cfg.parallel = runtime.scan_parallel
-                logger.warning(
-                    "Много ошибок API (%s/%s) — parallel=%s",
-                    errors,
-                    scanned,
-                    runtime.scan_parallel,
-                )
-            elif ratio < 0.12 and runtime.scan_parallel < 6:
-                runtime.scan_parallel += 1
-                cfg.parallel = runtime.scan_parallel
+        floods = int(scan.get("floods", 0) or 0)
+        if floods > 3 and runtime.scan_parallel > 4:
+            runtime.scan_parallel -= 1
+            cfg.parallel = runtime.scan_parallel
+            logger.warning(
+                "FloodWait x%s — parallel=%s",
+                floods,
+                runtime.scan_parallel,
+            )
+        elif floods == 0 and runtime.scan_parallel < 6:
+            runtime.scan_parallel += 1
+            cfg.parallel = runtime.scan_parallel
 
         await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
 

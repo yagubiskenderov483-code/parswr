@@ -85,6 +85,9 @@ class Lot:
     lang_code: str = ""
     seen_at: float = field(default_factory=time.time)
     discovered_at: float = 0.0  # когда трекер впервые увидел лот
+    collection_id: int | None = None  # gift_id коллекции для запроса пола рынка
+    market_floor: float | None = None  # актуальный пол коллекции (sort_by_price)
+    telegram_value: float | None = None  # оценка Telegram, если есть
 
     @property
     def model_key(self) -> str:
@@ -304,26 +307,33 @@ def is_clean_female_profile(lot: Lot) -> bool:
 
 
 class MarketPriceBook:
-    """Оценка рыночной цены по свежим листингам — отсекает завышенные (20k за 400⭐)."""
+    """Пол рынка: дешёвые лоты коллекции (sort_by_price), не свежие дампы за 10к."""
 
     MAX_SAMPLES = 60
     MIN_SAMPLES = 2
     DEFAULT_MAX_RATIO = 1.55
+    FLOOR_TTL = 180.0
 
     def __init__(self) -> None:
         self._samples: dict[str, list[float]] = {}
+        self._floors: dict[str, tuple[float, float]] = {}  # key → (floor, ts)
 
     def _keys(self, lot: Lot) -> list[str]:
         keys: list[str] = []
         mk = (lot.model_key or "").strip()
         if mk:
             keys.append(mk)
+        if lot.collection_id is not None:
+            cid = f"cid:{int(lot.collection_id)}"
+            if cid not in keys:
+                keys.append(cid)
         title = (lot.title or "").strip().lower()
         if title and title not in keys:
             keys.append(title)
         return keys
 
     def ingest(self, lots: Iterable[Lot]) -> None:
+        """Только дешёвая выборка (пол), не page1 по дате — иначе 10к затирает 300⭐."""
         for lot in lots:
             stars = float(lot.stars or 0)
             if stars <= 0:
@@ -333,7 +343,29 @@ class MarketPriceBook:
                 arr.append(stars)
                 if len(arr) > self.MAX_SAMPLES:
                     arr.sort()
-                    self._samples[key] = arr[-self.MAX_SAMPLES :]
+                    self._samples[key] = arr[: self.MAX_SAMPLES]
+
+    def set_floor(self, keys: Iterable[str], floor: float) -> None:
+        now = time.time()
+        val = float(floor)
+        if val <= 0:
+            return
+        for key in keys:
+            k = str(key or "").strip()
+            if k:
+                self._floors[k] = (val, now)
+
+    def live_floor(self, lot: Lot) -> float | None:
+        now = time.time()
+        for key in self._keys(lot):
+            hit = self._floors.get(key)
+            if hit and now - hit[1] < self.FLOOR_TTL and hit[0] > 0:
+                return hit[0]
+        return None
+
+    def remember_floor(self, lot: Lot, floor: float) -> None:
+        self.set_floor(self._keys(lot), floor)
+        lot.market_floor = float(floor)
 
     def _fair_for_key(self, key: str) -> float | None:
         prices = self._samples.get(key)
@@ -344,6 +376,13 @@ class MarketPriceBook:
         return sum(sorted_p[:n]) / n
 
     def fair_price(self, lot: Lot) -> float | None:
+        live = self.live_floor(lot)
+        if live is not None:
+            return live
+        if lot.market_floor and lot.market_floor > 0:
+            return float(lot.market_floor)
+        if lot.telegram_value and lot.telegram_value > 0:
+            return float(lot.telegram_value)
         for key in self._keys(lot):
             fair = self._fair_for_key(key)
             if fair is not None:
@@ -355,7 +394,7 @@ class MarketPriceBook:
         if fair is None:
             return None
         ratio = float(max_ratio or self.DEFAULT_MAX_RATIO)
-        return max(fair * ratio, fair + min(250.0, fair * 0.4))
+        return max(fair * ratio, fair + min(400.0, fair * 0.5))
 
     def is_fair_price(self, lot: Lot, *, max_ratio: float | None = None) -> bool:
         cap = self.price_cap(lot, max_ratio=max_ratio)
@@ -372,11 +411,18 @@ class MarketPriceBook:
             return ""
         return f"завышено {int(lot.stars):,}⭐ > рынок ~{int(fair):,}⭐ (макс {int(cap):,})"
 
-    def to_dict(self) -> dict[str, list[float]]:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            k: [float(x) for x in v[-self.MAX_SAMPLES :]]
-            for k, v in self._samples.items()
-            if v
+            "samples": {
+                k: [float(x) for x in v[: self.MAX_SAMPLES]]
+                for k, v in self._samples.items()
+                if v
+            },
+            "floors": {
+                k: [float(floor), float(ts)]
+                for k, (floor, ts) in self._floors.items()
+                if floor > 0
+            },
         }
 
     @classmethod
@@ -384,7 +430,13 @@ class MarketPriceBook:
         book = cls()
         if not isinstance(data, dict):
             return book
-        for key, raw in data.items():
+        if "samples" in data or "floors" in data:
+            samples = data.get("samples") if isinstance(data.get("samples"), dict) else {}
+            floors = data.get("floors") if isinstance(data.get("floors"), dict) else {}
+        else:
+            samples = data
+            floors = {}
+        for key, raw in (samples or {}).items():
             if not isinstance(raw, list):
                 continue
             prices = []
@@ -396,7 +448,18 @@ class MarketPriceBook:
                 if val > 0:
                     prices.append(val)
             if prices:
-                book._samples[str(key)] = prices[-cls.MAX_SAMPLES :]
+                book._samples[str(key)] = prices[: cls.MAX_SAMPLES]
+        now = time.time()
+        for key, raw in (floors or {}).items():
+            if not isinstance(raw, (list, tuple)) or len(raw) < 1:
+                continue
+            try:
+                floor = float(raw[0])
+                ts = float(raw[1]) if len(raw) > 1 else now
+            except (TypeError, ValueError):
+                continue
+            if floor > 0:
+                book._floors[str(key)] = (floor, ts)
         return book
 
 
@@ -1314,6 +1377,34 @@ class TelegramMarket:
             stats["ok"] += 1
         return lots, users, next_offset, total
 
+    async def fetch_cheapest(
+        self,
+        gift_id: int,
+        *,
+        limit: int = 15,
+        timeout: float = 3.0,
+        gap: float = 0.02,
+    ) -> list[Lot]:
+        """Первая страница resale, самые дешёвые — пол рынка коллекции."""
+        stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0}
+        result = await self._request(
+            int(gift_id),
+            limit,
+            True,
+            stats,
+            gap,
+            timeout,
+            max_attempts=1,
+            sort_by_price=True,
+        )
+        if result is None:
+            return []
+        self._remember_users(_extract_users(result))
+        lots = _parse_result(result)
+        for lot in lots:
+            lot.collection_id = int(gift_id)
+        return lots
+
     async def _fetch_one(
         self,
         gift_id: int,
@@ -1393,6 +1484,7 @@ class TelegramMarket:
         *,
         offset: str = "",
         max_attempts: int = 2,
+        sort_by_price: bool = False,
     ) -> Any | None:
         for attempt in range(max(1, int(max_attempts))):
             try:
@@ -1410,6 +1502,7 @@ class TelegramMarket:
                             offset=offset or "",
                             limit=min(limit, 50),
                             stars_only=True if stars_only else None,
+                            sort_by_price=True if sort_by_price else None,
                         )
                     ),
                     timeout=timeout,
@@ -1708,6 +1801,22 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
             seller_id = None
 
     number_i = int(number) if number is not None else None
+    collection_id: int | None = None
+    raw_coll = getattr(gift, "gift_id", None)
+    if raw_coll is not None:
+        try:
+            collection_id = int(raw_coll)
+        except (TypeError, ValueError):
+            collection_id = None
+    telegram_value: float | None = None
+    raw_val = getattr(gift, "value_amount", None)
+    if raw_val is not None:
+        try:
+            telegram_value = float(raw_val)
+            if telegram_value <= 0:
+                telegram_value = None
+        except (TypeError, ValueError):
+            telegram_value = None
     lot = Lot(
         id=str(gift_id or slug or f"{title}-{number_i}"),
         title=title,
@@ -1721,6 +1830,8 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         seller_id=seller_id,
         first_name=first_name,
         last_name=last_name,
+        collection_id=collection_id,
+        telegram_value=telegram_value,
     )
     if seller_id and users and seller_id in users:
         _fill_user(lot, users[seller_id])

@@ -48,6 +48,8 @@ from market import (
     is_russian_lot,
     seller_keys_overlap,
     seller_identity_keys,
+    naivety_score,
+    looks_female,
 )
 from tracker_bot import ChannelStore, ControlBot, channel_file_path
 
@@ -160,7 +162,7 @@ def _catalog_file_path() -> Path:
     return data_dir() / "tracker_catalog.json"
 
 
-def _load_catalog_file() -> tuple[list[int], int] | None:
+def _load_catalog_file() -> tuple[list[int], int, dict[str, str]] | None:
     path = _catalog_file_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -169,18 +171,30 @@ def _load_catalog_file() -> tuple[list[int], int] | None:
         ids = [int(x) for x in data.get("gift_ids", []) if str(x).isdigit()]
         if not ids:
             return None
-        return ids, int(data.get("hash", 0) or 0)
+        titles_raw = data.get("titles") or {}
+        titles: dict[str, str] = {}
+        if isinstance(titles_raw, dict):
+            titles = {str(k): str(v) for k, v in titles_raw.items() if v}
+        return ids, int(data.get("hash", 0) or 0), titles
     except (OSError, ValueError, TypeError):
         return None
 
 
-def _save_catalog_file(gift_ids: list[int], hash_val: int = 0) -> None:
+def _save_catalog_file(
+    gift_ids: list[int], hash_val: int = 0, titles: dict[str, str] | None = None
+) -> None:
     if not gift_ids:
         return
     path = _catalog_file_path()
     tmp = path.with_suffix(".tmp")
+    payload: dict[str, Any] = {
+        "gift_ids": gift_ids,
+        "hash": int(hash_val or 0),
+    }
+    if titles:
+        payload["titles"] = titles
     tmp.write_text(
-        json.dumps({"gift_ids": gift_ids, "hash": int(hash_val or 0)}),
+        json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
     tmp.replace(path)
@@ -189,19 +203,25 @@ def _save_catalog_file(gift_ids: list[int], hash_val: int = 0) -> None:
 def _setup_catalog_hooks(m: TelegramMarket) -> None:
     """Кэш коллекций: gifts.db → tracker_catalog.json → сеть."""
 
-    def _load() -> tuple[list[int], int] | None:
+    def _load() -> dict[str, Any] | tuple[list[int], int] | None:
         cached = _load_catalog_file()
         if cached:
-            return cached
+            ids, h, titles = cached
+            return {"ids": ids, "hash": h, "titles": titles}
         try:
             from db import GiftDB
 
-            return GiftDB().load_gift_catalog()
+            row = GiftDB().load_gift_catalog()
+            if row:
+                return {"ids": row[0], "hash": row[1], "titles": {}}
         except Exception:  # noqa: BLE001
             return None
+        return None
 
-    def _save(ids: list[int], h: int) -> None:
-        _save_catalog_file(ids, h)
+    def _save(
+        ids: list[int], h: int, titles: dict[str, str] | None = None
+    ) -> None:
+        _save_catalog_file(ids, h, titles)
         try:
             from db import GiftDB
 
@@ -258,16 +278,16 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 0.3
-    page_limit: int = 12  # только верх resale-листа
+    poll_interval: float = 0.15
+    page_limit: int = 16  # верх resale-листа коллекции
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.04
-    timeout: float = 8.0
+    gap: float = 0.02
+    timeout: float = 6.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
-    hot_limit: int = 3  # топ свежих в коллекции (1 часто фермер)
+    scan_batch: int = 0  # 0 = все коллекции каждый проход
+    hot_limit: int = 8  # свежих лотов в коллекции (не только топ-3)
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
     post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
@@ -279,7 +299,7 @@ class Config:
     channel_id: int | None = None
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
-    female_only: bool = False
+    female_only: bool = True
     strict_fair_price: bool = False
     fair_price_ratio: float = 1.55
 
@@ -329,16 +349,16 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 0.3),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
+            poll_interval=_f("POLL_INTERVAL", 0.15),
+            page_limit=int(_f("PAGE_LIMIT", 16)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.04),
-            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            gap=_f("REQUEST_GAP", 0.02),
+            timeout=_f("REQUEST_TIMEOUT", 6.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 45)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
+            scan_batch=int(_f("SCAN_BATCH", 0)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
             post_interval=_f("POST_INTERVAL", 1.5),
@@ -350,7 +370,7 @@ class Config:
             channel_id=channel_id,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
-            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
+            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") != "0",
             strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
         )
 
@@ -455,6 +475,11 @@ def format_lot(lot: Lot, cfg: Config, ts: float | None = None) -> str:
             f"🎁 Гифт: <b>{_esc(lot.title)}</b>",
             f"💲 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
             f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
+            *(
+                [f"🎨 Фон: <b>{_esc(lot.backdrop)}</b>"]
+                if (lot.backdrop or "").strip()
+                else []
+            ),
             f"👤 Продавец: {seller}",
             f"📶 Level: {format_account_level(lot)}",
             f"📢 Сообщения: {dm}",
@@ -938,7 +963,7 @@ async def _fetch_collection_pages(
         stats["errors"] += 1
         return []
     m._remember_users(market_mod._extract_users(result))
-    parsed = market_mod._parse_result(result)
+    parsed = m.parse_resale(result, gid)
     if parsed:
         stats["parsed"] += len(parsed)
         stats["ok"] += 1
@@ -1099,7 +1124,7 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
             pass
     if lot.seller_id is None:
         return
-    delays = (0.0, 0.35, 0.9, 1.8)
+    delays = (0.0, 0.2, 0.55)
     for attempt, delay in enumerate(delays):
         if delay:
             await asyncio.sleep(delay)
@@ -1269,24 +1294,29 @@ _FEMALE_HINT_RE = re.compile(
 )
 
 def _looks_female(lot: Lot) -> bool:
-    from market import looks_female
-
     return looks_female(lot)
 
 
-def _lot_priority(lot: Lot, *, boost_female: bool) -> float:
-    """Выше = раньше в очереди. Без TGP в приоритете, девочки — иногда."""
-    score = random.random() * 0.3
+def _lot_priority(
+    lot: Lot,
+    *,
+    boost_female: bool,
+    price_book: MarketPriceBook | None = None,
+) -> float:
+    """Выше = раньше в очереди. Свежие + наивные девочки (мало NFT, дешевле рынка)."""
+    score = float(lot.discovered_at or time.time())
+    naive = naivety_score(lot, price_book)
+    score += naive * 0.08
     if lot.is_premium is False:
-        score += 4.0
+        score += 0.4
     elif lot.is_premium is True:
-        score -= 3.0
+        score -= 0.3
     if lot.free_dm is True:
-        score += 1.5
+        score += 0.2
     elif lot.free_dm is False:
-        score -= 5.0
+        score -= 0.5
     if boost_female and _looks_female(lot):
-        score += 2.5
+        score += 0.35
     return score
 
 
@@ -1376,7 +1406,11 @@ class PostQueue:
             return 0
         for lot in rank_for_queue(lots):
             self._seq += 1
-            prio = -float(lot.discovered_at or time.time())
+            prio = -_lot_priority(
+                lot,
+                boost_female=True,
+                price_book=self._runtime.price_book,
+            )
             self._pq.put_nowait((prio, self._seq, lot))
         self._runtime.queue_pending = self.pending
         return len(lots)
@@ -1506,8 +1540,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.3"
-BUILD_TAG = "v3.8.3-gifts20"
+TRACKER_VERSION = "3.9.0"
+BUILD_TAG = "v3.9-girls-fast"
 
 
 @dataclass
@@ -1805,10 +1839,11 @@ async def run() -> None:
     client, control_bot = await _get_client(cfg, store)
     me = await client.get_me()
     logger.info(
-        "✅ Трекер v%s · %s · RU=%s · parallel≤%s · batch=%s",
+        "✅ Трекер v%s · %s · RU=%s · девочки=%s · parallel≤%s · batch=%s",
         TRACKER_VERSION,
         me.username or me.first_name,
         "да" if cfg.strict_ru else "нет",
+        "да" if cfg.female_only else "нет",
         cfg.parallel,
         cfg.scan_batch or "все",
     )
@@ -1877,11 +1912,12 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
-        "Коллекций: %s · scan page1 hot=%s · drip %ss · RU=%s · lvl≤%s · gifts≤%s",
+        "Коллекций: %s · scan page1 hot=%s · drip %ss · RU=%s · девочки=%s · lvl≤%s · gifts≤%s",
         len(gift_ids),
         cfg.hot_limit,
         int(cfg.post_interval),
         "да" if cfg.strict_ru else "нет",
+        "да" if cfg.female_only else "нет",
         cfg.max_account_level,
         cfg.max_gifts,
     )

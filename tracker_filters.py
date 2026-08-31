@@ -95,7 +95,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 4
+FILTER_SCHEMA = 5
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -106,7 +106,7 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "max_account_level": 2,
     "max_gifts": 20,
     "post_interval": 1.5,
-    "female_only": False,
+    "female_only": True,
     "strict_fair_price": False,
     "fair_price_ratio": 1.55,
 }
@@ -120,7 +120,7 @@ def ensure_default_filters(path: Path) -> None:
 
 
 def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
-    """Старый пресет 2k–5k → 5k–25k; schema<2 → мягкие фильтры (без female/рынок)."""
+    """Старый пресет 2k–5k → 5k–25k; schema<5 → девочки по умолчанию."""
     if not data:
         return dict(DEFAULT_FILTER_DATA)
     out = dict(data)
@@ -149,6 +149,8 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
             prev_gifts = 5
         if prev_gifts <= 5:
             out["max_gifts"] = 20
+        out["female_only"] = True
+        out["post_interval"] = min(float(out.get("post_interval", 1.5) or 1.5), 1.5)
     return out
 
 
@@ -178,5 +180,5 @@ def filters_summary(cfg: Any) -> str:
         f"Level ≤ <b>{int(cfg.max_account_level)}</b> · "
         f"gifts ≤ <b>{int(getattr(cfg, 'max_gifts', 5))}</b> · "
         f"Пост / <b>{int(cfg.post_interval)}</b>с\n"
-        f"Профиль: <b>{female}</b> · рынок≤<b>{fair}</b> · без рекламы"
+        f"Профиль: <b>{female}</b> · рынок≤<b>{fair}</b> · наивные первые"
     )

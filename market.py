@@ -60,6 +60,15 @@ _NON_RU_LANG_PREFIXES = (
 
 
 @dataclass(slots=True)
+class GiftPrototype:
+    """Коллекция маркета (StarGift): название и модели/паттерны/фоны."""
+
+    id: int
+    title: str = ""
+    attr_names: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class Lot:
     id: str
     title: str
@@ -69,6 +78,7 @@ class Lot:
     model: str = ""
     backdrop: str = ""
     symbol: str = ""
+    collection_id: int | None = None
     seller: str = ""
     seller_id: int | None = None
     first_name: str = ""
@@ -131,31 +141,297 @@ class Lot:
 # --- Фильтры профиля: только девочки, без рекламы/отзывов/GiftDouble ---
 
 _FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|💖|💕|💗|🌸)",
+    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|💖|💕|💗|🌸|♀️)",
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
     r"(парень|мужчин|мальчик|пацан|boy|man|he/him|👨|🧔|брат|бро\b|bro\b)",
     re.IGNORECASE,
 )
-_MALE_NAMES_RE = re.compile(
-    r"^(?:"
-    r"никита|илья|саша|женя|ваня|петя|петя|коля|вася|дима|миша|паша|фома|лука|савва|"
-    r"валера|слава|вова|лёша|леша|гоша|костя|артём|артем|макс|рома|"
-    r"кирилл|егор|игорь|олег|влад|данил|даниил|андрей|алексей|сергей|павел|"
-    r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
-    r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|andrey|pavel|ilya|vlad"
-    r")$",
-    re.IGNORECASE,
+# саша/женя/валя — унисекс, в мужской список не кладём
+_MALE_NAMES = frozenset(
+    {
+        "никита",
+        "илья",
+        "ваня",
+        "петя",
+        "коля",
+        "вася",
+        "дима",
+        "миша",
+        "паша",
+        "фома",
+        "лука",
+        "савва",
+        "валера",
+        "вова",
+        "лёша",
+        "леша",
+        "гоша",
+        "костя",
+        "артём",
+        "артем",
+        "макс",
+        "рома",
+        "кирилл",
+        "егор",
+        "игорь",
+        "олег",
+        "влад",
+        "данил",
+        "даниил",
+        "андрей",
+        "алексей",
+        "сергей",
+        "павел",
+        "иван",
+        "денис",
+        "роман",
+        "виктор",
+        "стас",
+        "тимур",
+        "глеб",
+        "борис",
+        "антон",
+        "ярослав",
+        "матвей",
+        "степан",
+        "михаил",
+        "дмитрий",
+        "александр",
+        "евгений",
+        "николай",
+        "владимир",
+        "владислав",
+        "константин",
+        "григорий",
+        "федор",
+        "фёдор",
+        "юрий",
+        "петр",
+        "пётр",
+        "stepan",
+        "ivan",
+        "nikita",
+        "alex",
+        "max",
+        "dmitry",
+        "daniil",
+        "artem",
+        "roman",
+        "sergey",
+        "andrey",
+        "pavel",
+        "ilya",
+        "vlad",
+        "igor",
+        "oleg",
+        "egor",
+        "kirill",
+        "maksim",
+        "maxim",
+        "denis",
+        "anton",
+        "boris",
+        "gleb",
+        "timur",
+        "misha",
+        "dima",
+        "vanya",
+        "pasha",
+        "kolya",
+        "kostya",
+        "lesha",
+        "lyosha",
+        "vova",
+        "roma",
+        "gosha",
+        "fedya",
+        "tolya",
+        "yura",
+        "seryozha",
+        "serezha",
+        "andrei",
+        "alexey",
+        "mikhail",
+        "nikolai",
+    }
 )
-_STRICT_FEMALE_NAME_RE = re.compile(
-    r"(?:"
-    r"ия|ья|ина|ела|ёна|юна|ита|лия|ея|"
-    r"овна|евна|ична|"
-    r"анна|мария|елена|ольга|наташа|катя|юля|даша|маша|"
-    r"света|лена|ира|вика|настя|полина|алина|диана|вероника|"
-    r"vera|maria|anna|elena|olga|kate|julia|diana"
-    r")$",
+_UNISEX_NAMES = frozenset({"саша", "женя", "саня", "валя", "слава", "sasha", "zhenya"})
+_FEMALE_NAMES = frozenset(
+    {
+        "аня",
+        "анечка",
+        "анюта",
+        "анна",
+        "ангелина",
+        "алина",
+        "алена",
+        "алёна",
+        "алиса",
+        "александра",
+        "арина",
+        "ариша",
+        "валя",
+        "валерия",
+        "варвара",
+        "варя",
+        "василиса",
+        "вера",
+        "вероника",
+        "вика",
+        "виктория",
+        "галя",
+        "галина",
+        "даша",
+        "дарья",
+        "диана",
+        "ева",
+        "евгения",
+        "екатерина",
+        "елена",
+        "жанна",
+        "злата",
+        "инна",
+        "ира",
+        "ирина",
+        "карина",
+        "катя",
+        "катерина",
+        "кира",
+        "кристина",
+        "ксения",
+        "ксюша",
+        "лариса",
+        "лена",
+        "лиза",
+        "лилия",
+        "любовь",
+        "люба",
+        "маргарита",
+        "марина",
+        "мария",
+        "маша",
+        "мила",
+        "милана",
+        "милена",
+        "мира",
+        "надя",
+        "надежда",
+        "настя",
+        "анастасия",
+        "ната",
+        "наташа",
+        "наталия",
+        "наталья",
+        "ника",
+        "нина",
+        "оксана",
+        "ольга",
+        "оля",
+        "полина",
+        "рима",
+        "римма",
+        "роза",
+        "руслана",
+        "света",
+        "светлана",
+        "снежана",
+        "соня",
+        "софия",
+        "софья",
+        "тамара",
+        "таня",
+        "татьяна",
+        "ульяна",
+        "юля",
+        "юлия",
+        "юлиана",
+        "яна",
+        "элина",
+        "эльвира",
+        "эльза",
+        "anya",
+        "anna",
+        "anne",
+        "alina",
+        "alena",
+        "alisa",
+        "alice",
+        "alexandra",
+        "arina",
+        "dasha",
+        "daria",
+        "darya",
+        "diana",
+        "elena",
+        "eva",
+        "irina",
+        "ira",
+        "julia",
+        "yulia",
+        "kate",
+        "katya",
+        "katie",
+        "karina",
+        "kira",
+        "kristina",
+        "christina",
+        "ksenia",
+        "ksusha",
+        "lena",
+        "liza",
+        "lisa",
+        "masha",
+        "maria",
+        "mary",
+        "marina",
+        "milana",
+        "nastya",
+        "anastasia",
+        "natasha",
+        "natalia",
+        "natalie",
+        "nika",
+        "nina",
+        "olga",
+        "olya",
+        "oksana",
+        "polina",
+        "sofia",
+        "sophia",
+        "sophie",
+        "sveta",
+        "svetlana",
+        "tanya",
+        "tatiana",
+        "tatyana",
+        "vera",
+        "victoria",
+        "viktoria",
+        "vika",
+        "yana",
+        "uliana",
+        "ulyana",
+        "varvara",
+        "zlata",
+        "valeria",
+        "veronica",
+        "veronika",
+        "ekaterina",
+        "evgenia",
+        "evgeniya",
+        "angelina",
+        "ruslana",
+        "elina",
+        "mia",
+        "emma",
+        "miss",
+        "mrs",
+    }
+)
+_FEMALE_NAME_END_RE = re.compile(
+    r"(ия|ья|ина|ена|ёна|яна|ела|юна|ита|лия|ея|овна|евна|ична|andra|ette)$",
     re.IGNORECASE,
 )
 _AD_PROFILE_RE = re.compile(
@@ -183,14 +459,19 @@ _REVIEW_RE = re.compile(
 _FEMALE_USER_RE = re.compile(
     r"(?:"
     r"girl|woman|lady|queen|princess|devoch|devush|miss|mrs|"
-    r"ann|maria|elena|olga|kate|julia|diana|vika|nastya|polina|alina|"
-    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света"
+    r"ann|maria|elena|olga|kate|katya|julia|diana|vika|nastya|polina|alina|"
+    r"masha|dasha|yulia|ksusha|liza|tanya|milana|karina|"
+    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света|ксюша|таня|лиза"
     r")",
     re.IGNORECASE,
 )
-_FEMALE_NAME_END_RE = re.compile(
-    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична)$"
-)
+
+
+def _first_token(name: str) -> str:
+    raw = (name or "").strip().lower()
+    if not raw:
+        return ""
+    return re.split(r"[\s\-_|.,/\\]+", raw, maxsplit=1)[0]
 
 
 def profile_text_blob(lot: Lot) -> str:
@@ -206,13 +487,28 @@ def profile_text_blob(lot: Lot) -> str:
     ).strip()
 
 
+def _name_is_female_token(token: str) -> bool:
+    t = (token or "").strip().lower()
+    if not t or t in _UNISEX_NAMES or t in _MALE_NAMES:
+        return False
+    if t in _FEMALE_NAMES:
+        return True
+    if len(t) >= 4 and _FEMALE_NAME_END_RE.search(t):
+        return True
+    return False
+
+
 def looks_male(lot: Lot) -> bool:
     blob = profile_text_blob(lot).lower()
     if _MALE_HINT_RE.search(blob):
         return True
-    fn = (lot.first_name or "").strip().lower()
+    fn = _first_token(lot.first_name or "")
     ln = (lot.last_name or "").strip().lower()
-    if fn and _MALE_NAMES_RE.search(fn):
+    if fn and _name_is_female_token(fn):
+        return False
+    if fn in _UNISEX_NAMES:
+        return False
+    if fn in _MALE_NAMES:
         return True
     if len(fn) >= 3:
         if fn.endswith(("ич", "он", "ил", "ём", "ем", "ур", "им")):
@@ -234,13 +530,18 @@ def _username_looks_female(username: str) -> bool:
     u = _normalize_handle(username)
     if len(u) < 3:
         return False
-    if _MALE_NAMES_RE.search(u):
+    if u in _MALE_NAMES:
         return False
+    if u in _FEMALE_NAMES:
+        return True
     if _FEMALE_USER_RE.search(u):
         return True
     if _FEMALE_NAME_END_RE.search(u):
         return True
-    if u.endswith(("ka", "ya", "na", "sha", "nya", "lia", "iya")):
+    if u.endswith(("ka", "ya", "na", "sha", "nya", "lia", "iya")) and u not in _UNISEX_NAMES:
+        # sasha ends with sha — унисекс, не считаем девочкой только по нику
+        if u in {"sasha"} or u.endswith("sasha"):
+            return False
         return True
     return False
 
@@ -249,19 +550,18 @@ def looks_female(lot: Lot) -> bool:
     """Женский профиль: имя, фамилия, bio или @username."""
     if looks_male(lot):
         return False
-    fn = (lot.first_name or "").strip().lower()
+    fn = _first_token(lot.first_name or "")
     ln = (lot.last_name or "").strip().lower()
-    if fn and _MALE_NAMES_RE.search(fn):
+    if fn in _MALE_NAMES:
         return False
     blob = profile_text_blob(lot).lower()
     if _FEMALE_HINT_RE.search(blob):
         return True
-    if fn and len(fn) >= 3:
-        if _STRICT_FEMALE_NAME_RE.search(fn):
-            return True
-        if _FEMALE_NAME_END_RE.search(fn):
-            return True
+    if fn and _name_is_female_token(fn):
+        return True
     if ln and (ln.endswith("овна") or ln.endswith("евна") or ln.endswith("ична")):
+        return True
+    if ln and _name_is_female_token(_first_token(ln)):
         return True
     seller = (lot.seller or "").strip()
     if seller and _username_looks_female(seller):
@@ -301,6 +601,56 @@ def female_filter_reason(lot: Lot) -> str:
 def is_clean_female_profile(lot: Lot) -> bool:
     """Женский профиль без рекламы, отзывов и GiftDouble."""
     return not female_filter_reason(lot)
+
+
+def naivety_score(lot: Lot, price_book: MarketPriceBook | None = None) -> float:
+    """Наивный продавец: мало NFT, низкий level, без Premium, цена ≤ рынка."""
+    score = 0.0
+    lvl = lot.account_level
+    if lvl is not None:
+        if lvl < 0:
+            score += 3.0
+        elif lvl <= 1:
+            score += 3.0
+        elif lvl <= 2:
+            score += 2.0
+        elif lvl <= 5:
+            score += 0.5
+        else:
+            score -= 2.0
+    gifts = lot.gifts_count
+    if gifts is not None:
+        if gifts <= 2:
+            score += 4.5
+        elif gifts <= 5:
+            score += 3.5
+        elif gifts <= 8:
+            score += 2.5
+        elif gifts <= 12:
+            score += 1.0
+        elif gifts > 20:
+            score -= 3.0
+    if lot.is_premium is False:
+        score += 2.0
+    elif lot.is_premium is True:
+        score -= 2.0
+    if lot.free_dm is True:
+        score += 1.0
+    if looks_female(lot):
+        score += 1.5
+    if price_book is not None:
+        fair = price_book.fair_price(lot)
+        if fair and fair > 0:
+            ratio = float(lot.stars) / fair
+            if ratio <= 0.85:
+                score += 3.5
+            elif ratio <= 1.0:
+                score += 2.0
+            elif ratio <= 1.15:
+                score += 0.5
+            elif ratio > 1.5:
+                score -= 2.5
+    return score
 
 
 class MarketPriceBook:
@@ -479,6 +829,7 @@ class TelegramMarket:
         self._owner_cache: dict[str, str] = {}
         self._profile_cache: dict[int, dict[str, Any]] = {}
         self._found_users: list[dict[str, Any]] = []
+        self._prototypes: dict[int, GiftPrototype] = {}
         self._progress_cb = None
         self._catalog_load: Any | None = None  # () -> (ids, hash) | None
         self._catalog_save: Any | None = None  # (ids, hash) -> None
@@ -538,20 +889,109 @@ class TelegramMarket:
             return False
         if not cached:
             return False
-        ids, h = cached
+        titles: dict[str, str] = {}
+        if isinstance(cached, dict):
+            ids = [int(x) for x in (cached.get("ids") or cached.get("gift_ids") or [])]
+            h = int(cached.get("hash") or 0)
+            raw_titles = cached.get("titles") or {}
+            if isinstance(raw_titles, dict):
+                titles = {str(k): str(v) for k, v in raw_titles.items() if v}
+        else:
+            ids = list(cached[0])
+            h = int(cached[1] or 0)
+            if len(cached) > 2 and isinstance(cached[2], dict):
+                titles = {str(k): str(v) for k, v in cached[2].items() if v}
         if not ids:
             return False
         self._gift_ids = list(ids)
         self._gifts_hash = int(h or 0)
+        self.import_titles(titles)
         if self._gift_ids:
             self._cursor = random.randrange(len(self._gift_ids))
         return True
 
+    def export_titles(self) -> dict[str, str]:
+        return {str(k): v.title for k, v in self._prototypes.items() if v.title}
+
+    def import_titles(self, titles: dict[str, str] | None) -> None:
+        for key, title in (titles or {}).items():
+            try:
+                gid = int(key)
+            except (TypeError, ValueError):
+                continue
+            text = str(title or "").strip()
+            if not text:
+                continue
+            prev = self._prototypes.get(gid)
+            if prev is None:
+                self._prototypes[gid] = GiftPrototype(id=gid, title=text)
+            elif not prev.title:
+                prev.title = text
+
+    def prototype(self, gift_id: int) -> GiftPrototype | None:
+        return self._prototypes.get(int(gift_id))
+
+    def _ingest_prototypes(self, gifts: Any) -> None:
+        """Названия коллекций из GetStarGifts — прототипы, не unique NFT."""
+        for gift in gifts or []:
+            cls = gift.__class__.__name__.lower()
+            title = str(
+                getattr(gift, "title", None) or getattr(gift, "name", None) or ""
+            ).strip()
+            if "unique" in cls:
+                raw_id = getattr(gift, "gift_id", None)
+            else:
+                raw_id = getattr(gift, "id", None)
+            if raw_id is None:
+                continue
+            try:
+                gid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            prev = self._prototypes.get(gid)
+            if prev is None:
+                self._prototypes[gid] = GiftPrototype(id=gid, title=title)
+            elif title and (not prev.title or len(title) > len(prev.title)):
+                prev.title = title
+
+    def parse_resale(self, result: Any, gift_id: int) -> list[Lot]:
+        """Разобрать resale-страницу коллекции с названием/моделями прототипа."""
+        gid = int(gift_id)
+        proto = self._prototypes.get(gid)
+        if result is not None:
+            idx = _attribute_index(result)
+            if idx:
+                if proto is None:
+                    proto = GiftPrototype(id=gid)
+                    self._prototypes[gid] = proto
+                proto.attr_names.update(idx)
+        lots = _parse_result(result, prototype=proto, collection_id=gid)
+        learned = next(
+            (lot.title for lot in lots if lot.title and not _generic_gift_title(lot.title)),
+            "",
+        )
+        if learned:
+            if proto is None:
+                proto = GiftPrototype(id=gid, title=learned)
+                self._prototypes[gid] = proto
+            elif not proto.title:
+                proto.title = learned
+            for lot in lots:
+                if _generic_gift_title(lot.title):
+                    lot.title = proto.title
+        return lots
+
     def _persist_catalog(self) -> None:
         if not callable(self._catalog_save) or not self._gift_ids:
             return
+        titles = self.export_titles()
         try:
-            self._catalog_save(list(self._gift_ids), int(self._gifts_hash or 0))
+            self._catalog_save(list(self._gift_ids), int(self._gifts_hash or 0), titles)
+        except TypeError:
+            try:
+                self._catalog_save(list(self._gift_ids), int(self._gifts_hash or 0))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("catalog save: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("catalog save: %s", exc)
 
@@ -601,6 +1041,7 @@ class TelegramMarket:
                         timeout=20.0,
                     )
                 gifts = getattr(result, "gifts", []) or []
+                self._ingest_prototypes(gifts)
                 ids = self._ids_from_gifts(gifts)
                 if not ids and gifts:
                     ids = [
@@ -1035,6 +1476,17 @@ class TelegramMarket:
             for u in (getattr(result, "users", None) or [])
             if getattr(u, "id", None) is not None
         }
+        if gift is not None:
+            proto = None
+            raw_proto = getattr(gift, "gift_id", None)
+            if raw_proto is not None:
+                try:
+                    proto = self._prototypes.get(int(raw_proto))
+                except (TypeError, ValueError):
+                    proto = None
+            parsed = _parse(gift, users, prototype=proto)
+            if parsed is not None:
+                _merge_gift_display(lot, parsed)
         owner = getattr(gift, "owner_id", None) if gift else None
         seller_id = None
         if owner is not None:
@@ -1276,7 +1728,7 @@ class TelegramMarket:
         if result is None:
             return [], [], "", 0
 
-        lots = _parse_result(result)
+        lots = self.parse_resale(result, gift_id)
         users = _extract_users(result)
         self._remember_users(users)
         # также продавцы с лотов — чтобы юзы точно копились
@@ -1327,7 +1779,7 @@ class TelegramMarket:
     ) -> list[Lot]:
         async def _do() -> list[Lot]:
             result = await self._request(gift_id, limit, True, stats, gap, timeout)
-            lots = _parse_result(result) if result is not None else []
+            lots = self.parse_resale(result, gift_id) if result is not None else []
             if result is not None:
                 self._remember_users(_extract_users(result))
             if not lots:
@@ -1335,7 +1787,7 @@ class TelegramMarket:
                     gift_id, limit, False, stats, gap, timeout
                 )
                 if result2 is not None:
-                    lots = _parse_result(result2)
+                    lots = self.parse_resale(result2, gift_id)
                     self._remember_users(_extract_users(result2))
                     result = result2
             # deep=True (Заново) — 2-я страница для новых юзов; обычный парс — быстро
@@ -1353,7 +1805,7 @@ class TelegramMarket:
                             offset=next_off,
                         )
                         if more is not None:
-                            extra = _parse_result(more)
+                            extra = self.parse_resale(more, gift_id)
                             self._remember_users(_extract_users(more))
                             lots.extend(extra)
                     except Exception:  # noqa: BLE001
@@ -1598,16 +2050,129 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
             pass
 
 
-def _parse_result(result: Any) -> list[Lot]:
+def _generic_gift_title(title: str) -> bool:
+    return (title or "").strip().lower() in {"", "gift", "nft", "unknown"}
+
+
+def _attribute_index(result: Any) -> dict[int, str]:
+    """document_id → имя из прототипа коллекции (result.attributes)."""
+    out: dict[int, str] = {}
+    for attr in getattr(result, "attributes", None) or []:
+        name = str(getattr(attr, "name", "") or getattr(attr, "text", "") or "").strip()
+        if not name:
+            continue
+        doc = getattr(attr, "document", None)
+        doc_id = (
+            getattr(doc, "id", None)
+            if doc is not None
+            else getattr(attr, "document_id", None)
+        )
+        if doc_id is None:
+            continue
+        try:
+            out[int(doc_id)] = name
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _attr_kind(attr: Any) -> str:
+    cls = attr.__class__.__name__.lower()
+    if "model" in cls:
+        return "model"
+    if "backdrop" in cls:
+        return "backdrop"
+    if "pattern" in cls or "symbol" in cls:
+        return "symbol"
+    return ""
+
+
+def _attr_name(attr: Any, index: dict[int, str] | None = None) -> str:
+    name = str(getattr(attr, "name", "") or getattr(attr, "text", "") or "").strip()
+    if name:
+        return name
+    if not index:
+        return ""
+    doc = getattr(attr, "document", None)
+    doc_id = (
+        getattr(doc, "id", None)
+        if doc is not None
+        else getattr(attr, "document_id", None)
+    )
+    if doc_id is None:
+        return ""
+    try:
+        return str(index.get(int(doc_id), "") or "")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_gift_attributes(
+    gift: Any, attr_index: dict[int, str] | None = None
+) -> tuple[str, str, str]:
+    model = backdrop = symbol = ""
+    for attr in getattr(gift, "attributes", None) or []:
+        kind = _attr_kind(attr)
+        name = _attr_name(attr, attr_index)
+        if not kind or not name:
+            continue
+        if kind == "model":
+            model = name
+        elif kind == "backdrop":
+            backdrop = name
+        else:
+            symbol = name
+    return model, backdrop, symbol
+
+
+def _merge_gift_display(lot: Lot, src: Lot) -> None:
+    """Добить title/model/slug с unique-гифта / прототипа коллекции."""
+    if src.title and (
+        _generic_gift_title(lot.title) or (not lot.title and src.title)
+    ):
+        lot.title = src.title
+    if src.model and not lot.model:
+        lot.model = src.model
+    if src.backdrop and not lot.backdrop:
+        lot.backdrop = src.backdrop
+    if src.symbol and not lot.symbol:
+        lot.symbol = src.symbol
+    if src.slug and not lot.slug:
+        lot.slug = src.slug
+    if src.collection_id is not None and lot.collection_id is None:
+        lot.collection_id = src.collection_id
+    if src.first_name and not lot.first_name:
+        lot.first_name = src.first_name
+    if src.last_name and not lot.last_name:
+        lot.last_name = src.last_name
+
+
+def _parse_result(
+    result: Any,
+    *,
+    prototype: GiftPrototype | None = None,
+    collection_id: int | None = None,
+) -> list[Lot]:
     users = {
         int(u.id): u
         for u in (getattr(result, "users", None) or [])
         if getattr(u, "id", None) is not None
     }
+    attr_index = _attribute_index(result)
+    if prototype is not None and prototype.attr_names:
+        merged = dict(prototype.attr_names)
+        merged.update(attr_index)
+        attr_index = merged
     now = time.time()
     lots: list[Lot] = []
     for gift in getattr(result, "gifts", []) or []:
-        lot = _parse(gift, users)
+        lot = _parse(
+            gift,
+            users,
+            prototype=prototype,
+            collection_id=collection_id,
+            attr_index=attr_index,
+        )
         if lot:
             lot.seen_at = now
             lots.append(lot)
@@ -1673,25 +2238,38 @@ def _extract_stars(gift: Any) -> float | None:
     return None
 
 
-def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
+def _parse(
+    gift: Any,
+    users: dict[int, Any] | None = None,
+    *,
+    prototype: GiftPrototype | None = None,
+    collection_id: int | None = None,
+    attr_index: dict[int, str] | None = None,
+) -> Lot | None:
     gift_id = getattr(gift, "id", None)
     slug = str(getattr(gift, "slug", None) or "")
-    title = str(getattr(gift, "title", None) or "Gift")
+    title = str(getattr(gift, "title", None) or "").strip()
+    proto_id = collection_id
+    raw_proto = getattr(gift, "gift_id", None)
+    if raw_proto is not None:
+        try:
+            proto_id = int(raw_proto)
+        except (TypeError, ValueError):
+            pass
+    proto_title = (prototype.title if prototype else "") or ""
+    if _generic_gift_title(title) and proto_title:
+        title = proto_title
+    if not title:
+        title = proto_title or "Gift"
     number = getattr(gift, "num", None)
     stars = _extract_stars(gift)
     if stars is None or stars <= 0:
         return None
 
-    model = backdrop = symbol = ""
-    for attr in getattr(gift, "attributes", None) or []:
-        cls = attr.__class__.__name__.lower()
-        name = str(getattr(attr, "name", "") or getattr(attr, "text", "") or "")
-        if "model" in cls:
-            model = name
-        elif "backdrop" in cls:
-            backdrop = name
-        elif "pattern" in cls or "symbol" in cls:
-            symbol = name
+    merged_index = dict(prototype.attr_names) if prototype and prototype.attr_names else {}
+    if attr_index:
+        merged_index.update(attr_index)
+    model, backdrop, symbol = _parse_gift_attributes(gift, merged_index)
 
     seller = ""
     seller_id: int | None = None
@@ -1706,6 +2284,10 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
             seller_id = None
 
     number_i = int(number) if number is not None else None
+    if not slug and number_i is not None and title and title != "Gift":
+        clean = "".join(ch for ch in title if ch.isalnum())
+        if clean:
+            slug = f"{clean}-{number_i}"
     lot = Lot(
         id=str(gift_id or slug or f"{title}-{number_i}"),
         title=title,
@@ -1715,6 +2297,7 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         model=model,
         backdrop=backdrop,
         symbol=symbol,
+        collection_id=proto_id,
         seller=seller,
         seller_id=seller_id,
         first_name=first_name,
@@ -1722,4 +2305,11 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
     )
     if seller_id and users and seller_id in users:
         _fill_user(lot, users[seller_id])
+    if not lot.first_name:
+        owner_name = str(getattr(gift, "owner_name", None) or "").strip()
+        if owner_name:
+            parts = owner_name.split()
+            lot.first_name = parts[0]
+            if len(parts) > 1 and not lot.last_name:
+                lot.last_name = " ".join(parts[1:])
     return lot

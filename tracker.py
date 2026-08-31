@@ -1122,7 +1122,6 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
             or lot.free_dm is None
             or lot.is_premium is None
             or (cfg.strict_ru and not lot.lang_code)
-            or (cfg.female_only and not (lot.first_name or "").strip())
         )
         if not need_profile:
             break
@@ -1197,16 +1196,22 @@ async def ensure_market_floor(
         if fair:
             lot.market_floor = fair
         return fair
-    try:
-        cheap = await m.fetch_cheapest(
-            int(cid),
-            limit=15,
-            timeout=min(3.0, float(cfg.timeout) or 3.0),
-            gap=cfg.gap,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("пол рынка %s: %s", cid, exc)
-        cheap = []
+    cheap: list[Lot] = []
+    for attempt in range(2):
+        try:
+            cheap = await m.fetch_cheapest(
+                int(cid),
+                limit=15,
+                timeout=min(4.0, float(cfg.timeout or 3.0) + attempt),
+                gap=cfg.gap,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("пол рынка %s (попытка %s): %s", cid, attempt + 1, exc)
+            cheap = []
+        if cheap:
+            break
+        if attempt == 0:
+            await asyncio.sleep(0.4)
     if not cheap:
         fair = book.fair_price(lot)
         if fair:
@@ -1604,8 +1609,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.2"
-BUILD_TAG = "v3.9.2-female-yield"
+TRACKER_VERSION = "3.9.3"
+BUILD_TAG = "v3.9.3-verified"
 
 
 @dataclass
@@ -1866,7 +1871,18 @@ async def scanner_loop(
 
         spent = time.monotonic() - started
         floods = int(scan.get("floods", 0) or 0)
-        if floods > 3 and runtime.scan_parallel > 4:
+        err_ratio = (errors / scanned) if scanned > 0 else 0.0
+        if err_ratio > 0.35 and runtime.scan_parallel > 3:
+            runtime.scan_parallel -= 1
+            cfg.parallel = runtime.scan_parallel
+            logger.warning(
+                "Много ошибок API (%s/%s) — parallel=%s · %s",
+                errors,
+                scanned,
+                runtime.scan_parallel,
+                m.last_error or "",
+            )
+        elif floods > 3 and runtime.scan_parallel > 4:
             runtime.scan_parallel -= 1
             cfg.parallel = runtime.scan_parallel
             logger.warning(
@@ -1874,7 +1890,11 @@ async def scanner_loop(
                 floods,
                 runtime.scan_parallel,
             )
-        elif floods == 0 and runtime.scan_parallel < 6:
+        elif (
+            floods == 0
+            and err_ratio < 0.15
+            and runtime.scan_parallel < 6
+        ):
             runtime.scan_parallel += 1
             cfg.parallel = runtime.scan_parallel
 

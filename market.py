@@ -419,11 +419,17 @@ class MarketPriceBook:
     def overprice_reason(self, lot: Lot, *, max_ratio: float | None = None) -> str:
         fair = self.fair_price(lot)
         cap = self.price_cap(lot, max_ratio=max_ratio)
-        if fair is None or cap is None:
-            return ""
-        if float(lot.stars) <= cap:
-            return ""
-        return f"завышено {int(lot.stars):,}⭐ > рынок ~{int(fair):,}⭐ (макс {int(cap):,})"
+        if fair is not None and cap is not None and float(lot.stars) > cap:
+            return (
+                f"завышено {int(lot.stars):,}⭐ > рынок ~{int(fair):,}⭐ "
+                f"(макс {int(cap):,})"
+            )
+        ref = lot.telegram_value
+        if ref and ref > 0 and float(lot.stars) > ref * 2.5:
+            return (
+                f"завышено {int(lot.stars):,}⭐ > TG value ~{int(ref):,}⭐"
+            )
+        return ""
 
     def to_dict(self) -> dict[str, Any]:
         return {

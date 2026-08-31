@@ -233,6 +233,23 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
+def test_neutral_profile_passes_female_filter() -> None:
+    """Пустое имя + нейтральный ник — не режем (было female−19 из 23)."""
+    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
+    assert is_clean_female_profile(lot) is True
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 0
+    assert len(out) == 1
+
+
+def test_male_username_blocked() -> None:
+    lot = _lot(first_name="", seller="nikita_gifts", seller_id=223)
+    assert is_clean_female_profile(lot) is False
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 1
+    assert out == []
+
+
 def test_migrate_schema5_enables_girls_and_market() -> None:
     out = migrate_legacy_filters(
         {
@@ -270,6 +287,8 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
+        test_neutral_profile_passes_female_filter,
+        test_male_username_blocked,
         test_migrate_schema5_enables_girls_and_market,
     ]
     for fn in tests:

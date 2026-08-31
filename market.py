@@ -225,6 +225,9 @@ def looks_male(lot: Lot) -> bool:
             return True
     if ln.endswith(("ович", "евич", "ич")):
         return True
+    seller = _normalize_handle(lot.seller or "")
+    if seller and len(seller) >= 3 and _MALE_NAMES_RE.search(seller):
+        return True
     return False
 
 
@@ -287,11 +290,9 @@ def is_ad_profile(lot: Lot) -> bool:
 
 
 def female_filter_reason(lot: Lot) -> str:
-    """Почему профиль не прошёл женский фильтр (для логов)."""
+    """Почему профиль не прошёл (для логов)."""
     if looks_male(lot):
         return "мужской"
-    if not looks_female(lot):
-        return "не девочка"
     if is_ad_profile(lot):
         return "реклама"
     if has_review_in_profile(lot):
@@ -302,7 +303,7 @@ def female_filter_reason(lot: Lot) -> str:
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Женский профиль без рекламы, отзывов и GiftDouble."""
+    """Без мужчин/рекламы. Неизвестный профиль (пустое имя, латинский ник) — ок."""
     return not female_filter_reason(lot)
 
 
@@ -555,6 +556,18 @@ class TelegramMarket:
         self._refresh_task: asyncio.Task | None = None
         self.check_no = 0
         self.last_error = ""
+        self._bad_until: dict[int, float] = {}
+
+    def mark_collection_bad(self, gift_id: int, cooldown: float = 300.0) -> None:
+        self._bad_until[int(gift_id)] = time.time() + max(30.0, float(cooldown))
+
+    def is_collection_bad(self, gift_id: int) -> bool:
+        until = self._bad_until.get(int(gift_id), 0.0)
+        if until and time.time() < until:
+            return True
+        if until:
+            self._bad_until.pop(int(gift_id), None)
+        return False
 
     def set_catalog_hooks(
         self,

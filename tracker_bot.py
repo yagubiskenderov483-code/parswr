@@ -463,7 +463,7 @@ def build_router(
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
                 f"gifts≤{getattr(cfg, 'max_gifts', 5)} · "
                 f"пост/{int(cfg.post_interval)}с · "
-                f"{'девочки' if getattr(cfg, 'female_only', False) else 'все'} · "
+                f"{'без мужчин' if getattr(cfg, 'female_only', False) else 'все'} · "
                 f"рынок={'да' if getattr(cfg, 'strict_fair_price', False) else 'нет'}"
             )
             lines.append("Менять: /filters")

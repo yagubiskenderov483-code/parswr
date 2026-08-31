@@ -848,10 +848,16 @@ def _select_scan_batch(
     if baseline or cfg.scan_batch <= 0 or cfg.scan_batch >= n:
         batch = list(gift_ids)
         random.shuffle(batch)
-        return batch
-    take = min(n, cfg.scan_batch)
-    batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
-    m._cursor = (m._cursor + take) % n
+    else:
+        take = min(n, cfg.scan_batch)
+        batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
+        m._cursor = (m._cursor + take) % n
+    batch = [g for g in batch if not m.is_collection_bad(g)]
+    if not batch and gift_ids:
+        batch = [g for g in gift_ids if not m.is_collection_bad(g)]
+        random.shuffle(batch)
+        if cfg.scan_batch > 0 and len(batch) > cfg.scan_batch:
+            batch = batch[:cfg.scan_batch]
     return batch
 
 
@@ -941,6 +947,7 @@ async def _fetch_collection_pages(
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
+        m.mark_collection_bad(gid, cooldown=300.0)
         return []
     m._remember_users(market_mod._extract_users(result))
     parsed = market_mod._parse_result(result)
@@ -1369,7 +1376,7 @@ def _skip_reason(stats: dict[str, int]) -> str:
     if stats.get("many_gifts"):
         parts.append("много NFT")
     if stats.get("not_female"):
-        parts.append("не девочка/реклама")
+        parts.append("мужской/реклама")
     if stats.get("overprice"):
         parts.append("завышена цена")
     if stats.get("paid"):
@@ -1516,13 +1523,12 @@ class PostQueue:
                         )
                         or (
                             fstats["not_female"]
-                            and (lot.first_name or "").strip()
-                        )
-                        or (
-                            fstats["not_female"]
-                            and (lot.seller or "").strip()
-                            and female_filter_reason(lot)
-                            in {"реклама", "отзывы", "giftdouble", "мужской"}
+                            and female_filter_reason(lot) in {
+                                "мужской",
+                                "реклама",
+                                "отзывы",
+                                "giftdouble",
+                            }
                         )
                         or fstats["overprice"]
                     )
@@ -1598,8 +1604,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.1"
-BUILD_TAG = "v3.9.1-deploy-fix"
+TRACKER_VERSION = "3.9.2"
+BUILD_TAG = "v3.9.2-female-yield"
 
 
 @dataclass

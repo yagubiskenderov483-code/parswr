@@ -175,7 +175,7 @@ def filters_summary(cfg: Any) -> str:
     rid = current_preset_id(cfg.min_stars, cfg.max_stars)
     preset = _preset_by_id(rid)
     price = preset[1] if preset else f"{int(cfg.min_stars):,}–{int(cfg.max_stars):,}⭐"
-    female = "девочки" if getattr(cfg, "female_only", False) else "все"
+    female = "без мужчин" if getattr(cfg, "female_only", False) else "все"
     fair = "да" if getattr(cfg, "strict_fair_price", False) else "нет"
     return (
         f"Цена: <b>{price}</b>\n"

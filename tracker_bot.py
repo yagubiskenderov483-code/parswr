@@ -259,6 +259,7 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
     ru = "✅" if cfg.strict_ru else "⬜️"
     free = "✅" if cfg.strict_free else "⬜️"
     female = "✅" if getattr(cfg, "female_only", True) else "⬜️"
+    fair = "✅" if getattr(cfg, "strict_fair_price", True) else "⬜️"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             price_row,
@@ -273,11 +274,14 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
                     text=f"{female} Девочки", callback_data="tf:female"
                 ),
                 InlineKeyboardButton(
-                    text=f"Level ≤{int(cfg.max_account_level)}",
-                    callback_data="tf:lvl",
+                    text=f"{fair} Рынок", callback_data="tf:fair"
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    text=f"Level ≤{int(cfg.max_account_level)}",
+                    callback_data="tf:lvl",
+                ),
                 InlineKeyboardButton(
                     text=f"Пост {int(cfg.post_interval)}с",
                     callback_data="tf:post",
@@ -458,7 +462,8 @@ def build_router(
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
                 f"пост/{int(cfg.post_interval)}с · "
-                f"{'девочки' if getattr(cfg, 'female_only', True) else 'все'}"
+                f"{'девочки' if getattr(cfg, 'female_only', True) else 'все'} · "
+                f"рынок={'да' if getattr(cfg, 'strict_fair_price', True) else 'нет'}"
             )
             lines.append("Менять: /filters")
         bot_handle = _bot_handle()
@@ -486,11 +491,12 @@ def build_router(
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев (посл.): ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
-                    f"lvl−{rt.last_skip_level} female−{rt.last_skip_female}",
+                    f"lvl−{rt.last_skip_level} female−{rt.last_skip_female} "
+                    f"over−{rt.last_skip_overprice}",
                     f"Отсев (всего): ru−{rt.skip_ru_total} dm−{rt.skip_dm_total} "
                     f"dup−{rt.skip_dup_total} noseller−{rt.skip_noseller_total} "
                     f"lvl−{rt.skip_level_total} female−{rt.skip_female_total} "
-                    f"ru?{rt.skip_unknown_ru_total}",
+                    f"over−{rt.skip_overprice_total} ru?{rt.skip_unknown_ru_total}",
                     f"Seen лотов: {rt.seen_lots} · снимок маркета: "
                     f"{len(rt.market_ids) if rt.market_ids else 0}",
                 ]
@@ -650,6 +656,10 @@ def build_router(
             cur = bool(getattr(cfg, "female_only", True))
             _apply_tracker_filters(control, female_only=not cur)
             note = "девочки" if not cur else "все профили"
+        elif action == "fair":
+            cur = bool(getattr(cfg, "strict_fair_price", True))
+            _apply_tracker_filters(control, strict_fair_price=not cur)
+            note = "честная цена" if not cur else "без проверки рынка"
         elif action == "lvl":
             nxt = {2: 5, 5: 10, 10: 2}.get(int(cfg.max_account_level), 2)
             _apply_tracker_filters(control, max_account_level=nxt)

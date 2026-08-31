@@ -39,6 +39,7 @@ from telethon.utils import get_peer_id
 import market as market_mod
 from market import (
     Lot,
+    MarketPriceBook,
     TelegramMarket,
     format_account_level,
     is_clean_female_profile,
@@ -257,18 +258,18 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 2.0
+    poll_interval: float = 1.0
     page_limit: int = 12  # только верх resale-листа
-    parallel: int = 4  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.25
-    timeout: float = 10.0
+    parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
+    gap: float = 0.06
+    timeout: float = 7.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
-    enrich_parallel: int = 4
+    enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 0  # 0 = все коллекции каждый проход (ловим новые быстрее)
-    hot_limit: int = 4  # топ-N = только что выставленные
+    scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
+    hot_limit: int = 8  # топ-N = только что выставленные
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    post_interval: float = 4.0  # сек между постами в канал (строгий тикер)
+    post_interval: float = 3.0  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -278,6 +279,8 @@ class Config:
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
     female_only: bool = True
+    strict_fair_price: bool = True
+    fair_price_ratio: float = 1.55
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -325,18 +328,18 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 2.0),
+            poll_interval=_f("POLL_INTERVAL", 1.0),
             page_limit=int(_f("PAGE_LIMIT", 12)),
-            parallel=min(6, int(_f("PARALLEL", 4))),
-            gap=_f("REQUEST_GAP", 0.25),
-            timeout=_f("REQUEST_TIMEOUT", 10.0),
+            parallel=min(6, int(_f("PARALLEL", 6))),
+            gap=_f("REQUEST_GAP", 0.06),
+            timeout=_f("REQUEST_TIMEOUT", 7.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
-            enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
+            enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
+            scan_batch=int(_f("SCAN_BATCH", 45)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            post_interval=_f("POST_INTERVAL", 4.0),
+            post_interval=_f("POST_INTERVAL", 3.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -362,11 +365,18 @@ def load_state(path: Path) -> dict:
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
             data.setdefault("market_ids", [])
+            data.setdefault("price_samples", {})
             data.setdefault("channel_id", None)
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "seen_sellers": {}, "market_ids": [], "channel_id": None}
+    return {
+        "seen": {},
+        "seen_sellers": {},
+        "market_ids": [],
+        "price_samples": {},
+        "channel_id": None,
+    }
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -937,6 +947,7 @@ async def poll_once(
     *,
     baseline: bool,
     market_ids: set[str],
+    price_book: MarketPriceBook | None = None,
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
     """Проход по коллекциям — только лоты, которых ещё не было на маркете (market_ids)."""
     started = time.monotonic()
@@ -957,12 +968,22 @@ async def poll_once(
     skipped_market = 0
     skipped_seen = 0
     skipped_price = 0
+    skipped_overprice = 0
     exc_errors = 0
+    parsed_rows: list[tuple[int, list[Lot]]] = []
+    ingest_lots: list[Lot] = []
     for gid, lots in zip(batch, chunks):
         if isinstance(lots, BaseException):
             exc_errors += 1
             logger.warning("коллекция %s: %s", gid, lots)
             continue
+        parsed_rows.append((gid, lots))
+        ingest_lots.extend(lots)
+
+    if price_book is not None and ingest_lots:
+        price_book.ingest(ingest_lots)
+
+    for _gid, lots in parsed_rows:
         for i, lot in enumerate(lots):
             batch_market_ids.add(lot.id)
             if i >= cfg.hot_limit:
@@ -982,6 +1003,16 @@ async def poll_once(
                 seen[lot.id] = now
                 skipped_price += 1
                 continue
+            if (
+                cfg.strict_fair_price
+                and price_book is not None
+                and not price_book.is_fair_price(
+                    lot, max_ratio=cfg.fair_price_ratio
+                )
+            ):
+                seen[lot.id] = now
+                skipped_overprice += 1
+                continue
             lot.discovered_at = now
             fresh.append(lot)
     market_ids |= batch_market_ids
@@ -997,6 +1028,7 @@ async def poll_once(
         "new_listings": len(fresh),
         "skipped_market": skipped_market,
         "skipped_price": skipped_price,
+        "skipped_overprice": skipped_overprice,
         "elapsed": round(time.monotonic() - started, 2),
     }
     if stats["floods"]:
@@ -1104,6 +1136,9 @@ def filter_for_post(
     strict_free: bool = False,
     max_account_level: int = 2,
     female_only: bool = True,
+    strict_fair_price: bool = True,
+    fair_price_ratio: float = 1.55,
+    price_book: MarketPriceBook | None = None,
 ) -> tuple[list[Lot], dict[str, int]]:
     """RU + level + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
@@ -1117,6 +1152,7 @@ def filter_for_post(
         "unknown_ru": 0,
         "level": 0,
         "not_female": 0,
+        "overprice": 0,
     }
     for lot in lots:
         key = lot.seller_key
@@ -1138,6 +1174,13 @@ def filter_for_post(
             continue
         if female_only and not is_clean_female_profile(lot):
             stats["not_female"] += 1
+            continue
+        if (
+            strict_fair_price
+            and price_book is not None
+            and not price_book.is_fair_price(lot, max_ratio=fair_price_ratio)
+        ):
+            stats["overprice"] += 1
             continue
         if strict_ru:
             ru = is_russian_lot(lot)
@@ -1203,6 +1246,8 @@ def _skip_reason(stats: dict[str, int]) -> str:
         parts.append("level")
     if stats.get("not_female"):
         parts.append("не девочка/реклама")
+    if stats.get("overprice"):
+        parts.append("завышена цена")
     if stats.get("paid"):
         parts.append("платные ЛС")
     if stats.get("unknown_dm"):
@@ -1300,6 +1345,9 @@ class PostQueue:
                     strict_free=self._cfg.strict_free,
                     max_account_level=self._cfg.max_account_level,
                     female_only=self._cfg.female_only,
+                    strict_fair_price=self._cfg.strict_fair_price,
+                    fair_price_ratio=self._cfg.fair_price_ratio,
+                    price_book=self._runtime.price_book,
                 )
                 self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
@@ -1307,12 +1355,14 @@ class PostQueue:
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
                 self._runtime.last_skip_female = fstats["not_female"]
+                self._runtime.last_skip_overprice = fstats["overprice"]
                 self._runtime.skip_ru_total += fstats["non_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.skip_dup_total += fstats["dup"]
                 self._runtime.skip_noseller_total += fstats["no_seller"]
                 self._runtime.skip_level_total += fstats["level"]
                 self._runtime.skip_female_total += fstats["not_female"]
+                self._runtime.skip_overprice_total += fstats["overprice"]
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
                 if not to_post:
@@ -1328,15 +1378,21 @@ class PostQueue:
                         or (
                             fstats["not_female"]
                             and (lot.seller or "").strip()
-                            and female_filter_reason(lot) in {"реклама", "отзывы", "giftdouble", "мужской"}
+                            and female_filter_reason(lot)
+                            in {"реклама", "отзывы", "giftdouble", "мужской"}
                         )
+                        or fstats["overprice"]
                     )
                     if skip_permanent and lot.seller_key:
                         self._seen[lot.id] = now
                     reason = (
-                        female_filter_reason(lot)
-                        if fstats["not_female"]
-                        else _skip_reason(fstats)
+                        self._runtime.price_book.overprice_reason(lot)
+                        if fstats["overprice"] and self._runtime.price_book
+                        else (
+                            female_filter_reason(lot)
+                            if fstats["not_female"]
+                            else _skip_reason(fstats)
+                        )
                     )
                     if reason:
                         logger.info(
@@ -1378,8 +1434,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6.5"
-BUILD_TAG = "v3.6.5-female-fix"
+TRACKER_VERSION = "3.7.0"
+BUILD_TAG = "v3.7.0-fair-fast"
 
 
 @dataclass
@@ -1396,12 +1452,14 @@ class TrackerRuntime:
     last_skip_noseller: int = 0
     last_skip_level: int = 0
     last_skip_female: int = 0
+    last_skip_overprice: int = 0
     skip_ru_total: int = 0
     skip_dm_total: int = 0
     skip_dup_total: int = 0
     skip_noseller_total: int = 0
     skip_level_total: int = 0
     skip_female_total: int = 0
+    skip_overprice_total: int = 0
     skip_unknown_ru_total: int = 0
     queue_processed: int = 0
     send_errors_total: int = 0
@@ -1420,6 +1478,7 @@ class TrackerRuntime:
     zero_parse_streak: int = 0
     market: Any | None = None
     gift_ids: list[int] | None = None
+    price_book: MarketPriceBook | None = None
     channel_id: int | None = None
     cfg: Config | None = None
     state_path: Path | None = None
@@ -1516,6 +1575,7 @@ async def scanner_loop(
     state_path: Path,
     state: dict,
     market_ids: set[str],
+    price_book: MarketPriceBook,
     *,
     snapshot_ready: asyncio.Event,
 ) -> None:
@@ -1547,7 +1607,13 @@ async def scanner_loop(
             continue
         try:
             fresh, scan = await poll_once(
-                m, gift_ids, seen, cfg, baseline=False, market_ids=market_ids
+                m,
+                gift_ids,
+                seen,
+                cfg,
+                baseline=False,
+                market_ids=market_ids,
+                price_book=price_book,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
@@ -1604,6 +1670,7 @@ async def scanner_loop(
             )
 
         state["market_ids"] = list(market_ids)
+        state["price_samples"] = price_book.to_dict()
         save_state(state_path, state)
 
         if time.monotonic() - catalog_refreshed > 600:
@@ -1672,6 +1739,7 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
     market_ids: set[str] = set(state.get("market_ids") or [])
+    price_book = MarketPriceBook.from_dict(state.get("price_samples"))
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
     logger.info(
@@ -1691,6 +1759,7 @@ async def run() -> None:
         seen_lots=len(seen),
         scan_parallel=cfg.parallel,
         market_ids=market_ids,
+        price_book=price_book,
     )
 
     dd = data_dir()
@@ -1756,6 +1825,7 @@ async def run() -> None:
                     cfg,
                     baseline=True,
                     market_ids=market_ids,
+                    price_book=price_book,
                 )
                 logger.info(
                     "Снимок проход %s/2: %s лотов в снимке · API %s",
@@ -1771,6 +1841,7 @@ async def run() -> None:
             if pass_n < 1 and time.monotonic() < deadline:
                 await asyncio.sleep(1.5)
         state["market_ids"] = list(market_ids)
+        state["price_samples"] = price_book.to_dict()
         save_state(state_path, state)
         logger.info(
             "Снимок готов: %s лотов · seen %s",
@@ -1814,6 +1885,7 @@ async def run() -> None:
             state_path,
             state,
             market_ids,
+            price_book,
             snapshot_ready=snapshot_ready,
         ),
         name="scanner",

@@ -13,7 +13,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -301,6 +301,103 @@ def female_filter_reason(lot: Lot) -> str:
 def is_clean_female_profile(lot: Lot) -> bool:
     """Женский профиль без рекламы, отзывов и GiftDouble."""
     return not female_filter_reason(lot)
+
+
+class MarketPriceBook:
+    """Оценка рыночной цены по свежим листингам — отсекает завышенные (20k за 400⭐)."""
+
+    MAX_SAMPLES = 60
+    MIN_SAMPLES = 2
+    DEFAULT_MAX_RATIO = 1.55
+
+    def __init__(self) -> None:
+        self._samples: dict[str, list[float]] = {}
+
+    def _keys(self, lot: Lot) -> list[str]:
+        keys: list[str] = []
+        mk = (lot.model_key or "").strip()
+        if mk:
+            keys.append(mk)
+        title = (lot.title or "").strip().lower()
+        if title and title not in keys:
+            keys.append(title)
+        return keys
+
+    def ingest(self, lots: Iterable[Lot]) -> None:
+        for lot in lots:
+            stars = float(lot.stars or 0)
+            if stars <= 0:
+                continue
+            for key in self._keys(lot):
+                arr = self._samples.setdefault(key, [])
+                arr.append(stars)
+                if len(arr) > self.MAX_SAMPLES:
+                    arr.sort()
+                    self._samples[key] = arr[-self.MAX_SAMPLES :]
+
+    def _fair_for_key(self, key: str) -> float | None:
+        prices = self._samples.get(key)
+        if not prices or len(prices) < self.MIN_SAMPLES:
+            return None
+        sorted_p = sorted(prices)
+        n = max(1, len(sorted_p) // 4)
+        return sum(sorted_p[:n]) / n
+
+    def fair_price(self, lot: Lot) -> float | None:
+        for key in self._keys(lot):
+            fair = self._fair_for_key(key)
+            if fair is not None:
+                return fair
+        return None
+
+    def price_cap(self, lot: Lot, *, max_ratio: float | None = None) -> float | None:
+        fair = self.fair_price(lot)
+        if fair is None:
+            return None
+        ratio = float(max_ratio or self.DEFAULT_MAX_RATIO)
+        return max(fair * ratio, fair + min(250.0, fair * 0.4))
+
+    def is_fair_price(self, lot: Lot, *, max_ratio: float | None = None) -> bool:
+        cap = self.price_cap(lot, max_ratio=max_ratio)
+        if cap is None:
+            return True
+        return float(lot.stars) <= cap
+
+    def overprice_reason(self, lot: Lot, *, max_ratio: float | None = None) -> str:
+        fair = self.fair_price(lot)
+        cap = self.price_cap(lot, max_ratio=max_ratio)
+        if fair is None or cap is None:
+            return ""
+        if float(lot.stars) <= cap:
+            return ""
+        return f"завышено {int(lot.stars):,}⭐ > рынок ~{int(fair):,}⭐ (макс {int(cap):,})"
+
+    def to_dict(self) -> dict[str, list[float]]:
+        return {
+            k: [float(x) for x in v[-self.MAX_SAMPLES :]]
+            for k, v in self._samples.items()
+            if v
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MarketPriceBook":
+        book = cls()
+        if not isinstance(data, dict):
+            return book
+        for key, raw in data.items():
+            if not isinstance(raw, list):
+                continue
+            prices = []
+            for item in raw:
+                try:
+                    val = float(item)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0:
+                    prices.append(val)
+            if prices:
+                book._samples[str(key)] = prices[-cls.MAX_SAMPLES :]
+        return book
 
 
 def sort_lots_fresh_first(lots: list[Lot], *, live_ids: set[str] | None = None) -> list[Lot]:

@@ -398,9 +398,16 @@ class MarketPriceBook:
 
     def is_fair_price(self, lot: Lot, *, max_ratio: float | None = None) -> bool:
         cap = self.price_cap(lot, max_ratio=max_ratio)
-        if cap is None:
+        if cap is not None:
+            return float(lot.stars) <= cap
+        # Нет снимка пола — режем явные дампы: TG value или типичный пол коллекции < 40% цены
+        stars = float(lot.stars or 0)
+        if stars <= 0:
             return True
-        return float(lot.stars) <= cap
+        ref = lot.telegram_value
+        if ref and ref > 0 and stars > ref * 2.5:
+            return False
+        return True
 
     def overprice_reason(self, lot: Lot, *, max_ratio: float | None = None) -> str:
         fair = self.fair_price(lot)

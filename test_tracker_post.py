@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 from market import Lot, MarketPriceBook, is_clean_female_profile, is_russian_lot
 from tracker import filter_for_post
@@ -173,10 +175,46 @@ def test_fair_listing_near_collection_floor() -> None:
     assert len(out) == 1
 
 
-def test_telegram_value_blocks_dump() -> None:
+def test_telegram_value_blocks_dump_without_floor() -> None:
     book = MarketPriceBook()
-    lot = _lot(stars=10000.0, telegram_value=320.0, title="Cheap Gift")
+    lot = _lot(
+        stars=10000.0,
+        telegram_value=320.0,
+        title="Cheap Gift",
+        first_name="Мария",
+        seller="mariagifts",
+    )
     assert book.is_fair_price(lot) is False
+    out, stats = _filter_strict([lot], book)
+    assert stats["overprice"] == 1
+
+
+def test_migrate_schema4_file_upgrades() -> None:
+    from tracker_filters import ensure_default_filters, load_filters, migrate_legacy_filters
+
+    class Cfg:
+        pass
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "tracker_filters.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "filter_schema": 4,
+                    "female_only": False,
+                    "strict_fair_price": False,
+                    "min_stars": 5000,
+                    "max_stars": 25000,
+                }
+            ),
+            encoding="utf-8",
+        )
+        ensure_default_filters(path)
+        migrated = migrate_legacy_filters(load_filters(path))
+        assert migrated["filter_schema"] == FILTER_SCHEMA
+        assert migrated["female_only"] is True
+        assert migrated["strict_fair_price"] is True
 
 
 def test_female_skips_boys() -> None:
@@ -228,7 +266,8 @@ def main() -> None:
         test_filter_allows_unknown_level,
         test_overprice_300_listed_at_10k,
         test_fair_listing_near_collection_floor,
-        test_telegram_value_blocks_dump,
+        test_telegram_value_blocks_dump_without_floor,
+        test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
         test_migrate_schema5_enables_girls_and_market,

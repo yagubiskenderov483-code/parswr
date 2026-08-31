@@ -917,7 +917,7 @@ async def _fetch_collection_pages(
     cfg: Config,
     stats: dict[str, int],
 ) -> list[Lot]:
-    """Только page1 resale по дате; без второго запроса — он удваивал таймауты."""
+    """page1 resale; один быстрый retry при таймауте."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
     result = await m._request(
         gid,
@@ -926,8 +926,18 @@ async def _fetch_collection_pages(
         local,
         cfg.gap,
         cfg.timeout,
-        max_attempts=1,
+        max_attempts=2,
     )
+    if result is None:
+        result = await m._request(
+            gid,
+            cfg.page_limit,
+            False,
+            local,
+            cfg.gap,
+            min(cfg.timeout + 1.0, 5.0),
+            max_attempts=1,
+        )
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
@@ -1588,8 +1598,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.0"
-BUILD_TAG = "v3.9.0-floor-girls"
+TRACKER_VERSION = "3.9.1"
+BUILD_TAG = "v3.9.1-deploy-fix"
 
 
 @dataclass

@@ -114,9 +114,15 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
 
 
 def ensure_default_filters(path: Path) -> None:
-    """Первый запуск: 5k–25k и остальные дефолты в data/tracker_filters.json."""
+    """Первый запуск или старый schema — прописать актуальные фильтры."""
     if path.exists():
-        return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            schema = int((raw or {}).get("filter_schema", 0) or 0)
+            if schema >= FILTER_SCHEMA:
+                return
+        except (OSError, ValueError, TypeError):
+            pass
     save_filters(path, dict(DEFAULT_FILTER_DATA))
 
 

@@ -1659,12 +1659,13 @@ async def scanner_loop(
         elif pass_no % 5 == 0:
             logger.info(
                 "Проход #%s: скан %s колл · %s лотов API · новых 0 "
-                "(снимок %s · вне цены %s · err=%s · %ss)",
+                "(снимок %s · вне цены %s · завыш %s · err=%s · %ss)",
                 pass_no,
                 scan.get("batch_size", "?"),
                 scan.get("parsed", 0),
                 scan.get("market_ids", "?"),
                 scan.get("skipped_price", 0),
+                scan.get("skipped_overprice", 0),
                 scan.get("errors", 0),
                 scan.get("elapsed", "?"),
             )

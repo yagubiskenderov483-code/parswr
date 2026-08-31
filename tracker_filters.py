@@ -95,7 +95,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 3
+FILTER_SCHEMA = 4
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -104,7 +104,7 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "strict_ru": True,
     "strict_free": False,
     "max_account_level": 2,
-    "max_gifts": 5,
+    "max_gifts": 20,
     "post_interval": 1.5,
     "female_only": False,
     "strict_fair_price": False,
@@ -141,8 +141,14 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
     if schema < FILTER_SCHEMA:
         out["filter_schema"] = FILTER_SCHEMA
         out["strict_ru"] = True
-        out.setdefault("max_gifts", 5)
         out["max_account_level"] = min(int(out.get("max_account_level", 2) or 2), 2)
+        # 5 резало обычных продавцов 5k–25k; фермы обычно 50+
+        try:
+            prev_gifts = int(out.get("max_gifts", 5) or 5)
+        except (TypeError, ValueError):
+            prev_gifts = 5
+        if prev_gifts <= 5:
+            out["max_gifts"] = 20
     return out
 
 

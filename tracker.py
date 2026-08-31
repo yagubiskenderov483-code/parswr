@@ -262,14 +262,14 @@ class Config:
     page_limit: int = 12  # только верх resale-листа
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
     gap: float = 0.04
-    timeout: float = 5.0
+    timeout: float = 8.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
     scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
-    hot_limit: int = 1  # только самый свежий лот в коллекции
+    hot_limit: int = 3  # топ свежих в коллекции (1 часто фермер)
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    max_gifts: int = 5  # не больше N NFT у продавца
+    max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
     post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -333,14 +333,14 @@ class Config:
             page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=min(6, int(_f("PARALLEL", 6))),
             gap=_f("REQUEST_GAP", 0.04),
-            timeout=_f("REQUEST_TIMEOUT", 5.0),
+            timeout=_f("REQUEST_TIMEOUT", 8.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 45)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            max_gifts=max(1, int(_f("MAX_GIFTS", 5))),
+            max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
             post_interval=_f("POST_INTERVAL", 1.5),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -921,6 +921,7 @@ async def _fetch_collection_pages(
         local,
         cfg.gap,
         cfg.timeout,
+        max_attempts=1,
     )
     if result is None:
         result = await m._request(
@@ -929,7 +930,8 @@ async def _fetch_collection_pages(
             False,
             local,
             cfg.gap,
-            cfg.timeout,
+            min(cfg.timeout, 4.0),
+            max_attempts=1,
         )
     stats["floods"] += local.get("floods", 0)
     if result is None:
@@ -1464,12 +1466,14 @@ class PostQueue:
                     )
                     if reason:
                         logger.info(
-                            "Пропуск %s (%s⭐ @%s): %s · имя=%s",
+                            "Пропуск %s (%s⭐ @%s): %s · имя=%s · lvl=%s gifts=%s",
                             lot_slug(lot),
                             int(lot.stars),
                             lot.seller or "?",
                             reason,
                             (lot.first_name or "—")[:24],
+                            lot.account_level if lot.account_level is not None else "—",
+                            lot.gifts_count if lot.gifts_count is not None else "—",
                         )
                     continue
                 lot = to_post[0]
@@ -1502,8 +1506,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.2"
-BUILD_TAG = "v3.8.2-filter-yield"
+TRACKER_VERSION = "3.8.3"
+BUILD_TAG = "v3.8.3-gifts20"
 
 
 @dataclass
@@ -1725,8 +1729,8 @@ async def scanner_loop(
             runtime.zero_parse_streak = 0
 
         runtime.last_fresh = len(fresh)
+        runtime.last_posted = len(fresh)
         if fresh:
-            runtime.last_posted = post_queue.pending
             logger.info(
                 "Проход #%s: +%s новых · очередь %s · %ss",
                 pass_no,

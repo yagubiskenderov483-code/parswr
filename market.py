@@ -1392,8 +1392,9 @@ class TelegramMarket:
         timeout: float,
         *,
         offset: str = "",
+        max_attempts: int = 2,
     ) -> Any | None:
-        for attempt in range(2):
+        for attempt in range(max(1, int(max_attempts))):
             try:
                 await self._wait_flood()
                 await self.ensure_connected()

@@ -461,6 +461,7 @@ def build_router(
                 f"Фильтры: RU={'да' if cfg.strict_ru else 'нет'} · "
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
+                f"gifts≤{getattr(cfg, 'max_gifts', 5)} · "
                 f"пост/{int(cfg.post_interval)}с · "
                 f"{'девочки' if getattr(cfg, 'female_only', False) else 'все'} · "
                 f"рынок={'да' if getattr(cfg, 'strict_fair_price', False) else 'нет'}"
@@ -491,12 +492,14 @@ def build_router(
                     f"Последний проход: +{rt.last_fresh} новых → {rt.last_posted} в очередь",
                     f"Отсев (посл.): ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
-                    f"lvl−{rt.last_skip_level} female−{rt.last_skip_female} "
+                    f"lvl−{rt.last_skip_level} gifts−{rt.last_skip_gifts} "
+                    f"female−{rt.last_skip_female} "
                     f"over−{rt.last_skip_overprice}",
                     f"Отсев (всего): ru−{rt.skip_ru_total} dm−{rt.skip_dm_total} "
                     f"dup−{rt.skip_dup_total} noseller−{rt.skip_noseller_total} "
-                    f"lvl−{rt.skip_level_total} female−{rt.skip_female_total} "
-                    f"over−{rt.skip_overprice_total} ru?{rt.skip_unknown_ru_total}",
+                    f"lvl−{rt.skip_level_total} gifts−{rt.skip_gifts_total} "
+                    f"female−{rt.skip_female_total} "
+                    f"over−{rt.skip_overprice_total}",
                     f"Seen лотов: {rt.seen_lots} · снимок маркета: "
                     f"{len(rt.market_ids) if rt.market_ids else 0}",
                 ]

@@ -269,6 +269,7 @@ class Config:
     scan_batch: int = 45  # ротация коллекций — быстрее проход чем все 149 сразу
     hot_limit: int = 1  # только самый свежий лот в коллекции
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
+    max_gifts: int = 5  # не больше N NFT у продавца
     post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -276,7 +277,7 @@ class Config:
     state_file: str = ""
     post_on_first_run: bool = False
     channel_id: int | None = None
-    strict_ru: bool = False
+    strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
     female_only: bool = False
     strict_fair_price: bool = False
@@ -339,6 +340,7 @@ class Config:
             scan_batch=int(_f("SCAN_BATCH", 45)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 1))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
+            max_gifts=max(1, int(_f("MAX_GIFTS", 5))),
             post_interval=_f("POST_INTERVAL", 1.5),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -346,7 +348,7 @@ class Config:
             state_file=state_file,
             post_on_first_run=os.environ.get("POST_ON_FIRST_RUN", "0") == "1",
             channel_id=channel_id,
-            strict_ru=os.environ.get("TRACKER_STRICT_RU", "0") == "1",
+            strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
             female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
             strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
@@ -1087,34 +1089,23 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Минимальный enrich: тяжёлый профиль только если включены строгие фильтры."""
-    need_name = bool(cfg.female_only)
-    need_ru = bool(cfg.strict_ru)
-    need_level = cfg.max_account_level < 99
-    need_dm = True  # всегда отсекаем платные ЛС
-    light = not (need_name or need_ru)
-
+    """Профиль продавца: level, язык, gifts — нужны для RU/level/NFT фильтров."""
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=3.0 if light else 4.0)
+            await m.resolve_owner(lot, timeout=4.0)
         except Exception:  # noqa: BLE001
             pass
     if lot.seller_id is None:
         return
-    if light:
-        if need_dm and lot.free_dm is None:
-            try:
-                await m.check_free_dm([lot], timeout=2.5)
-            except Exception:  # noqa: BLE001
-                pass
-        return
     for attempt in range(2):
         need_profile = (
-            (need_name and not (lot.first_name or "").strip())
-            or (need_level and lot.account_level is None)
-            or (need_dm and lot.free_dm is None)
+            not (lot.first_name or "").strip()
+            or lot.account_level is None
+            or lot.gifts_count is None
+            or lot.free_dm is None
             or lot.is_premium is None
-            or (need_ru and not lot.lang_code)
+            or (cfg.strict_ru and not lot.lang_code)
+            or (cfg.female_only and not (lot.first_name or "").strip())
         )
         if not need_profile:
             break
@@ -1122,10 +1113,10 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
             await m.enrich_profiles([lot], timeout=4.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
-        if (lot.first_name or "").strip() or attempt == 1:
+        if attempt == 1:
             break
         await asyncio.sleep(0.2)
-    if need_dm and lot.free_dm is None:
+    if lot.free_dm is None:
         try:
             await m.check_free_dm([lot], timeout=3.0)
         except Exception:  # noqa: BLE001
@@ -1189,12 +1180,13 @@ def filter_for_post(
     strict_ru: bool = True,
     strict_free: bool = False,
     max_account_level: int = 2,
+    max_gifts: int = 5,
     female_only: bool = True,
     strict_fair_price: bool = True,
     fair_price_ratio: float = 1.55,
     price_book: MarketPriceBook | None = None,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """RU + level + бесплатные ЛС + один раз на продавца."""
+    """RU + level + мало NFT + бесплатные ЛС + один раз на продавца."""
     out: list[Lot] = []
     used: set[str] = set()
     stats = {
@@ -1205,6 +1197,7 @@ def filter_for_post(
         "unknown_dm": 0,
         "unknown_ru": 0,
         "level": 0,
+        "many_gifts": 0,
         "not_female": 0,
         "overprice": 0,
     }
@@ -1243,6 +1236,19 @@ def filter_for_post(
                 continue
             if ru is None:
                 stats["unknown_ru"] += 1
+                continue
+        if max_gifts < 999:
+            gifts = lot.gifts_count
+            if gifts is None:
+                stats["many_gifts"] += 1
+                continue
+            if gifts > max_gifts:
+                stats["many_gifts"] += 1
+                continue
+        if max_account_level < 99:
+            if lot.account_level is None:
+                stats["level"] += 1
+                continue
         if not passes_account_level(lot, max_account_level):
             stats["level"] += 1
             continue
@@ -1294,10 +1300,12 @@ def _skip_reason(stats: dict[str, int]) -> str:
         parts.append("нет продавца")
     if stats.get("dup"):
         parts.append("дубль продавца")
-    if stats.get("non_ru"):
+    if stats.get("non_ru") or stats.get("unknown_ru"):
         parts.append("не RU")
     if stats.get("level"):
         parts.append("level")
+    if stats.get("many_gifts"):
+        parts.append("много NFT")
     if stats.get("not_female"):
         parts.append("не девочка/реклама")
     if stats.get("overprice"):
@@ -1398,23 +1406,26 @@ class PostQueue:
                     strict_ru=self._cfg.strict_ru,
                     strict_free=self._cfg.strict_free,
                     max_account_level=self._cfg.max_account_level,
+                    max_gifts=self._cfg.max_gifts,
                     female_only=self._cfg.female_only,
                     strict_fair_price=self._cfg.strict_fair_price,
                     fair_price_ratio=self._cfg.fair_price_ratio,
                     price_book=self._runtime.price_book,
                 )
-                self._runtime.last_skip_ru = fstats["non_ru"]
+                self._runtime.last_skip_ru = fstats["non_ru"] + fstats["unknown_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
                 self._runtime.last_skip_level = fstats["level"]
+                self._runtime.last_skip_gifts = fstats["many_gifts"]
                 self._runtime.last_skip_female = fstats["not_female"]
                 self._runtime.last_skip_overprice = fstats["overprice"]
-                self._runtime.skip_ru_total += fstats["non_ru"]
+                self._runtime.skip_ru_total += fstats["non_ru"] + fstats["unknown_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.skip_dup_total += fstats["dup"]
                 self._runtime.skip_noseller_total += fstats["no_seller"]
                 self._runtime.skip_level_total += fstats["level"]
+                self._runtime.skip_gifts_total += fstats["many_gifts"]
                 self._runtime.skip_female_total += fstats["not_female"]
                 self._runtime.skip_overprice_total += fstats["overprice"]
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
@@ -1423,8 +1434,10 @@ class PostQueue:
                     skip_permanent = (
                         fstats["dup"]
                         or fstats["non_ru"]
+                        or fstats["unknown_ru"]
                         or fstats["paid"]
                         or fstats["level"]
+                        or fstats["many_gifts"]
                         or (
                             fstats["not_female"]
                             and (lot.first_name or "").strip()
@@ -1488,8 +1501,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.0"
-BUILD_TAG = "v3.8.0-turbo-instant"
+TRACKER_VERSION = "3.8.1"
+BUILD_TAG = "v3.8.1-strict-ru-level"
 
 
 @dataclass
@@ -1505,6 +1518,7 @@ class TrackerRuntime:
     last_skip_dup: int = 0
     last_skip_noseller: int = 0
     last_skip_level: int = 0
+    last_skip_gifts: int = 0
     last_skip_female: int = 0
     last_skip_overprice: int = 0
     skip_ru_total: int = 0
@@ -1512,6 +1526,7 @@ class TrackerRuntime:
     skip_dup_total: int = 0
     skip_noseller_total: int = 0
     skip_level_total: int = 0
+    skip_gifts_total: int = 0
     skip_female_total: int = 0
     skip_overprice_total: int = 0
     skip_unknown_ru_total: int = 0
@@ -1857,11 +1872,13 @@ async def run() -> None:
     if not gift_ids:
         raise SystemExit("Не удалось загрузить коллекции — проверь сессию")
     logger.info(
-        "Коллекций: %s · scan page1 hot=%s · все колл/проход · drip %ss · lvl≤%s",
+        "Коллекций: %s · scan page1 hot=%s · drip %ss · RU=%s · lvl≤%s · gifts≤%s",
         len(gift_ids),
         cfg.hot_limit,
         int(cfg.post_interval),
+        "да" if cfg.strict_ru else "нет",
         cfg.max_account_level,
+        cfg.max_gifts,
     )
 
     runtime.collections_total = len(gift_ids)

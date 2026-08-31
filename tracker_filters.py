@@ -62,6 +62,7 @@ def config_to_filters(cfg: Any) -> dict[str, Any]:
         "strict_ru": bool(cfg.strict_ru),
         "strict_free": bool(cfg.strict_free),
         "max_account_level": int(cfg.max_account_level),
+        "max_gifts": int(getattr(cfg, "max_gifts", 5)),
         "post_interval": float(cfg.post_interval),
         "female_only": bool(getattr(cfg, "female_only", True)),
         "strict_fair_price": bool(getattr(cfg, "strict_fair_price", True)),
@@ -82,6 +83,8 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.strict_free = bool(data["strict_free"])
     if "max_account_level" in data:
         cfg.max_account_level = int(data["max_account_level"])
+    if "max_gifts" in data:
+        cfg.max_gifts = max(1, int(data["max_gifts"]))
     if "post_interval" in data:
         cfg.post_interval = max(0.5, float(data["post_interval"]))
     if "female_only" in data:
@@ -92,15 +95,16 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 2
+FILTER_SCHEMA = 3
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
     "min_stars": 5000.0,
     "max_stars": 25000.0,
-    "strict_ru": False,
+    "strict_ru": True,
     "strict_free": False,
     "max_account_level": 2,
+    "max_gifts": 5,
     "post_interval": 1.5,
     "female_only": False,
     "strict_fair_price": False,
@@ -129,12 +133,16 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
         out["min_stars"] = 5000.0
         out["max_stars"] = 25000.0
     schema = int(out.get("filter_schema", 0) or 0)
-    if schema < FILTER_SCHEMA:
-        out["filter_schema"] = FILTER_SCHEMA
-        out["strict_ru"] = False
+    if schema < 2:
+        out["filter_schema"] = 2
         out["female_only"] = False
         out["strict_fair_price"] = False
         out["post_interval"] = min(float(out.get("post_interval", 3.0) or 3.0), 1.5)
+    if schema < FILTER_SCHEMA:
+        out["filter_schema"] = FILTER_SCHEMA
+        out["strict_ru"] = True
+        out.setdefault("max_gifts", 5)
+        out["max_account_level"] = min(int(out.get("max_account_level", 2) or 2), 2)
     return out
 
 
@@ -162,6 +170,7 @@ def filters_summary(cfg: Any) -> str:
         f"RU: <b>{'да' if cfg.strict_ru else 'нет'}</b> · "
         f"ЛС free: <b>{'строго' if cfg.strict_free else 'не платные'}</b>\n"
         f"Level ≤ <b>{int(cfg.max_account_level)}</b> · "
+        f"gifts ≤ <b>{int(getattr(cfg, 'max_gifts', 5))}</b> · "
         f"Пост / <b>{int(cfg.post_interval)}</b>с\n"
         f"Профиль: <b>{female}</b> · рынок≤<b>{fair}</b> · без рекламы"
     )

@@ -226,8 +226,14 @@ def looks_male(lot: Lot) -> bool:
     if ln.endswith(("ович", "евич", "ич")):
         return True
     seller = _normalize_handle(lot.seller or "")
-    if seller and len(seller) >= 3 and _MALE_NAMES_RE.search(seller):
-        return True
+    if seller and len(seller) >= 3:
+        if _MALE_NAMES_RE.search(seller):
+            return True
+        raw_seller = (lot.seller or "").strip().lower().lstrip("@")
+        for part in re.split(r"[_.\-]+", raw_seller):
+            part_norm = _normalize_handle(part)
+            if part_norm and _MALE_NAMES_RE.match(part_norm):
+                return True
     return False
 
 

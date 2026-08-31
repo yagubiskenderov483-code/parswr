@@ -499,7 +499,7 @@ def build_router(
                     f"dup−{rt.skip_dup_total} noseller−{rt.skip_noseller_total} "
                     f"lvl−{rt.skip_level_total} gifts−{rt.skip_gifts_total} "
                     f"female−{rt.skip_female_total} "
-                    f"over−{rt.skip_overprice_total}",
+                    f"over−{rt.skip_overprice_total} ru?{rt.skip_unknown_ru_total}",
                     f"Seen лотов: {rt.seen_lots} · снимок маркета: "
                     f"{len(rt.market_ids) if rt.market_ids else 0}",
                 ]

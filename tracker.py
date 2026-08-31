@@ -1092,12 +1092,15 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     """Профиль продавца: level, язык, gifts — нужны для RU/level/NFT фильтров."""
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=4.0)
+            await m.resolve_owner(lot, timeout=5.0)
         except Exception:  # noqa: BLE001
             pass
     if lot.seller_id is None:
         return
-    for attempt in range(2):
+    delays = (0.0, 0.35, 0.9, 1.8)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
         need_profile = (
             not (lot.first_name or "").strip()
             or lot.account_level is None
@@ -1110,15 +1113,14 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
         if not need_profile:
             break
         try:
-            await m.enrich_profiles([lot], timeout=4.0, parallel=1)
+            await m.enrich_profiles([lot], timeout=5.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
-        if attempt == 1:
+        if attempt == len(delays) - 1:
             break
-        await asyncio.sleep(0.2)
     if lot.free_dm is None:
         try:
-            await m.check_free_dm([lot], timeout=3.0)
+            await m.check_free_dm([lot], timeout=4.0)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1236,18 +1238,10 @@ def filter_for_post(
                 continue
             if ru is None:
                 stats["unknown_ru"] += 1
-                continue
         if max_gifts < 999:
             gifts = lot.gifts_count
-            if gifts is None:
+            if gifts is not None and gifts > max_gifts:
                 stats["many_gifts"] += 1
-                continue
-            if gifts > max_gifts:
-                stats["many_gifts"] += 1
-                continue
-        if max_account_level < 99:
-            if lot.account_level is None:
-                stats["level"] += 1
                 continue
         if not passes_account_level(lot, max_account_level):
             stats["level"] += 1
@@ -1300,8 +1294,10 @@ def _skip_reason(stats: dict[str, int]) -> str:
         parts.append("нет продавца")
     if stats.get("dup"):
         parts.append("дубль продавца")
-    if stats.get("non_ru") or stats.get("unknown_ru"):
+    if stats.get("non_ru"):
         parts.append("не RU")
+    if stats.get("unknown_ru"):
+        parts.append("RU неизвестно")
     if stats.get("level"):
         parts.append("level")
     if stats.get("many_gifts"):
@@ -1412,7 +1408,7 @@ class PostQueue:
                     fair_price_ratio=self._cfg.fair_price_ratio,
                     price_book=self._runtime.price_book,
                 )
-                self._runtime.last_skip_ru = fstats["non_ru"] + fstats["unknown_ru"]
+                self._runtime.last_skip_ru = fstats["non_ru"]
                 self._runtime.last_skip_dm = fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.last_skip_dup = fstats["dup"]
                 self._runtime.last_skip_noseller = fstats["no_seller"]
@@ -1420,7 +1416,7 @@ class PostQueue:
                 self._runtime.last_skip_gifts = fstats["many_gifts"]
                 self._runtime.last_skip_female = fstats["not_female"]
                 self._runtime.last_skip_overprice = fstats["overprice"]
-                self._runtime.skip_ru_total += fstats["non_ru"] + fstats["unknown_ru"]
+                self._runtime.skip_ru_total += fstats["non_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
                 self._runtime.skip_dup_total += fstats["dup"]
                 self._runtime.skip_noseller_total += fstats["no_seller"]
@@ -1434,10 +1430,15 @@ class PostQueue:
                     skip_permanent = (
                         fstats["dup"]
                         or fstats["non_ru"]
-                        or fstats["unknown_ru"]
                         or fstats["paid"]
-                        or fstats["level"]
-                        or fstats["many_gifts"]
+                        or (
+                            fstats["level"]
+                            and lot.account_level is not None
+                        )
+                        or (
+                            fstats["many_gifts"]
+                            and lot.gifts_count is not None
+                        )
                         or (
                             fstats["not_female"]
                             and (lot.first_name or "").strip()
@@ -1501,8 +1502,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.8.1"
-BUILD_TAG = "v3.8.1-strict-ru-level"
+TRACKER_VERSION = "3.8.2"
+BUILD_TAG = "v3.8.2-filter-yield"
 
 
 @dataclass

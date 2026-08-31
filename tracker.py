@@ -42,6 +42,7 @@ from market import (
     TelegramMarket,
     format_account_level,
     is_clean_female_profile,
+    female_filter_reason,
     is_free_dm_lot,
     is_russian_lot,
     seller_keys_overlap,
@@ -1324,16 +1325,27 @@ class PostQueue:
                             fstats["not_female"]
                             and (lot.first_name or "").strip()
                         )
+                        or (
+                            fstats["not_female"]
+                            and (lot.seller or "").strip()
+                            and female_filter_reason(lot) in {"реклама", "отзывы", "giftdouble", "мужской"}
+                        )
                     )
                     if skip_permanent and lot.seller_key:
                         self._seen[lot.id] = now
-                    reason = _skip_reason(fstats)
+                    reason = (
+                        female_filter_reason(lot)
+                        if fstats["not_female"]
+                        else _skip_reason(fstats)
+                    )
                     if reason:
                         logger.info(
-                            "Пропуск %s (%s⭐): %s",
+                            "Пропуск %s (%s⭐ @%s): %s · имя=%s",
                             lot_slug(lot),
                             int(lot.stars),
+                            lot.seller or "?",
                             reason,
+                            (lot.first_name or "—")[:24],
                         )
                     continue
                 lot = to_post[0]
@@ -1366,8 +1378,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.6.4"
-BUILD_TAG = "v3.6.4-api-fix"
+TRACKER_VERSION = "3.6.5"
+BUILD_TAG = "v3.6.5-female-fix"
 
 
 @dataclass

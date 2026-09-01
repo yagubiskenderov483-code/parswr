@@ -848,16 +848,20 @@ def _select_scan_batch(
     if baseline or cfg.scan_batch <= 0 or cfg.scan_batch >= n:
         batch = list(gift_ids)
         random.shuffle(batch)
-    else:
-        take = min(n, cfg.scan_batch)
-        batch = [gift_ids[(m._cursor + i) % n] for i in range(take)]
-        m._cursor = (m._cursor + take) % n
-    batch = [g for g in batch if not m.is_collection_bad(g)]
+        return [g for g in batch if not m.is_collection_bad(g)] or batch
+    # Добираем до полного батча, пропуская bad — иначе проход усыхает (24 → 9)
+    take = min(n, cfg.scan_batch)
+    batch: list[int] = []
+    step = 0
+    while len(batch) < take and step < n:
+        gid = gift_ids[(m._cursor + step) % n]
+        step += 1
+        if m.is_collection_bad(gid):
+            continue
+        batch.append(gid)
+    m._cursor = (m._cursor + step) % n
     if not batch and gift_ids:
-        batch = [g for g in gift_ids if not m.is_collection_bad(g)]
-        random.shuffle(batch)
-        if cfg.scan_batch > 0 and len(batch) > cfg.scan_batch:
-            batch = batch[:cfg.scan_batch]
+        batch = list(gift_ids)[:take]
     return batch
 
 
@@ -923,7 +927,7 @@ async def _fetch_collection_pages(
     cfg: Config,
     stats: dict[str, int],
 ) -> list[Lot]:
-    """page1 resale; один быстрый retry при таймауте."""
+    """page1 resale; максимум 2 быстрых попытки (~7s worst, не 10.6s)."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
     result = await m._request(
         gid,
@@ -932,7 +936,7 @@ async def _fetch_collection_pages(
         local,
         cfg.gap,
         cfg.timeout,
-        max_attempts=2,
+        max_attempts=1,
     )
     if result is None:
         result = await m._request(
@@ -941,13 +945,13 @@ async def _fetch_collection_pages(
             False,
             local,
             cfg.gap,
-            min(cfg.timeout + 1.0, 5.0),
+            min(cfg.timeout + 0.5, 3.5),
             max_attempts=1,
         )
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
-        m.mark_collection_bad(gid, cooldown=300.0)
+        m.mark_collection_bad(gid, cooldown=120.0)
         return []
     m._remember_users(market_mod._extract_users(result))
     parsed = market_mod._parse_result(result)
@@ -1622,8 +1626,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.5"
-BUILD_TAG = "v3.9.5-female-names"
+TRACKER_VERSION = "3.9.6"
+BUILD_TAG = "v3.9.6-fast-scan"
 
 
 @dataclass
@@ -1887,7 +1891,16 @@ async def scanner_loop(
         spent = time.monotonic() - started
         floods = int(scan.get("floods", 0) or 0)
         err_ratio = (errors / scanned) if scanned > 0 else 0.0
-        if err_ratio > 0.35 and runtime.scan_parallel > 3:
+        if floods > 3 and runtime.scan_parallel > 4:
+            runtime.scan_parallel -= 1
+            cfg.parallel = runtime.scan_parallel
+            logger.warning(
+                "FloodWait x%s — parallel=%s",
+                floods,
+                runtime.scan_parallel,
+            )
+        elif err_ratio > 0.5 and runtime.scan_parallel > 4:
+            # таймауты — не повод замедляться до 3: скан и так буксует
             runtime.scan_parallel -= 1
             cfg.parallel = runtime.scan_parallel
             logger.warning(
@@ -1897,17 +1910,9 @@ async def scanner_loop(
                 runtime.scan_parallel,
                 m.last_error or "",
             )
-        elif floods > 3 and runtime.scan_parallel > 4:
-            runtime.scan_parallel -= 1
-            cfg.parallel = runtime.scan_parallel
-            logger.warning(
-                "FloodWait x%s — parallel=%s",
-                floods,
-                runtime.scan_parallel,
-            )
         elif (
             floods == 0
-            and err_ratio < 0.15
+            and err_ratio < 0.25
             and runtime.scan_parallel < 6
         ):
             runtime.scan_parallel += 1

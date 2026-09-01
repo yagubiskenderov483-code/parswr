@@ -175,6 +175,30 @@ def test_various_prices_pass_filters() -> None:
         assert stats["overprice"] == 0
 
 
+def test_scan_batch_backfills_around_bad_collections() -> None:
+    """Bad-коллекции не усыхают батч: 24 запрошено — 24 отдано."""
+    import time as _t
+
+    from tracker import Config, _select_scan_batch
+
+    class _StubMarket:
+        def __init__(self) -> None:
+            self._cursor = 0
+            self._bad = {gid: _t.time() + 60 for gid in range(10)}
+
+        def is_collection_bad(self, gid: int) -> bool:
+            return gid in self._bad
+
+    cfg = Config.__new__(Config)
+    object.__setattr__(cfg, "scan_batch", 24)
+    m = _StubMarket()
+    gift_ids = list(range(150))
+    batch = _select_scan_batch(gift_ids, m, cfg, baseline=False)
+    assert len(batch) == 24
+    assert all(g >= 10 for g in batch)
+    assert m._cursor == 34  # 10 bad пропущено + 24 взято
+
+
 def test_telegram_value_dump_blocked() -> None:
     book = MarketPriceBook()
     lot = _lot(
@@ -198,6 +222,7 @@ def main() -> None:
         test_seven_women_pass_filters,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
+        test_scan_batch_backfills_around_bad_collections,
         test_telegram_value_dump_blocked,
     ]
     for fn in tests:

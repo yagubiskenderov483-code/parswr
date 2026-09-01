@@ -1639,9 +1639,16 @@ class TelegramMarket:
                 self._flood_until = time.monotonic() + min(wait_s, 300.0)
                 self.last_error = f"FloodWait {exc.seconds}s · торможу"
                 await asyncio.sleep(min(wait_s, 120.0))
+            except asyncio.TimeoutError:
+                stats["errors"] += 1
+                self.last_error = f"таймаут {timeout:g}s (API медленный)"
+                await asyncio.sleep(0.2 * (attempt + 1))
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
-                self.last_error = str(exc)
+                msg = str(exc).strip()
+                self.last_error = (
+                    f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+                )
                 await asyncio.sleep(0.2 * (attempt + 1))
         return None
 

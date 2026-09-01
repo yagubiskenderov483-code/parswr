@@ -557,10 +557,11 @@ def build_router(
         probe = await probe_market(rt.market, gids, rt.cfg)
         err = str(probe.get("error") or rt.last_api_error or "").strip()
         await message.answer(
-            "🔎 <b>Probe маркета</b>\n"
+            "🔎 <b>Probe маркета</b> (таймаут 10s)\n"
             f"Коллекций: <b>{probe.get('collections', 0)}</b>\n"
             f"Лотов API: <b>{probe.get('parsed', 0)}</b>\n"
             f"Ошибок: <b>{probe.get('errors', 0)}</b>\n"
+            f"Время: {probe.get('elapsed', '?')}s\n"
             f"Цена: {int(rt.cfg.min_stars):,}–{int(rt.cfg.max_stars):,}⭐\n"
             + (f"Ошибка: <code>{_esc(err[:200])}</code>" if err else "Ошибка: нет")
         )

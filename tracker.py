@@ -262,7 +262,7 @@ class Config:
     page_limit: int = 8  # верх resale-листа (свежие)
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
     gap: float = 0.02
-    timeout: float = 3.0
+    timeout: float = 6.0  # Bothost медленный: 3s резало живые ответы API
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
@@ -333,7 +333,7 @@ class Config:
             page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=min(6, int(_f("PARALLEL", 6))),
             gap=_f("REQUEST_GAP", 0.02),
-            timeout=_f("REQUEST_TIMEOUT", 3.0),
+            timeout=_f("REQUEST_TIMEOUT", 6.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
@@ -903,20 +903,36 @@ async def _ensure_collection_ids(
 async def probe_market(
     m: TelegramMarket, gift_ids: list[int], cfg: Config
 ) -> dict[str, int | float | str]:
-    """Тест API: 3 коллекции, сколько лотов вернулось."""
+    """Тест API: 3 коллекции с щедрым таймаутом 10s — медленный или мёртвый."""
     sample = list(gift_ids[:3]) if gift_ids else list((m._gift_ids or [])[:3])
     if not sample:
         return {"collections": 0, "parsed": 0, "errors": 1, "error": "no collections"}
     stats: dict[str, int] = {"ok": 0, "errors": 0, "floods": 0, "parsed": 0}
+    started = time.monotonic()
     for gid in sample:
-        lots = await _fetch_collection_pages(m, gid, cfg, stats)
-        if lots:
-            stats["parsed"] += len(lots)
+        local: dict[str, int] = {"errors": 0, "floods": 0}
+        result = await m._request(
+            gid,
+            cfg.page_limit,
+            True,
+            local,
+            cfg.gap,
+            10.0,
+            max_attempts=1,
+        )
+        stats["floods"] += local.get("floods", 0)
+        if result is None:
+            stats["errors"] += 1
+            continue
+        lots = market_mod._parse_result(result)
+        stats["ok"] += 1
+        stats["parsed"] += len(lots)
     return {
         "collections": len(sample),
         "parsed": stats.get("parsed", 0),
         "errors": stats.get("errors", 0),
         "floods": stats.get("floods", 0),
+        "elapsed": round(time.monotonic() - started, 1),
         "error": m.last_error or "",
     }
 
@@ -945,7 +961,7 @@ async def _fetch_collection_pages(
             False,
             local,
             cfg.gap,
-            min(cfg.timeout + 0.5, 3.5),
+            min(cfg.timeout + 2.0, 10.0),
             max_attempts=1,
         )
     stats["floods"] += local.get("floods", 0)
@@ -1626,8 +1642,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.8"
-BUILD_TAG = "v3.9.8-girls-soft"
+TRACKER_VERSION = "3.9.9"
+BUILD_TAG = "v3.9.9-timeout6s"
 
 
 @dataclass

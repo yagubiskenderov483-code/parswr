@@ -390,7 +390,7 @@ def is_ad_profile(lot: Lot) -> bool:
 
 
 def female_filter_reason(lot: Lot) -> str:
-    """Почему профиль не прошёл (для логов)."""
+    """Почему профиль не прошёл (для логов). Мягкий режим: режем только явное."""
     if looks_male(lot):
         return "мужской"
     if is_ad_profile(lot):
@@ -399,15 +399,11 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
-    if looks_female(lot):
-        return ""
-    if not (lot.first_name or "").strip():
-        return "нет имени"
-    return "не женский"
+    return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Женский профиль без мужчин/рекламы. Пустой/нейтральный латинский ник — нет."""
+    """Без мужчин/рекламы. Нейтральный профиль (пустое имя, латинский ник) — ок."""
     return not female_filter_reason(lot)
 
 

@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 6
+FILTER_SCHEMA = 7
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -107,7 +107,7 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "max_account_level": 2,
     "max_gifts": 20,
     "post_interval": 1.5,
-    "female_only": False,
+    "female_only": True,
     "strict_fair_price": False,
     "fair_price_ratio": 1.55,
 }
@@ -127,7 +127,7 @@ def ensure_default_filters(path: Path) -> None:
 
 
 def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
-    """schema<6 → простой режим: 5k–25k, без girls-only и проверки рынка."""
+    """schema<7 → девочки (мягко, без мужчин), без проверки рынка, 5k–25k."""
     if not data:
         return dict(DEFAULT_FILTER_DATA)
     out = dict(data)
@@ -145,7 +145,7 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
             out["max_gifts"] = 20
     if schema < FILTER_SCHEMA:
         out["filter_schema"] = FILTER_SCHEMA
-        out["female_only"] = False
+        out["female_only"] = True
         out["strict_fair_price"] = False
         out["min_stars"] = 5000.0
         out["max_stars"] = 25000.0

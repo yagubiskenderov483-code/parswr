@@ -214,7 +214,7 @@ def test_migrate_schema4_file_upgrades() -> None:
         ensure_default_filters(path)
         migrated = migrate_legacy_filters(load_filters(path))
         assert migrated["filter_schema"] == FILTER_SCHEMA
-        assert migrated["female_only"] is False
+        assert migrated["female_only"] is True
         assert migrated["strict_fair_price"] is False
         assert migrated["min_stars"] == 5000.0
         assert migrated["max_stars"] == 25000.0
@@ -236,14 +236,12 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
-def test_neutral_profile_rejected_when_female_on() -> None:
-    """Girls-only включён: пустое имя + нейтральный ник — не постим."""
+def test_neutral_profile_passes_soft_female() -> None:
+    """Мягкий girls-режим: пустое имя + нейтральный ник — постим (не мужчина)."""
     lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
-    assert is_clean_female_profile(lot) is False
+    assert is_clean_female_profile(lot) is True
     out, stats = _filter_strict([lot])
-    assert stats["not_female"] == 1
-    assert stats["female_noname"] == 1
-    assert out == []
+    assert stats["not_female"] == 0
 
 
 def test_simple_mode_neutral_lot_passes() -> None:
@@ -263,13 +261,14 @@ def test_simple_mode_neutral_lot_passes() -> None:
     assert len(out) == 1
 
 
-def test_hidden_name_ru_profile_counted_as_noname() -> None:
-    """RU-профиль без имени — отсев female с пометкой «нет имени»."""
-    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222, about="привет")
-    out, stats = _filter_strict([lot])
-    assert stats["not_female"] == 1
-    assert stats["female_noname"] == 1
-    assert out == []
+def test_boys_still_blocked_in_soft_mode() -> None:
+    """Мягкий режим всё равно режет мужиков: Dima, Vanya, Никита."""
+    for fn, nick in (("Dima", "dima123"), ("Vanya", "vanya1"), ("Никита", "nik1")):
+        lot = _lot(first_name=fn, seller=nick, seller_id=300)
+        assert is_clean_female_profile(lot) is False, fn
+        out, stats = _filter_strict([lot])
+        assert stats["not_female"] == 1, fn
+        assert out == [], fn
 
 
 def test_latin_female_name_passes() -> None:
@@ -295,19 +294,19 @@ def test_male_username_blocked() -> None:
     assert out == []
 
 
-def test_migrate_schema6_resets_to_simple() -> None:
-    """schema<6 (включая girls-only) → простой режим 5k–25k."""
+def test_migrate_schema7_girls_soft_5k25k() -> None:
+    """schema<7 → девочки (мягко), рынок выкл, 5k–25k."""
     out = migrate_legacy_filters(
         {
-            "filter_schema": 5,
-            "female_only": True,
+            "filter_schema": 6,
+            "female_only": False,
             "strict_fair_price": True,
             "min_stars": 2000,
             "max_stars": 5000,
         }
     )
     assert out["filter_schema"] == FILTER_SCHEMA
-    assert out["female_only"] is False
+    assert out["female_only"] is True
     assert out["strict_fair_price"] is False
     assert out["min_stars"] == 5000.0
     assert out["max_stars"] == 25000.0
@@ -335,12 +334,12 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
-        test_neutral_profile_rejected_when_female_on,
+        test_neutral_profile_passes_soft_female,
         test_simple_mode_neutral_lot_passes,
-        test_hidden_name_ru_profile_counted_as_noname,
+        test_boys_still_blocked_in_soft_mode,
         test_latin_female_name_passes,
         test_male_username_blocked,
-        test_migrate_schema6_resets_to_simple,
+        test_migrate_schema7_girls_soft_5k25k,
     ]
     for fn in tests:
         fn()

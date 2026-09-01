@@ -279,7 +279,7 @@ class Config:
     channel_id: int | None = None
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
-    female_only: bool = False
+    female_only: bool = True  # мягко: режем только явных мужчин/рекламу
     strict_fair_price: bool = False
     fair_price_ratio: float = 1.55
 
@@ -350,7 +350,7 @@ class Config:
             channel_id=channel_id,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
-            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
+            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") == "1",
             strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
         )
 
@@ -1626,8 +1626,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.7"
-BUILD_TAG = "v3.9.7-simple-5k25k"
+TRACKER_VERSION = "3.9.8"
+BUILD_TAG = "v3.9.8-girls-soft"
 
 
 @dataclass

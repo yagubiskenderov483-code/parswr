@@ -107,13 +107,14 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_neutral_cut_only_by_girls_filter() -> None:
-    """RU не режет латиницу; girls-only (если включён) режет профиль без имени."""
-    lot_foreign = _lot(seller="cryptogifts", first_name="", lang_code="")
-    assert is_russian_lot(lot_foreign) is None
-    passed_f, stats_f = _filter_batch([lot_foreign])
-    assert passed_f == []
-    assert stats_f["not_female"] == 1
+def test_latin_neutral_passes_soft_mode() -> None:
+    """Мягкий режим: латинский нейтральный профиль проходит (RU? и не мужчина)."""
+    lot_neutral = _lot(seller="cryptogifts", first_name="", lang_code="")
+    assert is_russian_lot(lot_neutral) is None
+    passed, stats = _filter_batch([lot_neutral])
+    assert stats["not_female"] == 0
+    assert stats["non_ru"] == 0
+    assert len(passed) == 1
 
     lot_ru = _lot(
         seller="cryptogifts",
@@ -219,7 +220,7 @@ def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_neutral_cut_only_by_girls_filter,
+        test_latin_neutral_passes_soft_mode,
         test_seven_women_pass_filters,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,

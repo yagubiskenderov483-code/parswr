@@ -56,7 +56,16 @@ _NON_RU_LANG_PREFIXES = (
     "kk",
     "ky",
     "tg",
+    "uk",
+    "be",
+    "ka",
+    "hy",
 )
+# Короткие ники: могут быть и мужские и женские — не считаем мужским без других сигналов
+_AMBIGUOUS_RU_NAMES = frozenset(
+    {"саша", "женя", "валя", "слава", "паша", "оля", "катя", "даша", "маша"}
+)
+_MALE_SHORT_NICK_RE = re.compile(r"(иша|уша|ёша|еша)$")
 
 
 @dataclass(slots=True)
@@ -185,9 +194,12 @@ _REVIEW_RE = re.compile(
 )
 _FEMALE_USER_RE = re.compile(
     r"(?:"
-    r"girl|woman|lady|queen|princess|devoch|devush|miss|mrs|"
-    r"ann|maria|elena|olga|kate|julia|diana|vika|nastya|polina|alina|"
-    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света"
+    r"girl|woman|lady|queen|princess|devoch|devush|miss|mrs|babe|"
+    r"ann|anna|maria|masha|elena|olga|kate|julia|diana|vika|nastya|polina|alina|"
+    r"sofia|sonya|vera|liza|tanya|sveta|ira|yana|"
+    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света|"
+    r"анна|мария|елена|ольга|софия|соня|вероника|татьяна|"
+    r"devushka|devochka|zhenshina"
     r")",
     re.IGNORECASE,
 )
@@ -209,13 +221,37 @@ def profile_text_blob(lot: Lot) -> str:
     ).strip()
 
 
+def is_cyrillic_female_first_name(name: str) -> bool:
+    """Кириллическое имя с женскими признаками (а/я, -ия, список имён)."""
+    fn = (name or "").strip().lower()
+    if not fn or not _CYR_RE.search(fn):
+        return False
+    if _STRICT_FEMALE_NAME_RE.search(fn):
+        return True
+    if _FEMALE_NAME_END_RE.search(fn):
+        return True
+    if fn in _AMBIGUOUS_RU_NAMES:
+        return True
+    if len(fn) >= 4 and fn.endswith(("а", "я")):
+        if _MALE_SHORT_NICK_RE.search(fn):
+            return False
+        if _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS_RU_NAMES:
+            return False
+        return True
+    return False
+
+
 def looks_male(lot: Lot) -> bool:
+    fn = (lot.first_name or "").strip().lower()
+    if fn and is_cyrillic_female_first_name(fn):
+        return False
     blob = profile_text_blob(lot).lower()
     if _MALE_HINT_RE.search(blob):
         return True
-    fn = (lot.first_name or "").strip().lower()
     ln = (lot.last_name or "").strip().lower()
     if fn and _MALE_NAMES_RE.search(fn):
+        if fn in _AMBIGUOUS_RU_NAMES:
+            return False
         return True
     if len(fn) >= 3:
         if fn.endswith(("ич", "он", "ил", "ём", "ем", "ур", "им")):
@@ -263,7 +299,9 @@ def looks_female(lot: Lot) -> bool:
         return False
     fn = (lot.first_name or "").strip().lower()
     ln = (lot.last_name or "").strip().lower()
-    if fn and _MALE_NAMES_RE.search(fn):
+    if fn and is_cyrillic_female_first_name(fn):
+        return True
+    if fn and _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS_RU_NAMES:
         return False
     blob = profile_text_blob(lot).lower()
     if _FEMALE_HINT_RE.search(blob):
@@ -305,11 +343,13 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
+    if not looks_female(lot):
+        return "не женский"
     return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Без мужчин/рекламы. Неизвестный профиль (пустое имя, латинский ник) — ок."""
+    """Женский профиль без мужчин/рекламы. Пустой/нейтральный латинский ник — нет."""
     return not female_filter_reason(lot)
 
 
@@ -1636,8 +1676,10 @@ def is_russian_lot(lot: Lot) -> bool | None:
         return True
     if _CYR_RE.search(blob):
         return True
-    # Латинский ник/имя без явных чужих сигналов — неизвестно, не режем.
-    # У русских почти всегда латинский username; lang_code Telegram часто пустой.
+    # Латиница без кириллицы и без lang=ru — не русский (иностранцы с @gifttrader).
+    # Русские с латинским ником почти всегда имеют кириллическое имя после enrich.
+    if blob:
+        return False
     return None
 
 

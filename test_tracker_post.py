@@ -43,10 +43,10 @@ def _filter(lots: list[Lot]):
     )
 
 
-def test_latin_username_is_unknown_not_foreign() -> None:
-    """Типичный продавец: латинский ник, без lang_code — не режем как не-RU."""
+def test_latin_username_without_cyrillic_is_not_ru() -> None:
+    """Латинский ник без кириллицы в профиле — не русский."""
     lot = _lot()
-    assert is_russian_lot(lot) is None
+    assert is_russian_lot(lot) is False
 
 
 def test_empty_profile_is_unknown() -> None:
@@ -84,17 +84,17 @@ def test_saudi_flag_is_not_ru() -> None:
     assert is_russian_lot(lot) is False
 
 
-def test_filter_posts_latin_seller_with_strict_ru() -> None:
-    """Баг /status: 12 в очереди, 0 в канал — все латинские ники резались как не-RU."""
+def test_filter_skips_latin_seller_without_cyrillic() -> None:
+    """Латинский ник + латинское имя без кириллицы — не RU."""
     lot = _lot()
     out, stats = _filter([lot])
-    assert stats["non_ru"] == 0
-    assert len(out) == 1
-    assert out[0].id == "lot-1"
+    assert stats["non_ru"] == 1
+    assert out == []
 
 
-def test_filter_posts_cyrillic_seller() -> None:
-    lot = _lot(first_name="Мария")
+def test_russian_woman_latin_nick_passes_ru() -> None:
+    lot = _lot(first_name="Мария", seller="cryptogifts", lang_code="")
+    assert is_russian_lot(lot) is True
     out, stats = _filter([lot])
     assert stats["non_ru"] == 0
     assert len(out) == 1
@@ -108,21 +108,21 @@ def test_filter_skips_arabic_seller() -> None:
 
 
 def test_filter_skips_paid_dm() -> None:
-    lot = _lot(free_dm=False, paid_dm_stars=50)
+    lot = _lot(first_name="Мария", seller="mariagifts", free_dm=False, paid_dm_stars=50)
     out, stats = _filter([lot])
     assert stats["paid"] == 1
     assert out == []
 
 
 def test_filter_skips_high_level() -> None:
-    lot = _lot(account_level=5)
+    lot = _lot(first_name="Мария", seller="mariagifts", account_level=5)
     out, stats = _filter([lot])
     assert stats["level"] == 1
     assert out == []
 
 
 def test_filter_allows_unknown_level() -> None:
-    lot = _lot(account_level=None)
+    lot = _lot(first_name="Мария", seller="mariagifts", account_level=None)
     out, stats = _filter([lot])
     assert stats["level"] == 0
     assert len(out) == 1
@@ -233,13 +233,13 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
-def test_neutral_profile_passes_female_filter() -> None:
-    """Пустое имя + нейтральный ник — не режем (было female−19 из 23)."""
+def test_neutral_profile_rejected_by_female_filter() -> None:
+    """Пустое имя + нейтральный ник — не девочка."""
     lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
-    assert is_clean_female_profile(lot) is True
+    assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
-    assert stats["not_female"] == 0
-    assert len(out) == 1
+    assert stats["not_female"] == 1
+    assert out == []
 
 
 def test_male_username_blocked() -> None:
@@ -267,7 +267,7 @@ def test_migrate_schema5_enables_girls_and_market() -> None:
 
 def main() -> None:
     tests = [
-        test_latin_username_is_unknown_not_foreign,
+        test_latin_username_without_cyrillic_is_not_ru,
         test_empty_profile_is_unknown,
         test_cyrillic_name_is_ru,
         test_ru_flag_is_ru,
@@ -275,8 +275,8 @@ def main() -> None:
         test_arabic_name_is_not_ru,
         test_lang_ar_is_not_ru,
         test_saudi_flag_is_not_ru,
-        test_filter_posts_latin_seller_with_strict_ru,
-        test_filter_posts_cyrillic_seller,
+        test_filter_skips_latin_seller_without_cyrillic,
+        test_russian_woman_latin_nick_passes_ru,
         test_filter_skips_arabic_seller,
         test_filter_skips_paid_dm,
         test_filter_skips_high_level,
@@ -287,7 +287,7 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
-        test_neutral_profile_passes_female_filter,
+        test_neutral_profile_rejected_by_female_filter,
         test_male_username_blocked,
         test_migrate_schema5_enables_girls_and_market,
     ]

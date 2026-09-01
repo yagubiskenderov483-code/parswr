@@ -48,17 +48,19 @@ def _filter_batch(
 
 
 def test_scenario_23_like_bothost() -> None:
-    """19 нейтральных + 3 фермы + 1 завышение = 19 в канал."""
+    """19 девочек + 3 фермы + 1 завышение = 19 в канал."""
     book = MarketPriceBook()
     # Пол коллекции ~3.5k — лоты 3.2–4k ок, дамп 10k нет
     book.set_floor(["desk calendar", "cid:99"], 3500.0)
     lots: list[Lot] = []
+    names = ("Анна", "Мария", "Елена", "Ольга", "Катя", "Юля", "Даша")
     for i in range(19):
         lots.append(
             _lot(
                 id=f"n{i}",
                 seller=f"nfttrader{i}",
                 seller_id=100 + i,
+                first_name=names[i % len(names)],
                 stars=3200.0 + i,
             )
         )
@@ -68,6 +70,7 @@ def test_scenario_23_like_bothost() -> None:
                 id=f"farm{i}",
                 seller=f"farmer{i}",
                 seller_id=200 + i,
+                first_name="Анна",
                 gifts_count=45,
                 stars=4000.0,
             )
@@ -104,13 +107,44 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_ru_unknown_passes() -> None:
-    lot = _lot(seller="cryptogifts", first_name="", lang_code="")
-    assert is_russian_lot(lot) is None
-    passed, stats = _filter_batch([lot])
+def test_latin_foreign_rejected_russian_woman_passes() -> None:
+    lot_foreign = _lot(seller="cryptogifts", first_name="", lang_code="")
+    assert is_russian_lot(lot_foreign) is False
+    passed_f, stats_f = _filter_batch([lot_foreign])
+    assert passed_f == []
+    assert stats_f["non_ru"] + stats_f["not_female"] >= 1
+
+    lot_ru = _lot(
+        seller="cryptogifts",
+        first_name="Мария",
+        seller_id=999,
+        lang_code="en",
+    )
+    assert is_russian_lot(lot_ru) is True
+    passed_r, stats_r = _filter_batch([lot_ru])
+    assert stats_r["non_ru"] == 0
+    assert len(passed_r) == 1
+
+
+def test_seven_women_pass_filters() -> None:
+    """7 русских девочек с латинскими никами — все в канал."""
+    book = MarketPriceBook()
+    book.set_floor(["desk calendar", "cid:99"], 3500.0)
+    names = ("Мария", "Анна", "Елена", "Катя", "Ольга", "Саша", "Даша")
+    lots = [
+        _lot(
+            id=f"w{i}",
+            seller=f"giftgirl{i}",
+            seller_id=500 + i,
+            first_name=name,
+            stars=3800.0,
+        )
+        for i, name in enumerate(names)
+    ]
+    passed, stats = _filter_batch(lots, book)
+    assert stats["not_female"] == 0
     assert stats["non_ru"] == 0
-    assert stats["unknown_ru"] == 1
-    assert len(passed) == 1
+    assert len(passed) == 7
 
 
 def test_boy_blocked_girl_passes() -> None:
@@ -130,7 +164,12 @@ def test_various_prices_pass_filters() -> None:
     book = MarketPriceBook()
     book.set_floor(["desk calendar", "cid:99"], 3500.0)
     for stars in (2500.0, 4200.0):
-        lot = _lot(stars=stars, seller=f"u{int(stars)}", seller_id=int(stars))
+        lot = _lot(
+            stars=stars,
+            seller=f"u{int(stars)}",
+            seller_id=int(stars),
+            first_name="Анна",
+        )
         passed, stats = _filter_batch([lot], book)
         assert len(passed) == 1
         assert stats["overprice"] == 0
@@ -155,7 +194,8 @@ def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_ru_unknown_passes,
+        test_latin_foreign_rejected_russian_woman_passes,
+        test_seven_women_pass_filters,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,

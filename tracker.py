@@ -1103,7 +1103,7 @@ async def poll_once(
 
 
 async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
-    """Профиль продавца: level, язык, gifts — нужны для RU/level/NFT фильтров."""
+    """Профиль продавца: level, язык, gifts — нужны для RU/level/NFT/женский фильтр."""
     if not lot.seller or lot.seller_id is None:
         try:
             await m.resolve_owner(lot, timeout=5.0)
@@ -1122,15 +1122,22 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
             or lot.free_dm is None
             or lot.is_premium is None
             or (cfg.strict_ru and not lot.lang_code)
+            or (cfg.female_only and not (lot.first_name or "").strip())
+            or (cfg.female_only and not (lot.about or "").strip())
         )
         if not need_profile:
             break
         try:
-            await m.enrich_profiles([lot], timeout=3.0, parallel=1)
+            await m.enrich_profiles([lot], timeout=4.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
         if attempt == len(delays) - 1:
             break
+    if cfg.female_only and not (lot.first_name or "").strip() and lot.seller_id:
+        try:
+            await m.refresh_online([lot], timeout=3.5)
+        except Exception:  # noqa: BLE001
+            pass
     if lot.free_dm is None:
         try:
             await m.check_free_dm([lot], timeout=2.5)
@@ -1381,7 +1388,7 @@ def _skip_reason(stats: dict[str, int]) -> str:
     if stats.get("many_gifts"):
         parts.append("много NFT")
     if stats.get("not_female"):
-        parts.append("мужской/реклама")
+        parts.append("не девочка")
     if stats.get("overprice"):
         parts.append("завышена цена")
     if stats.get("paid"):
@@ -1533,6 +1540,7 @@ class PostQueue:
                                 "реклама",
                                 "отзывы",
                                 "giftdouble",
+                                "не женский",
                             }
                         )
                         or fstats["overprice"]
@@ -1609,8 +1617,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.3"
-BUILD_TAG = "v3.9.3-verified"
+TRACKER_VERSION = "3.9.4"
+BUILD_TAG = "v3.9.4-women-ru"
 
 
 @dataclass

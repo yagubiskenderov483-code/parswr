@@ -962,7 +962,24 @@ class App:
         self.phone = phone
         self.phone_code_hash = result.phone_code_hash
         self.logged_in = False
-        return "Код отправлен."
+        from tracker_bot import _sent_code_hint
+
+        return _sent_code_hint(result)
+
+    async def resend_sms(self) -> str:
+        if not self.phone:
+            raise ValueError("Сначала номер.")
+        await self.ensure_connected()
+        from tracker_bot import _sent_code_hint
+
+        try:
+            result = await self.client.send_code_request(
+                self.phone, force_sms=True
+            )
+        except FloodWaitError as exc:
+            raise ValueError(f"Подожди {exc.seconds} сек.") from exc
+        self.phone_code_hash = result.phone_code_hash
+        return _sent_code_hint(result)
 
     async def confirm_code(self, code: str) -> str:
         if not self.phone or not self.phone_code_hash:
@@ -3897,11 +3914,24 @@ async def got_phone(message: Message, state: FSMContext) -> None:
         await message.answer(f"⚠️ {exc}")
         return
     await state.set_state(AuthStates.code)
-    await message.answer(f"{reply} Пришли код:")
+    await message.answer(
+        f"{reply}\n\nПришли код сюда. Если пусто — напиши <code>смс</code>."
+    )
 
 
 @router.message(StateFilter(AuthStates.code))
 async def got_code(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        return
+    if raw.lower() in {"смс", "sms", "повтор", "resend"}:
+        try:
+            reply = await app.resend_sms()
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"⚠️ {exc}")
+            return
+        await message.answer(reply)
+        return
     try:
         result = await app.confirm_code(message.text or "")
     except Exception as exc:  # noqa: BLE001

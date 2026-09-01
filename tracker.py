@@ -1680,8 +1680,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.3"
-BUILD_TAG = "v3.10.3-name-or-bio"
+TRACKER_VERSION = "3.10.4"
+BUILD_TAG = "v3.10.4-login-sms"
 
 
 @dataclass

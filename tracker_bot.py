@@ -28,6 +28,8 @@ from telethon.errors import (
     FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberFloodError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
@@ -126,6 +128,45 @@ def _normalize_phone(phone: str) -> str:
     return phone
 
 
+def _sent_code_hint(result: Any) -> str:
+    """Куда Telegram отправил код: приложение / SMS / звонок / слово."""
+    t = getattr(result, "type", None)
+    name = type(t).__name__ if t is not None else ""
+    timeout = getattr(t, "timeout", None) or getattr(result, "timeout", None)
+    extra = f"\nКод живёт ~{int(timeout)}с." if timeout else ""
+    if "App" in name:
+        return (
+            "Код ушёл <b>в приложение Telegram</b> на этот номер "
+            "(чат «Telegram» / уведомление входа) — это не SMS."
+            f"{extra}\n"
+            "Нет кода? Напиши <code>смс</code> — отправим SMS."
+        )
+    if "Word" in name or "Phrase" in name:
+        return (
+            "Telegram прислал <b>слово/фразу</b>, не цифры. "
+            "Введи её сюда как есть."
+            f"{extra}"
+        )
+    if "Call" in name or "Flash" in name or "Missed" in name:
+        return (
+            "Код придёт <b>звонком</b> на номер (последние цифры — код)."
+            f"{extra}\n"
+            "Нет звонка? Напиши <code>смс</code>."
+        )
+    if "Email" in name:
+        return "Код ушёл на <b>email</b>, привязанный к аккаунту." + extra
+    if "Fragment" in name:
+        return "Код через Fragment/анонимный номер." + extra
+    if "Sms" in name or "Firebase" in name:
+        return "Код ушёл <b>SMS</b> на номер. Подожди 1–2 минуты." + extra
+    return (
+        "Код отправлен. Смотри приложение Telegram на этом номере "
+        "(не SMS)."
+        f"{extra}\n"
+        "Нет кода? Напиши <code>смс</code>."
+    )
+
+
 class AuthFlow:
     def __init__(self, client: TelegramClient, session_file: str) -> None:
         self.client = client
@@ -141,11 +182,40 @@ class AuthFlow:
             result = await self.client.send_code_request(phone)
         except PhoneNumberInvalidError as exc:
             raise ValueError("Неверный номер. Пример: +79991234567") from exc
+        except PhoneNumberBannedError as exc:
+            raise ValueError("Номер заблокирован в Telegram.") from exc
+        except PhoneNumberFloodError as exc:
+            raise ValueError(
+                "Слишком много запросов кода на этот номер. Подожди несколько часов."
+            ) from exc
         except FloodWaitError as exc:
-            raise ValueError(f"Подожди {exc.seconds} сек.") from exc
+            raise ValueError(f"Подожди {exc.seconds} сек. и запроси код снова.") from exc
         self.phone = phone
         self.phone_code_hash = result.phone_code_hash
-        return "Код отправлен."
+        logger.info(
+            "send_code %s type=%s",
+            phone,
+            type(getattr(result, "type", None)).__name__,
+        )
+        return _sent_code_hint(result)
+
+    async def resend_sms(self) -> str:
+        if not self.phone:
+            raise ValueError("Сначала отправь номер.")
+        if not self.client.is_connected():
+            await self.client.connect()
+        try:
+            result = await self.client.send_code_request(
+                self.phone, force_sms=True
+            )
+        except FloodWaitError as exc:
+            raise ValueError(f"Подожди {exc.seconds} сек.") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"SMS не ушло: {exc}. Смотри код в приложении Telegram."
+            ) from exc
+        self.phone_code_hash = result.phone_code_hash
+        return _sent_code_hint(result)
 
     async def confirm_code(self, code: str) -> str:
         if not self.phone or not self.phone_code_hash:
@@ -785,10 +855,25 @@ def build_router(
             await message.answer(f"⚠️ {exc}")
             return
         await state.set_state(LoginStates.code)
-        await message.answer(f"{reply} Пришли код из Telegram:")
+        await message.answer(
+            f"{reply}\n\n"
+            "Пришли код сюда.\n"
+            "Если пусто — напиши <code>смс</code>."
+        )
 
     @router.message(StateFilter(LoginStates.code))
     async def got_code(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if raw.startswith("/"):
+            return
+        if raw.lower() in {"смс", "sms", "повтор", "resend"}:
+            try:
+                reply = await auth.resend_sms()
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(f"⚠️ {exc}")
+                return
+            await message.answer(reply)
+            return
         try:
             result = await auth.confirm_code(message.text or "")
         except Exception as exc:  # noqa: BLE001

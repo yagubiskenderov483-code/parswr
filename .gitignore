@@ -159,8 +159,6 @@ venv.bak/
 
 # Runtime / secrets
 data/*
-!data/gifts.db
-!data/gifts.db-*
 !data/.gitkeep
 *.db
 !data/gifts.db

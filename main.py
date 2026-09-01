@@ -1,4 +1,5 @@
-"""Bothost entry point — запускает только гифт-трекер."""
+"""Bothost entry: python main.py"""
+
 from tracker import main
 
 if __name__ == "__main__":

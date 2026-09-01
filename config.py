@@ -1,0 +1,100 @@
+"""Жёсткие настройки гифт-трекера."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# @jsjeigiejwhnewbot
+BOT_USERNAME = "jsjeigiejwhnewbot"
+BOT_TOKEN = "8825465611:AAE8-3_hFqU32_-gUJLbvZC96i-MvDl3lNA"
+
+# User API (my.telegram.org) — вход в аккаунт для payments.getResaleStarGifts
+API_ID = 36101343
+API_HASH = "116195fa5e0459d25a9a6266b40807d7"
+
+CHANNEL_ID = -1003784435307
+
+MIN_STARS = 3000
+MAX_STARS = 25000
+MAX_ACCOUNT_LEVEL = 2
+MAX_NFTS = 12
+POST_INTERVAL = 4.0
+
+# Курс для строки «X Stars / Y TON» (как в tracker market)
+TON_RATE = 0.0102
+TZ_OFFSET = 3.0  # МСК
+
+POLL_INTERVAL = 0.08
+PAGE_LIMIT = 12
+SCAN_BATCH = 16
+SCAN_PARALLEL = 2
+REQUEST_GAP = 0.02
+REQUEST_TIMEOUT = 8.0
+ENRICH_TIMEOUT = 5.0
+
+TRACKER_VERSION = "4.0.0"
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def data_dir() -> Path:
+    bothost = Path("/app/data")
+    if bothost.is_dir():
+        return bothost
+    local = BASE_DIR / "data"
+    local.mkdir(parents=True, exist_ok=True)
+    return local
+
+
+def session_path() -> Path:
+    raw = (os.environ.get("SESSION_FILE") or "").strip()
+    if raw:
+        return Path(raw)
+    return data_dir() / "tracker_session.txt"
+
+
+def state_path() -> Path:
+    raw = (os.environ.get("STATE_FILE") or "").strip()
+    if raw:
+        return Path(raw)
+    return data_dir() / "tracker_state.json"
+
+
+def catalog_path() -> Path:
+    return data_dir() / "tracker_catalog.json"
+
+
+def env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def bot_token() -> str:
+    return (BOT_TOKEN or os.environ.get("BOT_TOKEN") or "").strip()
+
+
+def api_id() -> int:
+    return env_int("API_ID", API_ID)
+
+
+def api_hash() -> str:
+    return (os.environ.get("API_HASH") or API_HASH).strip()
+
+
+def channel_id() -> int:
+    return env_int("CHANNEL_ID", CHANNEL_ID)

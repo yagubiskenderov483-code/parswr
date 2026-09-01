@@ -203,6 +203,9 @@ def test_scan_batch_backfills_around_bad_collections() -> None:
         def is_collection_bad(self, gid: int) -> bool:
             return gid in self._bad
 
+        def hot_collection_ids(self, limit: int = 8) -> list[int]:
+            return []
+
     cfg = Config.__new__(Config)
     object.__setattr__(cfg, "scan_batch", 24)
     m = _StubMarket()

@@ -695,6 +695,22 @@ class TelegramMarket:
         self.check_no = 0
         self.last_error = ""
         self._bad_until: dict[int, float] = {}
+        self._ok_at: dict[int, float] = {}
+        self._rpc_sem = asyncio.Semaphore(2)
+
+    def mark_collection_ok(self, gift_id: int) -> None:
+        self._ok_at[int(gift_id)] = time.time()
+        self._bad_until.pop(int(gift_id), None)
+
+    def hot_collection_ids(self, limit: int = 8) -> list[int]:
+        now = time.time()
+        live = [
+            (gid, ts)
+            for gid, ts in self._ok_at.items()
+            if now - ts < 600 and not self.is_collection_bad(gid)
+        ]
+        live.sort(key=lambda x: -x[1])
+        return [gid for gid, _ in live[: max(0, int(limit))]]
 
     def mark_collection_bad(self, gift_id: int, cooldown: float = 300.0) -> None:
         self._bad_until[int(gift_id)] = time.time() + max(30.0, float(cooldown))
@@ -1662,23 +1678,24 @@ class TelegramMarket:
             try:
                 await self._wait_flood()
                 await self.ensure_connected()
-                async with self._gap_lock:
-                    wait = gap - (time.monotonic() - self._last_req)
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    self._last_req = time.monotonic()
-                return await asyncio.wait_for(
-                    self.client(
-                        GetResaleStarGiftsRequest(
-                            gift_id=gift_id,
-                            offset=offset or "",
-                            limit=min(limit, 50),
-                            stars_only=True if stars_only else None,
-                            sort_by_price=True if sort_by_price else None,
-                        )
-                    ),
-                    timeout=timeout,
-                )
+                async with self._rpc_sem:
+                    async with self._gap_lock:
+                        wait = gap - (time.monotonic() - self._last_req)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        self._last_req = time.monotonic()
+                    return await asyncio.wait_for(
+                        self.client(
+                            GetResaleStarGiftsRequest(
+                                gift_id=gift_id,
+                                offset=offset or "",
+                                limit=min(limit, 50),
+                                stars_only=True if stars_only else None,
+                                sort_by_price=True if sort_by_price else None,
+                            )
+                        ),
+                        timeout=timeout,
+                    )
             except FloodWaitError as exc:
                 stats["floods"] += 1
                 wait_s = float(exc.seconds) + 1.5

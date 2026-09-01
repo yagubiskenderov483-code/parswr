@@ -259,15 +259,15 @@ class Config:
     min_stars: float = 5000.0
     max_stars: float = 25000.0
     poll_interval: float = 0.05
-    page_limit: int = 8  # верх resale-листа (свежие)
-    parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
+    page_limit: int = 10  # верх resale-листа (свежие)
+    parallel: int = 2  # 1 Telethon-канал: больше 2 — таймауты копятся
     gap: float = 0.01
-    timeout: float = 6.0  # Bothost медленный: 3s резало живые ответы API
-    enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
-    enrich_parallel: int = 6
-    scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 36  # быстрее полный круг по 150 коллекциям
-    hot_limit: int = 2  # только что выставили (верх листа)
+    timeout: float = 8.0  # дать API ответить, не отменять RPC
+    enrich_cap: int = 60
+    enrich_parallel: int = 4
+    scan_pages: int = 1
+    scan_batch: int = 12  # короткий проход, чаще полный круг
+    hot_limit: int = 5  # только что выставили (верх листа)
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
     post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
@@ -330,15 +330,15 @@ class Config:
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
             poll_interval=_f("POLL_INTERVAL", 0.05),
-            page_limit=int(_f("PAGE_LIMIT", 8)),
-            parallel=min(6, int(_f("PARALLEL", 6))),
+            page_limit=int(_f("PAGE_LIMIT", 10)),
+            parallel=min(3, int(_f("PARALLEL", 2))),
             gap=_f("REQUEST_GAP", 0.01),
-            timeout=_f("REQUEST_TIMEOUT", 6.0),
+            timeout=_f("REQUEST_TIMEOUT", 8.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
-            enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
+            enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 36)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 2))),
+            scan_batch=int(_f("SCAN_BATCH", 12)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 5))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
             post_interval=_f("POST_INTERVAL", 1.5),
@@ -851,12 +851,18 @@ def _select_scan_batch(
         return [g for g in batch if not m.is_collection_bad(g)] or batch
     # Добираем до полного батча, пропуская bad — иначе проход усыхает (24 → 9)
     take = min(n, cfg.scan_batch)
-    batch: list[int] = []
+    hot_n = min(max(2, take // 2), take)
+    hot = [
+        gid
+        for gid in m.hot_collection_ids(hot_n)
+        if gid in set(gift_ids) and not m.is_collection_bad(gid)
+    ]
+    batch: list[int] = list(dict.fromkeys(hot))
     step = 0
     while len(batch) < take and step < n:
         gid = gift_ids[(m._cursor + step) % n]
         step += 1
-        if m.is_collection_bad(gid):
+        if m.is_collection_bad(gid) or gid in batch:
             continue
         batch.append(gid)
     m._cursor = (m._cursor + step) % n
@@ -969,7 +975,7 @@ async def _fetch_collection_pages(
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
-        m.mark_collection_bad(gid, cooldown=120.0)
+        m.mark_collection_bad(gid, cooldown=45.0)
         return []
     m._remember_users(market_mod._extract_users(result))
     parsed = market_mod._parse_result(result)
@@ -978,6 +984,7 @@ async def _fetch_collection_pages(
     if parsed:
         stats["parsed"] += len(parsed)
         stats["ok"] += 1
+        m.mark_collection_ok(gid)
     return parsed
 
 
@@ -1671,8 +1678,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.1"
-BUILD_TAG = "v3.10.1-nameerror"
+TRACKER_VERSION = "3.10.2"
+BUILD_TAG = "v3.10.2-hot-scan"
 
 
 @dataclass
@@ -1708,7 +1715,7 @@ class TrackerRuntime:
     send_errors_total: int = 0
     last_send_error: str = ""
     post_via: str = ""
-    scan_parallel: int = 8
+    scan_parallel: int = 2
     seen_lots: int = 0
     queue_pending: int = 0
     collections_total: int = 0
@@ -1937,8 +1944,7 @@ async def scanner_loop(
 
         spent = time.monotonic() - started
         floods = int(scan.get("floods", 0) or 0)
-        err_ratio = (errors / scanned) if scanned > 0 else 0.0
-        if floods > 3 and runtime.scan_parallel > 4:
+        if floods > 3 and runtime.scan_parallel > 2:
             runtime.scan_parallel -= 1
             cfg.parallel = runtime.scan_parallel
             logger.warning(
@@ -1946,24 +1952,9 @@ async def scanner_loop(
                 floods,
                 runtime.scan_parallel,
             )
-        elif err_ratio > 0.5 and runtime.scan_parallel > 4:
-            # таймауты — не повод замедляться до 3: скан и так буксует
-            runtime.scan_parallel -= 1
-            cfg.parallel = runtime.scan_parallel
-            logger.warning(
-                "Много ошибок API (%s/%s) — parallel=%s · %s",
-                errors,
-                scanned,
-                runtime.scan_parallel,
-                m.last_error or "",
-            )
-        elif (
-            floods == 0
-            and err_ratio < 0.25
-            and runtime.scan_parallel < 6
-        ):
-            runtime.scan_parallel += 1
-            cfg.parallel = runtime.scan_parallel
+        elif floods == 0 and runtime.scan_parallel < 2:
+            runtime.scan_parallel = 2
+            cfg.parallel = 2
 
         await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
 

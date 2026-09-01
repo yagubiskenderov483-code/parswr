@@ -43,10 +43,10 @@ def _filter(lots: list[Lot]):
     )
 
 
-def test_latin_username_without_cyrillic_is_not_ru() -> None:
-    """Латинский ник без кириллицы в профиле — не русский."""
+def test_latin_username_is_unknown_not_foreign() -> None:
+    """Латинский ник без lang_code — неизвестно, не режем (простой режим)."""
     lot = _lot()
-    assert is_russian_lot(lot) is False
+    assert is_russian_lot(lot) is None
 
 
 def test_empty_profile_is_unknown() -> None:
@@ -84,12 +84,13 @@ def test_saudi_flag_is_not_ru() -> None:
     assert is_russian_lot(lot) is False
 
 
-def test_filter_skips_latin_seller_without_cyrillic() -> None:
-    """Латинский ник + латинское имя без кириллицы — не RU."""
+def test_filter_posts_latin_seller_with_strict_ru() -> None:
+    """Латинский ник при RU=да проходит как «неизвестно» — выдача не глохнет."""
     lot = _lot()
     out, stats = _filter([lot])
-    assert stats["non_ru"] == 1
-    assert out == []
+    assert stats["non_ru"] == 0
+    assert stats["unknown_ru"] == 1
+    assert len(out) == 1
 
 
 def test_russian_woman_latin_nick_passes_ru() -> None:
@@ -213,8 +214,10 @@ def test_migrate_schema4_file_upgrades() -> None:
         ensure_default_filters(path)
         migrated = migrate_legacy_filters(load_filters(path))
         assert migrated["filter_schema"] == FILTER_SCHEMA
-        assert migrated["female_only"] is True
-        assert migrated["strict_fair_price"] is True
+        assert migrated["female_only"] is False
+        assert migrated["strict_fair_price"] is False
+        assert migrated["min_stars"] == 5000.0
+        assert migrated["max_stars"] == 25000.0
 
 
 def test_female_skips_boys() -> None:
@@ -233,13 +236,31 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
-def test_neutral_profile_rejected() -> None:
-    """Пустое имя + нейтральный латинский ник — режется RU-фильтром."""
+def test_neutral_profile_rejected_when_female_on() -> None:
+    """Girls-only включён: пустое имя + нейтральный ник — не постим."""
     lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
     assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
-    assert stats["non_ru"] == 1
+    assert stats["not_female"] == 1
+    assert stats["female_noname"] == 1
     assert out == []
+
+
+def test_simple_mode_neutral_lot_passes() -> None:
+    """Режим по умолчанию (без girls-only и рынка): нейтральный лот постится."""
+    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
+    out, stats = filter_for_post(
+        [lot],
+        {},
+        now=time.time(),
+        strict_ru=True,
+        strict_free=False,
+        max_account_level=2,
+        max_gifts=20,
+        female_only=False,
+        strict_fair_price=False,
+    )
+    assert len(out) == 1
 
 
 def test_hidden_name_ru_profile_counted_as_noname() -> None:
@@ -274,24 +295,27 @@ def test_male_username_blocked() -> None:
     assert out == []
 
 
-def test_migrate_schema5_enables_girls_and_market() -> None:
+def test_migrate_schema6_resets_to_simple() -> None:
+    """schema<6 (включая girls-only) → простой режим 5k–25k."""
     out = migrate_legacy_filters(
         {
-            "filter_schema": 4,
-            "female_only": False,
-            "strict_fair_price": False,
-            "min_stars": 5000,
-            "max_stars": 25000,
+            "filter_schema": 5,
+            "female_only": True,
+            "strict_fair_price": True,
+            "min_stars": 2000,
+            "max_stars": 5000,
         }
     )
     assert out["filter_schema"] == FILTER_SCHEMA
-    assert out["female_only"] is True
-    assert out["strict_fair_price"] is True
+    assert out["female_only"] is False
+    assert out["strict_fair_price"] is False
+    assert out["min_stars"] == 5000.0
+    assert out["max_stars"] == 25000.0
 
 
 def main() -> None:
     tests = [
-        test_latin_username_without_cyrillic_is_not_ru,
+        test_latin_username_is_unknown_not_foreign,
         test_empty_profile_is_unknown,
         test_cyrillic_name_is_ru,
         test_ru_flag_is_ru,
@@ -299,7 +323,7 @@ def main() -> None:
         test_arabic_name_is_not_ru,
         test_lang_ar_is_not_ru,
         test_saudi_flag_is_not_ru,
-        test_filter_skips_latin_seller_without_cyrillic,
+        test_filter_posts_latin_seller_with_strict_ru,
         test_russian_woman_latin_nick_passes_ru,
         test_filter_skips_arabic_seller,
         test_filter_skips_paid_dm,
@@ -311,11 +335,12 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
-        test_neutral_profile_rejected,
+        test_neutral_profile_rejected_when_female_on,
+        test_simple_mode_neutral_lot_passes,
         test_hidden_name_ru_profile_counted_as_noname,
         test_latin_female_name_passes,
         test_male_username_blocked,
-        test_migrate_schema5_enables_girls_and_market,
+        test_migrate_schema6_resets_to_simple,
     ]
     for fn in tests:
         fn()

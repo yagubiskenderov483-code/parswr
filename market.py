@@ -1734,10 +1734,8 @@ def is_russian_lot(lot: Lot) -> bool | None:
         return True
     if _CYR_RE.search(blob):
         return True
-    # Латиница без кириллицы и без lang=ru — не русский (иностранцы с @gifttrader).
-    # Русские с латинским ником почти всегда имеют кириллическое имя после enrich.
-    if blob:
-        return False
+    # Латинский ник/имя без явных чужих сигналов — неизвестно, не режем:
+    # у русских почти всегда латинский username, lang_code часто пустой.
     return None
 
 

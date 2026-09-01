@@ -107,12 +107,13 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_foreign_rejected_russian_woman_passes() -> None:
+def test_latin_neutral_cut_only_by_girls_filter() -> None:
+    """RU не режет латиницу; girls-only (если включён) режет профиль без имени."""
     lot_foreign = _lot(seller="cryptogifts", first_name="", lang_code="")
-    assert is_russian_lot(lot_foreign) is False
+    assert is_russian_lot(lot_foreign) is None
     passed_f, stats_f = _filter_batch([lot_foreign])
     assert passed_f == []
-    assert stats_f["non_ru"] + stats_f["not_female"] >= 1
+    assert stats_f["not_female"] == 1
 
     lot_ru = _lot(
         seller="cryptogifts",
@@ -218,7 +219,7 @@ def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_foreign_rejected_russian_woman_passes,
+        test_latin_neutral_cut_only_by_girls_filter,
         test_seven_women_pass_filters,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,

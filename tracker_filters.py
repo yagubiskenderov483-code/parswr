@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 5
+FILTER_SCHEMA = 6
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -107,8 +107,8 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "max_account_level": 2,
     "max_gifts": 20,
     "post_interval": 1.5,
-    "female_only": True,
-    "strict_fair_price": True,
+    "female_only": False,
+    "strict_fair_price": False,
     "fair_price_ratio": 1.55,
 }
 
@@ -127,18 +127,10 @@ def ensure_default_filters(path: Path) -> None:
 
 
 def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
-    """Старый пресет 2k–5k → 5k–25k; schema<5 → девочки + рынок коллекции."""
+    """schema<6 → простой режим: 5k–25k, без girls-only и проверки рынка."""
     if not data:
         return dict(DEFAULT_FILTER_DATA)
     out = dict(data)
-    try:
-        mn = float(out.get("min_stars", 0))
-        mx = float(out.get("max_stars", 0))
-    except (TypeError, ValueError):
-        mn = mx = 0.0
-    if abs(mn - 2000) < 1 and abs(mx - 5000) < 1:
-        out["min_stars"] = 5000.0
-        out["max_stars"] = 25000.0
     schema = int(out.get("filter_schema", 0) or 0)
     if schema < 2:
         out["post_interval"] = min(float(out.get("post_interval", 3.0) or 3.0), 1.5)
@@ -153,8 +145,10 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
             out["max_gifts"] = 20
     if schema < FILTER_SCHEMA:
         out["filter_schema"] = FILTER_SCHEMA
-        out["female_only"] = True
-        out["strict_fair_price"] = True
+        out["female_only"] = False
+        out["strict_fair_price"] = False
+        out["min_stars"] = 5000.0
+        out["max_stars"] = 25000.0
     return out
 
 

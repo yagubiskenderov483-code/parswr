@@ -9,9 +9,10 @@ from pathlib import Path
 BOT_USERNAME = "jsjeigiejwhnewbot"
 BOT_TOKEN = "8825465611:AAE8-3_hFqU32_-gUJLbvZC96i-MvDl3lNA"
 
-# User API (my.telegram.org) — вход в аккаунт для payments.getResaleStarGifts
-API_ID = 36101343
-API_HASH = "116195fa5e0459d25a9a6266b40807d7"
+# User API (my.telegram.org) — из реп Stars / ParserUs / Zayavki
+# старый 36101343 (ParserGift) забанен
+API_ID = 28687552
+API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 
 CHANNEL_ID = -1003784435307
 
@@ -33,7 +34,7 @@ REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 8.0
 ENRICH_TIMEOUT = 5.0
 
-TRACKER_VERSION = "4.0.0"
+TRACKER_VERSION = "4.0.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 

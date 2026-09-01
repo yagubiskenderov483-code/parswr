@@ -111,7 +111,8 @@ def test_hardcoded_filters() -> None:
     assert config.POST_INTERVAL == 4.0
     assert config.CHANNEL_ID == -1003784435307
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
-    assert config.API_ID and config.API_HASH
+    assert config.API_ID == 28687552
+    assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
 
 
 def test_girl_from_gifts_and_stories() -> None:

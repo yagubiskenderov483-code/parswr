@@ -149,7 +149,7 @@ def test_seven_women_pass_filters() -> None:
 
 def test_boy_blocked_girl_passes() -> None:
     boy, stats_b = _filter_batch(
-        [_lot(first_name="Alex", seller="alexgifts", seller_id=1)]
+        [_lot(first_name="Никита", seller="nikitagifts", seller_id=1)]
     )
     girl, stats_g = _filter_batch(
         [_lot(first_name="Мария", seller="mariagifts", seller_id=2)]

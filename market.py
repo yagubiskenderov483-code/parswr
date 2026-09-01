@@ -66,6 +66,36 @@ _AMBIGUOUS_RU_NAMES = frozenset(
     {"саша", "женя", "валя", "слава", "паша", "оля", "катя", "даша", "маша"}
 )
 _MALE_SHORT_NICK_RE = re.compile(r"(иша|уша|ёша|еша)$")
+# Мужские транслиты на -a: Dima, Vanya — чтобы -a-эвристика не считала их женскими
+_MALE_TRANSLIT_RE = re.compile(
+    r"^(?:"
+    r"nikita|ilya|ilia|misha|dima|vanya|vania|kostya|kostia|petya|petia|"
+    r"vasya|vasia|kolya|kolia|tolya|tolia|gosha|grisha|lyosha|lesha|alyosha|"
+    r"seryozha|serezha|seryoga|danila|danya|gena|styopa|stepa|borya|boria|"
+    r"fedya|fedia|mitya|mitia|senya|senia|yura|jura|roma|tima|sanya|sania|"
+    r"savva|luka|foma|seva|lyova|leva|zhora|vova|zhenya|"
+    r"mustafa|musa|isa|ali|akhmed|ahmed"
+    r")$",
+    re.IGNORECASE,
+)
+_LATIN_FEMALE_NAMES_RE = re.compile(
+    r"^(?:"
+    r"anna|anya|ania|maria|mariya|mariia|masha|elena|lena|olga|olya|olia|"
+    r"ekaterina|katerina|katya|katia|kate|katrin|yulia|julia|yuliya|julya|"
+    r"dasha|daria|darya|nastya|nastia|anastasia|anastasiya|polina|alina|arina|"
+    r"diana|vika|victoria|viktoria|viktoriya|kristina|christina|karina|marina|"
+    r"irina|ira|sofia|sofya|sophia|sonya|sonia|alisa|alice|liza|lisa|"
+    r"elizaveta|milana|mila|kira|vera|nadya|nadia|tanya|tania|tatiana|tatyana|"
+    r"natasha|natalia|nataliya|natali|sveta|svetlana|ksenia|kseniya|ksyusha|"
+    r"oksana|lera|valeria|valeriya|alena|alyona|angelina|veronika|veronica|"
+    r"varvara|varya|ulyana|uliana|zlata|eva|emma|rita|margarita|nina|galya|"
+    r"lyuba|luba|lyudmila|ludmila|luda|zhanna|inna|yana|jana|regina|snezhana|"
+    r"kamilla|camilla|amina|aliya|alia|elvira|albina|dinara|diora|madina|"
+    r"evgenia|evgeniya|olesya|olesia|lilya|lilia|liliya|elina|eleonora|"
+    r"vasilisa|taisia|taisiya|stefania|miroslava|yaroslava|vlada|vladislava"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -154,6 +184,7 @@ _MALE_NAMES_RE = re.compile(
     r"^(?:"
     r"никита|илья|саша|женя|ваня|петя|петя|коля|вася|дима|миша|паша|фома|лука|савва|"
     r"валера|слава|вова|лёша|леша|гоша|костя|артём|артем|макс|рома|"
+    r"юра|тима|лёва|лева|сеня|федя|митя|боря|гена|стёпа|степа|савва|"
     r"кирилл|егор|игорь|олег|влад|данил|даниил|андрей|алексей|сергей|павел|"
     r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
     r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|andrey|pavel|ilya|vlad"
@@ -226,29 +257,52 @@ def is_cyrillic_female_first_name(name: str) -> bool:
     fn = (name or "").strip().lower()
     if not fn or not _CYR_RE.search(fn):
         return False
+    if fn in _AMBIGUOUS_RU_NAMES:
+        return True
+    if _MALE_NAMES_RE.search(fn):
+        return False
+    if _MALE_SHORT_NICK_RE.search(fn):
+        return False
     if _STRICT_FEMALE_NAME_RE.search(fn):
         return True
     if _FEMALE_NAME_END_RE.search(fn):
         return True
-    if fn in _AMBIGUOUS_RU_NAMES:
+    if len(fn) >= 3 and fn.endswith(("а", "я")):
         return True
-    if len(fn) >= 4 and fn.endswith(("а", "я")):
-        if _MALE_SHORT_NICK_RE.search(fn):
-            return False
-        if _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS_RU_NAMES:
-            return False
+    return False
+
+
+def is_latin_female_first_name(name: str) -> bool:
+    """Латинское/транслит имя с женскими признаками (Kristina, Alisa, -a)."""
+    raw = (name or "").strip()
+    if not raw or _CYR_RE.search(raw):
+        return False
+    fn = re.sub(r"[^a-z]", "", raw.lower())
+    if len(fn) < 3:
+        return False
+    if _MALE_TRANSLIT_RE.match(fn) or _MALE_NAMES_RE.match(fn):
+        return False
+    if _LATIN_FEMALE_NAMES_RE.match(fn):
+        return True
+    if _STRICT_FEMALE_NAME_RE.search(fn) or _FEMALE_NAME_END_RE.search(fn):
+        return True
+    if fn.endswith(("a", "ya", "iya")):
         return True
     return False
 
 
 def looks_male(lot: Lot) -> bool:
     fn = (lot.first_name or "").strip().lower()
-    if fn and is_cyrillic_female_first_name(fn):
+    if fn and (
+        is_cyrillic_female_first_name(fn) or is_latin_female_first_name(fn)
+    ):
         return False
     blob = profile_text_blob(lot).lower()
     if _MALE_HINT_RE.search(blob):
         return True
     ln = (lot.last_name or "").strip().lower()
+    if fn and _MALE_TRANSLIT_RE.match(re.sub(r"[^a-z]", "", fn)):
+        return True
     if fn and _MALE_NAMES_RE.search(fn):
         if fn in _AMBIGUOUS_RU_NAMES:
             return False
@@ -299,7 +353,9 @@ def looks_female(lot: Lot) -> bool:
         return False
     fn = (lot.first_name or "").strip().lower()
     ln = (lot.last_name or "").strip().lower()
-    if fn and is_cyrillic_female_first_name(fn):
+    if fn and (
+        is_cyrillic_female_first_name(fn) or is_latin_female_first_name(fn)
+    ):
         return True
     if fn and _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS_RU_NAMES:
         return False
@@ -343,9 +399,11 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
-    if not looks_female(lot):
-        return "не женский"
-    return ""
+    if looks_female(lot):
+        return ""
+    if not (lot.first_name or "").strip():
+        return "нет имени"
+    return "не женский"
 
 
 def is_clean_female_profile(lot: Lot) -> bool:

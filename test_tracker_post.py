@@ -218,7 +218,7 @@ def test_migrate_schema4_file_upgrades() -> None:
 
 
 def test_female_skips_boys() -> None:
-    lot = _lot(first_name="Alex", seller="alexgifts")
+    lot = _lot(first_name="Никита", seller="nikitagifts")
     assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
     assert stats["not_female"] == 1
@@ -233,17 +233,41 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
-def test_neutral_profile_rejected_by_female_filter() -> None:
-    """Пустое имя + нейтральный ник — не девочка."""
+def test_neutral_profile_rejected() -> None:
+    """Пустое имя + нейтральный латинский ник — режется RU-фильтром."""
     lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
     assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
-    assert stats["not_female"] == 1
+    assert stats["non_ru"] == 1
     assert out == []
 
 
+def test_hidden_name_ru_profile_counted_as_noname() -> None:
+    """RU-профиль без имени — отсев female с пометкой «нет имени»."""
+    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222, about="привет")
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 1
+    assert stats["female_noname"] == 1
+    assert out == []
+
+
+def test_latin_female_name_passes() -> None:
+    """Kristina с кириллицей в bio — русская девочка, проходит."""
+    lot = _lot(
+        first_name="Kristina",
+        seller="kris2024",
+        seller_id=224,
+        about="привет, продаю подарки",
+    )
+    assert is_clean_female_profile(lot) is True
+    out, stats = _filter_strict([lot])
+    assert stats["not_female"] == 0
+    assert stats["non_ru"] == 0
+    assert len(out) == 1
+
+
 def test_male_username_blocked() -> None:
-    lot = _lot(first_name="", seller="nikita_gifts", seller_id=223)
+    lot = _lot(first_name="", seller="nikita_gifts", seller_id=223, about="привет")
     assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
     assert stats["not_female"] == 1
@@ -287,7 +311,9 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
-        test_neutral_profile_rejected_by_female_filter,
+        test_neutral_profile_rejected,
+        test_hidden_name_ru_profile_counted_as_noname,
+        test_latin_female_name_passes,
         test_male_username_blocked,
         test_migrate_schema5_enables_girls_and_market,
     ]

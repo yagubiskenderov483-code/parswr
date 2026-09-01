@@ -1286,6 +1286,7 @@ def filter_for_post(
         "level": 0,
         "many_gifts": 0,
         "not_female": 0,
+        "female_noname": 0,
         "overprice": 0,
     }
     for lot in lots:
@@ -1306,8 +1307,17 @@ def filter_for_post(
         ):
             stats["dup"] += 1
             continue
+        if strict_ru:
+            ru = is_russian_lot(lot)
+            if ru is False:
+                stats["non_ru"] += 1
+                continue
+            if ru is None:
+                stats["unknown_ru"] += 1
         if female_only and not is_clean_female_profile(lot):
             stats["not_female"] += 1
+            if not (lot.first_name or "").strip():
+                stats["female_noname"] += 1
             continue
         if (
             strict_fair_price
@@ -1316,13 +1326,6 @@ def filter_for_post(
         ):
             stats["overprice"] += 1
             continue
-        if strict_ru:
-            ru = is_russian_lot(lot)
-            if ru is False:
-                stats["non_ru"] += 1
-                continue
-            if ru is None:
-                stats["unknown_ru"] += 1
         if max_gifts < 999:
             gifts = lot.gifts_count
             if gifts is not None and gifts > max_gifts:
@@ -1509,6 +1512,7 @@ class PostQueue:
                 self._runtime.last_skip_level = fstats["level"]
                 self._runtime.last_skip_gifts = fstats["many_gifts"]
                 self._runtime.last_skip_female = fstats["not_female"]
+                self._runtime.last_skip_female_noname = fstats["female_noname"]
                 self._runtime.last_skip_overprice = fstats["overprice"]
                 self._runtime.skip_ru_total += fstats["non_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
@@ -1517,6 +1521,7 @@ class PostQueue:
                 self._runtime.skip_level_total += fstats["level"]
                 self._runtime.skip_gifts_total += fstats["many_gifts"]
                 self._runtime.skip_female_total += fstats["not_female"]
+                self._runtime.skip_female_noname_total += fstats["female_noname"]
                 self._runtime.skip_overprice_total += fstats["overprice"]
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
@@ -1617,8 +1622,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.4"
-BUILD_TAG = "v3.9.4-women-ru"
+TRACKER_VERSION = "3.9.5"
+BUILD_TAG = "v3.9.5-female-names"
 
 
 @dataclass
@@ -1636,6 +1641,7 @@ class TrackerRuntime:
     last_skip_level: int = 0
     last_skip_gifts: int = 0
     last_skip_female: int = 0
+    last_skip_female_noname: int = 0
     last_skip_overprice: int = 0
     skip_ru_total: int = 0
     skip_dm_total: int = 0
@@ -1644,6 +1650,7 @@ class TrackerRuntime:
     skip_level_total: int = 0
     skip_gifts_total: int = 0
     skip_female_total: int = 0
+    skip_female_noname_total: int = 0
     skip_overprice_total: int = 0
     skip_unknown_ru_total: int = 0
     queue_processed: int = 0

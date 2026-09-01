@@ -955,15 +955,17 @@ async def _fetch_collection_pages(
         max_attempts=1,
     )
     if result is None:
-        result = await m._request(
-            gid,
-            cfg.page_limit,
-            False,
-            local,
-            cfg.gap,
-            min(cfg.timeout + 2.0, 10.0),
-            max_attempts=1,
-        )
+        last = (m.last_error or "").lower()
+        if "таймаут" not in last:
+            result = await m._request(
+                gid,
+                cfg.page_limit,
+                False,
+                local,
+                cfg.gap,
+                cfg.timeout,
+                max_attempts=1,
+            )
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
@@ -1669,8 +1671,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.0"
-BUILD_TAG = "v3.10.0-filled-fresh"
+TRACKER_VERSION = "3.10.1"
+BUILD_TAG = "v3.10.1-nameerror"
 
 
 @dataclass

@@ -235,6 +235,9 @@ _FEMALE_USER_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_FEMALE_NAME_END_RE = re.compile(
+    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична)$"
+)
 _CHANNEL_RE = re.compile(
     r"(?:https?://)?(?:t\.me/|telegram\.me/|telegram\.dog/)[\w+]{3,}"
     r"|@[a-zA-Z][\w]{3,}",

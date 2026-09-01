@@ -231,6 +231,14 @@ def test_female_skips_boys() -> None:
     assert out == []
 
 
+def test_looks_female_does_not_crash() -> None:
+    """Регресс: send падал с NameError _FEMALE_NAME_END_RE."""
+    from market import looks_female
+
+    lot = _lot(first_name="Мария", seller="mariagifts", about="привет")
+    assert looks_female(lot) is True
+
+
 def test_female_keeps_maria() -> None:
     lot = _lot(first_name="Мария", seller="mariagifts", about="привет")
     assert is_clean_female_profile(lot) is True
@@ -360,6 +368,7 @@ def main() -> None:
         test_telegram_value_blocks_dump_without_floor,
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
+        test_looks_female_does_not_crash,
         test_female_keeps_maria,
         test_empty_profile_blocked,
         test_bio_or_channel_passes,

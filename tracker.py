@@ -851,7 +851,7 @@ def _select_scan_batch(
         return [g for g in batch if not m.is_collection_bad(g)] or batch
     # Добираем до полного батча, пропуская bad — иначе проход усыхает (24 → 9)
     take = min(n, cfg.scan_batch)
-    hot_n = min(max(2, take // 2), take)
+    hot_n = min(max(3, (take * 2) // 3), take)
     hot = [
         gid
         for gid in m.hot_collection_ids(hot_n)
@@ -949,15 +949,17 @@ async def _fetch_collection_pages(
     cfg: Config,
     stats: dict[str, int],
 ) -> list[Lot]:
-    """page1 resale; максимум 2 быстрых попытки (~7s worst, не 10.6s)."""
+    """page1 resale. Живые коллекции — 8s, остальные — 4s (не сидеть минуту)."""
     local: dict[str, int] = {"errors": 0, "floods": 0}
+    hot = gid in set(m.hot_collection_ids(40))
+    timeout = float(cfg.timeout) if hot else min(4.0, float(cfg.timeout))
     result = await m._request(
         gid,
         cfg.page_limit,
         True,
         local,
         cfg.gap,
-        cfg.timeout,
+        timeout,
         max_attempts=1,
     )
     if result is None:
@@ -1678,8 +1680,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.2"
-BUILD_TAG = "v3.10.2-hot-scan"
+TRACKER_VERSION = "3.10.3"
+BUILD_TAG = "v3.10.3-name-or-bio"
 
 
 @dataclass

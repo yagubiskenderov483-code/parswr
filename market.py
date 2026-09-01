@@ -398,11 +398,17 @@ def has_channel_in_profile(lot: Lot) -> bool:
 
 
 def has_filled_profile(lot: Lot) -> bool:
-    """Не пустышка: есть bio или канал. Имя/ник сами по себе не считаются."""
+    """Не пустышка: bio, канал, или кириллическое имя (не голый латинский ник)."""
     about = (lot.about or "").strip()
     if len(about) >= 3:
         return True
-    return has_channel_in_profile(lot)
+    if has_channel_in_profile(lot):
+        return True
+    fn = (lot.first_name or "").strip()
+    ln = (lot.last_name or "").strip()
+    if _CYR_RE.search(fn) or _CYR_RE.search(ln):
+        return True
+    return False
 
 
 def has_review_in_profile(lot: Lot) -> bool:

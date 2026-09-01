@@ -247,6 +247,16 @@ def test_female_keeps_maria() -> None:
     assert len(out) == 1
 
 
+def test_cyrillic_name_without_bio_passes() -> None:
+    """Русское имя без био — не пустышка (в отличие от голого @nftgifts)."""
+    lot = _lot(first_name="Мария", seller="cryptogifts", seller_id=401, about="")
+    assert is_clean_female_profile(lot) is True
+    out, stats = _filter_strict([lot])
+    assert stats["empty_profile"] == 0
+    assert stats["not_female"] == 0
+    assert len(out) == 1
+
+
 def test_empty_profile_blocked() -> None:
     """Пустое имя + нет био/канала — не постим (иностранцы-пустышки)."""
     lot = _lot(first_name="", seller="nftgifts2024", seller_id=222, about="")
@@ -370,6 +380,7 @@ def main() -> None:
         test_female_skips_boys,
         test_looks_female_does_not_crash,
         test_female_keeps_maria,
+        test_cyrillic_name_without_bio_passes,
         test_empty_profile_blocked,
         test_bio_or_channel_passes,
         test_simple_mode_neutral_lot_passes,

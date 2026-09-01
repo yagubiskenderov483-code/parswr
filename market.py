@@ -122,6 +122,7 @@ class Lot:
     # None=неизвестно, True=сейчас в сети
     is_online: bool | None = None
     lang_code: str = ""
+    personal_channel: str = ""  # t.me/… или id канала из профиля
     seen_at: float = field(default_factory=time.time)
     discovered_at: float = 0.0  # когда трекер впервые увидел лот
     collection_id: int | None = None  # gift_id коллекции для запроса пола рынка
@@ -234,8 +235,10 @@ _FEMALE_USER_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-_FEMALE_NAME_END_RE = re.compile(
-    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична)$"
+_CHANNEL_RE = re.compile(
+    r"(?:https?://)?(?:t\.me/|telegram\.me/|telegram\.dog/)[\w+]{3,}"
+    r"|@[a-zA-Z][\w]{3,}",
+    re.IGNORECASE,
 )
 
 
@@ -375,6 +378,30 @@ def looks_female(lot: Lot) -> bool:
     return False
 
 
+def has_channel_in_profile(lot: Lot) -> bool:
+    """Личный канал или ссылка t.me / @канал в bio."""
+    if (getattr(lot, "personal_channel", "") or "").strip():
+        return True
+    about = lot.about or ""
+    if not about:
+        return False
+    seller = _normalize_handle(lot.seller or "")
+    for match in _CHANNEL_RE.finditer(about):
+        raw = match.group(0).lstrip("@")
+        handle = _normalize_handle(raw.split("/")[-1].split("?")[0])
+        if handle and handle != seller and handle not in {"http", "https", "tme"}:
+            return True
+    return False
+
+
+def has_filled_profile(lot: Lot) -> bool:
+    """Не пустышка: есть bio или канал. Имя/ник сами по себе не считаются."""
+    about = (lot.about or "").strip()
+    if len(about) >= 3:
+        return True
+    return has_channel_in_profile(lot)
+
+
 def has_review_in_profile(lot: Lot) -> bool:
     blob = profile_text_blob(lot)
     return bool(blob and _REVIEW_RE.search(blob))
@@ -390,7 +417,7 @@ def is_ad_profile(lot: Lot) -> bool:
 
 
 def female_filter_reason(lot: Lot) -> str:
-    """Почему профиль не прошёл (для логов). Мягкий режим: режем только явное."""
+    """Мягкий режим: режем мужиков, рекламу и пустые профили (нет био/канала)."""
     if looks_male(lot):
         return "мужской"
     if is_ad_profile(lot):
@@ -399,11 +426,13 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
+    if not has_filled_profile(lot):
+        return "пусто"
     return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Без мужчин/рекламы. Нейтральный профиль (пустое имя, латинский ник) — ок."""
+    """Не мужчина, не реклама, не пустышка. Нейтральное имя + bio/канал — ок."""
     return not female_filter_reason(lot)
 
 
@@ -1175,6 +1204,9 @@ class TelegramMarket:
             about = str(getattr(uf, "about", "") or "")
             if about and not lot.about:
                 lot.about = about
+            raw_ch = getattr(uf, "personal_channel_id", None)
+            if raw_ch and not lot.personal_channel:
+                lot.personal_channel = str(raw_ch)
             rating = getattr(uf, "stars_rating", None)
             if rating is not None:
                 level = _normalize_level(getattr(rating, "level", None))
@@ -1314,6 +1346,16 @@ class TelegramMarket:
                             if paid_stars is not None and paid_stars > 0:
                                 free_dm = False
                 lot.about = about
+                if uf is not None:
+                    raw_ch = getattr(uf, "personal_channel_id", None)
+                    if raw_ch:
+                        lot.personal_channel = str(raw_ch)
+                    elif not lot.personal_channel:
+                        raw_ch = getattr(uf, "personal_channel", None)
+                        if raw_ch is not None:
+                            lot.personal_channel = str(
+                                getattr(raw_ch, "id", raw_ch) or ""
+                            )
                 if level is not None:
                     lot.account_level = level
                 if gifts is not None:
@@ -1332,6 +1374,7 @@ class TelegramMarket:
                     "gifts_count": gifts,
                     "free_dm": free_dm,
                     "paid_dm_stars": paid_stars,
+                    "personal_channel": lot.personal_channel,
                 }
                 self._profile_cache[lot.seller_id] = info
 
@@ -1824,6 +1867,8 @@ def _apply_profile(lot: Lot, info: dict[str, Any]) -> None:
             lot.paid_dm_stars = int(info["paid_dm_stars"])
         except (TypeError, ValueError):
             pass
+    if info.get("personal_channel"):
+        lot.personal_channel = str(info["personal_channel"])
 
 
 def _parse_result(result: Any) -> list[Lot]:

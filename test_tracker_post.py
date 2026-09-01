@@ -154,6 +154,7 @@ def test_overprice_300_listed_at_10k() -> None:
         collection_id=99,
         first_name="Мария",
         seller="mariagifts",
+        about="привет",
     )
     assert book.is_fair_price(lot) is False
     out, stats = _filter_strict([lot], book)
@@ -169,6 +170,7 @@ def test_fair_listing_near_collection_floor() -> None:
         title="Desk Calendar",
         first_name="Мария",
         seller="mariagifts",
+        about="привет",
     )
     assert book.is_fair_price(lot) is True
     out, stats = _filter_strict([lot], book)
@@ -184,6 +186,7 @@ def test_telegram_value_blocks_dump_without_floor() -> None:
         title="Cheap Gift",
         first_name="Мария",
         seller="mariagifts",
+        about="привет",
     )
     assert book.is_fair_price(lot) is False
     out, stats = _filter_strict([lot], book)
@@ -229,19 +232,43 @@ def test_female_skips_boys() -> None:
 
 
 def test_female_keeps_maria() -> None:
-    lot = _lot(first_name="Мария", seller="mariagifts")
+    lot = _lot(first_name="Мария", seller="mariagifts", about="привет")
     assert is_clean_female_profile(lot) is True
     out, stats = _filter_strict([lot])
     assert stats["not_female"] == 0
     assert len(out) == 1
 
 
-def test_neutral_profile_passes_soft_female() -> None:
-    """Мягкий girls-режим: пустое имя + нейтральный ник — постим (не мужчина)."""
-    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
-    assert is_clean_female_profile(lot) is True
+def test_empty_profile_blocked() -> None:
+    """Пустое имя + нет био/канала — не постим (иностранцы-пустышки)."""
+    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222, about="")
+    assert is_clean_female_profile(lot) is False
     out, stats = _filter_strict([lot])
-    assert stats["not_female"] == 0
+    assert stats["not_female"] == 1
+    assert stats["empty_profile"] == 1
+    assert out == []
+
+
+def test_bio_or_channel_passes() -> None:
+    bio = _lot(first_name="", seller="anngifts", seller_id=331, about="живу в спб")
+    ch = _lot(
+        first_name="",
+        seller="anngifts2",
+        seller_id=332,
+        about="",
+        personal_channel="12345",
+    )
+    link = _lot(
+        first_name="",
+        seller="anngifts3",
+        seller_id=333,
+        about="канал t.me/annachat",
+    )
+    for lot in (bio, ch, link):
+        assert is_clean_female_profile(lot) is True, lot.seller
+        out, stats = _filter_strict([lot])
+        assert stats["not_female"] == 0, lot.seller
+        assert len(out) == 1, lot.seller
 
 
 def test_simple_mode_neutral_lot_passes() -> None:
@@ -294,12 +321,12 @@ def test_male_username_blocked() -> None:
     assert out == []
 
 
-def test_migrate_schema7_girls_soft_5k25k() -> None:
-    """schema<7 → девочки (мягко), рынок выкл, 5k–25k."""
+def test_migrate_schema8_filled_profile_5k25k() -> None:
+    """schema<8 → девочки (не пустышки), рынок выкл, 5k–25k."""
     out = migrate_legacy_filters(
         {
-            "filter_schema": 6,
-            "female_only": False,
+            "filter_schema": 7,
+            "female_only": True,
             "strict_fair_price": True,
             "min_stars": 2000,
             "max_stars": 5000,
@@ -334,12 +361,13 @@ def main() -> None:
         test_migrate_schema4_file_upgrades,
         test_female_skips_boys,
         test_female_keeps_maria,
-        test_neutral_profile_passes_soft_female,
+        test_empty_profile_blocked,
+        test_bio_or_channel_passes,
         test_simple_mode_neutral_lot_passes,
         test_boys_still_blocked_in_soft_mode,
         test_latin_female_name_passes,
         test_male_username_blocked,
-        test_migrate_schema7_girls_soft_5k25k,
+        test_migrate_schema8_filled_profile_5k25k,
     ]
     for fn in tests:
         fn()

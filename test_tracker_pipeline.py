@@ -20,6 +20,7 @@ def _lot(**kwargs) -> Lot:
         seller="gifttrader",
         seller_id=111,
         first_name="",
+        about="привет",
         free_dm=True,
         account_level=1,
         gifts_count=6,
@@ -107,11 +108,22 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_neutral_passes_soft_mode() -> None:
-    """Мягкий режим: латинский нейтральный профиль проходит (RU? и не мужчина)."""
-    lot_neutral = _lot(seller="cryptogifts", first_name="", lang_code="")
-    assert is_russian_lot(lot_neutral) is None
-    passed, stats = _filter_batch([lot_neutral])
+def test_latin_neutral_empty_blocked_bio_passes() -> None:
+    """Пустышка режется; латинский ник + bio проходит."""
+    empty = _lot(seller="cryptogifts", first_name="", lang_code="", about="")
+    passed_e, stats_e = _filter_batch([empty])
+    assert passed_e == []
+    assert stats_e["empty_profile"] == 1
+
+    filled = _lot(
+        seller="cryptogifts",
+        first_name="",
+        lang_code="",
+        about="продаю гифты",
+        seller_id=888,
+    )
+    assert is_russian_lot(filled) is True  # кириллица в bio
+    passed, stats = _filter_batch([filled])
     assert stats["not_female"] == 0
     assert stats["non_ru"] == 0
     assert len(passed) == 1
@@ -201,6 +213,16 @@ def test_scan_batch_backfills_around_bad_collections() -> None:
     assert m._cursor == 34  # 10 bad пропущено + 24 взято
 
 
+def test_duplicate_owner_not_posted_twice() -> None:
+    lots = [
+        _lot(id="a", seller="annagifts", seller_id=10, first_name="Анна"),
+        _lot(id="b", seller="annagifts", seller_id=10, first_name="Анна"),
+    ]
+    passed, stats = _filter_batch(lots)
+    assert len(passed) == 1
+    assert stats["dup"] == 1
+
+
 def test_telegram_value_dump_blocked() -> None:
     book = MarketPriceBook()
     lot = _lot(
@@ -220,11 +242,12 @@ def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_neutral_passes_soft_mode,
+        test_latin_neutral_empty_blocked_bio_passes,
         test_seven_women_pass_filters,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
         test_scan_batch_backfills_around_bad_collections,
+        test_duplicate_owner_not_posted_twice,
         test_telegram_value_dump_blocked,
     ]
     for fn in tests:

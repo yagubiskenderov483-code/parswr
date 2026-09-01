@@ -258,16 +258,16 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 0.3
+    poll_interval: float = 0.05
     page_limit: int = 8  # верх resale-листа (свежие)
     parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.02
+    gap: float = 0.01
     timeout: float = 6.0  # Bothost медленный: 3s резало живые ответы API
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 6
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 24  # ротация: быстрее полный круг по 150 коллекциям
-    hot_limit: int = 3  # топ свежих в коллекции (1 часто фермер)
+    scan_batch: int = 36  # быстрее полный круг по 150 коллекциям
+    hot_limit: int = 2  # только что выставили (верх листа)
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
     post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
@@ -329,16 +329,16 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 0.3),
+            poll_interval=_f("POLL_INTERVAL", 0.05),
             page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.02),
+            gap=_f("REQUEST_GAP", 0.01),
             timeout=_f("REQUEST_TIMEOUT", 6.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 24)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
+            scan_batch=int(_f("SCAN_BATCH", 36)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 2))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
             post_interval=_f("POST_INTERVAL", 1.5),
@@ -1307,6 +1307,7 @@ def filter_for_post(
         "many_gifts": 0,
         "not_female": 0,
         "female_noname": 0,
+        "empty_profile": 0,
         "overprice": 0,
     }
     for lot in lots:
@@ -1315,6 +1316,7 @@ def filter_for_post(
             stats["no_seller"] += 1
             continue
         if seller_keys_overlap(lot, used):
+            stats["dup"] += 1
             continue
         prev = seen_sellers.get(key)
         if prev is not None and now - float(prev) < SELLER_TTL:
@@ -1335,7 +1337,10 @@ def filter_for_post(
             if ru is None:
                 stats["unknown_ru"] += 1
         if female_only and not is_clean_female_profile(lot):
+            reason = female_filter_reason(lot)
             stats["not_female"] += 1
+            if reason == "пусто":
+                stats["empty_profile"] += 1
             if not (lot.first_name or "").strip():
                 stats["female_noname"] += 1
             continue
@@ -1411,7 +1416,7 @@ def _skip_reason(stats: dict[str, int]) -> str:
     if stats.get("many_gifts"):
         parts.append("много NFT")
     if stats.get("not_female"):
-        parts.append("не девочка")
+        parts.append("не девочка/пусто")
     if stats.get("overprice"):
         parts.append("завышена цена")
     if stats.get("paid"):
@@ -1458,6 +1463,7 @@ class PostQueue:
         self._closed = False
         self._send_retries: dict[str, int] = {}
         self._max_send_retries = 3
+        self._queued_ids: set[str] = set()
 
     @property
     def pending(self) -> int:
@@ -1482,12 +1488,22 @@ class PostQueue:
     def enqueue(self, lots: list[Lot]) -> int:
         if not lots:
             return 0
+        added = 0
+        blocked = set(self._seen_sellers)
         for lot in rank_for_queue(lots):
+            if lot.id in self._seen or lot.id in self._queued_ids:
+                continue
+            if seller_keys_overlap(lot, blocked):
+                self._seen[lot.id] = time.time()
+                continue
             self._seq += 1
             prio = -float(lot.discovered_at or time.time())
             self._pq.put_nowait((prio, self._seq, lot))
+            self._queued_ids.add(lot.id)
+            blocked |= seller_identity_keys(lot)
+            added += 1
         self._runtime.queue_pending = self.pending
-        return len(lots)
+        return added
 
     def set_interval(self, seconds: float) -> None:
         self._interval = max(0.5, float(seconds))
@@ -1502,6 +1518,7 @@ class PostQueue:
             _, _, lot = await self._pq.get()
             if lot is None:
                 break
+            self._queued_ids.discard(getattr(lot, "id", "") or "")
             try:
                 await enrich_one(self._m, lot, self._cfg)
                 if self._cfg.strict_fair_price:
@@ -1533,6 +1550,7 @@ class PostQueue:
                 self._runtime.last_skip_gifts = fstats["many_gifts"]
                 self._runtime.last_skip_female = fstats["not_female"]
                 self._runtime.last_skip_female_noname = fstats["female_noname"]
+                self._runtime.last_skip_empty = fstats["empty_profile"]
                 self._runtime.last_skip_overprice = fstats["overprice"]
                 self._runtime.skip_ru_total += fstats["non_ru"]
                 self._runtime.skip_dm_total += fstats["paid"] + fstats["unknown_dm"]
@@ -1542,9 +1560,12 @@ class PostQueue:
                 self._runtime.skip_gifts_total += fstats["many_gifts"]
                 self._runtime.skip_female_total += fstats["not_female"]
                 self._runtime.skip_female_noname_total += fstats["female_noname"]
+                self._runtime.skip_empty_total += fstats["empty_profile"]
                 self._runtime.skip_overprice_total += fstats["overprice"]
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
+                self._queued_ids.discard(lot.id)
+                self._queued_ids.discard(lot.id)
                 if not to_post:
                     skip_permanent = (
                         fstats["dup"]
@@ -1566,12 +1587,18 @@ class PostQueue:
                                 "отзывы",
                                 "giftdouble",
                                 "не женский",
+                                "пусто",
                             }
                         )
                         or fstats["overprice"]
                     )
-                    if skip_permanent and lot.seller_key:
+                    if skip_permanent:
                         self._seen[lot.id] = now
+                        if lot.seller_key:
+                            for k in seller_identity_keys(lot):
+                                self._seen_sellers[k] = now
+                            self._state["seen_sellers"] = self._seen_sellers
+                            save_state(self._state_path, self._state)
                     reason = (
                         self._runtime.price_book.overprice_reason(lot)
                         if fstats["overprice"] and self._runtime.price_book
@@ -1642,8 +1669,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.9"
-BUILD_TAG = "v3.9.9-timeout6s"
+TRACKER_VERSION = "3.10.0"
+BUILD_TAG = "v3.10.0-filled-fresh"
 
 
 @dataclass
@@ -1662,6 +1689,7 @@ class TrackerRuntime:
     last_skip_gifts: int = 0
     last_skip_female: int = 0
     last_skip_female_noname: int = 0
+    last_skip_empty: int = 0
     last_skip_overprice: int = 0
     skip_ru_total: int = 0
     skip_dm_total: int = 0
@@ -1671,6 +1699,7 @@ class TrackerRuntime:
     skip_gifts_total: int = 0
     skip_female_total: int = 0
     skip_female_noname_total: int = 0
+    skip_empty_total: int = 0
     skip_overprice_total: int = 0
     skip_unknown_ru_total: int = 0
     queue_processed: int = 0

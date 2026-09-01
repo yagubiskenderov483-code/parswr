@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 7
+FILTER_SCHEMA = 8
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -127,7 +127,7 @@ def ensure_default_filters(path: Path) -> None:
 
 
 def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
-    """schema<7 → девочки (мягко, без мужчин), без проверки рынка, 5k–25k."""
+    """schema<8 → девочки (не пустышки/не мужики), без рынка, 5k–25k."""
     if not data:
         return dict(DEFAULT_FILTER_DATA)
     out = dict(data)

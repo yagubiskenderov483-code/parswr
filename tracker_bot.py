@@ -520,6 +520,18 @@ def build_router(
                     f"⚠️ Ошибки API: {rt.last_scan_errors}"
                     + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
                 )
+            flood_left = 0.0
+            if rt.market is not None:
+                import time as _time
+
+                flood_left = float(
+                    getattr(rt.market, "_flood_until", 0.0) or 0.0
+                ) - _time.monotonic()
+            if flood_left > 1:
+                lines.append(
+                    f"⏳ FloodWait: Telegram притормозил аккаунт ещё на "
+                    f"{int(flood_left)}s — скан ждёт, это не поломка"
+                )
             if rt.passes == 0 and not rt.snapshot_ready:
                 lines.append(
                     "⏳ Сканер ждёт снимок маркета — это нормально после старта"

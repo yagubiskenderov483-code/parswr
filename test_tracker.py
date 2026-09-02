@@ -48,6 +48,7 @@ def test_card_matches_screenshot() -> None:
 💰 Цена: <b>6666 Stars / 67.99 TON</b>
 🏷 Модель: <b>Avatar</b>
 👤 Продавец: @Katta_xoja (<code>7276424760</code>)
+👧 Имя: Мария
 📊 Level: 1
 📢 Сообщение: бесплатно
 💃 Статус: без Premium
@@ -124,7 +125,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.7.0"
+    assert config.TRACKER_VERSION == "4.8.0"
     assert config.MIN_COLLECTIONS == 50
     assert config.SNAPSHOT_PAGE_LIMIT >= config.PAGE_LIMIT
 
@@ -218,6 +219,29 @@ def test_girl_from_gifts_and_stories() -> None:
     assert is_girl(ru) is True
 
 
+def test_bio_hints_do_not_make_a_girl() -> None:
+    """@ynosleep / @Etalonkasexa пролезали из-за «девушке можно писать» в био."""
+    yno = _lot(first_name="", about="девушке можно писать 💅", seller="ynosleep")
+    assert is_girl(yno) is False
+    assert filter_lot(yno, min_stars=4500, max_stars=27000) != ""
+    boy = _lot(
+        first_name="Алексей",
+        about="девушке можно писать 💅 girl pink",
+        seller="etalonkasexa",
+    )
+    assert looks_male(boy) is True
+    assert is_girl(boy) is False
+    sasha = _lot(first_name="Саша", about="торгую гифтами", seller="sasha_nft")
+    assert is_girl(sasha) is False
+
+
+def test_latin_girl_with_russian_bio() -> None:
+    lot = _lot(first_name="Kristina", about="привет, пишите", seller="kris_shop")
+    assert is_russian(lot) is True
+    assert is_girl(lot) is True
+    assert filter_lot(lot, min_stars=4500, max_stars=27000) == ""
+
+
 def test_skips_persian_and_latin_boys() -> None:
     reza = _lot(first_name="Reza", about="", seller="reza_gifts", lang_code="fa")
     assert looks_male(reza) is True
@@ -290,6 +314,8 @@ def main() -> None:
         test_bundled_catalog_has_enough,
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
+        test_bio_hints_do_not_make_a_girl,
+        test_latin_girl_with_russian_bio,
         test_skips_persian_and_latin_boys,
         test_snapshot_uses_newest_feed,
         test_state_schema_clears_seller_bans,

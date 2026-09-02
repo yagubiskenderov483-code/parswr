@@ -62,6 +62,9 @@ def format_lot(lot: Lot, ts: float | None = None) -> str:
         if lot.number is not None
         else lot.title
     )
+    display_name = " ".join(
+        x for x in (lot.first_name, lot.last_name) if x
+    ).strip() or "—"
     return "\n".join(
         [
             "🎉 <b>НОВЫЙ ЛИСТИНГ</b>",
@@ -70,6 +73,7 @@ def format_lot(lot: Lot, ts: float | None = None) -> str:
             f"💰 Цена: <b>{stars} Stars / {ton:.2f} TON</b>",
             f"🏷 Модель: <b>{_esc(lot.model) or '—'}</b>",
             f"👤 Продавец: {seller}",
+            f"👧 Имя: {_esc(display_name)}",
             f"📊 Level: {format_level(lot)}",
             f"📢 Сообщение: {dm}",
             f"💃 Статус: {status}",
@@ -544,7 +548,6 @@ class PostQueue:
                     incomplete = reason in {
                         "нет данных",
                         "нет продавца",
-                        "нет женских признаков",
                     }
                     if incomplete:
                         logger.info(

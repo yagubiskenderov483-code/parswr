@@ -37,7 +37,7 @@ REQUEST_TIMEOUT = 6.0
 ENRICH_TIMEOUT = 2.5
 MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "4.7.0"
+TRACKER_VERSION = "4.8.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

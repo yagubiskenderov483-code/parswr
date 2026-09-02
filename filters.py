@@ -26,7 +26,7 @@ _MALE_HINT_RE = re.compile(
 )
 
 _AMBIGUOUS = frozenset(
-    {"саша", "женя", "валя", "слава", "паша", "оля", "катя", "даша", "маша"}
+    {"саша", "женя", "валя", "слава", "паша"}
 )
 
 _MALE_NAMES_RE = re.compile(
@@ -149,7 +149,7 @@ def is_cyrillic_female_name(name: str) -> bool:
     if not fn or not _CYR_RE.search(fn):
         return False
     if fn in _AMBIGUOUS:
-        return True
+        return False
     if _MALE_NAMES_RE.search(fn) or _MALE_SHORT_NICK_RE.search(fn):
         return False
     if _FEMALE_NAME_END_RE.search(fn):
@@ -229,7 +229,7 @@ def looks_male(lot: Lot) -> bool:
 
 
 def female_reason(lot: Lot) -> str:
-    """Нужно женское имя на кириллице. Эмодзи/название гифта не считаются."""
+    """Нужно женское имя. Био «девушке можно писать» / эмодзи / гифт не считаются."""
     if looks_male(lot):
         return "мужской"
     fn = _first_token(lot.first_name)
@@ -238,10 +238,12 @@ def female_reason(lot: Lot) -> str:
     ln = (lot.last_name or "").strip().lower()
     if ln.endswith(("овна", "евна", "ична")):
         return ""
-    about = lot.about or ""
-    if _CYR_RE.search(about) and _FEMALE_HINT_RE.search(about):
+    name_bio = " ".join(
+        x for x in (lot.first_name, lot.last_name, lot.about) if x
+    )
+    if is_latin_female_name(fn) and _CYR_RE.search(name_bio):
         return ""
-    if not fn and not about:
+    if not fn:
         return "нет женских признаков"
     return "нет женских признаков"
 

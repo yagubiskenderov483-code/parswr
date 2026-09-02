@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import struct
 import time
 import urllib.request
@@ -635,7 +636,9 @@ class TelegramMarket:
         total = len(self.gift_ids)
         if n <= 0 or n >= total:
             self._cursor = 0
-            return list(self.gift_ids)
+            ids = list(self.gift_ids)
+            random.shuffle(ids)
+            return ids
         take = min(max(1, n), total)
         batch = [self.gift_ids[(self._cursor + i) % total] for i in range(take)]
         self._cursor = (self._cursor + take) % total

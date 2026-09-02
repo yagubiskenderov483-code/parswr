@@ -267,9 +267,9 @@ class ControlBot:
             f"Аккаунт: {self.account_name if self.authorized else 'не вошёл'}",
             f"Канал: <code>{config.CHANNEL_ID}</code>",
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
-            f"Фильтры: девочки · free ЛС · lvl≤{config.MAX_ACCOUNT_LEVEL} · "
-            f"NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с",
-            "Обход: все коллекции",
+            f"Фильтры: русские девочки · free ЛС · lvl≤{config.MAX_ACCOUNT_LEVEL} · "
+            f"NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с · рандом",
+            "Обход: все коллекции · в канал только новые",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"
@@ -304,7 +304,7 @@ class ControlBot:
             f"Канал: <code>{config.CHANNEL_ID}</code>\n"
             f"Цена: <b>{config.MIN_STARS}–{config.MAX_STARS}⭐</b>\n"
             f"Level ≤ {config.MAX_ACCOUNT_LEVEL} · NFT ≤ {config.MAX_NFTS}\n"
-            f"Только девочки · бесплатные ЛС · пост / {int(config.POST_INTERVAL)}с\n\n"
+            f"Только русские девочки · бесплатные ЛС · пост / {int(config.POST_INTERVAL)}с · рандом\n\n"
             "Жми /status или кнопку ниже."
         )
 

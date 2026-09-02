@@ -1,4 +1,4 @@
-"""Гифт-трекер: все коллекции, лоты ~5000–25000⭐ (запас 4500–27000), пауза 4 сек."""
+"""Гифт-трекер: новые лоты ~5000–25000⭐, русские девочки, рандом, пауза 5 сек."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import html
 import json
 import logging
 import os
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,7 +27,7 @@ logger = logging.getLogger("tracker")
 _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
-MIN_SNAPSHOT = 0  # первый проход постит подходящие, не копит «тихий» снимок
+MIN_SNAPSHOT = 0  # снимок только запоминает рынок, в канал не постит
 
 
 def format_lot(lot: Lot, ts: float | None = None) -> str:
@@ -102,7 +103,7 @@ def lot_keyboard_telethon(lot: Lot) -> list[list[Any]]:
 
 
 class RateLimiter:
-    """Строгий интервал между постами (4 сек)."""
+    """Строгий интервал между постами (5 сек)."""
 
     def __init__(self, interval: float, lock_path: Path, ts_path: Path) -> None:
         self.interval = max(0.5, float(interval))
@@ -352,20 +353,21 @@ class PostQueue:
         self.state = state
         self.state_file = state_file
         self.runtime = runtime
-        self._q: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
-            asyncio.PriorityQueue()
-        )
-        self._seq = 0
+        self._items: list[Lot] = []
         self._queued: set[str] = set()
         self._task: asyncio.Task | None = None
         self._retries: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self._event = asyncio.Event()
+        self._stop = False
+        self._last_title = ""
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._worker(), name="post-drip")
 
     async def stop(self) -> None:
-        self._seq += 1
-        await self._q.put((0.0, self._seq, None))
+        self._stop = True
+        self._event.set()
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=15)
@@ -375,27 +377,49 @@ class PostQueue:
     def enqueue(self, lots: list[Lot]) -> int:
         added = 0
         blocked = set(self.seen_sellers)
-        for lot in sorted(lots, key=lambda x: -float(x.discovered_at or 0)):
+        incoming = list(lots)
+        random.shuffle(incoming)
+        for lot in incoming:
             if lot.id in self.seen or lot.id in self._queued:
                 continue
-            if seller_keys(lot) & blocked:
+            keys = seller_keys(lot)
+            if keys and keys & blocked:
                 self.seen[lot.id] = time.time()
                 continue
-            self._seq += 1
-            self._q.put_nowait((-float(lot.discovered_at or time.time()), self._seq, lot))
             self._queued.add(lot.id)
-            blocked |= seller_keys(lot)
+            self._items.append(lot)
+            blocked |= keys
             added += 1
-        self.runtime.queue = self._q.qsize()
+        if added:
+            random.shuffle(self._items)
+            self._event.set()
+        self.runtime.queue = len(self._items)
         return added
 
+    def _pick(self) -> Lot | None:
+        if not self._items:
+            return None
+        last = self._last_title
+        pool = [x for x in self._items if (x.title or "") != last] if last else self._items
+        if not pool:
+            pool = self._items
+        lot = random.choice(pool)
+        self._items.remove(lot)
+        self._queued.discard(lot.id)
+        return lot
+
     async def _worker(self) -> None:
-        logger.info("Очередь постов: пауза %s сек между лотами", int(config.POST_INTERVAL))
-        while True:
-            _, _, lot = await self._q.get()
+        logger.info("Очередь постов: рандом · пауза %s сек · без повтора владельца", int(config.POST_INTERVAL))
+        while not self._stop:
+            async with self._lock:
+                lot = self._pick()
             if lot is None:
-                break
-            self._queued.discard(lot.id)
+                self._event.clear()
+                try:
+                    await asyncio.wait_for(self._event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
             try:
                 await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
                 now = time.time()
@@ -445,6 +469,7 @@ class PostQueue:
                         "level",
                         "много NFT",
                         "мужской",
+                        "не русский",
                         "дубль",
                     }
                     self.seen[lot.id] = now
@@ -463,39 +488,36 @@ class PostQueue:
                 self.state["seen_sellers"] = self.seen_sellers
                 save_state(self.state_file, self.state)
                 self.runtime.posted += 1
+                self._last_title = lot.title or ""
                 logger.info(
                     "Отправил: %s за %s⭐ · lvl %s · очередь %s",
                     lot.title,
                     int(lot.stars),
                     format_level(lot),
-                    self._q.qsize(),
+                    len(self._items),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Ошибка поста %s: %s", lot.id, exc)
                 self.runtime.last_error = str(exc)
             finally:
-                self.runtime.queue = self._q.qsize()
-                self._q.task_done()
+                self.runtime.queue = len(self._items)
 
 
 async def snapshot_market(
     market: TelegramMarket,
     gift_ids: list[int],
     market_ids: set[str],
-    queue: PostQueue,
     runtime: Runtime,
 ) -> None:
-    """Полный обход всех коллекций: подходящие 4.5k–27k сразу в очередь."""
+    """Запомнить текущий рынок. Старые лоты в канал не постим."""
     ids = list(gift_ids)
+    random.shuffle(ids)
     logger.info(
-        "Полный обход %s коллекций · цена %s–%s⭐",
+        "Снимок %s коллекций — текущие лоты пропускаем, шлём только новые",
         len(ids),
-        int(config.MIN_STARS),
-        int(config.MAX_STARS),
     )
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
-    posted_like = 0
 
     async def one(gid: int) -> list[Lot]:
         async with sem:
@@ -511,31 +533,21 @@ async def snapshot_market(
     for i in range(0, len(ids), chunk):
         batch = ids[i : i + chunk]
         parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
-        fresh: list[Lot] = []
         for part in parts:
             if not isinstance(part, list):
                 runtime.last_error = str(part)
                 continue
             for lot in part:
                 market_ids.add(lot.id)
-                if config.MIN_STARS <= lot.stars <= config.MAX_STARS:
-                    fresh.append(lot)
-        n = queue.enqueue(fresh)
-        posted_like += n
         runtime.snapshot = len(market_ids)
-        runtime.queue = queue._q.qsize()
+        runtime.queue = 0
         logger.info(
-            "Обход %s/%s · лотов в снимке %s · в очередь +%s",
+            "Снимок %s/%s · уже на рынке %s лотов",
             min(i + len(batch), len(ids)),
             len(ids),
             len(market_ids),
-            n,
         )
-    logger.info(
-        "Обход готов: %s лотов на рынке · %s подошли по цене → очередь",
-        len(market_ids),
-        posted_like,
-    )
+    logger.info("Снимок готов: %s лотов. Дальше только свежие листинги", len(market_ids))
 
 
 async def scanner_loop(
@@ -550,7 +562,7 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: все коллекции · %s–%s⭐ · lvl≤%s · NFT≤%s · девочки · free ЛС · пост/%sс",
+        "Сканер: новые лоты · %s–%s⭐ · русские девочки · lvl≤%s · NFT≤%s · free ЛС · пост/%sс · рандом",
         config.MIN_STARS,
         config.MAX_STARS,
         config.MAX_ACCOUNT_LEVEL,
@@ -612,7 +624,7 @@ async def scanner_loop(
         runtime.last_fresh = len(fresh)
         runtime.snapshot = len(market_ids)
         if n:
-            logger.info("⚡ +%s свежих → очередь (%s)", n, queue._q.qsize())
+            logger.info("⚡ +%s свежих → очередь (%s)", n, len(queue._items))
         elif pass_no % 8 == 0:
             logger.info(
                 "Проход #%s: %s колл · %s лотов · новых 0 · снимок %s",
@@ -692,14 +704,19 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    if gift_ids:
+    if gift_ids and len(market_ids) < 500:
         try:
-            await snapshot_market(market, gift_ids, market_ids, queue, runtime)
+            await snapshot_market(market, gift_ids, market_ids, runtime)
             state["market_ids"] = list(market_ids)
             save_state(state_file, state)
         except Exception as exc:  # noqa: BLE001
             logger.error("обход: %s", exc)
             runtime.last_error = str(exc)
+    elif gift_ids:
+        logger.info(
+            "Снимок уже есть (%s лотов) — в канал только новые, без старой очереди",
+            len(market_ids),
+        )
     runtime.snapshot_ready = True
     runtime.snapshot = len(market_ids)
 

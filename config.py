@@ -21,7 +21,7 @@ MIN_STARS = 4500
 MAX_STARS = 27000
 MAX_ACCOUNT_LEVEL = 2
 MAX_NFTS = 12
-POST_INTERVAL = 4.0
+POST_INTERVAL = 5.0
 
 # Курс для строки «X Stars / Y TON» (как в tracker market)
 TON_RATE = 0.0102
@@ -36,7 +36,7 @@ REQUEST_TIMEOUT = 10.0
 ENRICH_TIMEOUT = 5.0
 MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "4.3.0"
+TRACKER_VERSION = "4.4.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

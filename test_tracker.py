@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import config
-from filters import filter_lot, is_girl, looks_male
+from filters import filter_lot, is_girl, is_russian, looks_male
 from market import (
     Lot,
     TelegramMarket,
@@ -114,13 +114,13 @@ def test_hardcoded_filters() -> None:
     assert config.MAX_STARS == 27000
     assert config.MAX_ACCOUNT_LEVEL == 2
     assert config.MAX_NFTS == 12
-    assert config.POST_INTERVAL == 4.0
+    assert config.POST_INTERVAL == 5.0
     assert config.CHANNEL_ID == -1003784435307
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.3.0"
+    assert config.TRACKER_VERSION == "4.4.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -141,7 +141,7 @@ def test_next_batch_all_collections() -> None:
     market.gift_ids = [1, 2, 3, 4, 5]
     market._cursor = 3
     batch = market.next_batch(0)
-    assert batch == [1, 2, 3, 4, 5]
+    assert sorted(batch) == [1, 2, 3, 4, 5]
     assert market._cursor == 0
 
 
@@ -180,6 +180,16 @@ def test_bundled_catalog_has_enough() -> None:
     assert len(ids) >= 100
 
 
+def test_skips_non_russian() -> None:
+    latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="en")
+    assert is_girl(latin) is True
+    assert is_russian(latin) is False
+    assert filter_lot(latin, min_stars=4500, max_stars=27000) == "не русский"
+    iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
+    assert is_russian(iranian) is False
+    assert is_russian(_lot()) is True
+
+
 def test_girl_from_gifts_and_stories() -> None:
     lot = _lot(
         first_name="Lee",
@@ -210,6 +220,7 @@ def main() -> None:
         test_merge_and_json_catalog,
         test_extract_star_gift_ids,
         test_bundled_catalog_has_enough,
+        test_skips_non_russian,
         test_girl_from_gifts_and_stories,
     ]
     for fn in tests:

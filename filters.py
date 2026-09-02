@@ -266,6 +266,51 @@ def is_girl(lot: Lot) -> bool:
     return not female_reason(lot)
 
 
+_FOREIGN_LANG = frozenset(
+    {
+        "en",
+        "ar",
+        "fa",
+        "tr",
+        "hi",
+        "th",
+        "vi",
+        "id",
+        "es",
+        "pt",
+        "de",
+        "fr",
+        "it",
+        "zh",
+        "ja",
+        "ko",
+        "ms",
+        "tl",
+        "ur",
+        "bn",
+        "he",
+        "am",
+    }
+)
+
+
+def is_russian(lot: Lot) -> bool | None:
+    """True если имя/био на кириллице или lang=ru. None — ещё нет текста."""
+    name_bio = " ".join(
+        x for x in (lot.first_name, lot.last_name, lot.about) if x
+    ).strip()
+    lang = (lot.lang_code or "").strip().lower()
+    if _CYR_RE.search(name_bio):
+        return True
+    if lang == "ru":
+        return True
+    if not name_bio and not lang:
+        return None
+    if lang in _FOREIGN_LANG:
+        return False
+    return False
+
+
 def passes_level(lot: Lot, max_level: int = 2) -> bool | None:
     """True/False если знаем; None — ещё нет данных (не режем навсегда)."""
     lvl = lot.account_level
@@ -317,6 +362,11 @@ def filter_lot(
         return "нет данных"
     if nfts is False:
         return "много NFT"
+    ru = is_russian(lot)
+    if ru is None:
+        return "нет данных"
+    if ru is False:
+        return "не русский"
     reason = female_reason(lot)
     if reason:
         return reason
@@ -332,6 +382,7 @@ def skip_stats() -> dict[str, int]:
         "level": 0,
         "nfts": 0,
         "not_girl": 0,
+        "not_ru": 0,
         "dup": 0,
         "incomplete": 0,
     }
@@ -346,6 +397,7 @@ def classify_skip(reason: str, stats: dict[str, int]) -> None:
         "нет данных": "incomplete",
         "level": "level",
         "много NFT": "nfts",
+        "не русский": "not_ru",
         "дубль": "dup",
     }
     key = mapping.get(reason, "not_girl")

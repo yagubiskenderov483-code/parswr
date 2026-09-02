@@ -89,19 +89,19 @@ def test_price_range() -> None:
 def test_level_max_2() -> None:
     assert filter_lot(_lot(account_level=2), min_stars=4500, max_stars=27000) == ""
     assert filter_lot(_lot(account_level=3), min_stars=4500, max_stars=27000) == "level"
-    assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == "нет данных"
+    assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == ""
 
 
 def test_max_12_nfts() -> None:
     assert filter_lot(_lot(gifts_count=12), min_stars=4500, max_stars=27000) == ""
     assert filter_lot(_lot(gifts_count=13), min_stars=4500, max_stars=27000) == "много NFT"
-    assert filter_lot(_lot(gifts_count=None), min_stars=4500, max_stars=27000) == "нет данных"
+    assert filter_lot(_lot(gifts_count=None), min_stars=4500, max_stars=27000) == ""
 
 
 def test_free_dm_only() -> None:
     assert filter_lot(_lot(free_dm=True), min_stars=4500, max_stars=27000) == ""
     assert filter_lot(_lot(free_dm=False), min_stars=4500, max_stars=27000) == "платные ЛС"
-    assert filter_lot(_lot(free_dm=None), min_stars=4500, max_stars=27000) == "нет данных"
+    assert filter_lot(_lot(free_dm=None), min_stars=4500, max_stars=27000) == ""
 
 
 def test_girl_from_bio_emoji() -> None:
@@ -120,7 +120,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.4.0"
+    assert config.TRACKER_VERSION == "4.5.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -188,6 +188,8 @@ def test_skips_non_russian() -> None:
     iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
     assert is_russian(iranian) is False
     assert is_russian(_lot()) is True
+    cis_latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="")
+    assert is_russian(cis_latin) is True
 
 
 def test_girl_from_gifts_and_stories() -> None:

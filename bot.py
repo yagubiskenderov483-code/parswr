@@ -282,7 +282,7 @@ class ControlBot:
                     coll,
                     f"Отправлено: {rt.posted}",
                     f"В очереди: {rt.queue}",
-                    f"Последний проход: +{rt.last_fresh}",
+                    f"Последний проход: найдено {getattr(rt, 'last_found', rt.last_fresh)} → очередь +{rt.last_fresh}",
                 ]
             )
             skip = rt.skip_total or {}

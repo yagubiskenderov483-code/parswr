@@ -288,6 +288,7 @@ class Runtime:
         self.posted = 0
         self.queue = 0
         self.last_fresh = 0
+        self.last_found = 0
         self.last_skip: dict[str, int] = skip_stats()
         self.skip_total: dict[str, int] = skip_stats()
         self.snapshot = 0
@@ -345,6 +346,7 @@ class PostQueue:
         state: dict,
         state_file: Path,
         runtime: Runtime,
+        market_ids: set[str] | None = None,
     ) -> None:
         self.market = market
         self.sender = sender
@@ -353,8 +355,10 @@ class PostQueue:
         self.state = state
         self.state_file = state_file
         self.runtime = runtime
+        self.market_ids = market_ids if market_ids is not None else set()
         self._items: list[Lot] = []
         self._queued: set[str] = set()
+        self._inflight: set[str] = set()
         self._task: asyncio.Task | None = None
         self._retries: dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -380,11 +384,14 @@ class PostQueue:
         incoming = list(lots)
         random.shuffle(incoming)
         for lot in incoming:
-            if lot.id in self.seen or lot.id in self._queued:
+            if lot.id in self.seen or lot.id in self._queued or lot.id in self._inflight:
                 continue
             keys = seller_keys(lot)
             if keys and keys & blocked:
-                self.seen[lot.id] = time.time()
+                now = time.time()
+                self.seen[lot.id] = now
+                self.market_ids.add(lot.id)
+                classify_skip("дубль", self.runtime.skip_total)
                 continue
             self._queued.add(lot.id)
             self._items.append(lot)
@@ -406,6 +413,7 @@ class PostQueue:
         lot = random.choice(pool)
         self._items.remove(lot)
         self._queued.discard(lot.id)
+        self._inflight.add(lot.id)
         return lot
 
     async def _worker(self) -> None:
@@ -458,12 +466,11 @@ class PostQueue:
                         "нет женских признаков",
                     }
                     if incomplete:
-                        ntry = self._retries.get(lot.id, 0) + 1
-                        self._retries[lot.id] = ntry
-                        if ntry <= 3:
-                            await asyncio.sleep(0.8)
-                            self.enqueue([lot])
-                            continue
+                        logger.info(
+                            "Мало данных %s — не сжигаю, следующий проход подхватит",
+                            lot.slug or lot.id,
+                        )
+                        continue
                     burn_seller = reason in {
                         "платные ЛС",
                         "level",
@@ -473,19 +480,23 @@ class PostQueue:
                         "дубль",
                     }
                     self.seen[lot.id] = now
+                    self.market_ids.add(lot.id)
                     self._retries.pop(lot.id, None)
                     if burn_seller and keys:
                         for k in keys:
                             self.seen_sellers[k] = now
                         self.state["seen_sellers"] = self.seen_sellers
-                        save_state(self.state_file, self.state)
+                    self.state["market_ids"] = list(self.market_ids)
+                    save_state(self.state_file, self.state)
                     continue
                 via = await self.sender.send(lot)
                 self.runtime.post_via = via
                 self.seen[lot.id] = now
+                self.market_ids.add(lot.id)
                 for k in keys:
                     self.seen_sellers[k] = now
                 self.state["seen_sellers"] = self.seen_sellers
+                self.state["market_ids"] = list(self.market_ids)
                 save_state(self.state_file, self.state)
                 self.runtime.posted += 1
                 self._last_title = lot.title or ""
@@ -500,6 +511,7 @@ class PostQueue:
                 logger.error("Ошибка поста %s: %s", lot.id, exc)
                 self.runtime.last_error = str(exc)
             finally:
+                self._inflight.discard(lot.id)
                 self.runtime.queue = len(self._items)
 
 
@@ -613,18 +625,19 @@ async def scanner_loop(
                 continue
             parsed += len(part)
             for lot in part:
-                if lot.id in market_ids or lot.id in seen:
+                if lot.id in market_ids or lot.id in seen or lot.id in queue._queued or lot.id in queue._inflight:
                     continue
                 if not (config.MIN_STARS <= lot.stars <= config.MAX_STARS):
-                    market_ids.add(lot.id)
                     continue
-                market_ids.add(lot.id)
                 fresh.append(lot)
         n = queue.enqueue(fresh)
-        runtime.last_fresh = len(fresh)
+        runtime.last_found = len(fresh)
+        runtime.last_fresh = n
         runtime.snapshot = len(market_ids)
         if n:
-            logger.info("⚡ +%s свежих → очередь (%s)", n, len(queue._items))
+            logger.info("⚡ новые %s → очередь %s (найдено %s)", n, len(queue._items), len(fresh))
+        elif len(fresh):
+            logger.info("Новые %s, в очередь 0 (дубли продавцов / уже в работе)", len(fresh))
         elif pass_no % 8 == 0:
             logger.info(
                 "Проход #%s: %s колл · %s лотов · новых 0 · снимок %s",
@@ -700,7 +713,9 @@ async def run() -> None:
     if not gift_ids:
         logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")
         runtime.last_error = market.last_error or "нет коллекций"
-    queue = PostQueue(market, sender, seen, seen_sellers, state, state_file, runtime)
+    queue = PostQueue(
+        market, sender, seen, seen_sellers, state, state_file, runtime, market_ids
+    )
     queue.start()
     control.queue = queue
 

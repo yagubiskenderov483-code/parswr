@@ -295,14 +295,17 @@ _FOREIGN_LANG = frozenset(
 
 
 def is_russian(lot: Lot) -> bool | None:
-    """True если имя/био на кириллице или lang=ru. None — ещё нет текста."""
+    """True если имя/био на кириллице, lang=ru, или русское имя латиницей."""
     name_bio = " ".join(
         x for x in (lot.first_name, lot.last_name, lot.about) if x
     ).strip()
     lang = (lot.lang_code or "").strip().lower()
-    if _CYR_RE.search(name_bio):
+    if _CYR_RE.search(name_bio) or _CYR_RE.search(lot.seller or ""):
         return True
     if lang == "ru":
+        return True
+    fn = _first_token(lot.first_name)
+    if fn and is_latin_female_name(fn) and lang not in _FOREIGN_LANG:
         return True
     if not name_bio and not lang:
         return None
@@ -342,24 +345,22 @@ def filter_lot(
     max_level: int = 2,
     max_nfts: int = 12,
 ) -> str:
-    """Пустая строка = проходит. Иначе причина отказа."""
+    """Пустая строка = проходит. Иначе причина отказа.
+
+    Неизвестные level / NFT / ЛС не режем — иначе новые лоты сгорают,
+    когда FloodWait не дал дотянуть профиль.
+    """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
     if not lot.seller_key:
         return "нет продавца"
     dm = passes_free_dm(lot)
-    if dm is None:
-        return "нет данных"
     if dm is False:
         return "платные ЛС"
     lvl = passes_level(lot, max_level)
-    if lvl is None:
-        return "нет данных"
     if lvl is False:
         return "level"
     nfts = passes_nfts(lot, max_nfts)
-    if nfts is None:
-        return "нет данных"
     if nfts is False:
         return "много NFT"
     ru = is_russian(lot)

@@ -1,4 +1,4 @@
-"""Гифт-трекер: свежие лоты 3000–25000⭐ сразу в канал, пауза 4 сек."""
+"""Гифт-трекер: все коллекции, лоты ~5000–25000⭐ (запас 4500–27000), пауза 4 сек."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ logger = logging.getLogger("tracker")
 _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
-MIN_SNAPSHOT = 300
+MIN_SNAPSHOT = 0  # первый проход постит подходящие, не копит «тихий» снимок
 
 
 def format_lot(lot: Lot, ts: float | None = None) -> str:
@@ -482,33 +482,60 @@ async def snapshot_market(
     market: TelegramMarket,
     gift_ids: list[int],
     market_ids: set[str],
+    queue: PostQueue,
+    runtime: Runtime,
 ) -> None:
-    logger.info("Снимок маркета — текущие лоты не постим")
-    deadline = time.monotonic() + 90.0
-    while time.monotonic() < deadline and len(market_ids) < MIN_SNAPSHOT:
-        batch = market.next_batch(config.SCAN_BATCH)
-        if not batch:
-            break
-        sem = asyncio.Semaphore(config.SCAN_PARALLEL)
+    """Полный обход всех коллекций: подходящие 4.5k–27k сразу в очередь."""
+    ids = list(gift_ids)
+    logger.info(
+        "Полный обход %s коллекций · цена %s–%s⭐",
+        len(ids),
+        int(config.MIN_STARS),
+        int(config.MAX_STARS),
+    )
+    parallel = max(2, int(config.SCAN_PARALLEL))
+    sem = asyncio.Semaphore(parallel)
+    posted_like = 0
 
-        async def one(gid: int) -> list[Lot]:
-            async with sem:
-                return await market.fetch_page(
-                    gid,
-                    limit=config.PAGE_LIMIT,
-                    timeout=config.REQUEST_TIMEOUT,
-                    gap=config.REQUEST_GAP,
-                )
+    async def one(gid: int) -> list[Lot]:
+        async with sem:
+            return await market.fetch_in_range(
+                gid,
+                config.MIN_STARS,
+                config.MAX_STARS,
+                timeout=config.REQUEST_TIMEOUT,
+                gap=config.REQUEST_GAP,
+            )
 
+    chunk = max(parallel * 4, 16)
+    for i in range(0, len(ids), chunk):
+        batch = ids[i : i + chunk]
         parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
+        fresh: list[Lot] = []
         for part in parts:
-            if isinstance(part, list):
-                for lot in part:
-                    market_ids.add(lot.id)
-        logger.info("Снимок: %s лотов", len(market_ids))
-        if not any(isinstance(p, list) and p for p in parts):
-            break
-    logger.info("Снимок готов: %s лотов", len(market_ids))
+            if not isinstance(part, list):
+                runtime.last_error = str(part)
+                continue
+            for lot in part:
+                market_ids.add(lot.id)
+                if config.MIN_STARS <= lot.stars <= config.MAX_STARS:
+                    fresh.append(lot)
+        n = queue.enqueue(fresh)
+        posted_like += n
+        runtime.snapshot = len(market_ids)
+        runtime.queue = queue._q.qsize()
+        logger.info(
+            "Обход %s/%s · лотов в снимке %s · в очередь +%s",
+            min(i + len(batch), len(ids)),
+            len(ids),
+            len(market_ids),
+            n,
+        )
+    logger.info(
+        "Обход готов: %s лотов на рынке · %s подошли по цене → очередь",
+        len(market_ids),
+        posted_like,
+    )
 
 
 async def scanner_loop(
@@ -520,9 +547,10 @@ async def scanner_loop(
     runtime: Runtime,
     state: dict,
     state_file: Path,
+    bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: %s–%s⭐ · lvl≤%s · NFT≤%s · только девочки · free ЛС · пост/%sс",
+        "Сканер: все коллекции · %s–%s⭐ · lvl≤%s · NFT≤%s · девочки · free ЛС · пост/%sс",
         config.MIN_STARS,
         config.MAX_STARS,
         config.MAX_ACCOUNT_LEVEL,
@@ -537,11 +565,14 @@ async def scanner_loop(
         batch = market.next_batch(config.SCAN_BATCH)
         if not batch:
             try:
-                fresh = await market.load_collections(force=True)
-                gift_ids[:] = list(fresh)
+                fresh_ids = await market.load_collections(force=True, bot=bot)
+                gift_ids[:] = list(fresh_ids)
                 runtime.collections = len(gift_ids)
+                if market.last_error:
+                    runtime.last_error = market.last_error
             except Exception as exc:  # noqa: BLE001
                 logger.error("коллекции: %s", exc)
+                runtime.last_error = str(exc)
             await asyncio.sleep(5)
             continue
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
@@ -622,28 +653,34 @@ async def run() -> None:
     gift_ids: list[int] = []
     for attempt in range(8):
         try:
-            gift_ids = list(await market.load_collections(force=attempt > 0))
+            gift_ids = list(
+                await market.load_collections(
+                    force=attempt > 0, bot=control.aiogram_bot
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             runtime.last_error = str(exc)
             logger.error("коллекции (%s): %s", attempt + 1, exc)
         if gift_ids:
             break
+        if market.last_error:
+            runtime.last_error = market.last_error
         await asyncio.sleep(2.5)
     runtime.collections = len(gift_ids)
     if not gift_ids:
         logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")
-        runtime.last_error = "нет коллекций"
+        runtime.last_error = market.last_error or "нет коллекций"
     queue = PostQueue(market, sender, seen, seen_sellers, state, state_file, runtime)
     queue.start()
     control.queue = queue
 
-    if gift_ids and len(market_ids) < MIN_SNAPSHOT:
+    if gift_ids:
         try:
-            await snapshot_market(market, gift_ids, market_ids)
+            await snapshot_market(market, gift_ids, market_ids, queue, runtime)
             state["market_ids"] = list(market_ids)
             save_state(state_file, state)
         except Exception as exc:  # noqa: BLE001
-            logger.error("снимок: %s", exc)
+            logger.error("обход: %s", exc)
             runtime.last_error = str(exc)
     runtime.snapshot_ready = True
     runtime.snapshot = len(market_ids)
@@ -660,6 +697,7 @@ async def run() -> None:
                     runtime,
                     state,
                     state_file,
+                    bot=control.aiogram_bot,
                 )
             except asyncio.CancelledError:
                 raise

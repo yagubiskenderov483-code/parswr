@@ -332,74 +332,122 @@ class TelegramMarket:
         tmp.replace(path)
 
     @staticmethod
-    def _ids_from_gifts(gifts: Any) -> list[int]:
+    def _collect_gift_ids(gifts: Any) -> list[int]:
+        """Все id из каталога — и обычные, и unique, без фильтра resale."""
         ids: list[int] = []
-        for gift in gifts or []:
-            gift_id = getattr(gift, "id", None)
-            if gift_id is None:
-                continue
-            resale = getattr(gift, "availability_resale", None)
-            if resale is None:
-                ids.append(int(gift_id))
-                continue
+        seen: set[int] = set()
+
+        def add(raw: Any) -> None:
+            if raw is None:
+                return
             try:
-                if int(resale) > 0:
-                    ids.append(int(gift_id))
+                gid = int(raw)
             except (TypeError, ValueError):
-                ids.append(int(gift_id))
+                return
+            if gid and gid not in seen:
+                seen.add(gid)
+                ids.append(gid)
+
+        for gift in gifts or []:
+            add(getattr(gift, "id", None))
+            add(getattr(gift, "gift_id", None))
+            inner = getattr(gift, "gift", None)
+            if inner is not None and inner is not gift:
+                add(getattr(inner, "id", None))
+                add(getattr(inner, "gift_id", None))
         return ids
 
-    async def load_collections(self, force: bool = False) -> list[int]:
-        self._load_catalog()
-        if self.gift_ids and not force:
-            return self.gift_ids
-        await self.ensure_connected()
+    async def load_from_bot_api(self, bot: Any) -> list[int]:
+        """Каталог через Bot API — не зависит от слоя Telethon юзера."""
+        if bot is None:
+            return []
+        try:
+            result = await asyncio.wait_for(bot.get_available_gifts(), timeout=25.0)
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"getAvailableGifts: {exc}"
+            logger.warning("Bot API каталог: %s", exc)
+            return []
+        gifts = getattr(result, "gifts", None) or []
+        ids: list[int] = []
+        seen: set[int] = set()
+        for gift in gifts:
+            raw = getattr(gift, "id", None)
+            try:
+                gid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if gid and gid not in seen:
+                seen.add(gid)
+                ids.append(gid)
+        if ids:
+            logger.info("Каталог Bot API: %s коллекций", len(ids))
+        elif gifts:
+            self.last_error = f"getAvailableGifts пустой (gifts={len(gifts)})"
+        else:
+            self.last_error = "getAvailableGifts пустой"
+        return ids
+
+    async def _load_user_gifts(self) -> list[int]:
         last: Exception | None = None
         for attempt in range(4):
             try:
                 await self._wait_flood()
                 result = await asyncio.wait_for(
-                    self.client(GetStarGiftsRequest(hash=0 if attempt >= 2 else self._hash)),
-                    timeout=20.0,
+                    self.client(GetStarGiftsRequest(hash=0)),
+                    timeout=30.0,
                 )
                 if isinstance(result, StarGiftsNotModified) or (
                     result.__class__.__name__ == "StarGiftsNotModified"
                 ):
                     if self.gift_ids:
                         return self.gift_ids
-                    result = await asyncio.wait_for(
-                        self.client(GetStarGiftsRequest(hash=0)),
-                        timeout=20.0,
-                    )
+                    continue
                 gifts = getattr(result, "gifts", []) or []
-                ids = self._ids_from_gifts(gifts)
-                if not ids:
-                    ids = [
-                        int(g.id)
-                        for g in gifts
-                        if getattr(g, "id", None) is not None
-                    ]
+                ids = self._collect_gift_ids(gifts)
                 try:
                     self._hash = int(getattr(result, "hash", 0) or 0)
                 except (TypeError, ValueError):
                     self._hash = 0
                 if ids:
-                    self.gift_ids = ids
-                    self._save_catalog()
-                    logger.info("Коллекций маркета: %s", len(ids))
+                    logger.info("Коллекций маркета (user API): %s", len(ids))
                     return ids
+                self.last_error = f"GetStarGifts пустой (gifts={len(gifts)})"
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                self.last_error = str(exc)
-                await asyncio.sleep(1.5 * (attempt + 1))
+                self.last_error = f"GetStarGifts: {type(exc).__name__}: {exc}"
+                logger.warning("GetStarGifts attempt %s: %s", attempt + 1, exc)
+                await asyncio.sleep(1.2 * (attempt + 1))
         if last:
             logger.error("GetStarGifts: %s", last)
+        return []
+
+    async def load_collections(
+        self, force: bool = False, *, bot: Any | None = None
+    ) -> list[int]:
+        self._load_catalog()
+        if self.gift_ids and not force:
+            return self.gift_ids
+        await self.ensure_connected()
+        # Bot API сначала: user GetStarGifts часто отдаёт 0 из‑за слоя Telethon
+        via_bot = await self.load_from_bot_api(bot) if bot is not None else []
+        if via_bot:
+            self.gift_ids = via_bot
+            self._save_catalog()
+            return via_bot
+        via_user = await self._load_user_gifts()
+        if via_user:
+            self.gift_ids = via_user
+            self._save_catalog()
+            return via_user
         return self.gift_ids
 
     def next_batch(self, n: int) -> list[int]:
         if not self.gift_ids:
             return []
         total = len(self.gift_ids)
+        if n <= 0 or n >= total:
+            self._cursor = 0
+            return list(self.gift_ids)
         take = min(max(1, n), total)
         batch = [self.gift_ids[(self._cursor + i) % total] for i in range(take)]
         self._cursor = (self._cursor + take) % total
@@ -413,14 +461,29 @@ class TelegramMarket:
         timeout: float = 8.0,
         gap: float = 0.02,
         sort_by_price: bool = False,
+        offset: str = "",
     ) -> list[Lot]:
         stats = {"errors": 0, "floods": 0}
         result = await self._request(
-            gift_id, limit, True, stats, gap, timeout, sort_by_price=sort_by_price
+            gift_id,
+            limit,
+            True,
+            stats,
+            gap,
+            timeout,
+            offset=offset,
+            sort_by_price=sort_by_price,
         )
         if result is None:
             result = await self._request(
-                gift_id, limit, False, stats, gap, timeout, sort_by_price=sort_by_price
+                gift_id,
+                limit,
+                False,
+                stats,
+                gap,
+                timeout,
+                offset=offset,
+                sort_by_price=sort_by_price,
             )
         if result is None:
             return []
@@ -428,6 +491,69 @@ class TelegramMarket:
         for lot in lots:
             lot.collection_id = int(gift_id)
         return lots
+
+    async def fetch_in_range(
+        self,
+        gift_id: int,
+        min_stars: float,
+        max_stars: float,
+        *,
+        timeout: float = 10.0,
+        gap: float = 0.02,
+        max_pages: int = 8,
+    ) -> list[Lot]:
+        """Лоты коллекции в диапазоне цены (сортировка по цене, пагинация)."""
+        offset = ""
+        collected: list[Lot] = []
+        stats = {"errors": 0, "floods": 0}
+        for _ in range(max(1, int(max_pages))):
+            result = await self._request(
+                gift_id,
+                50,
+                True,
+                stats,
+                gap,
+                timeout,
+                offset=offset,
+                sort_by_price=True,
+            )
+            if result is None:
+                result = await self._request(
+                    gift_id,
+                    50,
+                    False,
+                    stats,
+                    gap,
+                    timeout,
+                    offset=offset,
+                    sort_by_price=True,
+                )
+            if result is None:
+                break
+            lots = parse_result(result)
+            if not lots:
+                break
+            for lot in lots:
+                lot.collection_id = int(gift_id)
+                if min_stars <= lot.stars <= max_stars:
+                    collected.append(lot)
+            prices = [lot.stars for lot in lots]
+            ascending = prices[0] <= prices[-1]
+            if ascending:
+                if prices[0] > max_stars:
+                    break
+                if prices[-1] > max_stars:
+                    break
+            else:
+                if prices[0] < min_stars:
+                    break
+                if prices[-1] < min_stars:
+                    break
+            next_off = str(getattr(result, "next_offset", "") or "")
+            if not next_off or next_off == offset:
+                break
+            offset = next_off
+        return collected
 
     async def _request(
         self,

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import config
 from filters import filter_lot, is_girl, looks_male
-from market import Lot
+from market import Lot, TelegramMarket
 from tracker import format_lot
 
 
@@ -72,30 +72,30 @@ def test_skips_male_nick() -> None:
 
 
 def test_price_range() -> None:
-    ok = _lot(stars=3000)
-    assert filter_lot(ok, min_stars=3000, max_stars=25000) == ""
-    low = _lot(stars=2999)
-    assert filter_lot(low, min_stars=3000, max_stars=25000) == "цена"
-    high = _lot(stars=25001)
-    assert filter_lot(high, min_stars=3000, max_stars=25000) == "цена"
+    ok = _lot(stars=5000)
+    assert filter_lot(ok, min_stars=4500, max_stars=27000) == ""
+    low = _lot(stars=4499)
+    assert filter_lot(low, min_stars=4500, max_stars=27000) == "цена"
+    high = _lot(stars=27001)
+    assert filter_lot(high, min_stars=4500, max_stars=27000) == "цена"
 
 
 def test_level_max_2() -> None:
-    assert filter_lot(_lot(account_level=2), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(account_level=3), min_stars=3000, max_stars=25000) == "level"
-    assert filter_lot(_lot(account_level=None), min_stars=3000, max_stars=25000) == "нет данных"
+    assert filter_lot(_lot(account_level=2), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(account_level=3), min_stars=4500, max_stars=27000) == "level"
+    assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == "нет данных"
 
 
 def test_max_12_nfts() -> None:
-    assert filter_lot(_lot(gifts_count=12), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(gifts_count=13), min_stars=3000, max_stars=25000) == "много NFT"
-    assert filter_lot(_lot(gifts_count=None), min_stars=3000, max_stars=25000) == "нет данных"
+    assert filter_lot(_lot(gifts_count=12), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(gifts_count=13), min_stars=4500, max_stars=27000) == "много NFT"
+    assert filter_lot(_lot(gifts_count=None), min_stars=4500, max_stars=27000) == "нет данных"
 
 
 def test_free_dm_only() -> None:
-    assert filter_lot(_lot(free_dm=True), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(free_dm=False), min_stars=3000, max_stars=25000) == "платные ЛС"
-    assert filter_lot(_lot(free_dm=None), min_stars=3000, max_stars=25000) == "нет данных"
+    assert filter_lot(_lot(free_dm=True), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(free_dm=False), min_stars=4500, max_stars=27000) == "платные ЛС"
+    assert filter_lot(_lot(free_dm=None), min_stars=4500, max_stars=27000) == "нет данных"
 
 
 def test_girl_from_bio_emoji() -> None:
@@ -104,8 +104,8 @@ def test_girl_from_bio_emoji() -> None:
 
 
 def test_hardcoded_filters() -> None:
-    assert config.MIN_STARS == 3000
-    assert config.MAX_STARS == 25000
+    assert config.MIN_STARS == 4500
+    assert config.MAX_STARS == 27000
     assert config.MAX_ACCOUNT_LEVEL == 2
     assert config.MAX_NFTS == 12
     assert config.POST_INTERVAL == 4.0
@@ -113,6 +113,29 @@ def test_hardcoded_filters() -> None:
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
+    assert config.SCAN_BATCH == 0
+    assert config.TRACKER_VERSION == "4.2.0"
+
+
+def test_collect_ids_keeps_zero_resale() -> None:
+    class Gift:
+        def __init__(self, gid: int, resale: int = 0) -> None:
+            self.id = gid
+            self.availability_resale = resale
+
+    ids = TelegramMarket._collect_gift_ids(
+        [Gift(11, 0), Gift(12, 5), Gift(11, 0), Gift(13, 0)]
+    )
+    assert ids == [11, 12, 13]
+
+
+def test_next_batch_all_collections() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.gift_ids = [1, 2, 3, 4, 5]
+    market._cursor = 3
+    batch = market.next_batch(0)
+    assert batch == [1, 2, 3, 4, 5]
+    assert market._cursor == 0
 
 
 def test_girl_from_gifts_and_stories() -> None:
@@ -140,6 +163,8 @@ def main() -> None:
         test_free_dm_only,
         test_girl_from_bio_emoji,
         test_hardcoded_filters,
+        test_collect_ids_keeps_zero_resale,
+        test_next_batch_all_collections,
         test_girl_from_gifts_and_stories,
     ]
     for fn in tests:

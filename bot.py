@@ -266,9 +266,10 @@ class ControlBot:
             f"✅ Трекер v{config.TRACKER_VERSION}",
             f"Аккаунт: {self.account_name if self.authorized else 'не вошёл'}",
             f"Канал: <code>{config.CHANNEL_ID}</code>",
-            f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐",
+            f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
             f"Фильтры: девочки · free ЛС · lvl≤{config.MAX_ACCOUNT_LEVEL} · "
             f"NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с",
+            "Обход: все коллекции",
         ]
         if rt:
             lines.extend(

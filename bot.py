@@ -272,11 +272,14 @@ class ControlBot:
             "Обход: все коллекции",
         ]
         if rt:
+            coll = f"Коллекций: {rt.collections}"
+            if rt.collections < config.MIN_COLLECTIONS:
+                coll += f" (мало, нужно ≥{config.MIN_COLLECTIONS})"
             lines.extend(
                 [
                     f"Снимок: {'готов' if rt.snapshot_ready else 'строится'} ({rt.snapshot})",
                     f"Проходов: {rt.passes}",
-                    f"Коллекций: {rt.collections}",
+                    coll,
                     f"Отправлено: {rt.posted}",
                     f"В очереди: {rt.queue}",
                     f"Последний проход: +{rt.last_fresh}",

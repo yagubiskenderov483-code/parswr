@@ -563,18 +563,24 @@ async def scanner_loop(
         pass_no += 1
         runtime.passes = pass_no
         batch = market.next_batch(config.SCAN_BATCH)
-        if not batch:
+        if not batch or len(gift_ids) < config.MIN_COLLECTIONS:
             try:
                 fresh_ids = await market.load_collections(force=True, bot=bot)
-                gift_ids[:] = list(fresh_ids)
-                runtime.collections = len(gift_ids)
-                if market.last_error:
+                if fresh_ids:
+                    gift_ids[:] = list(fresh_ids)
+                    runtime.collections = len(gift_ids)
+                if market.last_error and len(gift_ids) < config.MIN_COLLECTIONS:
                     runtime.last_error = market.last_error
             except Exception as exc:  # noqa: BLE001
                 logger.error("коллекции: %s", exc)
                 runtime.last_error = str(exc)
-            await asyncio.sleep(5)
-            continue
+            if not gift_ids:
+                await asyncio.sleep(5)
+                continue
+            batch = market.next_batch(config.SCAN_BATCH)
+            if not batch:
+                await asyncio.sleep(5)
+                continue
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
 
         async def one(gid: int) -> list[Lot]:
@@ -666,6 +672,18 @@ async def run() -> None:
         if market.last_error:
             runtime.last_error = market.last_error
         await asyncio.sleep(2.5)
+    if len(gift_ids) < config.MIN_COLLECTIONS:
+        logger.warning(
+            "Коллекций %s — мало, нужно ≥%s. Пробуем ещё раз",
+            len(gift_ids),
+            config.MIN_COLLECTIONS,
+        )
+        try:
+            gift_ids = list(
+                await market.load_collections(force=True, bot=control.aiogram_bot)
+            )
+        except Exception as exc:  # noqa: BLE001
+            runtime.last_error = str(exc)
     runtime.collections = len(gift_ids)
     if not gift_ids:
         logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")

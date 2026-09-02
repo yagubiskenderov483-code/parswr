@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import config
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -37,6 +41,100 @@ except ImportError:
     GetPeerStoriesRequest = None  # type: ignore[misc, assignment]
 
 logger = logging.getLogger("market")
+
+STAR_GIFT_CTOR = 0x313A9547
+_PUBLIC_CATALOG_URLS = (
+    "https://api.changes.tg/ids",
+    "https://cdn.changes.tg/gifts/id-to-name.json",
+)
+_BUNDLED_CATALOG = Path(__file__).resolve().parent / "gift_catalog.json"
+
+
+def merge_ids(*groups: list[int]) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for group in groups:
+        for gid in group or []:
+            try:
+                n = int(gid)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in seen:
+                seen.add(n)
+                out.append(n)
+    return out
+
+
+def ids_from_json_payload(data: Any) -> list[int]:
+    found: list[int] = []
+
+    def add(raw: Any) -> None:
+        if raw is None or isinstance(raw, bool):
+            return
+        if isinstance(raw, float) and not raw.is_integer():
+            return
+        try:
+            gid = int(raw)
+        except (TypeError, ValueError):
+            return
+        if gid > 10**12:
+            found.append(gid)
+
+    if isinstance(data, dict):
+        for item in data.get("gift_ids") or []:
+            add(item)
+        for key, val in data.items():
+            if key == "gift_ids":
+                continue
+            add(key)
+            if isinstance(val, dict):
+                add(val.get("telegram_id") or val.get("gift_id") or val.get("id"))
+            else:
+                add(val)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                add(item.get("telegram_id") or item.get("gift_id") or item.get("id"))
+            else:
+                add(item)
+    return merge_ids(found)
+
+
+def extract_star_gift_ids(data: bytes) -> list[int]:
+    """Достаёт gift id из сырого TL, даже если StarGift не парсится целиком."""
+    needle = struct.pack("<I", STAR_GIFT_CTOR)
+    found: list[int] = []
+    start = 0
+    while True:
+        pos = data.find(needle, start)
+        if pos < 0:
+            break
+        if pos + 16 > len(data):
+            break
+        gid = struct.unpack_from("<q", data, pos + 8)[0]
+        if gid > 10**12:
+            found.append(gid)
+        start = pos + 4
+    return merge_ids(found)
+
+
+class GetStarGiftsIdsRequest(GetStarGiftsRequest):
+    """getStarGifts: распарсенный список или id из сырых байт."""
+
+    @staticmethod
+    def read_result(reader):  # noqa: ANN001
+        start = reader.tell_position()
+        raw = bytes(reader.get_bytes()[start:])
+        parsed: list[int] = []
+        try:
+            obj = reader.tgread_object()
+            parsed = TelegramMarket._collect_gift_ids(getattr(obj, "gifts", None) or [])
+        except Exception:  # noqa: BLE001
+            try:
+                reader.set_position(len(reader.get_bytes()))
+            except Exception:  # noqa: BLE001
+                pass
+        return merge_ids(parsed, extract_star_gift_ids(raw))
 
 
 @dataclass(slots=True)
@@ -312,15 +410,23 @@ class TelegramMarket:
             return
         try:
             data = json.loads(self.catalog_file.read_text(encoding="utf-8"))
-            ids = [int(x) for x in data.get("gift_ids", [])]
-            if ids:
+            ids = ids_from_json_payload(data)
+            if len(ids) >= config.MIN_COLLECTIONS:
                 self.gift_ids = ids
-                self._hash = int(data.get("hash", 0) or 0)
+                try:
+                    self._hash = int(data.get("hash", 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    self._hash = 0
+            else:
+                logger.warning(
+                    "Кэш каталога слишком маленький (%s) — грузим заново",
+                    len(ids),
+                )
         except (OSError, ValueError, TypeError):
             pass
 
     def _save_catalog(self) -> None:
-        if not self.catalog_file or not self.gift_ids:
+        if not self.catalog_file or len(self.gift_ids) < config.MIN_COLLECTIONS:
             return
         path = self.catalog_file
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -389,25 +495,22 @@ class TelegramMarket:
 
     async def _load_user_gifts(self) -> list[int]:
         last: Exception | None = None
-        for attempt in range(4):
+        for attempt in range(2):
             try:
                 await self._wait_flood()
                 result = await asyncio.wait_for(
-                    self.client(GetStarGiftsRequest(hash=0)),
-                    timeout=30.0,
+                    self.client(GetStarGiftsIdsRequest(hash=0)),
+                    timeout=15.0,
                 )
+                if isinstance(result, list) and result:
+                    logger.info("Коллекций маркета (user API): %s", len(result))
+                    return merge_ids(result)
                 if isinstance(result, StarGiftsNotModified) or (
                     result.__class__.__name__ == "StarGiftsNotModified"
                 ):
-                    if self.gift_ids:
-                        return self.gift_ids
                     continue
                 gifts = getattr(result, "gifts", []) or []
                 ids = self._collect_gift_ids(gifts)
-                try:
-                    self._hash = int(getattr(result, "hash", 0) or 0)
-                except (TypeError, ValueError):
-                    self._hash = 0
                 if ids:
                     logger.info("Коллекций маркета (user API): %s", len(ids))
                     return ids
@@ -421,24 +524,109 @@ class TelegramMarket:
             logger.error("GetStarGifts: %s", last)
         return []
 
+    def load_from_bundled(self) -> list[int]:
+        if not _BUNDLED_CATALOG.exists():
+            return []
+        try:
+            data = json.loads(_BUNDLED_CATALOG.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Встроенный каталог: %s", exc)
+            return []
+        ids = ids_from_json_payload(data)
+        if ids:
+            logger.info("Каталог из репо: %s коллекций", len(ids))
+        return ids
+
+    def _fetch_public_sync(self) -> list[int]:
+        last_err = ""
+        for url in _PUBLIC_CATALOG_URLS:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "gift-tracker/4.3"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                ids = ids_from_json_payload(data)
+                if ids:
+                    logger.info("Каталог %s: %s коллекций", url, len(ids))
+                    return ids
+                last_err = f"{url} без id"
+            except Exception as exc:  # noqa: BLE001
+                last_err = f"{url}: {exc}"
+                logger.warning("Публичный каталог %s", last_err)
+        if last_err:
+            self.last_error = last_err
+        return []
+
+    async def load_from_public(self) -> list[int]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_public_sync), timeout=20.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"public catalog: {exc}"
+            logger.warning("Публичный каталог: %s", exc)
+            return []
+
     async def load_collections(
         self, force: bool = False, *, bot: Any | None = None
     ) -> list[int]:
         self._load_catalog()
-        if self.gift_ids and not force:
+        if self.gift_ids and not force and len(self.gift_ids) >= config.MIN_COLLECTIONS:
             return self.gift_ids
-        await self.ensure_connected()
-        # Bot API сначала: user GetStarGifts часто отдаёт 0 из‑за слоя Telethon
-        via_bot = await self.load_from_bot_api(bot) if bot is not None else []
-        if via_bot:
-            self.gift_ids = via_bot
+        try:
+            await self.ensure_connected()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("connect перед каталогом: %s", exc)
+
+        via_bundled = self.load_from_bundled()
+        via_public: list[int] = []
+        via_user: list[int] = []
+        via_bot: list[int] = []
+
+        public_task = asyncio.create_task(self.load_from_public())
+        user_task = asyncio.create_task(self._load_user_gifts())
+        bot_task = (
+            asyncio.create_task(self.load_from_bot_api(bot))
+            if bot is not None
+            else None
+        )
+        try:
+            via_public = await asyncio.wait_for(asyncio.shield(public_task), timeout=12.0)
+        except Exception:  # noqa: BLE001
+            public_task.cancel()
+        try:
+            via_user = await asyncio.wait_for(asyncio.shield(user_task), timeout=18.0)
+        except Exception:  # noqa: BLE001
+            user_task.cancel()
+        if bot_task is not None:
+            try:
+                via_bot = await asyncio.wait_for(asyncio.shield(bot_task), timeout=12.0)
+            except Exception:  # noqa: BLE001
+                bot_task.cancel()
+        if not isinstance(via_public, list):
+            via_public = []
+        if not isinstance(via_user, list):
+            via_user = []
+        if not isinstance(via_bot, list):
+            via_bot = []
+
+        merged = merge_ids(via_user, via_public, via_bundled, via_bot)
+        if merged:
+            self.gift_ids = merged
             self._save_catalog()
-            return via_bot
-        via_user = await self._load_user_gifts()
-        if via_user:
-            self.gift_ids = via_user
-            self._save_catalog()
-            return via_user
+            logger.info(
+                "Каталог суммарно %s · user=%s public=%s bundled=%s bot=%s",
+                len(merged),
+                len(via_user),
+                len(via_public),
+                len(via_bundled),
+                len(via_bot),
+            )
+            if len(merged) < config.MIN_COLLECTIONS:
+                self.last_error = f"мало коллекций: {len(merged)}"
+            return merged
         return self.gift_ids
 
     def next_batch(self, n: int) -> list[int]:

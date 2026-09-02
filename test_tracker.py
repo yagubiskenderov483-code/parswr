@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 import config
 from filters import filter_lot, is_girl, looks_male
-from market import Lot, TelegramMarket
+from market import (
+    Lot,
+    TelegramMarket,
+    extract_star_gift_ids,
+    ids_from_json_payload,
+    merge_ids,
+)
 from tracker import format_lot
 
 
@@ -114,7 +120,8 @@ def test_hardcoded_filters() -> None:
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.2.0"
+    assert config.TRACKER_VERSION == "4.3.0"
+    assert config.MIN_COLLECTIONS == 50
 
 
 def test_collect_ids_keeps_zero_resale() -> None:
@@ -136,6 +143,41 @@ def test_next_batch_all_collections() -> None:
     batch = market.next_batch(0)
     assert batch == [1, 2, 3, 4, 5]
     assert market._cursor == 0
+
+
+def test_merge_and_json_catalog() -> None:
+    assert merge_ids([1, 2], [2, 3], []) == [1, 2, 3]
+    ids = ids_from_json_payload(
+        {
+            "gift_ids": [5983471780763796287],
+            "5936085638515261992": "Signet Ring",
+        }
+    )
+    assert 5983471780763796287 in ids
+    assert 5936085638515261992 in ids
+    small = ids_from_json_payload({"gift_ids": [11, 12]})
+    assert small == []  # короткие id витрины не считаем коллекциями
+
+
+def test_extract_star_gift_ids() -> None:
+    import struct
+
+    gid = 5983471780763796287
+    blob = (
+        b"xxxx"
+        + struct.pack("<I", 0x313A9547)
+        + struct.pack("<I", 0)
+        + struct.pack("<q", gid)
+        + b"yyyy"
+    )
+    assert extract_star_gift_ids(blob) == [gid]
+
+
+def test_bundled_catalog_has_enough() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    ids = TelegramMarket.load_from_bundled(market)
+    assert len(ids) >= 50
+    assert len(ids) >= 100
 
 
 def test_girl_from_gifts_and_stories() -> None:
@@ -165,6 +207,9 @@ def main() -> None:
         test_hardcoded_filters,
         test_collect_ids_keeps_zero_resale,
         test_next_batch_all_collections,
+        test_merge_and_json_catalog,
+        test_extract_star_gift_ids,
+        test_bundled_catalog_has_enough,
         test_girl_from_gifts_and_stories,
     ]
     for fn in tests:

@@ -34,8 +34,9 @@ SCAN_PARALLEL = 4
 REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 10.0
 ENRICH_TIMEOUT = 5.0
+MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "4.2.0"
+TRACKER_VERSION = "4.3.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

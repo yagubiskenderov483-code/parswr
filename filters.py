@@ -50,7 +50,11 @@ _MALE_TRANSLIT_RE = re.compile(
     r"alyosha|seryozha|serezha|danila|danya|gena|styopa|stepa|borya|"
     r"fedya|fedia|mitya|mitia|senya|yura|jura|roma|tima|sanya|sania|"
     r"savva|luka|foma|seva|lyova|leva|zhora|vova|zhenya|"
-    r"mustafa|musa|isa|ali|akhmed|ahmed"
+    r"mustafa|musa|isa|ali|akhmed|ahmed|reza|rezaa|amir|mehdi|mahdi|"
+    r"mohammad|muhammad|hossein|hussein|hassan|hasan|saeed|said|"
+    r"arman|nima|pouya|pooya|parsa|arash|kasra|kian|farhad|milad|"
+    r"kamran|omid|javad|babak|dariush|kaveh|siavash|peyman|"
+    r"ahmad|hamid|majid|vahid|navid|behzad|hooman|keyvan"
     r")$",
     re.IGNORECASE,
 )
@@ -162,18 +166,16 @@ def is_latin_female_name(name: str) -> bool:
         return False
     if _MALE_TRANSLIT_RE.match(fn) or _MALE_NAMES_RE.match(fn):
         return False
-    if _LATIN_FEMALE_RE.match(fn) or _FEMALE_NAME_END_RE.search(fn):
+    if _LATIN_FEMALE_RE.match(fn):
         return True
-    return fn.endswith(("a", "ya", "iya"))
+    return False
 
 
 def _username_female(username: str) -> bool:
     u = _norm(username)
     if len(u) < 3 or _MALE_NAMES_RE.search(u):
         return False
-    if _FEMALE_USER_RE.search(u) or _FEMALE_NAME_END_RE.search(u):
-        return True
-    return u.endswith(("ka", "ya", "na", "sha", "nya", "lia", "iya"))
+    return bool(_FEMALE_USER_RE.search(u))
 
 
 def _blob(lot: Lot) -> str:
@@ -195,7 +197,7 @@ def _blob(lot: Lot) -> str:
 
 def looks_male(lot: Lot) -> bool:
     fn = _first_token(lot.first_name)
-    if fn and (is_cyrillic_female_name(fn) or is_latin_female_name(fn)):
+    if fn and is_cyrillic_female_name(fn):
         return False
     blob = _blob(lot)
     if _MALE_HINT_RE.search(blob) or _MALE_EMOJI_RE.search(blob):
@@ -206,6 +208,10 @@ def looks_male(lot: Lot) -> bool:
             return True
         if _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS:
             return True
+        if _CYR_RE.search(fn) and not is_cyrillic_female_name(fn):
+            return True
+        if latin and not is_latin_female_name(fn):
+            return True
         if len(fn) >= 3 and fn.endswith(("ич", "он", "ил", "ём", "ем", "ур", "им")):
             if not fn.endswith(("ия", "ья")):
                 return True
@@ -213,12 +219,31 @@ def looks_male(lot: Lot) -> bool:
     if ln.endswith(("ович", "евич", "ич")):
         return True
     seller = _norm(lot.seller)
-    if seller and _MALE_NAMES_RE.search(seller):
+    if seller and (_MALE_NAMES_RE.search(seller) or _MALE_TRANSLIT_RE.search(seller)):
         return True
     for part in re.split(r"[_.\-]+", (lot.seller or "").lower().lstrip("@")):
-        if _norm(part) and _MALE_NAMES_RE.match(_norm(part)):
+        n = _norm(part)
+        if n and (_MALE_NAMES_RE.match(n) or _MALE_TRANSLIT_RE.match(n)):
             return True
     return False
+
+
+def female_reason(lot: Lot) -> str:
+    """Нужно женское имя на кириллице. Эмодзи/название гифта не считаются."""
+    if looks_male(lot):
+        return "мужской"
+    fn = _first_token(lot.first_name)
+    if is_cyrillic_female_name(fn):
+        return ""
+    ln = (lot.last_name or "").strip().lower()
+    if ln.endswith(("овна", "евна", "ична")):
+        return ""
+    about = lot.about or ""
+    if _CYR_RE.search(about) and _FEMALE_HINT_RE.search(about):
+        return ""
+    if not fn and not about:
+        return "нет женских признаков"
+    return "нет женских признаков"
 
 
 def female_score(lot: Lot) -> int:
@@ -254,14 +279,6 @@ def female_score(lot: Lot) -> int:
     return score
 
 
-def female_reason(lot: Lot) -> str:
-    if looks_male(lot):
-        return "мужской"
-    if female_score(lot) <= 0:
-        return "нет женских признаков"
-    return ""
-
-
 def is_girl(lot: Lot) -> bool:
     return not female_reason(lot)
 
@@ -295,22 +312,15 @@ _FOREIGN_LANG = frozenset(
 
 
 def is_russian(lot: Lot) -> bool | None:
-    """True если имя/био на кириллице, lang=ru, или русское имя латиницей."""
+    """Только кириллица в имени или био. Латиница / fa / en — не русские."""
     name_bio = " ".join(
         x for x in (lot.first_name, lot.last_name, lot.about) if x
     ).strip()
     lang = (lot.lang_code or "").strip().lower()
-    if _CYR_RE.search(name_bio) or _CYR_RE.search(lot.seller or ""):
-        return True
-    if lang == "ru":
-        return True
-    fn = _first_token(lot.first_name)
-    if fn and is_latin_female_name(fn) and lang not in _FOREIGN_LANG:
+    if _CYR_RE.search(name_bio):
         return True
     if not name_bio and not lang:
         return None
-    if lang in _FOREIGN_LANG:
-        return False
     return False
 
 

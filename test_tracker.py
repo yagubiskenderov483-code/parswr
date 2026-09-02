@@ -62,8 +62,10 @@ def test_girl_keeps_maria() -> None:
 
 
 def test_girl_keeps_latin_name() -> None:
+    """Латиница без кириллицы — не русская девочка (Reza/Nima больше не пролезают)."""
     lot = _lot(first_name="Kristina", about="🌸", seller="kris_shop")
-    assert is_girl(lot) is True
+    assert is_girl(lot) is False
+    assert is_russian(lot) is False
 
 
 def test_skips_boy() -> None:
@@ -106,7 +108,9 @@ def test_free_dm_only() -> None:
 
 def test_girl_from_bio_emoji() -> None:
     lot = _lot(first_name="Alexa", about="she/her 🎀", seller="alexa_nft")
-    assert is_girl(lot) is True
+    assert is_girl(lot) is False
+    ru = _lot(first_name="Алекса", about="девушка, пишите 🎀", seller="alexa_nft")
+    assert is_girl(ru) is True
 
 
 def test_hardcoded_filters() -> None:
@@ -114,14 +118,15 @@ def test_hardcoded_filters() -> None:
     assert config.MAX_STARS == 27000
     assert config.MAX_ACCOUNT_LEVEL == 2
     assert config.MAX_NFTS == 12
-    assert config.POST_INTERVAL == 5.0
+    assert config.POST_INTERVAL == 3.0
     assert config.CHANNEL_ID == -1003784435307
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.6.0"
+    assert config.TRACKER_VERSION == "4.7.0"
     assert config.MIN_COLLECTIONS == 50
+    assert config.SNAPSHOT_PAGE_LIMIT >= config.PAGE_LIMIT
 
 
 def test_collect_ids_keeps_zero_resale() -> None:
@@ -182,14 +187,14 @@ def test_bundled_catalog_has_enough() -> None:
 
 def test_skips_non_russian() -> None:
     latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="en")
-    assert is_girl(latin) is True
+    assert is_girl(latin) is False
     assert is_russian(latin) is False
     assert filter_lot(latin, min_stars=4500, max_stars=27000) == "не русский"
     iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
     assert is_russian(iranian) is False
     assert is_russian(_lot()) is True
     cis_latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="")
-    assert is_russian(cis_latin) is True
+    assert is_russian(cis_latin) is False
 
 
 def test_girl_from_gifts_and_stories() -> None:
@@ -201,7 +206,41 @@ def test_girl_from_gifts_and_stories() -> None:
         stories_text="новая ава 💅",
         has_photo=True,
     )
-    assert is_girl(lot) is True
+    assert is_girl(lot) is False
+    ru = _lot(
+        first_name="Мария",
+        about="пишите 💅",
+        seller="masha_shop",
+        gifts_text="Rose Heart Perfume",
+        stories_text="новая ава 💅",
+        has_photo=True,
+    )
+    assert is_girl(ru) is True
+
+
+def test_skips_persian_and_latin_boys() -> None:
+    reza = _lot(first_name="Reza", about="", seller="reza_gifts", lang_code="fa")
+    assert looks_male(reza) is True
+    assert is_girl(reza) is False
+    assert filter_lot(reza, min_stars=4500, max_stars=27000) != ""
+    nima = _lot(first_name="Nima", about="nft", seller="nima_shop")
+    assert looks_male(nima) is True
+    amir = _lot(first_name="Shop", about="", seller="amir_nft")
+    assert looks_male(amir) is True
+    boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
+    assert looks_male(boy) is True
+    assert is_girl(boy) is False
+
+
+def test_snapshot_uses_newest_feed() -> None:
+    import inspect
+
+    from tracker import snapshot_market
+
+    src = inspect.getsource(snapshot_market)
+    assert "fetch_page" in src
+    assert "sort_by_price=False" in src
+    assert "fetch_in_range" not in src
 
 
 def test_state_schema_clears_seller_bans() -> None:
@@ -251,6 +290,8 @@ def main() -> None:
         test_bundled_catalog_has_enough,
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
+        test_skips_persian_and_latin_boys,
+        test_snapshot_uses_newest_feed,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

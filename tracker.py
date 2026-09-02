@@ -1,4 +1,4 @@
-"""Гифт-трекер: новые лоты ~5000–25000⭐, русские девочки, рандом, пауза 5 сек."""
+"""Гифт-трекер: новые лоты ~5000–25000⭐, русские девочки, рандом, пауза 3 сек."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ def lot_keyboard_telethon(lot: Lot) -> list[list[Any]]:
 
 
 class RateLimiter:
-    """Строгий интервал между постами (5 сек)."""
+    """Строгий интервал между постами."""
 
     def __init__(self, interval: float, lock_path: Path, ts_path: Path) -> None:
         self.interval = max(0.5, float(interval))
@@ -472,6 +472,44 @@ class PostQueue:
                     pass
                 continue
             try:
+                pre = filter_lot(
+                    lot,
+                    min_stars=config.MIN_STARS,
+                    max_stars=config.MAX_STARS,
+                    max_level=config.MAX_ACCOUNT_LEVEL,
+                    max_nfts=config.MAX_NFTS,
+                )
+                hard = {
+                    "мужской",
+                    "не русский",
+                    "цена",
+                    "платные ЛС",
+                    "level",
+                    "много NFT",
+                    "дубль",
+                }
+                if pre in hard:
+                    now = time.time()
+                    keys = seller_keys(lot)
+                    stats = skip_stats()
+                    classify_skip(pre, stats)
+                    classify_skip(pre, self.runtime.skip_total)
+                    self.runtime.last_skip = stats
+                    logger.info(
+                        "Пропуск без RPC %s: %s · %s",
+                        lot.slug or lot.id,
+                        pre,
+                        (lot.first_name or lot.seller or "?")[:24],
+                    )
+                    self.seen[lot.id] = now
+                    self.market_ids.add(lot.id)
+                    if pre != "дубль" and keys:
+                        for k in keys:
+                            self.skip_sellers[k] = now
+                        self.state["skip_sellers"] = self.skip_sellers
+                    self.state["market_ids"] = list(self.market_ids)
+                    save_state(self.state_file, self.state)
+                    continue
                 await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
                 now = time.time()
                 reason = filter_lot(
@@ -556,25 +594,35 @@ async def snapshot_market(
     market_ids: set[str],
     runtime: Runtime,
 ) -> None:
-    """Запомнить текущий рынок. Старые лоты в канал не постим."""
+    """Запомнить newest-ленту каждой коллекции — ту же, что читает сканер.
+
+    Снимок, отсортированный по цене, пропускал старые лоты из ленты
+    «последнее изменение цены» — они потом уходили в канал как «новые».
+    """
     ids = list(gift_ids)
     random.shuffle(ids)
+    limit = max(int(config.PAGE_LIMIT), int(getattr(config, "SNAPSHOT_PAGE_LIMIT", 20)))
     logger.info(
-        "Снимок %s коллекций — текущие лоты пропускаем, шлём только новые",
+        "Снимок newest-ленты %s коллекций (по %s лотов) — в канал только то, что появится после",
         len(ids),
+        limit,
     )
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
     async def one(gid: int) -> list[Lot]:
         async with sem:
-            return await market.fetch_in_range(
-                gid,
-                config.MIN_STARS,
-                config.MAX_STARS,
-                timeout=config.REQUEST_TIMEOUT,
-                gap=config.REQUEST_GAP,
-            )
+            try:
+                return await market.fetch_page(
+                    gid,
+                    limit=limit,
+                    timeout=config.REQUEST_TIMEOUT,
+                    gap=config.REQUEST_GAP,
+                    sort_by_price=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                runtime.last_error = str(exc)
+                return []
 
     chunk = max(parallel * 4, 16)
     for i in range(0, len(ids), chunk):
@@ -589,7 +637,7 @@ async def snapshot_market(
         runtime.snapshot = len(market_ids)
         runtime.queue = 0
         logger.info(
-            "Снимок %s/%s · уже на рынке %s лотов",
+            "Снимок %s/%s · already-on-market %s",
             min(i + len(batch), len(ids)),
             len(ids),
             len(market_ids),
@@ -644,35 +692,58 @@ async def scanner_loop(
 
         async def one(gid: int) -> list[Lot]:
             async with sem:
-                return await market.fetch_page(
-                    gid,
-                    limit=config.PAGE_LIMIT,
-                    timeout=config.REQUEST_TIMEOUT,
-                    gap=config.REQUEST_GAP,
-                )
+                try:
+                    return await market.fetch_page(
+                        gid,
+                        limit=config.PAGE_LIMIT,
+                        timeout=config.REQUEST_TIMEOUT,
+                        gap=config.REQUEST_GAP,
+                        sort_by_price=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    runtime.last_error = str(exc)
+                    return []
 
-        parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
-        fresh: list[Lot] = []
+        found = 0
+        queued = 0
         parsed = 0
-        for part in parts:
-            if not isinstance(part, list):
-                runtime.last_error = str(part)
-                continue
+
+        def absorb(part: list[Lot]) -> None:
+            nonlocal found, queued, parsed
             parsed += len(part)
+            chunk: list[Lot] = []
             for lot in part:
-                if lot.id in market_ids or lot.id in seen or lot.id in queue._queued or lot.id in queue._inflight:
+                if (
+                    lot.id in market_ids
+                    or lot.id in seen
+                    or lot.id in queue._queued
+                    or lot.id in queue._inflight
+                ):
                     continue
                 if not (config.MIN_STARS <= lot.stars <= config.MAX_STARS):
                     continue
-                fresh.append(lot)
-        n = queue.enqueue(fresh)
-        runtime.last_found = len(fresh)
-        runtime.last_fresh = n
+                chunk.append(lot)
+            if not chunk:
+                return
+            found += len(chunk)
+            queued += queue.enqueue(chunk)
+
+        tasks = [asyncio.create_task(one(g)) for g in batch]
+        for fut in asyncio.as_completed(tasks):
+            try:
+                part = await fut
+            except Exception as exc:  # noqa: BLE001
+                runtime.last_error = str(exc)
+                continue
+            if isinstance(part, list):
+                absorb(part)
+        runtime.last_found = found
+        runtime.last_fresh = queued
         runtime.snapshot = len(market_ids)
-        if n:
-            logger.info("⚡ новые %s → очередь %s (найдено %s)", n, len(queue._items), len(fresh))
-        elif len(fresh):
-            logger.info("Новые %s, в очередь 0 (дубли продавцов / уже в работе)", len(fresh))
+        if queued:
+            logger.info("⚡ новые %s → очередь %s (найдено %s)", queued, len(queue._items), found)
+        elif found:
+            logger.info("Новые %s, в очередь 0 (дубли продавцов / уже в работе)", found)
         elif pass_no % 8 == 0:
             logger.info(
                 "Проход #%s: %s колл · %s лотов · новых 0 · снимок %s",
@@ -754,19 +825,20 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    if gift_ids and len(market_ids) < 500:
+    if gift_ids:
+        had = len(market_ids)
         try:
             await snapshot_market(market, gift_ids, market_ids, runtime)
             state["market_ids"] = list(market_ids)
             save_state(state_file, state)
+            logger.info(
+                "Newest-снимок: было %s, стало %s id (старая цена-лента больше не путается с новыми)",
+                had,
+                len(market_ids),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("обход: %s", exc)
             runtime.last_error = str(exc)
-    elif gift_ids:
-        logger.info(
-            "Снимок уже есть (%s лотов) — в канал только новые, без старой очереди",
-            len(market_ids),
-        )
     runtime.snapshot_ready = True
     runtime.snapshot = len(market_ids)
 

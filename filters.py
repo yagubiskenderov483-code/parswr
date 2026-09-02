@@ -364,6 +364,8 @@ def filter_lot(
     """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
+    if looks_male(lot):
+        return "мужской"
     if not lot.seller_key:
         return "нет продавца"
     dm = passes_free_dm(lot)
@@ -375,14 +377,6 @@ def filter_lot(
     nfts = passes_nfts(lot, max_nfts)
     if nfts is False:
         return "много NFT"
-    ru = is_russian(lot)
-    if ru is None:
-        return "нет данных"
-    if ru is False:
-        return "не русский"
-    reason = female_reason(lot)
-    if reason:
-        return reason
     return ""
 
 

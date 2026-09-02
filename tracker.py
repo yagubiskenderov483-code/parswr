@@ -1,4 +1,4 @@
-"""Гифт-трекер: новые лоты ~5000–25000⭐, русские девочки, рандом, пауза 3 сек."""
+"""Гифт-трекер: только что выставленные лоты ~5000–25000⭐, пост каждые 4 сек."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from telethon.sessions import StringSession
 
 import config
 from bot import ControlBot
-from filters import classify_skip, filter_lot, seller_keys, skip_stats
+from filters import classify_skip, filter_lot, is_girl, seller_keys, skip_stats
 from market import Lot, TelegramMarket, format_level
 
 logger = logging.getLogger("tracker")
@@ -27,9 +27,9 @@ logger = logging.getLogger("tracker")
 _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
-SKIP_SELLER_TTL = 3 * 3600  # отсев (paid/lvl) — не путать с «уже постили»
-STATE_SCHEMA = 6
-MIN_SNAPSHOT = 0  # снимок только запоминает рынок, в канал не постит
+SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
+STATE_SCHEMA = 7
+MIN_SNAPSHOT = 0
 
 
 def format_lot(lot: Lot, ts: float | None = None) -> str:
@@ -242,6 +242,7 @@ def load_state(path: Path) -> dict:
             data.setdefault("seen_sellers", {})
             data.setdefault("skip_sellers", {})
             data.setdefault("market_ids", [])
+            data.setdefault("heads", {})
             schema = 0
             try:
                 schema = int(data.get("schema", 0) or 0)
@@ -249,11 +250,10 @@ def load_state(path: Path) -> dict:
                 schema = 0
             if schema < STATE_SCHEMA:
                 logger.warning(
-                    "Сбросил бан продавцов (schema %s→%s): отсев больше не блокирует новые лоты",
+                    "Схема %s→%s: сброс skip_sellers, дальше ловим смену #1",
                     schema,
                     STATE_SCHEMA,
                 )
-                data["seen_sellers"] = {}
                 data["skip_sellers"] = {}
                 data["schema"] = STATE_SCHEMA
             return data
@@ -264,6 +264,7 @@ def load_state(path: Path) -> dict:
         "seen_sellers": {},
         "skip_sellers": {},
         "market_ids": [],
+        "heads": {},
         "schema": STATE_SCHEMA,
     }
 
@@ -425,7 +426,6 @@ class PostQueue:
             if now - float(ts) < SKIP_SELLER_TTL
         }
         incoming = list(lots)
-        random.shuffle(incoming)
         batch_owners: set[str] = set()
         for lot in incoming:
             if lot.id in self.seen or lot.id in self._queued or lot.id in self._inflight:
@@ -445,7 +445,6 @@ class PostQueue:
             batch_owners |= keys
             added += 1
         if added:
-            random.shuffle(self._items)
             self._event.set()
         self.runtime.queue = len(self._items)
         return added
@@ -454,17 +453,19 @@ class PostQueue:
         if not self._items:
             return None
         last = self._last_title
-        pool = [x for x in self._items if (x.title or "") != last] if last else self._items
+        pool = [x for x in self._items if (x.title or "") != last] if last else list(self._items)
         if not pool:
-            pool = self._items
-        lot = random.choice(pool)
+            pool = list(self._items)
+        girls = [x for x in pool if is_girl(x)]
+        cand = girls or pool
+        lot = max(cand, key=lambda x: float(getattr(x, "discovered_at", 0) or 0))
         self._items.remove(lot)
         self._queued.discard(lot.id)
         self._inflight.add(lot.id)
         return lot
 
     async def _worker(self) -> None:
-        logger.info("Очередь постов: рандом · пауза %s сек · без повтора владельца", int(config.POST_INTERVAL))
+        logger.info("Очередь: только что выставленные · пауза %s сек · без повтора владельца", int(config.POST_INTERVAL))
         while not self._stop:
             async with self._lock:
                 lot = self._pick()
@@ -485,7 +486,6 @@ class PostQueue:
                 )
                 hard = {
                     "мужской",
-                    "не русский",
                     "цена",
                     "платные ЛС",
                     "level",
@@ -507,7 +507,7 @@ class PostQueue:
                     )
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
-                    if pre != "дубль" and keys:
+                    if pre == "мужской" and keys:
                         for k in keys:
                             self.skip_sellers[k] = now
                         self.state["skip_sellers"] = self.skip_sellers
@@ -558,7 +558,7 @@ class PostQueue:
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
                     self._retries.pop(lot.id, None)
-                    if reason != "дубль" and keys:
+                    if reason == "мужской" and keys:
                         for k in keys:
                             self.skip_sellers[k] = now
                         self.state["skip_sellers"] = self.skip_sellers
@@ -591,68 +591,77 @@ class PostQueue:
                 self.runtime.queue = len(self._items)
 
 
-async def snapshot_market(
+def fresh_from_head(
+    prev: str | None,
+    lots: list[Lot],
+    seen: dict[str, float] | set[str],
+    min_stars: float,
+    max_stars: float,
+) -> tuple[str | None, list[Lot]]:
+    """Новые лоты после смены #1. Старую голову не постим."""
+    if not lots:
+        return prev, []
+    new_head = lots[0].id
+    if prev is None or new_head == prev:
+        return new_head, []
+    out: list[Lot] = []
+    for lot in lots:
+        if lot.id == prev or lot.id in seen:
+            break
+        if min_stars <= float(lot.stars) <= max_stars:
+            out.append(lot)
+    return new_head, out
+
+
+async def sync_heads(
     market: TelegramMarket,
     gift_ids: list[int],
-    market_ids: set[str],
+    heads: dict[str, str],
     runtime: Runtime,
 ) -> None:
-    """Запомнить newest-ленту каждой коллекции — ту же, что читает сканер.
-
-    Снимок, отсортированный по цене, пропускал старые лоты из ленты
-    «последнее изменение цены» — они потом уходили в канал как «новые».
-    """
+    """Запомнить текущий #1 каждой коллекции. В канал не постим."""
     ids = list(gift_ids)
     random.shuffle(ids)
-    limit = max(int(config.PAGE_LIMIT), int(getattr(config, "SNAPSHOT_PAGE_LIMIT", 20)))
-    logger.info(
-        "Снимок newest-ленты %s коллекций (по %s лотов) — в канал только то, что появится после",
-        len(ids),
-        limit,
-    )
+    logger.info("Синхрон #1 · %s коллекций — дальше только смена головы", len(ids))
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
-    async def one(gid: int) -> list[Lot]:
+    async def one(gid: int) -> tuple[int, list[Lot]]:
         async with sem:
             try:
-                return await market.fetch_page(
+                lots = await market.fetch_page(
                     gid,
-                    limit=limit,
+                    limit=1,
                     timeout=config.REQUEST_TIMEOUT,
                     gap=config.REQUEST_GAP,
                     sort_by_price=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
-                return []
+                lots = []
+            return gid, lots
 
     chunk = max(parallel * 4, 16)
     for i in range(0, len(ids), chunk):
         batch = ids[i : i + chunk]
         parts = await asyncio.gather(*[one(g) for g in batch], return_exceptions=True)
         for part in parts:
-            if not isinstance(part, list):
+            if not isinstance(part, tuple):
                 runtime.last_error = str(part)
                 continue
-            for lot in part:
-                market_ids.add(lot.id)
-        runtime.snapshot = len(market_ids)
-        runtime.queue = 0
-        logger.info(
-            "Снимок %s/%s · already-on-market %s",
-            min(i + len(batch), len(ids)),
-            len(ids),
-            len(market_ids),
-        )
-    logger.info("Снимок готов: %s лотов. Дальше только свежие листинги", len(market_ids))
+            gid, lots = part
+            if lots:
+                heads[str(gid)] = lots[0].id
+        runtime.snapshot = len(heads)
+        logger.info("Головы %s/%s · %s", min(i + len(batch), len(ids)), len(ids), len(heads))
+    logger.info("Головы готовы: %s. Жду только что выставленные", len(heads))
 
 
 async def scanner_loop(
     market: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
-    market_ids: set[str],
+    heads: dict[str, str],
     queue: PostQueue,
     runtime: Runtime,
     state: dict,
@@ -660,7 +669,7 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: новые лоты · %s–%s⭐ · русские девочки · lvl≤%s · NFT≤%s · free ЛС · пост/%sс · рандом",
+        "Сканер: смена #1 · %s–%s⭐ · не мальчики · lvl≤%s · NFT≤%s · free ЛС · пост/%sс",
         config.MIN_STARS,
         config.MAX_STARS,
         config.MAX_ACCOUNT_LEVEL,
@@ -693,10 +702,10 @@ async def scanner_loop(
                 continue
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
 
-        async def one(gid: int) -> list[Lot]:
+        async def one(gid: int) -> tuple[int, list[Lot]]:
             async with sem:
                 try:
-                    return await market.fetch_page(
+                    lots = await market.fetch_page(
                         gid,
                         limit=config.PAGE_LIMIT,
                         timeout=config.REQUEST_TIMEOUT,
@@ -705,27 +714,25 @@ async def scanner_loop(
                     )
                 except Exception as exc:  # noqa: BLE001
                     runtime.last_error = str(exc)
-                    return []
+                    lots = []
+                return gid, lots
 
         found = 0
         queued = 0
-        parsed = 0
 
-        def absorb(part: list[Lot]) -> None:
-            nonlocal found, queued, parsed
-            parsed += len(part)
-            chunk: list[Lot] = []
-            for lot in part:
-                if (
-                    lot.id in market_ids
-                    or lot.id in seen
-                    or lot.id in queue._queued
-                    or lot.id in queue._inflight
-                ):
-                    continue
-                if not (config.MIN_STARS <= lot.stars <= config.MAX_STARS):
-                    continue
-                chunk.append(lot)
+        def absorb(gid: int, lots: list[Lot]) -> None:
+            nonlocal found, queued
+            key = str(gid)
+            prev = heads.get(key)
+            new_head, chunk = fresh_from_head(
+                prev,
+                lots,
+                seen,
+                config.MIN_STARS,
+                config.MAX_STARS,
+            )
+            if new_head:
+                heads[key] = new_head
             if not chunk:
                 return
             found += len(chunk)
@@ -734,28 +741,24 @@ async def scanner_loop(
         tasks = [asyncio.create_task(one(g)) for g in batch]
         for fut in asyncio.as_completed(tasks):
             try:
-                part = await fut
+                gid, lots = await fut
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
                 continue
-            if isinstance(part, list):
-                absorb(part)
+            absorb(gid, lots)
         runtime.last_found = found
         runtime.last_fresh = queued
-        runtime.snapshot = len(market_ids)
+        runtime.snapshot = len(heads)
         if queued:
-            logger.info("⚡ новые %s → очередь %s (найдено %s)", queued, len(queue._items), found)
-        elif found:
-            logger.info("Новые %s, в очередь 0 (дубли продавцов / уже в работе)", found)
-        elif pass_no % 8 == 0:
+            logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))
+        elif pass_no % 16 == 0:
             logger.info(
-                "Проход #%s: %s колл · %s лотов · новых 0 · снимок %s",
+                "Проход #%s: %s колл · голов %s · новых 0",
                 pass_no,
                 len(batch),
-                parsed,
-                len(market_ids),
+                len(heads),
             )
-        state["market_ids"] = list(market_ids)
+        state["heads"] = heads
         save_state(state_file, state)
         spent = time.monotonic() - started
         await asyncio.sleep(max(config.POLL_INTERVAL - spent, 0.02))
@@ -768,6 +771,10 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.setdefault("seen_sellers", {})
     market_ids: set[str] = set(state.get("market_ids") or [])
+    heads: dict[str, str] = state.setdefault("heads", {})
+    if not isinstance(heads, dict):
+        heads = {}
+        state["heads"] = heads
 
     client, control = await _client_and_bot()
     chat_id = config.channel_id()
@@ -828,22 +835,18 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    if gift_ids:
-        had = len(market_ids)
+    if gift_ids and len(heads) < max(10, len(gift_ids) // 2):
         try:
-            await snapshot_market(market, gift_ids, market_ids, runtime)
-            state["market_ids"] = list(market_ids)
+            await sync_heads(market, gift_ids, heads, runtime)
+            state["heads"] = heads
             save_state(state_file, state)
-            logger.info(
-                "Newest-снимок: было %s, стало %s id (старая цена-лента больше не путается с новыми)",
-                had,
-                len(market_ids),
-            )
         except Exception as exc:  # noqa: BLE001
-            logger.error("обход: %s", exc)
+            logger.error("головы: %s", exc)
             runtime.last_error = str(exc)
+    elif heads:
+        logger.info("Головы уже есть (%s) — жду смену #1", len(heads))
     runtime.snapshot_ready = True
-    runtime.snapshot = len(market_ids)
+    runtime.snapshot = len(heads)
 
     try:
         while True:
@@ -852,7 +855,7 @@ async def run() -> None:
                     market,
                     gift_ids,
                     seen,
-                    market_ids,
+                    heads,
                     queue,
                     runtime,
                     state,

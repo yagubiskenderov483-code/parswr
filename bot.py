@@ -267,9 +267,9 @@ class ControlBot:
             f"Аккаунт: {self.account_name if self.authorized else 'не вошёл'}",
             f"Канал: <code>{config.CHANNEL_ID}</code>",
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
-            f"Фильтры: русские девочки · free ЛС · lvl≤{config.MAX_ACCOUNT_LEVEL} · "
-            f"NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с · рандом",
-            "Обход: все коллекции · в канал только новые",
+            f"Фильтры: только что выставили · не мальчики · free ЛС · "
+            f"lvl≤{config.MAX_ACCOUNT_LEVEL} · NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с",
+            "Обход: кольцо #1 · в канал только смена головы",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"
@@ -277,12 +277,12 @@ class ControlBot:
                 coll += f" (мало, нужно ≥{config.MIN_COLLECTIONS})"
             lines.extend(
                 [
-                    f"Снимок: {'готов' if rt.snapshot_ready else 'строится'} ({rt.snapshot})",
+                    f"Головы: {'готовы' if rt.snapshot_ready else 'синхрон'} ({rt.snapshot})",
                     f"Проходов: {rt.passes}",
                     coll,
                     f"Отправлено: {rt.posted}",
                     f"В очереди: {rt.queue}",
-                    f"Последний проход: найдено {getattr(rt, 'last_found', rt.last_fresh)} → очередь +{rt.last_fresh}",
+                    f"Последний проход: выставили {getattr(rt, 'last_found', rt.last_fresh)} → очередь +{rt.last_fresh}",
                 ]
             )
             skip = rt.skip_total or {}
@@ -304,7 +304,7 @@ class ControlBot:
             f"Канал: <code>{config.CHANNEL_ID}</code>\n"
             f"Цена: <b>{config.MIN_STARS}–{config.MAX_STARS}⭐</b>\n"
             f"Level ≤ {config.MAX_ACCOUNT_LEVEL} · NFT ≤ {config.MAX_NFTS}\n"
-            f"Только русские девочки · бесплатные ЛС · пост / {int(config.POST_INTERVAL)}с · рандом\n\n"
+            f"Только что выставленные · не мальчики · пост / {int(config.POST_INTERVAL)}с\n\n"
             "Жми /status или кнопку ниже."
         )
 

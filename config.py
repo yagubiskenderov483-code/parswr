@@ -21,23 +21,22 @@ MIN_STARS = 4500
 MAX_STARS = 27000
 MAX_ACCOUNT_LEVEL = 2
 MAX_NFTS = 12
-POST_INTERVAL = 3.0
+POST_INTERVAL = 4.0
 
 # Курс для строки «X Stars / Y TON» (как в tracker market)
 TON_RATE = 0.0102
 TZ_OFFSET = 3.0  # МСК
 
 POLL_INTERVAL = 0.05
-PAGE_LIMIT = 8
-SNAPSHOT_PAGE_LIMIT = 20  # newest-лента, та же сортировка что у сканера
-SCAN_BATCH = 0  # все коллекции; очередь наполняется по мере ответа
-SCAN_PARALLEL = 6
+PAGE_LIMIT = 3  # только голова newest — только что выставили
+SCAN_BATCH = 36  # кольцо ~4с на полный круг 131 коллекции
+SCAN_PARALLEL = 8
 REQUEST_GAP = 0.02
-REQUEST_TIMEOUT = 6.0
+REQUEST_TIMEOUT = 5.0
 ENRICH_TIMEOUT = 2.5
 MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "4.8.0"
+TRACKER_VERSION = "4.9.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

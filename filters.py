@@ -266,23 +266,26 @@ def is_girl(lot: Lot) -> bool:
     return not female_reason(lot)
 
 
-def passes_level(lot: Lot, max_level: int = 2) -> bool:
+def passes_level(lot: Lot, max_level: int = 2) -> bool | None:
+    """True/False если знаем; None — ещё нет данных (не режем навсегда)."""
     lvl = lot.account_level
     if lvl is None:
-        return False
+        return None
     if lvl < 0:
         return True
     return lvl <= max_level
 
 
-def passes_nfts(lot: Lot, max_nfts: int = 12) -> bool:
+def passes_nfts(lot: Lot, max_nfts: int = 12) -> bool | None:
     n = lot.gifts_count
     if n is None:
-        return False
+        return None
     return n <= max_nfts
 
 
-def passes_free_dm(lot: Lot) -> bool:
+def passes_free_dm(lot: Lot) -> bool | None:
+    if lot.free_dm is None:
+        return None
     return lot.free_dm is True
 
 
@@ -299,11 +302,20 @@ def filter_lot(
         return "цена"
     if not lot.seller_key:
         return "нет продавца"
-    if not passes_free_dm(lot):
-        return "платные ЛС" if lot.free_dm is False else "ЛС неизвестно"
-    if not passes_level(lot, max_level):
+    dm = passes_free_dm(lot)
+    if dm is None:
+        return "нет данных"
+    if dm is False:
+        return "платные ЛС"
+    lvl = passes_level(lot, max_level)
+    if lvl is None:
+        return "нет данных"
+    if lvl is False:
         return "level"
-    if not passes_nfts(lot, max_nfts):
+    nfts = passes_nfts(lot, max_nfts)
+    if nfts is None:
+        return "нет данных"
+    if nfts is False:
         return "много NFT"
     reason = female_reason(lot)
     if reason:
@@ -321,6 +333,7 @@ def skip_stats() -> dict[str, int]:
         "nfts": 0,
         "not_girl": 0,
         "dup": 0,
+        "incomplete": 0,
     }
 
 
@@ -329,7 +342,8 @@ def classify_skip(reason: str, stats: dict[str, int]) -> None:
         "цена": "price",
         "нет продавца": "no_seller",
         "платные ЛС": "paid",
-        "ЛС неизвестно": "unknown_dm",
+        "ЛС неизвестно": "incomplete",
+        "нет данных": "incomplete",
         "level": "level",
         "много NFT": "nfts",
         "дубль": "dup",

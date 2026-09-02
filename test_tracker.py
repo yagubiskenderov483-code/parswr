@@ -83,19 +83,19 @@ def test_price_range() -> None:
 def test_level_max_2() -> None:
     assert filter_lot(_lot(account_level=2), min_stars=3000, max_stars=25000) == ""
     assert filter_lot(_lot(account_level=3), min_stars=3000, max_stars=25000) == "level"
-    assert filter_lot(_lot(account_level=None), min_stars=3000, max_stars=25000) == "level"
+    assert filter_lot(_lot(account_level=None), min_stars=3000, max_stars=25000) == "нет данных"
 
 
 def test_max_12_nfts() -> None:
     assert filter_lot(_lot(gifts_count=12), min_stars=3000, max_stars=25000) == ""
     assert filter_lot(_lot(gifts_count=13), min_stars=3000, max_stars=25000) == "много NFT"
-    assert filter_lot(_lot(gifts_count=None), min_stars=3000, max_stars=25000) == "много NFT"
+    assert filter_lot(_lot(gifts_count=None), min_stars=3000, max_stars=25000) == "нет данных"
 
 
 def test_free_dm_only() -> None:
     assert filter_lot(_lot(free_dm=True), min_stars=3000, max_stars=25000) == ""
     assert filter_lot(_lot(free_dm=False), min_stars=3000, max_stars=25000) == "платные ЛС"
-    assert filter_lot(_lot(free_dm=None), min_stars=3000, max_stars=25000) == "ЛС неизвестно"
+    assert filter_lot(_lot(free_dm=None), min_stars=3000, max_stars=25000) == "нет данных"
 
 
 def test_girl_from_bio_emoji() -> None:

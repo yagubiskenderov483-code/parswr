@@ -567,7 +567,7 @@ class TelegramMarket:
                         lot.free_dm = False
                         lot.paid_dm_stars = paid
         self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
-        await self._extra_signals(lot, timeout=timeout)
+        # сторис/список подарков не тянем на каждый лот — FloodWait глушит бота
 
     async def _extra_signals(self, lot: Lot, timeout: float = 4.0) -> None:
         """Сторис + названия подарков — для женского фильтра."""

@@ -157,17 +157,27 @@ class RateLimiter:
 
 
 class Sender:
-    def __init__(self, client: TelegramClient, chat_id: int, limiter: RateLimiter) -> None:
+    def __init__(
+        self,
+        client: TelegramClient,
+        chat_id: int,
+        limiter: RateLimiter,
+        *,
+        bot: Any | None = None,
+    ) -> None:
         self.client = client
         self.chat_id = chat_id
         self.limiter = limiter
         self.last_via = ""
-        token = config.bot_token()
-        self._bot = None
-        if token:
-            from aiogram import Bot
+        self._bot = bot
+        self._owns_bot = False
+        if self._bot is None:
+            token = config.bot_token()
+            if token:
+                from aiogram import Bot
 
-            self._bot = Bot(token=token)
+                self._bot = Bot(token=token)
+                self._owns_bot = True
 
     async def send(self, lot: Lot) -> str:
         text = format_lot(lot)
@@ -213,7 +223,7 @@ class Sender:
         return await self.limiter.gated(_do)
 
     async def close(self) -> None:
-        if self._bot is not None:
+        if self._owns_bot and self._bot is not None:
             await self._bot.session.close()
 
 
@@ -294,18 +304,33 @@ async def _client_and_bot() -> tuple[TelegramClient, ControlBot]:
         config.api_hash(),
     )
     await client.connect()
-    if session and not await client.is_user_authorized():
-        await client.disconnect()
-        logger.warning("Сессия недействительна — нужен /start")
-        client = TelegramClient(StringSession(), config.api_id(), config.api_hash())
-        await client.connect()
+    authorized = False
+    if session:
+        try:
+            authorized = bool(
+                await asyncio.wait_for(client.is_user_authorized(), timeout=12.0)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("is_user_authorized: %s", exc)
+            authorized = False
+        if not authorized:
+            await client.disconnect()
+            logger.warning("Сессия недействительна — нужен /start")
+            client = TelegramClient(StringSession(), config.api_id(), config.api_hash())
+            await client.connect()
     bot = ControlBot(client, str(config.session_path()))
+    if authorized:
+        name = "аккаунт"
+        try:
+            me = await asyncio.wait_for(client.get_me(), timeout=8.0)
+            name = me.username or me.first_name or str(me.id)
+        except Exception:  # noqa: BLE001
+            pass
+        bot.mark_authorized(str(name))
     await bot.start()
-    if not await client.is_user_authorized():
+    if not bot.authorized:
         logger.warning("Нет сессии — войди через @%s /start", config.BOT_USERNAME)
         await bot.wait_login()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Вход не завершён")
     return client, bot
 
 
@@ -333,6 +358,7 @@ class PostQueue:
         self._seq = 0
         self._queued: set[str] = set()
         self._task: asyncio.Task | None = None
+        self._retries: dict[str, int] = {}
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._worker(), name="post-drip")
@@ -402,16 +428,31 @@ class PostQueue:
                         lot.account_level if lot.account_level is not None else "—",
                         lot.gifts_count if lot.gifts_count is not None else "—",
                     )
-                    if reason in {
+                    incomplete = reason in {
+                        "нет данных",
+                        "нет продавца",
+                        "нет женских признаков",
+                    }
+                    if incomplete:
+                        ntry = self._retries.get(lot.id, 0) + 1
+                        self._retries[lot.id] = ntry
+                        if ntry <= 3:
+                            await asyncio.sleep(0.8)
+                            self.enqueue([lot])
+                            continue
+                    burn_seller = reason in {
                         "платные ЛС",
                         "level",
                         "много NFT",
                         "мужской",
                         "дубль",
-                    }:
-                        self.seen[lot.id] = now
+                    }
+                    self.seen[lot.id] = now
+                    self._retries.pop(lot.id, None)
+                    if burn_seller and keys:
                         for k in keys:
                             self.seen_sellers[k] = now
+                        self.state["seen_sellers"] = self.seen_sellers
                         save_state(self.state_file, self.state)
                     continue
                 via = await self.sender.send(lot)
@@ -558,46 +599,74 @@ async def run() -> None:
     market_ids: set[str] = set(state.get("market_ids") or [])
 
     client, control = await _client_and_bot()
-    me = await client.get_me()
     chat_id = config.channel_id()
+    runtime = Runtime()
+    control.runtime = runtime
     logger.warning(
-        "=== Трекер v%s · @%s · канал %s · %s–%s⭐ ===",
+        "=== Трекер v%s · %s · канал %s · %s–%s⭐ ===",
         config.TRACKER_VERSION,
-        me.username or me.first_name,
+        control.account_name,
         chat_id,
         config.MIN_STARS,
         config.MAX_STARS,
     )
 
-    runtime = Runtime()
-    control.runtime = runtime
     dd = config.data_dir()
     limiter = RateLimiter(
         config.POST_INTERVAL,
         dd / "tracker_post.lock",
         dd / "tracker_last_post.txt",
     )
-    sender = Sender(client, chat_id, limiter)
+    sender = Sender(client, chat_id, limiter, bot=control.aiogram_bot)
     market = TelegramMarket(client, config.catalog_path())
-    gift_ids = list(await market.load_collections())
-    if not gift_ids:
-        raise SystemExit("Не удалось загрузить коллекции — проверь сессию (/start)")
+    gift_ids: list[int] = []
+    for attempt in range(8):
+        try:
+            gift_ids = list(await market.load_collections(force=attempt > 0))
+        except Exception as exc:  # noqa: BLE001
+            runtime.last_error = str(exc)
+            logger.error("коллекции (%s): %s", attempt + 1, exc)
+        if gift_ids:
+            break
+        await asyncio.sleep(2.5)
     runtime.collections = len(gift_ids)
+    if not gift_ids:
+        logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")
+        runtime.last_error = "нет коллекций"
     queue = PostQueue(market, sender, seen, seen_sellers, state, state_file, runtime)
     queue.start()
     control.queue = queue
 
-    if len(market_ids) < MIN_SNAPSHOT:
-        await snapshot_market(market, gift_ids, market_ids)
-        state["market_ids"] = list(market_ids)
-        save_state(state_file, state)
+    if gift_ids and len(market_ids) < MIN_SNAPSHOT:
+        try:
+            await snapshot_market(market, gift_ids, market_ids)
+            state["market_ids"] = list(market_ids)
+            save_state(state_file, state)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("снимок: %s", exc)
+            runtime.last_error = str(exc)
     runtime.snapshot_ready = True
     runtime.snapshot = len(market_ids)
 
     try:
-        await scanner_loop(
-            market, gift_ids, seen, market_ids, queue, runtime, state, state_file
-        )
+        while True:
+            try:
+                await scanner_loop(
+                    market,
+                    gift_ids,
+                    seen,
+                    market_ids,
+                    queue,
+                    runtime,
+                    state,
+                    state_file,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("сканер упал — рестарт")
+                runtime.last_error = str(exc)
+                await asyncio.sleep(5.0)
     finally:
         await queue.stop()
         await sender.close()

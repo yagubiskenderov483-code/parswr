@@ -34,7 +34,7 @@ REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 8.0
 ENRICH_TIMEOUT = 5.0
 
-TRACKER_VERSION = "4.0.1"
+TRACKER_VERSION = "4.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

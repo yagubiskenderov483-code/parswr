@@ -120,7 +120,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 0
-    assert config.TRACKER_VERSION == "4.5.0"
+    assert config.TRACKER_VERSION == "4.6.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -204,6 +204,33 @@ def test_girl_from_gifts_and_stories() -> None:
     assert is_girl(lot) is True
 
 
+def test_state_schema_clears_seller_bans() -> None:
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from tracker import STATE_SCHEMA, load_state
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "seen": {"lot1": 1.0},
+                    "seen_sellers": {"spammer": 1.0},
+                    "market_ids": ["old"],
+                    "schema": 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        data = load_state(path)
+        assert data["seen_sellers"] == {}
+        assert data["schema"] == STATE_SCHEMA
+        assert data["seen"]["lot1"] == 1.0
+        assert data["market_ids"] == ["old"]
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -224,6 +251,7 @@ def main() -> None:
         test_bundled_catalog_has_enough,
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
+        test_state_schema_clears_seller_bans,
     ]
     for fn in tests:
         fn()

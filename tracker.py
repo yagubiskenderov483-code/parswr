@@ -27,6 +27,8 @@ logger = logging.getLogger("tracker")
 _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
+SKIP_SELLER_TTL = 3 * 3600  # отсев (paid/lvl) — не путать с «уже постили»
+STATE_SCHEMA = 6
 MIN_SNAPSHOT = 0  # снимок только запоминает рынок, в канал не постит
 
 
@@ -234,15 +236,37 @@ def load_state(path: Path) -> dict:
         if isinstance(data, dict):
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
+            data.setdefault("skip_sellers", {})
             data.setdefault("market_ids", [])
+            schema = 0
+            try:
+                schema = int(data.get("schema", 0) or 0)
+            except (TypeError, ValueError):
+                schema = 0
+            if schema < STATE_SCHEMA:
+                logger.warning(
+                    "Сбросил бан продавцов (schema %s→%s): отсев больше не блокирует новые лоты",
+                    schema,
+                    STATE_SCHEMA,
+                )
+                data["seen_sellers"] = {}
+                data["skip_sellers"] = {}
+                data["schema"] = STATE_SCHEMA
             return data
     except (OSError, ValueError):
         pass
-    return {"seen": {}, "seen_sellers": {}, "market_ids": []}
+    return {
+        "seen": {},
+        "seen_sellers": {},
+        "skip_sellers": {},
+        "market_ids": [],
+        "schema": STATE_SCHEMA,
+    }
 
 
 def save_state(path: Path, state: dict) -> None:
     now = time.time()
+    state["schema"] = STATE_SCHEMA
     seen = state.get("seen", {})
     if len(seen) > 200_000:
         state["seen"] = {k: v for k, v in seen.items() if now - float(v) < SEEN_TTL}
@@ -251,6 +275,10 @@ def save_state(path: Path, state: dict) -> None:
         state["seen_sellers"] = {
             k: v for k, v in sellers.items() if now - float(v) < SELLER_TTL
         }
+    skipped = state.get("skip_sellers", {})
+    state["skip_sellers"] = {
+        k: v for k, v in skipped.items() if now - float(v) < SKIP_SELLER_TTL
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -352,6 +380,7 @@ class PostQueue:
         self.sender = sender
         self.seen = seen
         self.seen_sellers = seen_sellers
+        self.skip_sellers = state.setdefault("skip_sellers", {})
         self.state = state
         self.state_file = state_file
         self.runtime = runtime
@@ -380,22 +409,36 @@ class PostQueue:
 
     def enqueue(self, lots: list[Lot]) -> int:
         added = 0
-        blocked = set(self.seen_sellers)
+        now = time.time()
+        posted = {
+            k
+            for k, ts in self.seen_sellers.items()
+            if now - float(ts) < SELLER_TTL
+        }
+        recently_skipped = {
+            k
+            for k, ts in self.skip_sellers.items()
+            if now - float(ts) < SKIP_SELLER_TTL
+        }
         incoming = list(lots)
         random.shuffle(incoming)
+        batch_owners: set[str] = set()
         for lot in incoming:
             if lot.id in self.seen or lot.id in self._queued or lot.id in self._inflight:
                 continue
             keys = seller_keys(lot)
-            if keys and keys & blocked:
-                now = time.time()
+            if keys and (keys & posted or keys & batch_owners):
                 self.seen[lot.id] = now
                 self.market_ids.add(lot.id)
                 classify_skip("дубль", self.runtime.skip_total)
                 continue
+            if keys and keys & recently_skipped:
+                self.seen[lot.id] = now
+                self.market_ids.add(lot.id)
+                continue
             self._queued.add(lot.id)
             self._items.append(lot)
-            blocked |= keys
+            batch_owners |= keys
             added += 1
         if added:
             random.shuffle(self._items)
@@ -471,21 +514,13 @@ class PostQueue:
                             lot.slug or lot.id,
                         )
                         continue
-                    burn_seller = reason in {
-                        "платные ЛС",
-                        "level",
-                        "много NFT",
-                        "мужской",
-                        "не русский",
-                        "дубль",
-                    }
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
                     self._retries.pop(lot.id, None)
-                    if burn_seller and keys:
+                    if reason != "дубль" and keys:
                         for k in keys:
-                            self.seen_sellers[k] = now
-                        self.state["seen_sellers"] = self.seen_sellers
+                            self.skip_sellers[k] = now
+                        self.state["skip_sellers"] = self.skip_sellers
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue

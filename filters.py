@@ -322,22 +322,85 @@ _FOREIGN_LANG = frozenset(
 )
 
 
-def is_russian(lot: Lot) -> bool | None:
-    """Кириллица в имени/био, либо латинское женское имя (СНГ) без fa/ar."""
-    name_bio = " ".join(
+def _name_bio(lot: Lot) -> str:
+    return " ".join(
         x for x in (lot.first_name, lot.last_name, lot.about) if x
     ).strip()
+
+
+def russian_why(lot: Lot) -> str:
+    """Почему is_russian дал True / False / None — для DEBUG, не для фильтра."""
+    name_bio = _name_bio(lot)
+    lang = (lot.lang_code or "").strip().lower()
+    fn = _first_token(lot.first_name)
+    if lang in _FOREIGN_LANG:
+        return f"FAIL lang={lang!r} in FOREIGN (name/bio ignored)"
+    if _CYR_RE.search(name_bio):
+        return "OK cyrillic in first/last/bio"
+    if _CYR_RE.search(lot.seller or ""):
+        return "OK cyrillic in username"
+    if is_latin_female_name(fn):
+        return f"OK latin female first_name={fn!r}"
+    if _username_female_name(lot.seller):
+        return f"OK latin female username={lot.seller!r}"
+    if not name_bio and not lang:
+        return "NONE empty first/last/bio + no lang_code (profile not loaded)"
+    return (
+        f"FAIL no cyrillic, first={fn!r} not latin-female, "
+        f"user={lot.seller!r} lang={lang!r} name_bio={name_bio[:60]!r}"
+    )
+
+
+def is_russian(lot: Lot) -> bool | None:
+    """Кириллица в имени/био/username, либо латинское женское имя (СНГ).
+
+    lang_code пустой ≠ not_ru. Telegram почти никогда не отдаёт lang_code
+    чужих юзеров. not_ru только если: явный fa/ar/… ИЛИ есть имя/био
+    без кириллицы и без латинского женского имени.
+    Пустой профиль (ещё не enrich) → None, не режем.
+    """
+    name_bio = _name_bio(lot)
     lang = (lot.lang_code or "").strip().lower()
     if lang in _FOREIGN_LANG:
         return False
-    if _CYR_RE.search(name_bio):
+    if _CYR_RE.search(name_bio) or _CYR_RE.search(lot.seller or ""):
         return True
     fn = _first_token(lot.first_name)
     if is_latin_female_name(fn):
         return True
+    if _username_female_name(lot.seller):
+        return True
     if not name_bio and not lang:
         return None
     return False
+
+
+def explain_filters(
+    lot: Lot,
+    *,
+    min_stars: float,
+    max_stars: float,
+    max_level: int = 2,
+    max_nfts: int = 6,
+) -> dict[str, Any]:
+    """Срез всех стадий фильтра — для DEBUG-лога."""
+    price_ok = min_stars <= float(lot.stars) <= max_stars
+    male = looks_male(lot)
+    ru = is_russian(lot)
+    girl = female_reason(lot)
+    dm = passes_free_dm(lot)
+    lvl = passes_level(lot, max_level)
+    nfts = passes_nfts(lot, max_nfts)
+    return {
+        "price": price_ok,
+        "male": male,
+        "ru": ru,
+        "ru_why": russian_why(lot),
+        "girl": girl or "ok",
+        "dm": dm,
+        "level": lvl,
+        "nfts": nfts,
+    }
 
 
 def passes_level(lot: Lot, max_level: int = 2) -> bool | None:
@@ -411,6 +474,8 @@ def skip_stats() -> dict[str, int]:
         "not_girl": 0,
         "not_ru": 0,
         "dup": 0,
+        "dup_seller": 0,
+        "dup_listing": 0,
         "incomplete": 0,
     }
 
@@ -425,10 +490,14 @@ def classify_skip(reason: str, stats: dict[str, int]) -> None:
         "level": "level",
         "много NFT": "nfts",
         "не русский": "not_ru",
-        "дубль": "dup",
+        "дубль": "dup_seller",
+        "дубль продавца": "dup_seller",
+        "дубль лота": "dup_listing",
     }
     key = mapping.get(reason, "not_girl")
     stats[key] = stats.get(key, 0) + 1
+    if key in {"dup_seller", "dup_listing"}:
+        stats["dup"] = stats.get("dup", 0) + 1
 
 
 def seller_keys(lot: Lot) -> set[str]:

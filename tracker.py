@@ -19,7 +19,14 @@ from telethon.sessions import StringSession
 
 import config
 from bot import ControlBot
-from filters import classify_skip, filter_lot, is_girl, seller_keys, skip_stats
+from filters import (
+    classify_skip,
+    explain_filters,
+    filter_lot,
+    is_girl,
+    seller_keys,
+    skip_stats,
+)
 from market import Lot, TelegramMarket, format_level
 
 logger = logging.getLogger("tracker")
@@ -319,6 +326,71 @@ def acquire_lock() -> Any:
     return handle
 
 
+def empty_funnel() -> dict[str, int]:
+    return {
+        "fresh": 0,
+        "price_pass": 0,
+        "ru_pass": 0,
+        "girl_pass": 0,
+        "dm_pass": 0,
+        "level_pass": 0,
+        "nft_pass": 0,
+        "duplicate": 0,
+        "dup_listing": 0,
+        "queued": 0,
+        "sent": 0,
+    }
+
+
+def debug_lot_line(lot: Lot, stage: str, reason: str) -> str:
+    exp = explain_filters(
+        lot,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    )
+    bio = (lot.about or "").replace("\n", " ")[:80]
+    return (
+        f"[DEBUG] {stage} {lot.slug or lot.id} gift_id={lot.id} "
+        f"price={int(lot.stars)} seller_id={lot.seller_id} "
+        f"user=@{lot.seller or '—'} first={lot.first_name!r} "
+        f"last={lot.last_name!r} bio={bio!r} lang={lot.lang_code!r} "
+        f"lvl={lot.account_level} dm={lot.free_dm} nfts={lot.gifts_count} | "
+        f"price={'ok' if exp['price'] else 'fail'} "
+        f"ru={exp['ru']} ({exp['ru_why']}) "
+        f"girl={exp['girl']} male={exp['male']} "
+        f"dm={exp['dm']} level={exp['level']} nfts={exp['nfts']} | "
+        f"skip={reason or 'ok'}"
+    )
+
+
+def apply_funnel(funnel: dict[str, int], lot: Lot, *, queued: bool, sent: bool) -> None:
+    exp = explain_filters(
+        lot,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    )
+    if exp["price"]:
+        funnel["price_pass"] += 1
+    if exp["ru"] is True:
+        funnel["ru_pass"] += 1
+    if exp["girl"] == "ok" and not exp["male"]:
+        funnel["girl_pass"] += 1
+    if exp["dm"] is True:
+        funnel["dm_pass"] += 1
+    if exp["level"] is True:
+        funnel["level_pass"] += 1
+    if exp["nfts"] is True:
+        funnel["nft_pass"] += 1
+    if queued:
+        funnel["queued"] += 1
+    if sent:
+        funnel["sent"] += 1
+
+
 class Runtime:
     def __init__(self) -> None:
         self.passes = 0
@@ -328,6 +400,8 @@ class Runtime:
         self.last_found = 0
         self.last_skip: dict[str, int] = skip_stats()
         self.skip_total: dict[str, int] = skip_stats()
+        self.funnel: dict[str, int] = empty_funnel()
+        self.last_funnel: dict[str, int] = empty_funnel()
         self.snapshot = 0
         self.collections = 0
         self.last_error = ""
@@ -436,34 +510,67 @@ class PostQueue:
         incoming = list(lots)
         batch_owners: set[str] = set()
         for lot in incoming:
+            self.runtime.funnel["fresh"] += 1
             if (
                 lot.id in self.seen
                 or lot.id in self._queued
                 or lot.id in self._inflight
                 or (lot.slug and lot.slug in self.seen)
             ):
+                hit = []
+                if lot.id in self.seen:
+                    hit.append("seen:id")
+                if lot.slug and lot.slug in self.seen:
+                    hit.append("seen:slug")
+                if lot.id in self._queued:
+                    hit.append("queued")
+                if lot.id in self._inflight:
+                    hit.append("inflight")
+                classify_skip("дубль лота", self.runtime.skip_total)
+                self.runtime.funnel["dup_listing"] += 1
+                if config.DEBUG_FILTERS:
+                    logger.info(
+                        debug_lot_line(
+                            lot,
+                            "enqueue",
+                            f"дубль лота ({','.join(hit) or 'seen'})",
+                        )
+                    )
                 continue
             keys = seller_keys(lot)
             if keys and (keys & blocked or keys & batch_owners):
-                # продавец уже в очереди или только что опубликован —
-                # НЕ пишем в seen, чтобы лот подхватился на следующем проходе
+                overlap = sorted(keys & (blocked | batch_owners))
+                # продавец уже опубликован / в очереди — НЕ пишем лот в seen
                 logger.info(
-                    "[pipeline] seller-dup skip %s · seller=%s",
+                    "[pipeline] seller-dup skip %s · seller=%s keys=%s",
                     lot.slug or lot.id,
                     (lot.seller or str(lot.seller_id) or "?")[:24],
+                    ",".join(overlap)[:80],
                 )
-                classify_skip("дубль", self.runtime.skip_total)
+                classify_skip("дубль продавца", self.runtime.skip_total)
+                self.runtime.funnel["duplicate"] += 1
+                if config.DEBUG_FILTERS:
+                    logger.info(
+                        debug_lot_line(
+                            lot,
+                            "enqueue",
+                            f"дубль продавца ({','.join(overlap)})",
+                        )
+                    )
                 continue
             self._queued.add(lot.id)
             self._items.append(lot)
             batch_owners |= keys
             added += 1
+            self.runtime.funnel["queued"] += 1
             logger.info(
                 "[pipeline] queued %s · %s⭐ · q=%s",
                 lot.slug or lot.id,
                 int(lot.stars),
                 len(self._items),
             )
+            if config.DEBUG_FILTERS:
+                logger.info(debug_lot_line(lot, "enqueue", "queued"))
         if added:
             self._event.set()
         self.runtime.queue = len(self._items)
@@ -534,6 +641,9 @@ class PostQueue:
                         pre,
                         (lot.first_name or lot.seller or "?")[:24],
                     )
+                    if config.DEBUG_FILTERS:
+                        logger.info(debug_lot_line(lot, "pre-filter", pre))
+                    apply_funnel(self.runtime.funnel, lot, queued=False, sent=False)
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
                     self.state["market_ids"] = list(self.market_ids)
@@ -541,14 +651,14 @@ class PostQueue:
                     continue
                 await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
                 logger.info(
-                    "[pipeline] enriched %s · name=%s seller=%s lvl=%s dm=%s nfts=%s ru=%s",
+                    "[pipeline] enriched %s · name=%s seller=%s lvl=%s dm=%s nfts=%s lang=%s",
                     tag,
                     (lot.first_name or "—")[:24],
                     (lot.seller or "?")[:24],
                     lot.account_level if lot.account_level is not None else "none",
                     lot.free_dm if lot.free_dm is not None else "none",
                     lot.gifts_count if lot.gifts_count is not None else "none",
-                    (lot.lang_code or "—")[:8],
+                    lot.lang_code or "—",
                 )
                 now = time.time()
                 keys = seller_keys(lot)
@@ -575,7 +685,7 @@ class PostQueue:
                             if now - float(ts) < SELLER_TTL
                         }
                         if keys & blocked:
-                            reason = "дубль"
+                            reason = "дубль продавца"
                 stats = skip_stats()
                 if reason:
                     classify_skip(reason, stats)
@@ -591,6 +701,9 @@ class PostQueue:
                         lot.account_level if lot.account_level is not None else "—",
                         lot.gifts_count if lot.gifts_count is not None else "—",
                     )
+                    if config.DEBUG_FILTERS:
+                        logger.info(debug_lot_line(lot, "final-filter", reason))
+                    apply_funnel(self.runtime.funnel, lot, queued=False, sent=False)
                     incomplete = reason in {
                         "нет данных",
                         "нет продавца",
@@ -609,6 +722,9 @@ class PostQueue:
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue
+                if config.DEBUG_FILTERS:
+                    logger.info(debug_lot_line(lot, "final-filter", "ok"))
+                apply_funnel(self.runtime.funnel, lot, queued=False, sent=True)
                 logger.info("[pipeline] send %s …", lot.slug or lot.id)
                 via = await self.sender.send(lot)
                 self.runtime.post_via = via
@@ -813,7 +929,6 @@ async def scanner_loop(
             if not chunk:
                 return
             found += len(chunk)
-            before = len(queue._items)
             enqueued = queue.enqueue(chunk)
             seller_skip += len(chunk) - enqueued
             queued += enqueued
@@ -829,6 +944,8 @@ async def scanner_loop(
         runtime.last_found = found
         runtime.last_fresh = queued
         runtime.snapshot = len(pages)
+        fn = runtime.funnel
+        runtime.last_funnel = dict(fn)
         logger.info(
             "[pipeline] pass #%s API=%s fresh=%s seen_skip=%s seller_dup=%s queued=%s pages=%s q=%s skip=%s",
             pass_no,
@@ -840,6 +957,22 @@ async def scanner_loop(
             len(pages),
             len(queue._items),
             dict(queue.runtime.skip_total),
+        )
+        logger.info(
+            "[pipeline] FUNNEL fresh=%s price_pass=%s ru_pass=%s girl_pass=%s "
+            "dm_pass=%s level_pass=%s nft_pass=%s duplicate=%s dup_listing=%s "
+            "queued=%s sent=%s",
+            fn["fresh"],
+            fn["price_pass"],
+            fn["ru_pass"],
+            fn["girl_pass"],
+            fn["dm_pass"],
+            fn["level_pass"],
+            fn["nft_pass"],
+            fn["duplicate"],
+            fn["dup_listing"],
+            fn["queued"],
+            fn["sent"],
         )
         if queued:
             logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))

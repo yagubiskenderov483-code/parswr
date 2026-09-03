@@ -291,6 +291,28 @@ class ControlBot:
                     "Отсев: "
                     + " ".join(f"{k}−{v}" for k, v in skip.items() if v)
                 )
+            funnel = getattr(rt, "funnel", None) or {}
+            if funnel.get("fresh"):
+                lines.append(
+                    "Воронка: "
+                    + " ".join(
+                        f"{k}={funnel[k]}"
+                        for k in (
+                            "fresh",
+                            "price_pass",
+                            "ru_pass",
+                            "girl_pass",
+                            "dm_pass",
+                            "level_pass",
+                            "nft_pass",
+                            "duplicate",
+                            "dup_listing",
+                            "queued",
+                            "sent",
+                        )
+                        if k in funnel
+                    )
+                )
             if rt.last_error:
                 lines.append(f"⚠️ {_esc(str(rt.last_error)[:160])}")
         else:

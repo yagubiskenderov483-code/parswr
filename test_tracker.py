@@ -5,7 +5,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import config
-from filters import filter_lot, is_girl, is_russian, looks_male
+from filters import (
+    classify_skip,
+    filter_lot,
+    is_girl,
+    is_russian,
+    looks_male,
+    russian_why,
+    skip_stats,
+)
 from market import (
     Lot,
     TelegramMarket,
@@ -130,7 +138,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.4.0"
+    assert config.TRACKER_VERSION == "5.5.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -188,6 +196,50 @@ def test_bundled_catalog_has_enough() -> None:
     ids = TelegramMarket.load_from_bundled(market)
     assert len(ids) >= 50
     assert len(ids) >= 100
+
+
+def test_is_russian_empty_profile_is_unknown() -> None:
+    """Нет имени/био/lang — не not_ru, а «нет данных». lang_code пустой сам по себе не режет."""
+    empty = _lot(first_name="", last_name="", about="", seller="nft_store", lang_code="")
+    empty.first_name = ""
+    empty.about = ""
+    empty.lang_code = ""
+    assert is_russian(empty) is None
+    assert "empty" in russian_why(empty)
+    assert filter_lot(empty, min_stars=4500, max_stars=27000) == "нет данных"
+
+
+def test_is_russian_latin_shop_name_is_not_ru() -> None:
+    """Латинское имя-магазин без кириллицы → not_ru. Это и есть 83 в статусе."""
+    shop = _lot(first_name="Shop", about="", seller="gift_market", lang_code="")
+    assert is_russian(shop) is False
+    why = russian_why(shop)
+    assert "FAIL" in why
+    assert "no cyrillic" in why
+    assert filter_lot(shop, min_stars=4500, max_stars=27000) == "не русский"
+
+
+def test_is_russian_female_username_counts() -> None:
+    """Ник masha_nft без кириллического имени — всё равно ru (согласовано с girl)."""
+    nick = _lot(first_name="Shop", about="", seller="masha_nft", lang_code="")
+    assert is_russian(nick) is True
+    assert "username" in russian_why(nick)
+
+
+def test_is_russian_cyrillic_without_lang_code() -> None:
+    """Telegram не отдаёт lang_code чужих юзеров — кириллица всё равно ru."""
+    ru = _lot(first_name="Мария", about="привет", lang_code="")
+    assert is_russian(ru) is True
+    assert "cyrillic" in russian_why(ru)
+
+
+def test_dup_reasons_split_listing_and_seller() -> None:
+    stats = skip_stats()
+    classify_skip("дубль продавца", stats)
+    classify_skip("дубль лота", stats)
+    assert stats["dup_seller"] == 1
+    assert stats["dup_listing"] == 1
+    assert stats["dup"] == 2
 
 
 def test_skips_non_russian() -> None:
@@ -439,6 +491,11 @@ def main() -> None:
         test_merge_and_json_catalog,
         test_extract_star_gift_ids,
         test_bundled_catalog_has_enough,
+        test_is_russian_empty_profile_is_unknown,
+        test_is_russian_latin_shop_name_is_not_ru,
+        test_is_russian_female_username_counts,
+        test_is_russian_cyrillic_without_lang_code,
+        test_dup_reasons_split_listing_and_seller,
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
         test_bio_hints_do_not_make_a_girl,

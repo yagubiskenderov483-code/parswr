@@ -296,21 +296,22 @@ class ControlBot:
                 lines.append(
                     "Воронка: "
                     + " ".join(
-                        f"{k}={funnel[k]}"
+                        f"{k}={funnel.get(k, 0)}"
                         for k in (
                             "fresh",
-                            "price_pass",
-                            "ru_pass",
-                            "girl_pass",
-                            "dm_pass",
-                            "level_pass",
-                            "nft_pass",
+                            "price",
+                            "ru",
+                            "girl",
+                            "dm",
+                            "level",
+                            "nft",
                             "duplicate",
-                            "dup_listing",
-                            "queued",
+                            "enqueued",
+                            "dequeued",
+                            "send_attempt",
                             "sent",
+                            "failed",
                         )
-                        if k in funnel
                     )
                 )
             if rt.last_error:

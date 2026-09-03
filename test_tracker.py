@@ -23,7 +23,7 @@ from market import (
     merge_ids,
     _stars_level,
 )
-from tracker import format_lot, fresh_from_page
+from tracker import count_filter_stages, empty_funnel, format_lot, fresh_from_page
 
 
 def _lot(**kwargs) -> Lot:
@@ -138,7 +138,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.5.0"
+    assert config.TRACKER_VERSION == "5.6.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -444,6 +444,27 @@ def test_seller_dup_does_not_burn_to_seen() -> None:
     assert "X1" not in seen
 
 
+def test_funnel_is_sequential() -> None:
+    """ru/girl считаются только если предыдущий этап прошёл — queued ≠ price."""
+    fn = empty_funnel()
+    count_filter_stages(fn, _lot(first_name="Shop", about="", seller="gift_market"), "не русский")
+    assert fn["ru"] == 0
+    assert fn["girl"] == 0
+    assert fn["enqueued"] == 0
+    count_filter_stages(fn, _lot(first_name="Мария"), "")
+    assert fn["ru"] == 1
+    assert fn["girl"] == 1
+    assert fn["dm"] == 1
+    assert fn["level"] == 1
+    assert fn["nft"] == 1
+    assert fn["enqueued"] == 1
+    boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
+    count_filter_stages(fn, boy, "мужской")
+    assert fn["ru"] == 2  # кириллица есть
+    assert fn["girl"] == 1  # мужской — обрыв
+    assert fn["enqueued"] == 1
+
+
 def test_state_schema_clears_seller_bans() -> None:
     import json
     import tempfile
@@ -507,6 +528,7 @@ def main() -> None:
         test_fresh_from_page_only_new_listings,
         test_fresh_from_page_ignores_api_order,
         test_seller_dup_does_not_burn_to_seen,
+        test_funnel_is_sequential,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

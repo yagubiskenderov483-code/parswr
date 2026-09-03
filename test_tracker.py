@@ -95,16 +95,8 @@ def test_price_range() -> None:
 def test_level_max_2() -> None:
     assert filter_lot(_lot(account_level=2), min_stars=4500, max_stars=27000) == ""
     assert filter_lot(_lot(account_level=3), min_stars=4500, max_stars=27000) == "level"
+    # Telegram часто не отдаёт stars_rating — None не сжигает лот как «level»
     assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == ""
-    assert (
-        filter_lot(
-            _lot(account_level=None),
-            min_stars=4500,
-            max_stars=27000,
-            require_known=True,
-        )
-        == "level"
-    )
 
 
 def test_max_12_nfts() -> None:
@@ -138,7 +130,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.2.0"
+    assert config.TRACKER_VERSION == "5.3.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -247,6 +239,9 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     assert is_girl(boy) is False
     sasha = _lot(first_name="Саша", about="торгую гифтами", seller="sasha_nft")
     assert is_girl(sasha) is False
+    nick = _lot(first_name="Shop", about="торгую гифтами", seller="masha_nft")
+    assert is_girl(nick) is True
+    assert filter_lot(nick, min_stars=4500, max_stars=27000) == ""
 
 
 def test_stars_level_reads_current_level() -> None:
@@ -339,6 +334,26 @@ def test_fresh_from_page_only_new_listings() -> None:
     assert fresh == []
 
 
+def test_fresh_from_page_ignores_api_order() -> None:
+    """Известный id больше не делает break — новый лот после него не теряется."""
+    a = _lot(id="A", stars=8000)
+    b = _lot(id="B", stars=9000)
+    c = _lot(id="C", stars=10000)
+    new = _lot(id="NEW", stars=7000)
+    # Telegram отдал не newest→oldest: известный B стоит перед новым
+    page, fresh = fresh_from_page(["A", "B", "C"], [b, new, a], {}, 4500, 27000)
+    assert page == ["B", "NEW", "A"]
+    assert [x.id for x in fresh] == ["NEW"]
+    # пустой снимок — ничего не постим
+    page, fresh = fresh_from_page([], [new, a], {}, 4500, 27000)
+    assert fresh == []
+    # всплытие mid среди перемешанных известных
+    mid = _lot(id="mid", stars=9000)
+    old = _lot(id="old", stars=10000)
+    page, fresh = fresh_from_page(["old", "mid"], [mid, old, new], {}, 4500, 27000)
+    assert [x.id for x in fresh] == ["NEW"]
+
+
 def test_state_schema_clears_seller_bans() -> None:
     import json
     import tempfile
@@ -395,6 +410,7 @@ def main() -> None:
         test_latin_girl_with_russian_bio,
         test_skips_persian_and_latin_boys,
         test_fresh_from_page_only_new_listings,
+        test_fresh_from_page_ignores_api_order,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

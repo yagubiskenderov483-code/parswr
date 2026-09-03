@@ -877,10 +877,9 @@ class TelegramMarket:
         if not lot.seller_id:
             return
         cached = self._profile_cache.get(int(lot.seller_id))
-        if cached and cached.get("account_level") is not None and cached.get("first_name"):
+        if cached and cached.get("first_name"):
             _apply_cache(lot, cached)
-            if lot.account_level is not None:
-                return
+            return
         try:
             await self._wait_flood()
             full = await asyncio.wait_for(
@@ -888,6 +887,8 @@ class TelegramMarket:
                 timeout=timeout,
             )
         except Exception:  # noqa: BLE001
+            if lot.first_name:
+                self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
             return
         for u in getattr(full, "users", None) or []:
             if getattr(u, "id", None) == lot.seller_id:
@@ -914,8 +915,7 @@ class TelegramMarket:
                     if paid is not None and paid > 0:
                         lot.free_dm = False
                         lot.paid_dm_stars = paid
-        if lot.account_level is not None:
-            self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
+        self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
         # сторис/список подарков не тянем на каждый лот — FloodWait глушит бота
 
     async def _extra_signals(self, lot: Lot, timeout: float = 4.0) -> None:

@@ -445,6 +445,11 @@ class PostQueue:
                 continue
             keys = seller_keys(lot)
             if keys and (keys & blocked or keys & batch_owners):
+                logger.info(
+                    "[pipeline] queued skip %s: дубль · seller=%s",
+                    lot.slug or lot.id,
+                    (lot.seller or str(lot.seller_id) or "?")[:24],
+                )
                 self.seen[lot.id] = now
                 if lot.slug:
                     self.seen[lot.slug] = now
@@ -455,6 +460,12 @@ class PostQueue:
             self._items.append(lot)
             batch_owners |= keys
             added += 1
+            logger.info(
+                "[pipeline] queued %s · %s⭐ · q=%s",
+                lot.slug or lot.id,
+                int(lot.stars),
+                len(self._items),
+            )
         if added:
             self._event.set()
         self.runtime.queue = len(self._items)
@@ -489,12 +500,20 @@ class PostQueue:
                     pass
                 continue
             try:
+                tag = lot.slug or lot.id
                 pre = filter_lot(
                     lot,
                     min_stars=config.MIN_STARS,
                     max_stars=config.MAX_STARS,
                     max_level=config.MAX_ACCOUNT_LEVEL,
                     max_nfts=config.MAX_NFTS,
+                )
+                logger.info(
+                    "[pipeline] pre-filter %s: %s · name=%s seller=%s",
+                    tag,
+                    pre or "ok",
+                    (lot.first_name or "—")[:24],
+                    (lot.seller or "?")[:24],
                 )
                 hard = {
                     "мужской",
@@ -512,8 +531,8 @@ class PostQueue:
                     classify_skip(pre, self.runtime.skip_total)
                     self.runtime.last_skip = stats
                     logger.info(
-                        "Пропуск без RPC %s: %s · %s",
-                        lot.slug or lot.id,
+                        "[pipeline] skip %s без RPC: %s · %s",
+                        tag,
                         pre,
                         (lot.first_name or lot.seller or "?")[:24],
                     )
@@ -523,6 +542,16 @@ class PostQueue:
                     save_state(self.state_file, self.state)
                     continue
                 await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
+                logger.info(
+                    "[pipeline] enriched %s · name=%s seller=%s lvl=%s dm=%s nfts=%s ru=%s",
+                    tag,
+                    (lot.first_name or "—")[:24],
+                    (lot.seller or "?")[:24],
+                    lot.account_level if lot.account_level is not None else "none",
+                    lot.free_dm if lot.free_dm is not None else "none",
+                    lot.gifts_count if lot.gifts_count is not None else "none",
+                    (lot.lang_code or "—")[:8],
+                )
                 now = time.time()
                 keys = seller_keys(lot)
                 reason = filter_lot(
@@ -531,7 +560,12 @@ class PostQueue:
                     max_stars=config.MAX_STARS,
                     max_level=config.MAX_ACCOUNT_LEVEL,
                     max_nfts=config.MAX_NFTS,
-                    require_known=True,
+                )
+                logger.info(
+                    "[pipeline] final-filter %s: %s · lvl=%s",
+                    tag,
+                    reason or "ok",
+                    lot.account_level if lot.account_level is not None else "none",
                 )
                 if not reason:
                     if lot.seller_id is None:
@@ -550,7 +584,7 @@ class PostQueue:
                     classify_skip(reason, self.runtime.skip_total)
                     self.runtime.last_skip = stats
                     logger.info(
-                        "Пропуск %s (%s⭐ @%s): %s · %s · lvl=%s gifts=%s",
+                        "[pipeline] skip %s (%s⭐ @%s): %s · %s · lvl=%s gifts=%s",
                         lot.slug or lot.id,
                         int(lot.stars),
                         lot.seller or "?",
@@ -577,6 +611,7 @@ class PostQueue:
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue
+                logger.info("[pipeline] send %s …", lot.slug or lot.id)
                 via = await self.sender.send(lot)
                 self.runtime.post_via = via
                 self.seen[lot.id] = now
@@ -591,10 +626,11 @@ class PostQueue:
                 self.runtime.posted += 1
                 self._last_title = lot.title or ""
                 logger.info(
-                    "Отправил: %s за %s⭐ · lvl %s · очередь %s",
+                    "[pipeline] send ok %s за %s⭐ · lvl %s · via=%s · очередь %s",
                     lot.title,
                     int(lot.stars),
                     format_level(lot),
+                    via,
                     len(self._items),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -613,9 +649,11 @@ def fresh_from_page(
     min_stars: float,
     max_stars: float,
 ) -> tuple[list[str], list[Lot]]:
-    """Только id, которых не было на предыдущей странице.
+    """Новые id = разность с предыдущей страницей и seen.
 
-    Если купили #1, бывший #2 всплывает — он уже был на странице, не постим.
+    Порядок ответа API не обязан быть newest→oldest: известный id
+    больше не обрывает страницу. Всплытие старого #2 после покупки #1
+    не постим — id уже был в prev_ids. Первый снимок (prev пустой) — без постов.
     """
     page = [lot.id for lot in lots]
     if not lots or not prev_ids:
@@ -624,7 +662,7 @@ def fresh_from_page(
     out: list[Lot] = []
     for lot in lots:
         if lot.id in known:
-            break
+            continue
         if lot.id in seen or (lot.slug and lot.slug in seen):
             continue
         if min_stars <= float(lot.stars) <= max_stars:
@@ -738,11 +776,19 @@ async def scanner_loop(
 
         found = 0
         queued = 0
+        api_n = 0
 
         def absorb(gid: int, lots: list[Lot]) -> None:
-            nonlocal found, queued
+            nonlocal found, queued, api_n
+            api_n += len(lots)
             key = str(gid)
             prev = pages.get(key)
+            logger.debug(
+                "[pipeline] API returned gid=%s n=%s prev=%s",
+                gid,
+                len(lots),
+                len(prev or []),
+            )
             new_page, chunk = fresh_from_page(
                 prev,
                 lots,
@@ -752,6 +798,14 @@ async def scanner_loop(
             )
             if new_page:
                 pages[key] = new_page
+            if chunk:
+                slugs = ",".join((x.slug or x.id)[:22] for x in chunk[:8])
+                logger.info(
+                    "[pipeline] fresh detected gid=%s n=%s %s",
+                    gid,
+                    len(chunk),
+                    slugs,
+                )
             if not chunk:
                 return
             found += len(chunk)
@@ -768,6 +822,15 @@ async def scanner_loop(
         runtime.last_found = found
         runtime.last_fresh = queued
         runtime.snapshot = len(pages)
+        logger.info(
+            "[pipeline] pass #%s API=%s fresh=%s queued=%s pages=%s q=%s",
+            pass_no,
+            api_n,
+            found,
+            queued,
+            len(pages),
+            len(queue._items),
+        )
         if queued:
             logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))
         elif pass_no % 16 == 0:

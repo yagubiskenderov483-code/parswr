@@ -226,20 +226,30 @@ def looks_male(lot: Lot) -> bool:
     return False
 
 
+def _username_female_name(username: str) -> bool:
+    """Токен ника — настоящее женское имя (masha_nft). Не био-хинты."""
+    raw = (username or "").lower().lstrip("@")
+    for part in re.split(r"[_.\-]+", raw):
+        tok = _first_token(part)
+        if not tok:
+            continue
+        if is_cyrillic_female_name(tok) or is_latin_female_name(tok):
+            return True
+    return False
+
+
 def female_reason(lot: Lot) -> str:
-    """Нужно женское имя. Био «девушке можно писать» / эмодзи / гифт не считаются."""
+    """Женское имя в first/last или в токене username. Био/эмодзи/гифт не считаются."""
     if looks_male(lot):
         return "мужской"
     fn = _first_token(lot.first_name)
-    if is_cyrillic_female_name(fn):
+    if is_cyrillic_female_name(fn) or is_latin_female_name(fn):
         return ""
     ln = (lot.last_name or "").strip().lower()
     if ln.endswith(("овна", "евна", "ична")):
         return ""
-    if is_latin_female_name(fn):
+    if _username_female_name(lot.seller):
         return ""
-    if not fn:
-        return "нет женских признаков"
     return "нет женских признаков"
 
 
@@ -350,12 +360,11 @@ def filter_lot(
     max_stars: float,
     max_level: int = 2,
     max_nfts: int = 6,
-    require_known: bool = False,
 ) -> str:
     """Пустая строка = проходит. Иначе причина отказа.
 
-    Неизвестные level / NFT / ЛС не режем — иначе новые лоты сгорают,
-    когда FloodWait не дал дотянуть профиль.
+    Неизвестные level / NFT / ЛС не режем: Telegram часто не отдаёт
+    stars_rating, и лот с lvl=None нельзя сжигать как «level».
     """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
@@ -374,8 +383,6 @@ def filter_lot(
         return "платные ЛС"
     lvl = passes_level(lot, max_level)
     if lvl is False:
-        return "level"
-    if require_known and lvl is None:
         return "level"
     nfts = passes_nfts(lot, max_nfts)
     if nfts is False:

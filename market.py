@@ -9,9 +9,10 @@ import random
 import struct
 import time
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import config
 
@@ -164,6 +165,10 @@ class Lot:
     lang_code: str = ""
     collection_id: int | None = None
     discovered_at: float = field(default_factory=time.time)
+    # instrumentation (v5.9) — listing_created_at только если API даст время выставления
+    listing_created_at: float | None = None
+    discovery_round: int | None = None
+    username_source: str = ""
 
     @property
     def nft_url(self) -> str:
@@ -254,10 +259,13 @@ def _emoji_status_text(user: Any) -> str:
     return type(st).__name__
 
 
-def fill_user(lot: Lot, user: Any) -> None:
+def fill_user(lot: Lot, user: Any, *, username_source: str = "") -> None:
     username = _username_of(user)
     if username:
+        had = bool(lot.seller)
         lot.seller = username
+        if username_source and not had and not lot.username_source:
+            lot.username_source = username_source
     sid = getattr(user, "id", None)
     if sid is not None:
         try:
@@ -383,7 +391,9 @@ def parse_gift(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         collection_id=collection_id,
     )
     if seller_id and users and seller_id in users:
-        fill_user(lot, users[seller_id])
+        fill_user(lot, users[seller_id], username_source="resale_user")
+    # StarGiftUnique не отдаёт timestamp выставления на resale — не выдумываем.
+    lot.listing_created_at = None
     return lot
 
 
@@ -427,6 +437,32 @@ class TelegramMarket:
         self._rpc_sem = asyncio.Semaphore(2)
         self._profile_cache: dict[int, dict[str, Any]] = {}
         self.last_error = ""
+        self.diag: Any | None = None
+        self._rpc_kind = "scan"
+        self.last_fetch_ok = True
+
+    @contextmanager
+    def rpc_kind(self, kind: str) -> Iterator[None]:
+        prev = self._rpc_kind
+        self._rpc_kind = kind
+        try:
+            yield
+        finally:
+            self._rpc_kind = prev
+
+    def _note_flood(self, seconds: float) -> None:
+        if self.diag is not None:
+            self.diag.note_flood(self._rpc_kind, float(seconds))
+
+    def _note_timeout(self) -> None:
+        if self.diag is not None:
+            self.diag.note_timeout(self._rpc_kind)
+
+    def _note_exc(self, exc: BaseException) -> None:
+        if isinstance(exc, FloodWaitError):
+            self._note_flood(float(getattr(exc, "seconds", 0) or 0))
+        elif isinstance(exc, asyncio.TimeoutError):
+            self._note_timeout()
 
     async def ensure_connected(self) -> None:
         if not self.client.is_connected():
@@ -692,7 +728,8 @@ class TelegramMarket:
         sort_by_price: bool = False,
         offset: str = "",
     ) -> list[Lot]:
-        stats = {"errors": 0, "floods": 0}
+        stats = {"errors": 0, "floods": 0, "timeouts": 0}
+        self.last_fetch_ok = True
         result = await self._request(
             gift_id,
             limit,
@@ -715,6 +752,7 @@ class TelegramMarket:
                 sort_by_price=sort_by_price,
             )
         if result is None:
+            self.last_fetch_ok = False
             return []
         lots = parse_result(result)
         for lot in lots:
@@ -819,10 +857,13 @@ class TelegramMarket:
                 wait_s = float(exc.seconds) + 1.5
                 self._flood_until = time.monotonic() + min(wait_s, 300.0)
                 self.last_error = f"FloodWait {exc.seconds}s"
+                self._note_flood(float(exc.seconds))
                 await asyncio.sleep(min(wait_s, 120.0))
             except asyncio.TimeoutError:
                 stats["errors"] += 1
+                stats["timeouts"] = stats.get("timeouts", 0) + 1
                 self.last_error = f"таймаут {timeout:g}s"
+                self._note_timeout()
                 await asyncio.sleep(0.2 * (attempt + 1))
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
@@ -839,11 +880,11 @@ class TelegramMarket:
                 ent = await asyncio.wait_for(
                     self.client.get_entity(lot.seller_id), timeout=timeout
                 )
-                fill_user(lot, ent)
+                fill_user(lot, ent, username_source="get_entity")
                 if lot.seller:
                     return
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._note_exc(exc)
         if not lot.slug:
             return
         try:
@@ -852,7 +893,8 @@ class TelegramMarket:
                 self.client(GetUniqueStarGiftRequest(slug=lot.slug)),
                 timeout=timeout,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._note_exc(exc)
             return
         gift = getattr(result, "gift", None)
         users = {
@@ -871,7 +913,7 @@ class TelegramMarket:
         if seller_id:
             lot.seller_id = seller_id
             if seller_id in users:
-                fill_user(lot, users[seller_id])
+                fill_user(lot, users[seller_id], username_source="unique_gift")
         # username всё ещё пуст — ещё одна попытка entity
         if lot.seller_id and not lot.seller:
             try:
@@ -879,9 +921,9 @@ class TelegramMarket:
                 ent = await asyncio.wait_for(
                     self.client.get_entity(int(lot.seller_id)), timeout=timeout
                 )
-                fill_user(lot, ent)
-            except Exception:  # noqa: BLE001
-                pass
+                fill_user(lot, ent, username_source="get_entity")
+            except Exception as exc:  # noqa: BLE001
+                self._note_exc(exc)
 
     async def enrich_profile(self, lot: Lot, timeout: float = 5.0) -> None:
         if not lot.seller_id:
@@ -896,13 +938,14 @@ class TelegramMarket:
                 self.client(GetFullUserRequest(lot.seller_id)),
                 timeout=timeout,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._note_exc(exc)
             if lot.first_name:
                 self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
             return
         for u in getattr(full, "users", None) or []:
             if getattr(u, "id", None) == lot.seller_id:
-                fill_user(lot, u)
+                fill_user(lot, u, username_source="full_user")
                 break
         uf = getattr(full, "full_user", None)
         if uf is not None:
@@ -951,8 +994,8 @@ class TelegramMarket:
                         texts.append(cap)
                 if texts:
                     lot.stories_text = " ".join(texts)[:400]
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._note_exc(exc)
         if GetSavedStarGiftsRequest is not None and not lot.gifts_text:
             try:
                 await self._wait_flood()
@@ -985,8 +1028,8 @@ class TelegramMarket:
                     lot.gifts_text = " ".join(titles)[:400]
                 if unique and (lot.gifts_count is None or unique < lot.gifts_count):
                     lot.gifts_count = unique
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._note_exc(exc)
         cached = self._profile_cache.get(int(lot.seller_id))
         if cached is not None:
             cached.update(_cache_from(lot))
@@ -1011,7 +1054,8 @@ class TelegramMarket:
                 ),
                 timeout=timeout,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._note_exc(exc)
             return
         lot.gifts_count = count_unique_star_gifts(saved)
         # названия unique gifts — сигнал для female_score (без второго RPC)
@@ -1039,7 +1083,8 @@ class TelegramMarket:
                 self.client(GetRequirementsToContactRequest(id=[ent])),
                 timeout=timeout,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._note_exc(exc)
             return
         reqs = list(result or [])
         if not reqs:
@@ -1065,50 +1110,52 @@ class TelegramMarket:
         lot.free_dm = True
 
     async def enrich_lot(self, lot: Lot, timeout: float = 5.0) -> None:
-        await self.resolve_owner(lot, timeout=timeout)
-        if lot.seller_id is None:
-            return
-        await self.enrich_profile(lot, timeout=timeout)
-        # username мог появиться только в FullUser.users
-        if not lot.seller:
-            try:
-                await self._wait_flood()
-                ent = await asyncio.wait_for(
-                    self.client.get_entity(int(lot.seller_id)), timeout=timeout
-                )
-                fill_user(lot, ent)
-            except Exception:  # noqa: BLE001
-                pass
-        await self.count_unique_gifts(lot, timeout=timeout)
-        # Stories — доп. сигнал; FloodWait глотаем внутри
-        if GetPeerStoriesRequest is not None and not lot.stories_text:
-            try:
-                await self._wait_flood()
-                ent = await asyncio.wait_for(
-                    self.client.get_input_entity(lot.seller_id), timeout=min(timeout, 3.0)
-                )
-                stories = await asyncio.wait_for(
-                    self.client(GetPeerStoriesRequest(peer=ent)),
-                    timeout=min(timeout, 3.0),
-                )
-                texts: list[str] = []
-                peer_stories = getattr(stories, "stories", None)
-                items = getattr(peer_stories, "stories", None) or []
-                for item in items:
-                    cap = str(getattr(item, "caption", "") or "")
-                    if cap:
-                        texts.append(cap)
-                if texts:
-                    lot.stories_text = " ".join(texts)[:400]
-            except Exception:  # noqa: BLE001
-                pass
-        if lot.free_dm is None:
-            await self.check_free_dm(lot, timeout=timeout)
-        cached = self._profile_cache.get(int(lot.seller_id))
-        if cached is not None:
-            cached.update(_cache_from(lot))
-        else:
-            self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
+        with self.rpc_kind("enrich"):
+            await self.resolve_owner(lot, timeout=timeout)
+            if lot.seller_id is None:
+                return
+            await self.enrich_profile(lot, timeout=timeout)
+            # username мог появиться только в FullUser.users
+            if not lot.seller:
+                try:
+                    await self._wait_flood()
+                    ent = await asyncio.wait_for(
+                        self.client.get_entity(int(lot.seller_id)), timeout=timeout
+                    )
+                    fill_user(lot, ent, username_source="get_entity")
+                except Exception as exc:  # noqa: BLE001
+                    self._note_exc(exc)
+            await self.count_unique_gifts(lot, timeout=timeout)
+            # Stories — доп. сигнал; FloodWait глотаем внутри
+            if GetPeerStoriesRequest is not None and not lot.stories_text:
+                try:
+                    await self._wait_flood()
+                    ent = await asyncio.wait_for(
+                        self.client.get_input_entity(lot.seller_id),
+                        timeout=min(timeout, 3.0),
+                    )
+                    stories = await asyncio.wait_for(
+                        self.client(GetPeerStoriesRequest(peer=ent)),
+                        timeout=min(timeout, 3.0),
+                    )
+                    texts: list[str] = []
+                    peer_stories = getattr(stories, "stories", None)
+                    items = getattr(peer_stories, "stories", None) or []
+                    for item in items:
+                        cap = str(getattr(item, "caption", "") or "")
+                        if cap:
+                            texts.append(cap)
+                    if texts:
+                        lot.stories_text = " ".join(texts)[:400]
+                except Exception as exc:  # noqa: BLE001
+                    self._note_exc(exc)
+            if lot.free_dm is None:
+                await self.check_free_dm(lot, timeout=timeout)
+            cached = self._profile_cache.get(int(lot.seller_id))
+            if cached is not None:
+                cached.update(_cache_from(lot))
+            else:
+                self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
 
 
 def _cache_from(lot: Lot) -> dict[str, Any]:

@@ -151,7 +151,7 @@ def test_hardcoded_filters() -> None:
     assert config.SCAN_BATCH == 0
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.8.0"
+    assert config.TRACKER_VERSION == "5.9.0"
     assert config.MIN_COLLECTIONS == 50
     assert config.GIRL_MIN_SCORE == 5
 
@@ -700,6 +700,156 @@ def test_state_schema_clears_seller_bans() -> None:
         assert data["seen_sellers"] == {"spammer": 1.0}
 
 
+def test_percentile_and_scan_round_metrics() -> None:
+    from diagnostics import Diagnostics, percentile
+
+    assert percentile([], 50) is None
+    assert percentile([10.0], 50) == 10.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.5
+    d = Diagnostics()
+    d.record_scan_round(
+        {
+            "pass": 1,
+            "round_started_at": 1.0,
+            "round_finished_at": 2.0,
+            "round_ms": 1000.0,
+            "collections_checked": 10,
+            "collections_success": 9,
+            "collections_failed": 1,
+            "api_fetch_count": 10,
+            "found_in_range": 3,
+            "fresh_detected": 5,
+            "queued": 2,
+            "duplicate_seller": 1,
+            "duplicate_listing": 0,
+            "flood_wait_count": 0,
+            "flood_wait_seconds": 0.0,
+            "timeout_count": 0,
+        }
+    )
+    assert d.last_round["pass"] == 1
+    assert d.scan_p50() == 1000.0
+    lines = d.status_lines()
+    assert any("scan round:" in x for x in lines)
+    assert any("detection_latency: UNKNOWN" in x for x in lines)
+
+
+def test_detection_latency_unknown_without_listing_time() -> None:
+    from diagnostics import Diagnostics
+
+    d = Diagnostics()
+    lot = _lot(listing_created_at=None)
+    d.record_detection(lot, pass_no=3)
+    assert d.detection_latency_unknown == 1
+    assert d.detection_latency_known == 0
+    assert d.detections[-1]["detection_latency"] is None
+    assert lot.listing_created_at is None
+
+
+def test_ru_reject_codes() -> None:
+    from diagnostics import russian_reject_code
+
+    assert russian_reject_code(_lot(lang_code="fa", first_name="Ali", about="")) == (
+        "foreign_lang"
+    )
+    shop = _lot(first_name="GiftShop", last_name="", about="best deals", lang_code="")
+    shop.seller = "gift_shop_99"
+    # ensure no cyrillic / not latin female
+    assert is_russian(shop) is False
+    assert russian_reject_code(shop) == "no_cyrillic"
+
+
+def test_girl_forensics_no_identity_and_pass() -> None:
+    from diagnostics import Diagnostics, girl_forensics, girl_reject_code
+    from filters import has_female_identity
+
+    maria = _lot()
+    assert girl_reject_code(maria) == "ok"
+    fx2 = girl_forensics(maria)
+    assert fx2["identity"] is True
+    assert fx2["score"] >= config.GIRL_MIN_SCORE
+    assert any(s.startswith("name:") for s in fx2["signals"])
+
+    d = Diagnostics()
+    d.record_girl_outcome(maria, passed=True)
+    no_id = _lot(
+        first_name="Seller",
+        last_name="",
+        seller="nft_market",
+        about="пиши 💅",
+        has_photo=True,
+        emoji_status="",
+        gifts_text="",
+        stories_text="",
+        personal_channel="",
+    )
+    assert has_female_identity(no_id) is False
+    assert girl_reject_code(no_id) == "no_identity"
+    d.record_girl_outcome(no_id, passed=False)
+    assert d.girl_pass == 1
+    assert d.girl_reject_no_identity == 1
+    assert d.girl_identity_false == 1
+
+
+def test_username_and_floodwait_split() -> None:
+    from diagnostics import Diagnostics
+
+    d = Diagnostics()
+    page = _lot(seller="maria_x")
+    page.username_source = "resale_user"
+    d.record_username(page, had_before_enrich=True)
+    assert d.username_from_page == 1
+    assert d.username_from_resale_user == 1
+
+    later = _lot(seller="kate")
+    later.username_source = "get_entity"
+    d.record_username(later, had_before_enrich=False)
+    assert d.username_from_get_entity == 1
+
+    missing = _lot(seller="")
+    d.record_username(missing, had_before_enrich=False)
+    assert d.username_unknown == 1
+
+    d.note_flood("scan", 2.0)
+    d.note_flood("enrich", 3.0)
+    d.note_flood("send", 1.0)
+    assert d.scan_floodwait_count == 1
+    assert d.enrich_floodwait_count == 1
+    assert d.send_floodwait_count == 1
+    assert d.scan_floodwait_seconds == 2.0
+    d.record_enrich(120.0, ok=True)
+    d.record_enrich(200.0, ok=False)
+    assert d.enrich_count == 2
+    assert d.enrich_success == 1
+    assert d.enrich_failed == 1
+    assert d.enrich_p50() is not None
+
+
+def test_fill_user_sets_username_source() -> None:
+    from types import SimpleNamespace
+
+    from market import fill_user
+
+    lot = _lot(seller="")
+    user = SimpleNamespace(
+        id=1,
+        username="anna_nft",
+        first_name="Anna",
+        last_name="",
+        premium=False,
+        lang_code="",
+        photo=None,
+        emoji_status=None,
+        stars_rating=None,
+        usernames=None,
+    )
+    fill_user(lot, user, username_source="resale_user")
+    assert lot.seller == "anna_nft"
+    assert lot.username_source == "resale_user"
+    fill_user(lot, user, username_source="get_entity")
+    assert lot.username_source == "resale_user"  # first wins
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -749,6 +899,12 @@ def main() -> None:
         test_post_interval_separate_from_poll,
         test_seller_keys_username_found,
         test_state_schema_clears_seller_bans,
+        test_percentile_and_scan_round_metrics,
+        test_detection_latency_unknown_without_listing_time,
+        test_ru_reject_codes,
+        test_girl_forensics_no_identity_and_pass,
+        test_username_and_floodwait_split,
+        test_fill_user_sets_username_source,
     ]
     for fn in tests:
         fn()

@@ -352,6 +352,10 @@ class ControlBot:
                 )
             if rt.last_error:
                 lines.append(f"⚠️ {_esc(str(rt.last_error)[:160])}")
+            diag = getattr(rt, "diag", None)
+            if diag is not None:
+                lines.append("DIAGNOSTICS")
+                lines.extend(diag.status_lines())
         else:
             lines.append("⏳ Сканер ещё поднимается — подожди пару секунд.")
         return "\n".join(lines)

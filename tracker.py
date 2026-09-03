@@ -19,6 +19,12 @@ from telethon.sessions import StringSession
 
 import config
 from bot import ControlBot
+from diagnostics import (
+    Diagnostics,
+    log_girl_forensics,
+    log_male_forensics,
+    log_ru_forensics,
+)
 from filters import (
     classify_skip,
     explain_filters,
@@ -690,6 +696,32 @@ def debug_lot_line(lot: Lot, stage: str, reason: str) -> str:
     )
 
 
+def _record_filter_diagnostics(diag: Diagnostics, lot: Lot, reason: str) -> None:
+    """Логи/счётчики male·ru·girl. Не влияет на решения фильтра."""
+    if reason in {"дубль", "дубль продавца"}:
+        return
+    if looks_male(lot) or reason == "мужской":
+        log_male_forensics(lot, rejected=True)
+        return
+    log_male_forensics(lot, rejected=False)
+    ru = is_russian(lot)
+    if ru is False or reason == "не русский":
+        log_ru_forensics(lot, passed=False)
+        diag.record_ru_reject(lot)
+        return
+    if ru is None or reason == "нет данных":
+        log_ru_forensics(lot, passed=None)
+        return
+    log_ru_forensics(lot, passed=True)
+    girl_r = female_reason(lot)
+    if girl_r or reason == "нет женских признаков":
+        log_girl_forensics(lot, passed=False)
+        diag.record_girl_outcome(lot, passed=False)
+        return
+    log_girl_forensics(lot, passed=True)
+    diag.record_girl_outcome(lot, passed=True)
+
+
 class Runtime:
     def __init__(self) -> None:
         self.passes = 0
@@ -706,6 +738,7 @@ class Runtime:
         self.last_error = ""
         self.post_via = ""
         self.snapshot_ready = False
+        self.diag: Diagnostics = Diagnostics()
 
 
 async def _client_and_bot() -> tuple[TelegramClient, ControlBot]:
@@ -949,6 +982,8 @@ class PostQueue:
                     )
                     if config.DEBUG_FILTERS:
                         logger.info(debug_lot_line(lot, "pre-filter", pre))
+                    if pre == "мужской":
+                        log_male_forensics(lot, rejected=True)
                     record_worker_filter(self.runtime.funnel, lot, pre)
                     _bump(self.runtime.funnel, "worker_filtered")
                     self.seen[lot.id] = now
@@ -956,7 +991,22 @@ class PostQueue:
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue
-                await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
+                had_username = bool(lot.seller)
+                enrich_t0 = time.monotonic()
+                enrich_ok = True
+                try:
+                    await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
+                except Exception:  # noqa: BLE001
+                    enrich_ok = False
+                    raise
+                finally:
+                    self.runtime.diag.record_enrich(
+                        (time.monotonic() - enrich_t0) * 1000.0,
+                        ok=enrich_ok,
+                    )
+                    self.runtime.diag.record_username(
+                        lot, had_before_enrich=had_username
+                    )
                 logger.info(
                     "[pipeline] enriched %s · name=%s seller=%s lvl=%s dm=%s nfts=%s lang=%s",
                     tag,
@@ -1010,6 +1060,7 @@ class PostQueue:
                     )
                     if config.DEBUG_FILTERS:
                         logger.info(debug_lot_line(lot, "final-filter", reason))
+                    _record_filter_diagnostics(self.runtime.diag, lot, reason)
                     record_worker_filter(self.runtime.funnel, lot, reason)
                     _bump(self.runtime.funnel, "worker_filtered")
                     incomplete = reason in {
@@ -1032,6 +1083,7 @@ class PostQueue:
                     continue
                 if config.DEBUG_FILTERS:
                     logger.info(debug_lot_line(lot, "final-filter", "ok"))
+                _record_filter_diagnostics(self.runtime.diag, lot, "")
                 record_worker_filter(self.runtime.funnel, lot, "")
                 _bump(self.runtime.funnel, "send_attempt")
                 logger.info("[pipeline] send %s …", lot.slug or lot.id)
@@ -1064,6 +1116,12 @@ class PostQueue:
                 _bump(self.runtime.funnel, "worker_failed")
                 if "FloodWait" in type(exc).__name__ or "flood" in str(exc).lower():
                     _bump(self.runtime.funnel, "flood_wait")
+                    sec = 0.0
+                    try:
+                        sec = float(getattr(exc, "seconds", 0) or 0)
+                    except (TypeError, ValueError):
+                        sec = 0.0
+                    self.runtime.diag.note_flood("send", sec)
             finally:
                 self._inflight.discard(lot.id)
                 self._inflight_sellers = set()
@@ -1179,9 +1237,15 @@ async def scanner_loop(
     )
     pass_no = 0
     while True:
+        round_started_at = time.time()
         started = time.monotonic()
         pass_no += 1
         runtime.passes = pass_no
+        diag = runtime.diag
+        flood_before = diag.scan_floodwait_count
+        flood_s_before = diag.scan_floodwait_seconds
+        timeout_before = diag.scan_timeout_count
+        fn_before = dict(runtime.funnel)
         batch = market.next_batch(config.SCAN_BATCH)
         if not batch or len(gift_ids) < config.MIN_COLLECTIONS:
             try:
@@ -1203,24 +1267,32 @@ async def scanner_loop(
                 continue
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
 
-        async def one(gid: int) -> tuple[int, list[Lot]]:
+        async def one(gid: int) -> tuple[int, list[Lot], bool]:
             async with sem:
+                ok = True
                 try:
-                    lots = await market.fetch_page(
-                        gid,
-                        limit=config.PAGE_LIMIT,
-                        timeout=config.REQUEST_TIMEOUT,
-                        gap=config.REQUEST_GAP,
-                        sort_by_price=False,
-                    )
+                    with market.rpc_kind("scan"):
+                        lots = await market.fetch_page(
+                            gid,
+                            limit=config.PAGE_LIMIT,
+                            timeout=config.REQUEST_TIMEOUT,
+                            gap=config.REQUEST_GAP,
+                            sort_by_price=False,
+                        )
+                    if not market.last_fetch_ok:
+                        ok = False
                 except Exception as exc:  # noqa: BLE001
                     runtime.last_error = str(exc)
                     lots = []
-                return gid, lots
+                    ok = False
+                return gid, lots, ok
 
         found = 0
         queued = 0
         api_n = 0
+        api_fetch_count = 0
+        collections_success = 0
+        collections_failed = 0
 
         seen_skip = 0
         seller_skip = 0
@@ -1262,6 +1334,9 @@ async def scanner_loop(
                     len(chunk),
                     slugs,
                 )
+                for lot in chunk:
+                    lot.discovery_round = pass_no
+                    diag.record_detection(lot, pass_no=pass_no)
             if not chunk:
                 return
             found += len(chunk)
@@ -1272,10 +1347,16 @@ async def scanner_loop(
         tasks = [asyncio.create_task(one(g)) for g in batch]
         for fut in asyncio.as_completed(tasks):
             try:
-                gid, lots = await fut
+                gid, lots, ok = await fut
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
+                collections_failed += 1
                 continue
+            api_fetch_count += 1
+            if ok:
+                collections_success += 1
+            else:
+                collections_failed += 1
             absorb(gid, lots)
         runtime.last_found = found
         runtime.last_fresh = queued
@@ -1286,6 +1367,38 @@ async def scanner_loop(
         inv = funnel_invariants(fn)
         if inv:
             logger.warning("[pipeline] FUNNEL invariants: %s", "; ".join(inv))
+        round_ms = (time.monotonic() - started) * 1000.0
+        round_finished_at = time.time()
+        flood_count = diag.scan_floodwait_count - flood_before
+        flood_seconds = diag.scan_floodwait_seconds - flood_s_before
+        timeout_count = diag.scan_timeout_count - timeout_before
+        fresh_delta = int(fn.get("fresh_detected", 0)) - int(
+            fn_before.get("fresh_detected", 0)
+        )
+        dup_s_delta = int(fn.get("dup_seller", 0)) - int(fn_before.get("dup_seller", 0))
+        dup_l_delta = int(fn.get("dup_listing", 0)) - int(
+            fn_before.get("dup_listing", 0)
+        )
+        diag.record_scan_round(
+            {
+                "pass": pass_no,
+                "round_started_at": round_started_at,
+                "round_finished_at": round_finished_at,
+                "round_ms": round_ms,
+                "collections_checked": len(batch),
+                "collections_success": collections_success,
+                "collections_failed": collections_failed,
+                "api_fetch_count": api_fetch_count,
+                "found_in_range": found,
+                "fresh_detected": fresh_delta,
+                "queued": queued,
+                "duplicate_seller": dup_s_delta,
+                "duplicate_listing": dup_l_delta,
+                "flood_wait_count": flood_count,
+                "flood_wait_seconds": flood_seconds,
+                "timeout_count": timeout_count,
+            }
+        )
         logger.info(
             "[pipeline] pass #%s API=%s fresh=%s price_pass=%s seen_pass=%s "
             "dup_seller=%s dup_listing=%s work_in=%s dequeued=%s "
@@ -1358,6 +1471,7 @@ async def run() -> None:
     )
     sender = Sender(client, chat_id, limiter, bot=control.aiogram_bot)
     market = TelegramMarket(client, config.catalog_path())
+    market.diag = runtime.diag
     gift_ids: list[int] = []
     for attempt in range(8):
         try:

@@ -13,6 +13,7 @@ from market import (
     extract_star_gift_ids,
     ids_from_json_payload,
     merge_ids,
+    _stars_level,
 )
 from tracker import format_lot, fresh_from_page
 
@@ -64,10 +65,10 @@ def test_girl_keeps_maria() -> None:
 
 
 def test_girl_keeps_latin_name() -> None:
-    """Латиница без кириллицы — не русская девочка (Reza/Nima больше не пролезают)."""
     lot = _lot(first_name="Kristina", about="🌸", seller="kris_shop")
-    assert is_girl(lot) is False
-    assert is_russian(lot) is False
+    assert is_girl(lot) is True
+    assert is_russian(lot) is True
+    assert filter_lot(lot, min_stars=4500, max_stars=27000) == ""
 
 
 def test_skips_boy() -> None:
@@ -95,6 +96,15 @@ def test_level_max_2() -> None:
     assert filter_lot(_lot(account_level=2), min_stars=4500, max_stars=27000) == ""
     assert filter_lot(_lot(account_level=3), min_stars=4500, max_stars=27000) == "level"
     assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == ""
+    assert (
+        filter_lot(
+            _lot(account_level=None),
+            min_stars=4500,
+            max_stars=27000,
+            require_known=True,
+        )
+        == "level"
+    )
 
 
 def test_max_12_nfts() -> None:
@@ -128,7 +138,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.1.0"
+    assert config.TRACKER_VERSION == "5.2.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -190,16 +200,16 @@ def test_bundled_catalog_has_enough() -> None:
 
 def test_skips_non_russian() -> None:
     latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="en")
-    assert is_girl(latin) is False
-    assert is_russian(latin) is False
-    assert filter_lot(latin, min_stars=4500, max_stars=27000) == "не русский"
+    assert is_girl(latin) is True
+    assert is_russian(latin) is True
+    assert filter_lot(latin, min_stars=4500, max_stars=27000) == ""
     iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
     assert is_russian(iranian) is False
     assert looks_male(iranian) is False
     assert filter_lot(iranian, min_stars=4500, max_stars=27000) == "не русский"
     assert is_russian(_lot()) is True
     cis_latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="")
-    assert is_russian(cis_latin) is False
+    assert is_russian(cis_latin) is True
 
 
 def test_girl_from_gifts_and_stories() -> None:
@@ -237,6 +247,27 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     assert is_girl(boy) is False
     sasha = _lot(first_name="Саша", about="торгую гифтами", seller="sasha_nft")
     assert is_girl(sasha) is False
+
+
+def test_stars_level_reads_current_level() -> None:
+    class Rating:
+        def __init__(self) -> None:
+            self.current_level = 3
+            self.level = None
+
+    assert _stars_level(Rating()) == 3
+    assert _stars_level(2) == 2
+    assert _stars_level({"level": 1}) == 1
+
+
+def test_seller_keys_match_username_and_id() -> None:
+    from filters import seller_keys
+
+    a = _lot(seller="Masha", seller_id=111)
+    b = _lot(seller="masha", seller_id=111)
+    c = _lot(seller="", seller_id=111)
+    assert seller_keys(a) & seller_keys(b)
+    assert seller_keys(a) & seller_keys(c)
 
 
 def test_count_unique_nfts_skips_unlimited() -> None:
@@ -358,6 +389,8 @@ def main() -> None:
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
         test_bio_hints_do_not_make_a_girl,
+        test_stars_level_reads_current_level,
+        test_seller_keys_match_username_and_id,
         test_count_unique_nfts_skips_unlimited,
         test_latin_girl_with_russian_bio,
         test_skips_persian_and_latin_boys,

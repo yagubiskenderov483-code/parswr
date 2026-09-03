@@ -397,6 +397,7 @@ class PostQueue:
         self._items: list[Lot] = []
         self._queued: set[str] = set()
         self._inflight: set[str] = set()
+        self._inflight_sellers: set[str] = set()
         self._task: asyncio.Task | None = None
         self._retries: dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -416,14 +417,22 @@ class PostQueue:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
 
-    def enqueue(self, lots: list[Lot]) -> int:
-        added = 0
+    def _blocked_sellers(self) -> set[str]:
         now = time.time()
-        posted = {
+        blocked = {
             k
             for k, ts in self.seen_sellers.items()
             if now - float(ts) < SELLER_TTL
         }
+        blocked |= self._inflight_sellers
+        for lot in self._items:
+            blocked |= seller_keys(lot)
+        return blocked
+
+    def enqueue(self, lots: list[Lot]) -> int:
+        added = 0
+        now = time.time()
+        blocked = self._blocked_sellers()
         incoming = list(lots)
         batch_owners: set[str] = set()
         for lot in incoming:
@@ -435,8 +444,10 @@ class PostQueue:
             ):
                 continue
             keys = seller_keys(lot)
-            if keys and (keys & posted or keys & batch_owners):
+            if keys and (keys & blocked or keys & batch_owners):
                 self.seen[lot.id] = now
+                if lot.slug:
+                    self.seen[lot.slug] = now
                 self.market_ids.add(lot.id)
                 classify_skip("дубль", self.runtime.skip_total)
                 continue
@@ -462,6 +473,7 @@ class PostQueue:
         self._items.remove(lot)
         self._queued.discard(lot.id)
         self._inflight.add(lot.id)
+        self._inflight_sellers = seller_keys(lot)
         return lot
 
     async def _worker(self) -> None:
@@ -512,20 +524,26 @@ class PostQueue:
                     continue
                 await self.market.enrich_lot(lot, timeout=config.ENRICH_TIMEOUT)
                 now = time.time()
+                keys = seller_keys(lot)
                 reason = filter_lot(
                     lot,
                     min_stars=config.MIN_STARS,
                     max_stars=config.MAX_STARS,
                     max_level=config.MAX_ACCOUNT_LEVEL,
                     max_nfts=config.MAX_NFTS,
+                    require_known=True,
                 )
-                keys = seller_keys(lot)
                 if not reason:
-                    for k in keys:
-                        prev = self.seen_sellers.get(k)
-                        if prev is not None and now - float(prev) < SELLER_TTL:
+                    if lot.seller_id is None:
+                        reason = "нет продавца"
+                    else:
+                        blocked = {
+                            k
+                            for k, ts in self.seen_sellers.items()
+                            if now - float(ts) < SELLER_TTL
+                        }
+                        if keys & blocked:
                             reason = "дубль"
-                            break
                 stats = skip_stats()
                 if reason:
                     classify_skip(reason, stats)
@@ -584,6 +602,7 @@ class PostQueue:
                 self.runtime.last_error = str(exc)
             finally:
                 self._inflight.discard(lot.id)
+                self._inflight_sellers = set()
                 self.runtime.queue = len(self._items)
 
 

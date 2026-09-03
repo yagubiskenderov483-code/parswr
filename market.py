@@ -190,12 +190,39 @@ def format_level(lot: Lot) -> str:
 
 
 def _normalize_level(raw: Any) -> int | None:
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
         return int(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _stars_level(rating: Any) -> int | None:
+    """Telegram StarsRating.level / current_level — не путать с None."""
+    if rating is None:
+        return None
+    direct = _normalize_level(rating)
+    if direct is not None:
+        return direct
+    for attr in ("level", "current_level"):
+        got = _normalize_level(getattr(rating, attr, None))
+        if got is not None:
+            return got
+    if isinstance(rating, dict):
+        for key in ("level", "current_level"):
+            got = _normalize_level(rating.get(key))
+            if got is not None:
+                return got
+    return None
+
+
+def _apply_level(lot: Lot, raw: Any) -> None:
+    got = _stars_level(raw)
+    if got is None:
+        return
+    if lot.account_level is None or got > lot.account_level:
+        lot.account_level = got
 
 
 def _username_of(user: Any) -> str:
@@ -253,8 +280,8 @@ def fill_user(lot: Lot, user: Any) -> None:
     if emoji:
         lot.emoji_status = emoji
     rating = getattr(user, "stars_rating", None)
-    if rating is not None and lot.account_level is None:
-        lot.account_level = _normalize_level(getattr(rating, "level", None))
+    if rating is not None:
+        _apply_level(lot, rating)
     if hasattr(user, "send_paid_messages_stars"):
         raw = getattr(user, "send_paid_messages_stars", None)
         if raw is not None:
@@ -850,9 +877,10 @@ class TelegramMarket:
         if not lot.seller_id:
             return
         cached = self._profile_cache.get(int(lot.seller_id))
-        if cached:
+        if cached and cached.get("account_level") is not None and cached.get("first_name"):
             _apply_cache(lot, cached)
-            return
+            if lot.account_level is not None:
+                return
         try:
             await self._wait_flood()
             full = await asyncio.wait_for(
@@ -875,9 +903,7 @@ class TelegramMarket:
                 lot.personal_channel = str(raw_ch)
             rating = getattr(uf, "stars_rating", None)
             if rating is not None:
-                level = _normalize_level(getattr(rating, "level", None))
-                if level is not None:
-                    lot.account_level = level
+                _apply_level(lot, rating)
             if hasattr(uf, "send_paid_messages_stars"):
                 raw_paid = getattr(uf, "send_paid_messages_stars", None)
                 if raw_paid is not None:
@@ -888,7 +914,8 @@ class TelegramMarket:
                     if paid is not None and paid > 0:
                         lot.free_dm = False
                         lot.paid_dm_stars = paid
-        self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
+        if lot.account_level is not None:
+            self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
         # сторис/список подарков не тянем на каждый лот — FloodWait глушит бота
 
     async def _extra_signals(self, lot: Lot, timeout: float = 4.0) -> None:
@@ -1056,7 +1083,7 @@ def _apply_cache(lot: Lot, info: dict[str, Any]) -> None:
     if info.get("is_premium") is not None:
         lot.is_premium = bool(info["is_premium"])
     if info.get("account_level") is not None:
-        lot.account_level = _normalize_level(info["account_level"])
+        _apply_level(lot, info["account_level"])
     if info.get("gifts_count") is not None:
         lot.gifts_count = int(info["gifts_count"])
     if info.get("free_dm") is not None:

@@ -236,10 +236,7 @@ def female_reason(lot: Lot) -> str:
     ln = (lot.last_name or "").strip().lower()
     if ln.endswith(("овна", "евна", "ична")):
         return ""
-    name_bio = " ".join(
-        x for x in (lot.first_name, lot.last_name, lot.about) if x
-    )
-    if is_latin_female_name(fn) and _CYR_RE.search(name_bio):
+    if is_latin_female_name(fn):
         return ""
     if not fn:
         return "нет женских признаков"
@@ -285,7 +282,6 @@ def is_girl(lot: Lot) -> bool:
 
 _FOREIGN_LANG = frozenset(
     {
-        "en",
         "ar",
         "fa",
         "tr",
@@ -293,11 +289,6 @@ _FOREIGN_LANG = frozenset(
         "th",
         "vi",
         "id",
-        "es",
-        "pt",
-        "de",
-        "fr",
-        "it",
         "zh",
         "ja",
         "ko",
@@ -312,12 +303,17 @@ _FOREIGN_LANG = frozenset(
 
 
 def is_russian(lot: Lot) -> bool | None:
-    """Только кириллица в имени или био. Латиница / fa / en — не русские."""
+    """Кириллица в имени/био, либо латинское женское имя (СНГ) без fa/ar."""
     name_bio = " ".join(
         x for x in (lot.first_name, lot.last_name, lot.about) if x
     ).strip()
     lang = (lot.lang_code or "").strip().lower()
+    if lang in _FOREIGN_LANG:
+        return False
     if _CYR_RE.search(name_bio):
+        return True
+    fn = _first_token(lot.first_name)
+    if is_latin_female_name(fn):
         return True
     if not name_bio and not lang:
         return None
@@ -354,6 +350,7 @@ def filter_lot(
     max_stars: float,
     max_level: int = 2,
     max_nfts: int = 6,
+    require_known: bool = False,
 ) -> str:
     """Пустая строка = проходит. Иначе причина отказа.
 
@@ -377,6 +374,8 @@ def filter_lot(
         return "платные ЛС"
     lvl = passes_level(lot, max_level)
     if lvl is False:
+        return "level"
+    if require_known and lvl is None:
         return "level"
     nfts = passes_nfts(lot, max_nfts)
     if nfts is False:

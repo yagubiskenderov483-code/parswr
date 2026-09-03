@@ -337,11 +337,11 @@ def empty_funnel() -> dict[str, int]:
 
     Порядок фактического pipeline:
       fresh_detected → price → seen → dup_listing|dup_seller|work_in
-      → dequeued → (male→reject_girl) → ru → girl → dm → level → nft
+      → dequeued → post-enrich dup_seller (terminal)
+      → male → ru → girl → dm → level → nft
       → send_attempt → sent|failed
 
-    duplicate_seller / duplicate_listing считаются на enqueue и НЕ входят
-    в ru/girl/dm/level/nft checked.
+    duplicate_seller на enqueue и post-enrich НЕ входят в ru/girl/dm/level/nft.
     """
     keys = [
         "fresh_detected",
@@ -363,8 +363,13 @@ def empty_funnel() -> dict[str, int]:
         "reject_duplicate_listing",
         "dup_seller",
         "dup_listing",
+        "dup_seller_post_enrich",
         "work_in",
         "dequeued",
+        "male_checked",
+        "male_pass",
+        "male_reject",
+        "reject_male",
         "ru_checked",
         "ru_pass",
         "ru_reject",
@@ -451,16 +456,28 @@ def record_work_in(stats: dict[str, int]) -> None:
 
 
 def record_worker_filter(stats: dict[str, int], lot: Lot, reason: str) -> None:
-    """Один раз на dequeued лот. Стадии строго по порядку filter_lot.
+    """Один раз на dequeued лот.
 
-    male → reject_girl до ru (как в filter_lot).
-    incomplete (ru is None) → reject_incomplete, не ru_reject.
-    Unknown dm/level/nft (None) считаются pass (не режем).
+    Порядок:
+      1) post-enrich seller dup → terminal (НЕ ru/girl/dm/level/nft)
+      2) male → male stage (НЕ ru/girl)
+      3) ru → girl → dm → level → nft
+    Unknown dm/level/nft (None) = pass.
     """
-    # male до ru — как filter_lot; в girl stage не входит (girl.checked == ru.pass)
-    if looks_male(lot):
-        _bump(stats, "reject_girl")
+    # BUG#1 fix: post-enrich seller dup — отдельная terminal ветка до фильтров
+    if reason in {"дубль", "дубль продавца"}:
+        _bump(stats, "dup_seller")
+        _bump(stats, "reject_duplicate_seller")
+        _bump(stats, "dup_seller_post_enrich")
         return
+
+    # BUG#2 fix: male — отдельная стадия, не girl / не ru
+    _bump(stats, "male_checked")
+    if looks_male(lot):
+        _bump(stats, "male_reject")
+        _bump(stats, "reject_male")
+        return
+    _bump(stats, "male_pass")
 
     _bump(stats, "ru_checked")
     ru = is_russian(lot)
@@ -505,11 +522,6 @@ def record_worker_filter(stats: dict[str, int], lot: Lot, reason: str) -> None:
         return
     _bump(stats, "nft_pass")
 
-    if reason in {"дубль", "дубль продавца"}:
-        # редкий post-enrich seller dup — не путать с enqueue dup
-        _bump(stats, "dup_seller")
-        _bump(stats, "reject_duplicate_seller")
-        return
     if reason:
         return
     # готов к send — send_attempt/sent считает worker отдельно
@@ -543,6 +555,13 @@ def funnel_invariants(stats: dict[str, int]) -> list[str]:
         stats.get("seen_reject", 0),
         exact=True,
     )
+    chk(
+        "male",
+        stats.get("male_checked", 0),
+        stats.get("male_pass", 0),
+        stats.get("male_reject", 0),
+        exact=True,
+    )
     # ru: reject_incomplete тоже «уходит» из checked без ru_pass/ru_reject
     ru_c = stats.get("ru_checked", 0)
     ru_p = stats.get("ru_pass", 0)
@@ -560,11 +579,17 @@ def funnel_invariants(stats: dict[str, int]) -> list[str]:
             stats.get(f"{name}_reject", 0),
             exact=True,
         )
-    # girl.checked == ru.pass (male уходит в reject_girl до ru)
+    # girl.checked == ru.pass; ru.checked == male.pass
     if stats.get("girl_checked", 0) != stats.get("ru_pass", 0):
         errors.append(
             f"girl.checked({stats.get('girl_checked', 0)}) != ru.pass({stats.get('ru_pass', 0)})"
         )
+    if stats.get("ru_checked", 0) != stats.get("male_pass", 0):
+        errors.append(
+            f"ru.checked({stats.get('ru_checked', 0)}) != male.pass({stats.get('male_pass', 0)})"
+        )
+    # post-enrich dup не должен раздувать nft_pass относительно send
+    # (проверяется тестами; здесь только согласованность stages)
     return errors
 
 
@@ -589,6 +614,12 @@ def format_funnel_report(stats: dict[str, int]) -> str:
         f"  listing: {stats.get('dup_listing', 0)}",
         f"  work_in: {stats.get('work_in', 0)}",
         f"  dequeued: {stats.get('dequeued', 0)}",
+        f"  post_enrich_seller: {stats.get('dup_seller_post_enrich', 0)}",
+        "",
+        "male:",
+        f"  checked: {stats.get('male_checked', 0)}",
+        f"  passed: {stats.get('male_pass', 0)}",
+        f"  rejected: {stats.get('male_reject', 0)}",
         "",
         "ru:",
         f"  checked: {stats.get('ru_checked', 0)}",

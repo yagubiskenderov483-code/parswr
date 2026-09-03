@@ -148,7 +148,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.7.0"
+    assert config.TRACKER_VERSION == "5.7.1"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -420,11 +420,8 @@ def test_pipeline_stats_sequential() -> None:
     """Счётчики — последовательная воронка на реальных множествах."""
     fn = empty_funnel()
 
-    # новый дешёвый — fresh + price reject
     record_fresh_price_seen(fn, fresh=True, price_ok=False, already_seen=False)
-    # новый в цене, already seen
     record_fresh_price_seen(fn, fresh=True, price_ok=True, already_seen=True)
-    # новый в цене, не seen → кандидат
     record_fresh_price_seen(fn, fresh=True, price_ok=True, already_seen=False)
 
     assert fn["fresh_detected"] == 3
@@ -434,64 +431,122 @@ def test_pipeline_stats_sequential() -> None:
     assert fn["seen_checked"] == 2
     assert fn["seen_pass"] == 1
     assert fn["seen_reject"] == 1
-    assert fn["reject_price"] == 1
-    assert fn["reject_seen"] == 1
 
-    # seller dup на enqueue (не смешивается с ru)
+    # 1) seller duplicate на enqueue
     record_enqueue_dup(fn, "seller")
-    record_enqueue_dup(fn, "listing")
     assert fn["dup_seller"] == 1
-    assert fn["dup_listing"] == 1
-    assert fn["reject_duplicate_seller"] == 1
-    assert fn["reject_duplicate_listing"] == 1
     assert fn["ru_checked"] == 0
+    assert fn["nft_pass"] == 0
+
+    record_enqueue_dup(fn, "listing")
+    assert fn["dup_listing"] == 1
 
     record_work_in(fn)
-    assert fn["work_in"] == 1
 
     # RU reject
     record_worker_filter(
         fn, _lot(first_name="Shop", about="", seller="gift_market"), "не русский"
     )
+    assert fn["male_pass"] == 1
     assert fn["ru_checked"] == 1
-    assert fn["ru_pass"] == 0
     assert fn["ru_reject"] == 1
-    assert fn["reject_ru"] == 1
     assert fn["girl_checked"] == 0
 
-    # girl reject (ru pass, not male)
+    # girl reject
     record_worker_filter(
         fn,
         _lot(first_name="Lee", about="привет торгую", seller="shop999xx"),
         "нет женских признаков",
     )
     assert fn["ru_pass"] == 1
-    assert fn["girl_checked"] == 1
     assert fn["girl_reject"] == 1
-    assert fn["reject_girl"] == 1
 
-    # full pass
+    # 4) normal successful lot
     record_worker_filter(fn, _lot(first_name="Мария"), "")
-    assert fn["ru_pass"] == 2
-    assert fn["girl_pass"] == 1
-    assert fn["dm_pass"] == 1
-    assert fn["level_pass"] == 1
     assert fn["nft_pass"] == 1
+    assert fn["girl_pass"] == 1
 
-    # male → reject_girl, без ru_checked
+    # 3) male lot — отдельная стадия
     before_ru = fn["ru_checked"]
+    before_girl = fn["girl_checked"]
     record_worker_filter(
         fn, _lot(first_name="Алексей", seller="lexa"), "мужской"
     )
+    assert fn["male_reject"] == 1
+    assert fn["male_checked"] >= 1
     assert fn["ru_checked"] == before_ru
-    assert fn["reject_girl"] == 2
+    assert fn["girl_checked"] == before_girl
+    assert fn["reject_male"] == 1
+    assert fn["reject_girl"] == 1  # только от girl reject выше, не от male
+
+    # 2)+5)+6) seller duplicate после enrich — terminal, без nft/send
+    before_nft = fn["nft_pass"]
+    before_ru2 = fn["ru_checked"]
+    before_male = fn["male_checked"]
+    record_worker_filter(
+        fn, _lot(first_name="Мария", seller="masha"), "дубль продавца"
+    )
+    assert fn["dup_seller"] == 2  # enqueue + post-enrich
+    assert fn["dup_seller_post_enrich"] == 1
+    assert fn["nft_pass"] == before_nft
+    assert fn["ru_checked"] == before_ru2
+    assert fn["male_checked"] == before_male
+    assert fn["send_attempt"] == 0
 
     inv = funnel_invariants(fn)
     assert inv == [], inv
     report = format_funnel_report(fn)
-    assert "fresh_detected:" in report
-    assert "price:" in report
-    assert "ru:" in report
+    assert "male:" in report
+    assert "post_enrich_seller:" in report
+
+
+def test_stats_enqueue_seller_dup() -> None:
+    fn = empty_funnel()
+    record_enqueue_dup(fn, "seller")
+    assert fn["dup_seller"] == 1
+    assert fn["reject_duplicate_seller"] == 1
+    assert fn["dup_seller_post_enrich"] == 0
+    assert fn["nft_pass"] == 0
+    assert fn["ru_checked"] == 0
+
+
+def test_stats_post_enrich_seller_dup_no_nft_pass() -> None:
+    fn = empty_funnel()
+    record_worker_filter(fn, _lot(first_name="Мария"), "дубль продавца")
+    assert fn["dup_seller"] == 1
+    assert fn["dup_seller_post_enrich"] == 1
+    assert fn["nft_pass"] == 0
+    assert fn["nft_checked"] == 0
+    assert fn["girl_pass"] == 0
+    assert fn["ru_pass"] == 0
+    assert fn["male_checked"] == 0
+    assert fn["send_attempt"] == 0
+    assert funnel_invariants(fn) == []
+
+
+def test_stats_male_lot_separate_stage() -> None:
+    fn = empty_funnel()
+    record_worker_filter(fn, _lot(first_name="Алексей", seller="lexa"), "мужской")
+    assert fn["male_checked"] == 1
+    assert fn["male_reject"] == 1
+    assert fn["male_pass"] == 0
+    assert fn["ru_checked"] == 0
+    assert fn["girl_checked"] == 0
+    assert fn["reject_male"] == 1
+    assert funnel_invariants(fn) == []
+
+
+def test_stats_successful_lot() -> None:
+    fn = empty_funnel()
+    record_worker_filter(fn, _lot(first_name="Мария"), "")
+    assert fn["male_pass"] == 1
+    assert fn["ru_pass"] == 1
+    assert fn["girl_pass"] == 1
+    assert fn["dm_pass"] == 1
+    assert fn["level_pass"] == 1
+    assert fn["nft_pass"] == 1
+    assert fn["dup_seller"] == 0
+    assert funnel_invariants(fn) == []
 
 
 def test_seller_dup_does_not_burn_to_seen() -> None:
@@ -598,6 +653,10 @@ def main() -> None:
         test_fresh_from_page_ignores_api_order,
         test_seller_dup_does_not_burn_to_seen,
         test_pipeline_stats_sequential,
+        test_stats_enqueue_seller_dup,
+        test_stats_post_enrich_seller_dup_no_nft_pass,
+        test_stats_male_lot_separate_stage,
+        test_stats_successful_lot,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

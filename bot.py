@@ -301,6 +301,7 @@ class ControlBot:
                     f"seen={funnel.get('seen_pass', 0)}/{funnel.get('seen_checked', 0)} "
                     f"dup_s={funnel.get('dup_seller', 0)} dup_l={funnel.get('dup_listing', 0)} "
                     f"work={funnel.get('work_in', 0)} deq={funnel.get('dequeued', 0)} "
+                    f"male={funnel.get('male_reject', 0)}/{funnel.get('male_checked', 0)} "
                     f"ru={funnel.get('ru_pass', 0)}/{funnel.get('ru_checked', 0)} "
                     f"girl={funnel.get('girl_pass', 0)}/{funnel.get('girl_checked', 0)} "
                     f"dm={funnel.get('dm_pass', 0)}/{funnel.get('dm_checked', 0)} "
@@ -320,8 +321,12 @@ class ControlBot:
                         f"rejected={funnel.get('seen_reject', 0)}",
                         f"duplicates: seller={funnel.get('dup_seller', 0)} "
                         f"listing={funnel.get('dup_listing', 0)} "
+                        f"post_enrich={funnel.get('dup_seller_post_enrich', 0)} "
                         f"work_in={funnel.get('work_in', 0)} "
                         f"dequeued={funnel.get('dequeued', 0)}",
+                        f"male: checked={funnel.get('male_checked', 0)} "
+                        f"passed={funnel.get('male_pass', 0)} "
+                        f"rejected={funnel.get('male_reject', 0)}",
                         f"ru: checked={funnel.get('ru_checked', 0)} "
                         f"passed={funnel.get('ru_pass', 0)} "
                         f"rejected={funnel.get('ru_reject', 0)} "

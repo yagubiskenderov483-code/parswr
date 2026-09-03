@@ -130,7 +130,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.3.0"
+    assert config.TRACKER_VERSION == "5.4.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -354,6 +354,44 @@ def test_fresh_from_page_ignores_api_order() -> None:
     assert [x.id for x in fresh] == ["NEW"]
 
 
+def test_seller_dup_does_not_burn_to_seen() -> None:
+    """Seller dup в enqueue не должен писать лот в seen: лот должен подхватиться на следующем проходе."""
+    from tracker import PostQueue, Runtime
+    from market import TelegramMarket
+    import asyncio
+
+    seen: dict = {}
+    seen_sellers: dict = {}
+    runtime = Runtime()
+    q = PostQueue.__new__(PostQueue)
+    q.seen = seen
+    q.seen_sellers = seen_sellers
+    q.market_ids = set()
+    q._items = []
+    q._queued = set()
+    q._inflight = set()
+    q._inflight_sellers = set()
+    q._stop = False
+    q._event = asyncio.Event()
+    q._lock = asyncio.Lock()
+    q._retries = {}
+    q._last_title = ""
+    q.state = {}
+    q.state_file = None
+    q.runtime = runtime
+
+    # публикуем продавца
+    import time
+    seen_sellers["u:masha"] = time.time()
+    seen_sellers["id:111"] = time.time()
+
+    lot = _lot(id="X1", seller="masha", seller_id=111, stars=8000)
+    added = q.enqueue([lot])
+    assert added == 0
+    # лот НЕ в seen — следующий проход подхватит
+    assert "X1" not in seen
+
+
 def test_state_schema_clears_seller_bans() -> None:
     import json
     import tempfile
@@ -411,6 +449,7 @@ def main() -> None:
         test_skips_persian_and_latin_boys,
         test_fresh_from_page_only_new_listings,
         test_fresh_from_page_ignores_api_order,
+        test_seller_dup_does_not_burn_to_seen,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

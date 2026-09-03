@@ -239,7 +239,13 @@ def _username_female_name(username: str) -> bool:
 
 
 def female_reason(lot: Lot) -> str:
-    """Женское имя в first/last или в токене username. Био/эмодзи/гифт не считаются."""
+    """Женское имя в first/last/username ИЛИ female_score >= 3.
+
+    Один сигнал из: Кирилл имя-ж + female emoji, bio hint + emoji, женский username
+    без имени, отчество -овна и т.п. — этого достаточно.
+    Блокирует мужское имя/признак даже при высоком score.
+    «девушке можно писать» в bio без имени — НЕ хватает (score=3 нужно ≥2 сигналов).
+    """
     if looks_male(lot):
         return "мужской"
     fn = _first_token(lot.first_name)
@@ -249,6 +255,10 @@ def female_reason(lot: Lot) -> str:
     if ln.endswith(("овна", "евна", "ична")):
         return ""
     if _username_female_name(lot.seller):
+        return ""
+    # Без имени принимаем только если в нике есть явный женский паттерн
+    # (_FEMALE_USER_RE: anna, masha, girl, …) — bio-hint без имени не хватает.
+    if _username_female(lot.seller):
         return ""
     return "нет женских признаков"
 

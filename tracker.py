@@ -445,15 +445,13 @@ class PostQueue:
                 continue
             keys = seller_keys(lot)
             if keys and (keys & blocked or keys & batch_owners):
+                # продавец уже в очереди или только что опубликован —
+                # НЕ пишем в seen, чтобы лот подхватился на следующем проходе
                 logger.info(
-                    "[pipeline] queued skip %s: дубль · seller=%s",
+                    "[pipeline] seller-dup skip %s · seller=%s",
                     lot.slug or lot.id,
                     (lot.seller or str(lot.seller_id) or "?")[:24],
                 )
-                self.seen[lot.id] = now
-                if lot.slug:
-                    self.seen[lot.slug] = now
-                self.market_ids.add(lot.id)
                 classify_skip("дубль", self.runtime.skip_total)
                 continue
             self._queued.add(lot.id)
@@ -778,17 +776,14 @@ async def scanner_loop(
         queued = 0
         api_n = 0
 
+        seen_skip = 0
+        seller_skip = 0
+
         def absorb(gid: int, lots: list[Lot]) -> None:
-            nonlocal found, queued, api_n
+            nonlocal found, queued, api_n, seen_skip, seller_skip
             api_n += len(lots)
             key = str(gid)
             prev = pages.get(key)
-            logger.debug(
-                "[pipeline] API returned gid=%s n=%s prev=%s",
-                gid,
-                len(lots),
-                len(prev or []),
-            )
             new_page, chunk = fresh_from_page(
                 prev,
                 lots,
@@ -796,6 +791,15 @@ async def scanner_loop(
                 config.MIN_STARS,
                 config.MAX_STARS,
             )
+            # сколько отфильтровал fresh_from_page по seen/цене
+            seen_skip += len([
+                lot for lot in lots
+                if lot.id not in set(prev or [])
+                and (
+                    lot.id in seen
+                    or (lot.slug and lot.slug in seen)
+                )
+            ])
             if new_page:
                 pages[key] = new_page
             if chunk:
@@ -809,7 +813,10 @@ async def scanner_loop(
             if not chunk:
                 return
             found += len(chunk)
-            queued += queue.enqueue(chunk)
+            before = len(queue._items)
+            enqueued = queue.enqueue(chunk)
+            seller_skip += len(chunk) - enqueued
+            queued += enqueued
 
         tasks = [asyncio.create_task(one(g)) for g in batch]
         for fut in asyncio.as_completed(tasks):
@@ -823,13 +830,16 @@ async def scanner_loop(
         runtime.last_fresh = queued
         runtime.snapshot = len(pages)
         logger.info(
-            "[pipeline] pass #%s API=%s fresh=%s queued=%s pages=%s q=%s",
+            "[pipeline] pass #%s API=%s fresh=%s seen_skip=%s seller_dup=%s queued=%s pages=%s q=%s skip=%s",
             pass_no,
             api_n,
             found,
+            seen_skip,
+            seller_skip,
             queued,
             len(pages),
             len(queue._items),
+            dict(queue.runtime.skip_total),
         )
         if queued:
             logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))

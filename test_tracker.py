@@ -9,6 +9,7 @@ from filters import filter_lot, is_girl, is_russian, looks_male
 from market import (
     Lot,
     TelegramMarket,
+    count_unique_star_gifts,
     extract_star_gift_ids,
     ids_from_json_payload,
     merge_ids,
@@ -73,6 +74,7 @@ def test_skips_boy() -> None:
     lot = _lot(first_name="Никита", about="торгую гифтами", seller="nikita_gifts")
     assert is_girl(lot) is False
     assert looks_male(lot) is True
+    assert filter_lot(lot, min_stars=4500, max_stars=27000) == "мужской"
 
 
 def test_skips_male_nick() -> None:
@@ -96,8 +98,8 @@ def test_level_max_2() -> None:
 
 
 def test_max_12_nfts() -> None:
-    assert filter_lot(_lot(gifts_count=12), min_stars=4500, max_stars=27000) == ""
-    assert filter_lot(_lot(gifts_count=13), min_stars=4500, max_stars=27000) == "много NFT"
+    assert filter_lot(_lot(gifts_count=6), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(gifts_count=7), min_stars=4500, max_stars=27000) == "много NFT"
     assert filter_lot(_lot(gifts_count=None), min_stars=4500, max_stars=27000) == ""
 
 
@@ -118,7 +120,7 @@ def test_hardcoded_filters() -> None:
     assert config.MIN_STARS == 4500
     assert config.MAX_STARS == 27000
     assert config.MAX_ACCOUNT_LEVEL == 2
-    assert config.MAX_NFTS == 12
+    assert config.MAX_NFTS == 6
     assert config.POST_INTERVAL == 4.0
     assert config.CHANNEL_ID == -1003784435307
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
@@ -126,7 +128,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 3
-    assert config.TRACKER_VERSION == "4.9.1"
+    assert config.TRACKER_VERSION == "5.0.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -190,10 +192,11 @@ def test_skips_non_russian() -> None:
     latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="en")
     assert is_girl(latin) is False
     assert is_russian(latin) is False
-    assert filter_lot(latin, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(latin, min_stars=4500, max_stars=27000) == "не русский"
     iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
     assert is_russian(iranian) is False
-    assert looks_male(iranian) is True
+    assert looks_male(iranian) is False
+    assert filter_lot(iranian, min_stars=4500, max_stars=27000) == "не русский"
     assert is_russian(_lot()) is True
     cis_latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="")
     assert is_russian(cis_latin) is False
@@ -224,7 +227,7 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     """@ynosleep / @Etalonkasexa пролезали из-за «девушке можно писать» в био."""
     yno = _lot(first_name="", about="девушке можно писать 💅", seller="ynosleep")
     assert is_girl(yno) is False
-    assert filter_lot(yno, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(yno, min_stars=4500, max_stars=27000) == "нет женских признаков"
     boy = _lot(
         first_name="Алексей",
         about="девушке можно писать 💅 girl pink",
@@ -234,6 +237,30 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     assert is_girl(boy) is False
     sasha = _lot(first_name="Саша", about="торгую гифтами", seller="sasha_nft")
     assert is_girl(sasha) is False
+
+
+def test_count_unique_nfts_skips_unlimited() -> None:
+    class Gift:
+        def __init__(self, slug: str = "") -> None:
+            self.slug = slug
+
+    class Item:
+        def __init__(self, gift: Gift) -> None:
+            self.gift = gift
+
+    class Saved:
+        def __init__(self, gifts: list) -> None:
+            self.gifts = gifts
+
+    cheap = Gift(slug="")
+    one = Gift(slug="PlushPepe-1")
+    two = Gift(slug="DurovCap-2")
+    saved = Saved([Item(cheap), Item(one), Item(two)])
+    assert count_unique_star_gifts(saved) == 2
+    whale = _lot(first_name="Мария", gifts_count=10)
+    assert filter_lot(whale, min_stars=4500, max_stars=27000) == "много NFT"
+    few = _lot(first_name="Мария", gifts_count=3)
+    assert filter_lot(few, min_stars=4500, max_stars=27000) == ""
 
 
 def test_latin_girl_with_russian_bio() -> None:
@@ -247,16 +274,16 @@ def test_skips_persian_and_latin_boys() -> None:
     reza = _lot(first_name="Reza", about="", seller="reza_gifts", lang_code="fa")
     assert looks_male(reza) is True
     assert is_girl(reza) is False
-    assert filter_lot(reza, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(reza, min_stars=4500, max_stars=27000) == "мужской"
     nima = _lot(first_name="Nima", about="nft", seller="nima_shop")
     assert looks_male(nima) is True
     amir = _lot(first_name="Shop", about="", seller="amir_nft")
     assert looks_male(amir) is True
-    assert filter_lot(amir, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(amir, min_stars=4500, max_stars=27000) == "мужской"
     boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
     assert looks_male(boy) is True
     assert is_girl(boy) is False
-    assert filter_lot(boy, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(boy, min_stars=4500, max_stars=27000) == "мужской"
 
 
 def test_fresh_from_head_only_new_listings() -> None:
@@ -329,6 +356,7 @@ def main() -> None:
         test_skips_non_russian,
         test_girl_from_gifts_and_stories,
         test_bio_hints_do_not_make_a_girl,
+        test_count_unique_nfts_skips_unlimited,
         test_latin_girl_with_russian_bio,
         test_skips_persian_and_latin_boys,
         test_fresh_from_head_only_new_listings,

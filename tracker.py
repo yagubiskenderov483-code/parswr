@@ -476,6 +476,8 @@ class PostQueue:
                     max_nfts=config.MAX_NFTS,
                 )
                 hard = {
+                    "мужской",
+                    "не русский",
                     "цена",
                     "платные ЛС",
                     "level",
@@ -651,11 +653,11 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: смена #1 · %s–%s⭐ · lvl≤%s · NFT≤%s · free ЛС · пост/%sс",
+        "Сканер: смена #1 · %s–%s⭐ · русские девочки · ≤%s дорогих NFT · lvl≤%s · free ЛС · пост/%sс",
         config.MIN_STARS,
         config.MAX_STARS,
-        config.MAX_ACCOUNT_LEVEL,
         config.MAX_NFTS,
+        config.MAX_ACCOUNT_LEVEL,
         int(config.POST_INTERVAL),
     )
     pass_no = 0

@@ -210,8 +210,6 @@ def looks_male(lot: Lot) -> bool:
             return True
         if _CYR_RE.search(fn) and not is_cyrillic_female_name(fn):
             return True
-        if latin and not is_latin_female_name(fn):
-            return True
         if len(fn) >= 3 and fn.endswith(("ич", "он", "ил", "ём", "ем", "ур", "им")):
             if not fn.endswith(("ия", "ья")):
                 return True
@@ -336,7 +334,7 @@ def passes_level(lot: Lot, max_level: int = 2) -> bool | None:
     return lvl <= max_level
 
 
-def passes_nfts(lot: Lot, max_nfts: int = 12) -> bool | None:
+def passes_nfts(lot: Lot, max_nfts: int = 6) -> bool | None:
     n = lot.gifts_count
     if n is None:
         return None
@@ -355,7 +353,7 @@ def filter_lot(
     min_stars: float,
     max_stars: float,
     max_level: int = 2,
-    max_nfts: int = 12,
+    max_nfts: int = 6,
 ) -> str:
     """Пустая строка = проходит. Иначе причина отказа.
 
@@ -364,6 +362,16 @@ def filter_lot(
     """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
+    if looks_male(lot):
+        return "мужской"
+    ru = is_russian(lot)
+    if ru is False:
+        return "не русский"
+    if ru is None:
+        return "нет данных"
+    reason = female_reason(lot)
+    if reason:
+        return reason
     dm = passes_free_dm(lot)
     if dm is False:
         return "платные ЛС"

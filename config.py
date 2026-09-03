@@ -20,7 +20,7 @@ CHANNEL_ID = -1003784435307
 MIN_STARS = 4500
 MAX_STARS = 27000
 MAX_ACCOUNT_LEVEL = 2
-MAX_NFTS = 12
+MAX_NFTS = 6  # уникальные/дорогие; дешёвые безлимитные не считаем
 POST_INTERVAL = 4.0
 
 # Курс для строки «X Stars / Y TON» (как в tracker market)
@@ -33,10 +33,10 @@ SCAN_BATCH = 36  # кольцо ~4с на полный круг 131 коллек
 SCAN_PARALLEL = 8
 REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 5.0
-ENRICH_TIMEOUT = 2.5
+ENRICH_TIMEOUT = 4.0
 MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "4.9.1"
+TRACKER_VERSION = "5.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

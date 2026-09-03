@@ -267,9 +267,9 @@ class ControlBot:
             f"Аккаунт: {self.account_name if self.authorized else 'не вошёл'}",
             f"Канал: <code>{config.CHANNEL_ID}</code>",
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
-            f"Фильтры: только что выставили · free ЛС · "
-            f"lvl≤{config.MAX_ACCOUNT_LEVEL} · NFT≤{config.MAX_NFTS} · пост/{int(config.POST_INTERVAL)}с",
-            "Обход: кольцо #1 · в канал только смена головы",
+            f"Фильтры: русские девочки · ≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
+            f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
+            "Обход: кольцо #1 · только что выставили",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"
@@ -303,8 +303,8 @@ class ControlBot:
             f"Аккаунт: {'подключён ✅' if self.authorized else 'нужен вход'}\n"
             f"Канал: <code>{config.CHANNEL_ID}</code>\n"
             f"Цена: <b>{config.MIN_STARS}–{config.MAX_STARS}⭐</b>\n"
-            f"Level ≤ {config.MAX_ACCOUNT_LEVEL} · NFT ≤ {config.MAX_NFTS}\n"
-            f"Только что выставленные · пост / {int(config.POST_INTERVAL)}с\n\n"
+            f"Level ≤ {config.MAX_ACCOUNT_LEVEL} · дорогих NFT ≤ {config.MAX_NFTS}\n"
+            f"Русские девочки · ≤{config.MAX_NFTS} дорогих NFT · пост / {int(config.POST_INTERVAL)}с\n\n"
             "Жми /status или кнопку ниже."
         )
 

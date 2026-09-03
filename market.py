@@ -376,6 +376,17 @@ def parse_result(result: Any) -> list[Lot]:
     return lots
 
 
+def count_unique_star_gifts(saved: Any) -> int:
+    """Сколько unique NFT у продавца. Безлимитные дешёвые гифты не считаем."""
+    unique = 0
+    for item in getattr(saved, "gifts", None) or []:
+        gift = getattr(item, "gift", None) or item
+        name = type(gift).__name__
+        if getattr(gift, "slug", None) or "Unique" in name:
+            unique += 1
+    return unique
+
+
 class TelegramMarket:
     def __init__(self, client: TelegramClient, catalog_file: Path | None = None) -> None:
         self.client = client
@@ -862,12 +873,6 @@ class TelegramMarket:
             raw_ch = getattr(uf, "personal_channel_id", None)
             if raw_ch:
                 lot.personal_channel = str(raw_ch)
-            raw_gifts = getattr(uf, "stargifts_count", None)
-            if raw_gifts is not None:
-                try:
-                    lot.gifts_count = int(raw_gifts)
-                except (TypeError, ValueError):
-                    pass
             rating = getattr(uf, "stars_rating", None)
             if rating is not None:
                 level = _normalize_level(getattr(rating, "level", None))
@@ -949,6 +954,30 @@ class TelegramMarket:
         if cached is not None:
             cached.update(_cache_from(lot))
 
+    async def count_unique_gifts(self, lot: Lot, timeout: float = 4.0) -> None:
+        """Считает только unique NFT. Дешёвые безлимитные (розы и т.п.) не входят."""
+        if GetSavedStarGiftsRequest is None or lot.seller_id is None:
+            return
+        try:
+            await self._wait_flood()
+            ent = await asyncio.wait_for(
+                self.client.get_input_entity(int(lot.seller_id)), timeout=timeout
+            )
+            saved = await asyncio.wait_for(
+                self.client(
+                    GetSavedStarGiftsRequest(
+                        peer=ent,
+                        offset="",
+                        limit=20,
+                        exclude_unlimited=True,
+                    )
+                ),
+                timeout=timeout,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        lot.gifts_count = count_unique_star_gifts(saved)
+
     async def check_free_dm(self, lot: Lot, timeout: float = 4.0) -> None:
         if lot.seller_id is None:
             return
@@ -991,6 +1020,7 @@ class TelegramMarket:
         if lot.seller_id is None:
             return
         await self.enrich_profile(lot, timeout=timeout)
+        await self.count_unique_gifts(lot, timeout=timeout)
         if lot.free_dm is None:
             await self.check_free_dm(lot, timeout=timeout)
 

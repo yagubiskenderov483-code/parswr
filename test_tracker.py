@@ -126,7 +126,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 3
-    assert config.TRACKER_VERSION == "4.9.0"
+    assert config.TRACKER_VERSION == "4.9.1"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -247,14 +247,16 @@ def test_skips_persian_and_latin_boys() -> None:
     reza = _lot(first_name="Reza", about="", seller="reza_gifts", lang_code="fa")
     assert looks_male(reza) is True
     assert is_girl(reza) is False
-    assert filter_lot(reza, min_stars=4500, max_stars=27000) != ""
+    assert filter_lot(reza, min_stars=4500, max_stars=27000) == ""
     nima = _lot(first_name="Nima", about="nft", seller="nima_shop")
     assert looks_male(nima) is True
     amir = _lot(first_name="Shop", about="", seller="amir_nft")
     assert looks_male(amir) is True
+    assert filter_lot(amir, min_stars=4500, max_stars=27000) == ""
     boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
     assert looks_male(boy) is True
     assert is_girl(boy) is False
+    assert filter_lot(boy, min_stars=4500, max_stars=27000) == ""
 
 
 def test_fresh_from_head_only_new_listings() -> None:

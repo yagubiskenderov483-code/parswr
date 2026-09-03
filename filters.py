@@ -364,10 +364,6 @@ def filter_lot(
     """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
-    if looks_male(lot):
-        return "мужской"
-    if not lot.seller_key:
-        return "нет продавца"
     dm = passes_free_dm(lot)
     if dm is False:
         return "платные ЛС"

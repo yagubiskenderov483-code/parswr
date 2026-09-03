@@ -28,7 +28,7 @@ _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
 SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
-STATE_SCHEMA = 7
+STATE_SCHEMA = 8
 MIN_SNAPSHOT = 0
 
 
@@ -420,11 +420,6 @@ class PostQueue:
             for k, ts in self.seen_sellers.items()
             if now - float(ts) < SELLER_TTL
         }
-        recently_skipped = {
-            k
-            for k, ts in self.skip_sellers.items()
-            if now - float(ts) < SKIP_SELLER_TTL
-        }
         incoming = list(lots)
         batch_owners: set[str] = set()
         for lot in incoming:
@@ -435,10 +430,6 @@ class PostQueue:
                 self.seen[lot.id] = now
                 self.market_ids.add(lot.id)
                 classify_skip("дубль", self.runtime.skip_total)
-                continue
-            if keys and keys & recently_skipped:
-                self.seen[lot.id] = now
-                self.market_ids.add(lot.id)
                 continue
             self._queued.add(lot.id)
             self._items.append(lot)
@@ -485,7 +476,6 @@ class PostQueue:
                     max_nfts=config.MAX_NFTS,
                 )
                 hard = {
-                    "мужской",
                     "цена",
                     "платные ЛС",
                     "level",
@@ -507,10 +497,6 @@ class PostQueue:
                     )
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
-                    if pre == "мужской" and keys:
-                        for k in keys:
-                            self.skip_sellers[k] = now
-                        self.state["skip_sellers"] = self.skip_sellers
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue
@@ -558,10 +544,6 @@ class PostQueue:
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
                     self._retries.pop(lot.id, None)
-                    if reason == "мужской" and keys:
-                        for k in keys:
-                            self.skip_sellers[k] = now
-                        self.state["skip_sellers"] = self.skip_sellers
                     self.state["market_ids"] = list(self.market_ids)
                     save_state(self.state_file, self.state)
                     continue
@@ -669,7 +651,7 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: смена #1 · %s–%s⭐ · не мальчики · lvl≤%s · NFT≤%s · free ЛС · пост/%sс",
+        "Сканер: смена #1 · %s–%s⭐ · lvl≤%s · NFT≤%s · free ЛС · пост/%sс",
         config.MIN_STARS,
         config.MAX_STARS,
         config.MAX_ACCOUNT_LEVEL,

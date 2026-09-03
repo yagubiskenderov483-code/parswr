@@ -292,27 +292,56 @@ class ControlBot:
                     + " ".join(f"{k}−{v}" for k, v in skip.items() if v)
                 )
             funnel = getattr(rt, "funnel", None) or {}
-            if funnel.get("fresh"):
+            if funnel.get("fresh_detected") or funnel.get("fresh"):
+                fd = funnel.get("fresh_detected", funnel.get("fresh", 0))
                 lines.append(
                     "Воронка: "
-                    + " ".join(
-                        f"{k}={funnel.get(k, 0)}"
-                        for k in (
-                            "fresh",
-                            "price",
-                            "ru",
-                            "girl",
-                            "dm",
-                            "level",
-                            "nft",
-                            "duplicate",
-                            "enqueued",
-                            "dequeued",
-                            "send_attempt",
-                            "sent",
-                            "failed",
-                        )
-                    )
+                    f"fresh={fd} "
+                    f"price={funnel.get('price_pass', 0)}/{funnel.get('price_checked', 0)} "
+                    f"seen={funnel.get('seen_pass', 0)}/{funnel.get('seen_checked', 0)} "
+                    f"dup_s={funnel.get('dup_seller', 0)} dup_l={funnel.get('dup_listing', 0)} "
+                    f"work={funnel.get('work_in', 0)} deq={funnel.get('dequeued', 0)} "
+                    f"ru={funnel.get('ru_pass', 0)}/{funnel.get('ru_checked', 0)} "
+                    f"girl={funnel.get('girl_pass', 0)}/{funnel.get('girl_checked', 0)} "
+                    f"dm={funnel.get('dm_pass', 0)}/{funnel.get('dm_checked', 0)} "
+                    f"lvl={funnel.get('level_pass', 0)}/{funnel.get('level_checked', 0)} "
+                    f"nft={funnel.get('nft_pass', 0)}/{funnel.get('nft_checked', 0)} "
+                    f"send={funnel.get('sent', 0)}/{funnel.get('send_attempt', 0)}"
+                )
+                lines.extend(
+                    [
+                        "PIPELINE",
+                        f"fresh_detected: {fd}",
+                        f"price: checked={funnel.get('price_checked', 0)} "
+                        f"passed={funnel.get('price_pass', 0)} "
+                        f"rejected={funnel.get('price_reject', 0)}",
+                        f"seen: checked={funnel.get('seen_checked', 0)} "
+                        f"passed={funnel.get('seen_pass', 0)} "
+                        f"rejected={funnel.get('seen_reject', 0)}",
+                        f"duplicates: seller={funnel.get('dup_seller', 0)} "
+                        f"listing={funnel.get('dup_listing', 0)} "
+                        f"work_in={funnel.get('work_in', 0)} "
+                        f"dequeued={funnel.get('dequeued', 0)}",
+                        f"ru: checked={funnel.get('ru_checked', 0)} "
+                        f"passed={funnel.get('ru_pass', 0)} "
+                        f"rejected={funnel.get('ru_reject', 0)} "
+                        f"incomplete={funnel.get('reject_incomplete', 0)}",
+                        f"girl: checked={funnel.get('girl_checked', 0)} "
+                        f"passed={funnel.get('girl_pass', 0)} "
+                        f"rejected={funnel.get('girl_reject', 0)}",
+                        f"dm: checked={funnel.get('dm_checked', 0)} "
+                        f"passed={funnel.get('dm_pass', 0)} "
+                        f"rejected={funnel.get('dm_reject', 0)}",
+                        f"level: checked={funnel.get('level_checked', 0)} "
+                        f"passed={funnel.get('level_pass', 0)} "
+                        f"rejected={funnel.get('level_reject', 0)}",
+                        f"nft: checked={funnel.get('nft_checked', 0)} "
+                        f"passed={funnel.get('nft_pass', 0)} "
+                        f"rejected={funnel.get('nft_reject', 0)}",
+                        f"send_attempt={funnel.get('send_attempt', 0)} "
+                        f"sent={funnel.get('sent', 0)} "
+                        f"failed={funnel.get('failed', 0)}",
+                    ]
                 )
             if rt.last_error:
                 lines.append(f"⚠️ {_esc(str(rt.last_error)[:160])}")

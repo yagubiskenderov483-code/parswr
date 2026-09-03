@@ -23,7 +23,17 @@ from market import (
     merge_ids,
     _stars_level,
 )
-from tracker import count_filter_stages, empty_funnel, format_lot, fresh_from_page
+from tracker import (
+    empty_funnel,
+    format_funnel_report,
+    format_lot,
+    fresh_from_page,
+    funnel_invariants,
+    record_enqueue_dup,
+    record_fresh_price_seen,
+    record_work_in,
+    record_worker_filter,
+)
 
 
 def _lot(**kwargs) -> Lot:
@@ -138,7 +148,7 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
     assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.6.0"
+    assert config.TRACKER_VERSION == "5.7.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -406,10 +416,87 @@ def test_fresh_from_page_ignores_api_order() -> None:
     assert [x.id for x in fresh] == ["NEW"]
 
 
+def test_pipeline_stats_sequential() -> None:
+    """Счётчики — последовательная воронка на реальных множествах."""
+    fn = empty_funnel()
+
+    # новый дешёвый — fresh + price reject
+    record_fresh_price_seen(fn, fresh=True, price_ok=False, already_seen=False)
+    # новый в цене, already seen
+    record_fresh_price_seen(fn, fresh=True, price_ok=True, already_seen=True)
+    # новый в цене, не seen → кандидат
+    record_fresh_price_seen(fn, fresh=True, price_ok=True, already_seen=False)
+
+    assert fn["fresh_detected"] == 3
+    assert fn["price_checked"] == 3
+    assert fn["price_pass"] == 2
+    assert fn["price_reject"] == 1
+    assert fn["seen_checked"] == 2
+    assert fn["seen_pass"] == 1
+    assert fn["seen_reject"] == 1
+    assert fn["reject_price"] == 1
+    assert fn["reject_seen"] == 1
+
+    # seller dup на enqueue (не смешивается с ru)
+    record_enqueue_dup(fn, "seller")
+    record_enqueue_dup(fn, "listing")
+    assert fn["dup_seller"] == 1
+    assert fn["dup_listing"] == 1
+    assert fn["reject_duplicate_seller"] == 1
+    assert fn["reject_duplicate_listing"] == 1
+    assert fn["ru_checked"] == 0
+
+    record_work_in(fn)
+    assert fn["work_in"] == 1
+
+    # RU reject
+    record_worker_filter(
+        fn, _lot(first_name="Shop", about="", seller="gift_market"), "не русский"
+    )
+    assert fn["ru_checked"] == 1
+    assert fn["ru_pass"] == 0
+    assert fn["ru_reject"] == 1
+    assert fn["reject_ru"] == 1
+    assert fn["girl_checked"] == 0
+
+    # girl reject (ru pass, not male)
+    record_worker_filter(
+        fn,
+        _lot(first_name="Lee", about="привет торгую", seller="shop999xx"),
+        "нет женских признаков",
+    )
+    assert fn["ru_pass"] == 1
+    assert fn["girl_checked"] == 1
+    assert fn["girl_reject"] == 1
+    assert fn["reject_girl"] == 1
+
+    # full pass
+    record_worker_filter(fn, _lot(first_name="Мария"), "")
+    assert fn["ru_pass"] == 2
+    assert fn["girl_pass"] == 1
+    assert fn["dm_pass"] == 1
+    assert fn["level_pass"] == 1
+    assert fn["nft_pass"] == 1
+
+    # male → reject_girl, без ru_checked
+    before_ru = fn["ru_checked"]
+    record_worker_filter(
+        fn, _lot(first_name="Алексей", seller="lexa"), "мужской"
+    )
+    assert fn["ru_checked"] == before_ru
+    assert fn["reject_girl"] == 2
+
+    inv = funnel_invariants(fn)
+    assert inv == [], inv
+    report = format_funnel_report(fn)
+    assert "fresh_detected:" in report
+    assert "price:" in report
+    assert "ru:" in report
+
+
 def test_seller_dup_does_not_burn_to_seen() -> None:
     """Seller dup в enqueue не должен писать лот в seen: лот должен подхватиться на следующем проходе."""
     from tracker import PostQueue, Runtime
-    from market import TelegramMarket
     import asyncio
 
     seen: dict = {}
@@ -442,27 +529,9 @@ def test_seller_dup_does_not_burn_to_seen() -> None:
     assert added == 0
     # лот НЕ в seen — следующий проход подхватит
     assert "X1" not in seen
-
-
-def test_funnel_is_sequential() -> None:
-    """ru/girl считаются только если предыдущий этап прошёл — queued ≠ price."""
-    fn = empty_funnel()
-    count_filter_stages(fn, _lot(first_name="Shop", about="", seller="gift_market"), "не русский")
-    assert fn["ru"] == 0
-    assert fn["girl"] == 0
-    assert fn["enqueued"] == 0
-    count_filter_stages(fn, _lot(first_name="Мария"), "")
-    assert fn["ru"] == 1
-    assert fn["girl"] == 1
-    assert fn["dm"] == 1
-    assert fn["level"] == 1
-    assert fn["nft"] == 1
-    assert fn["enqueued"] == 1
-    boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
-    count_filter_stages(fn, boy, "мужской")
-    assert fn["ru"] == 2  # кириллица есть
-    assert fn["girl"] == 1  # мужской — обрыв
-    assert fn["enqueued"] == 1
+    assert runtime.funnel["dup_seller"] == 1
+    assert runtime.funnel["reject_duplicate_seller"] == 1
+    assert runtime.funnel["ru_checked"] == 0
 
 
 def test_state_schema_clears_seller_bans() -> None:
@@ -528,7 +597,7 @@ def main() -> None:
         test_fresh_from_page_only_new_listings,
         test_fresh_from_page_ignores_api_order,
         test_seller_dup_does_not_burn_to_seen,
-        test_funnel_is_sequential,
+        test_pipeline_stats_sequential,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

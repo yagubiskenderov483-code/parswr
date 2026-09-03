@@ -26,6 +26,7 @@ from filters import (
     filter_lot,
     is_girl,
     is_russian,
+    looks_male,
     passes_free_dm,
     passes_level,
     passes_nfts,
@@ -331,72 +332,308 @@ def acquire_lock() -> Any:
     return handle
 
 
-FUNNEL_ORDER = (
-    "fresh",
-    "price",
-    "ru",
-    "girl",
-    "dm",
-    "level",
-    "nft",
-    "duplicate",
-    "enqueued",
-    "dequeued",
-    "send_attempt",
-    "sent",
-    "failed",
-)
-
-
 def empty_funnel() -> dict[str, int]:
-    """Последовательная воронка: каждый этап ≤ предыдущего.
+    """Последовательная воронка: каждый этап — checked / pass / reject.
 
-    work_in — лоты, попавшие в worker после цены (ещё НЕ все фильтры).
-    enqueued — прошли ВСЕ фильтры и пошли на send.
+    Порядок фактического pipeline:
+      fresh_detected → price → seen → dup_listing|dup_seller|work_in
+      → dequeued → (male→reject_girl) → ru → girl → dm → level → nft
+      → send_attempt → sent|failed
+
+    duplicate_seller / duplicate_listing считаются на enqueue и НЕ входят
+    в ru/girl/dm/level/nft checked.
     """
-    data = {k: 0 for k in FUNNEL_ORDER}
-    data.update(
-        {
-            "work_in": 0,
-            "dup_listing": 0,
-            "queue_enqueued": 0,
-            "queue_dequeued": 0,
-            "worker_started": 0,
-            "worker_processed": 0,
-            "worker_filtered": 0,
-            "worker_failed": 0,
-            "flood_wait": 0,
-            "queue_remaining": 0,
-        }
-    )
-    return data
+    keys = [
+        "fresh_detected",
+        "price_checked",
+        "price_pass",
+        "price_reject",
+        "seen_checked",
+        "seen_pass",
+        "seen_reject",
+        "reject_seen",
+        "reject_price",
+        "reject_ru",
+        "reject_girl",
+        "reject_dm",
+        "reject_level",
+        "reject_nft",
+        "reject_incomplete",
+        "reject_duplicate_seller",
+        "reject_duplicate_listing",
+        "dup_seller",
+        "dup_listing",
+        "work_in",
+        "dequeued",
+        "ru_checked",
+        "ru_pass",
+        "ru_reject",
+        "girl_checked",
+        "girl_pass",
+        "girl_reject",
+        "dm_checked",
+        "dm_pass",
+        "dm_reject",
+        "level_checked",
+        "level_pass",
+        "level_reject",
+        "nft_checked",
+        "nft_pass",
+        "nft_reject",
+        "send_attempt",
+        "sent",
+        "failed",
+        "worker_started",
+        "worker_processed",
+        "worker_filtered",
+        "worker_failed",
+        "flood_wait",
+        "queue_remaining",
+        # aliases for old status keys (filled in format_funnel_report)
+        "fresh",
+        "price",
+        "ru",
+        "girl",
+        "dm",
+        "level",
+        "nft",
+        "duplicate",
+        "enqueued",
+    ]
+    return {k: 0 for k in keys}
 
 
-def count_filter_stages(funnel: dict[str, int], lot: Lot, reason: str) -> None:
-    """Считаем стадии строго по порядку filter_lot. Обрыв на первом отказе."""
-    ru = is_russian(lot)
-    if ru is not True:
+def _bump(stats: dict[str, int], key: str, n: int = 1) -> None:
+    stats[key] = stats.get(key, 0) + n
+
+
+def record_fresh_price_seen(
+    stats: dict[str, int],
+    *,
+    fresh: bool,
+    price_ok: bool | None,
+    already_seen: bool,
+) -> None:
+    """Один новый id относительно prev page (вызывается один раз на объект).
+
+    fresh=True → объект обнаружен как новый относительно предыдущей страницы.
+    Дальше: price → (если price_ok) seen.
+    """
+    if not fresh:
         return
-    funnel["ru"] += 1
+    _bump(stats, "fresh_detected")
+    _bump(stats, "price_checked")
+    if price_ok is True:
+        _bump(stats, "price_pass")
+        _bump(stats, "seen_checked")
+        if already_seen:
+            _bump(stats, "seen_reject")
+            _bump(stats, "reject_seen")
+        else:
+            _bump(stats, "seen_pass")
+    elif price_ok is False:
+        _bump(stats, "price_reject")
+        _bump(stats, "reject_price")
+
+
+def record_enqueue_dup(stats: dict[str, int], kind: str) -> None:
+    """kind: listing | seller. Только на enqueue, до worker-фильтров."""
+    if kind == "listing":
+        _bump(stats, "dup_listing")
+        _bump(stats, "reject_duplicate_listing")
+    elif kind == "seller":
+        _bump(stats, "dup_seller")
+        _bump(stats, "reject_duplicate_seller")
+
+
+def record_work_in(stats: dict[str, int]) -> None:
+    _bump(stats, "work_in")
+
+
+def record_worker_filter(stats: dict[str, int], lot: Lot, reason: str) -> None:
+    """Один раз на dequeued лот. Стадии строго по порядку filter_lot.
+
+    male → reject_girl до ru (как в filter_lot).
+    incomplete (ru is None) → reject_incomplete, не ru_reject.
+    Unknown dm/level/nft (None) считаются pass (не режем).
+    """
+    # male до ru — как filter_lot; в girl stage не входит (girl.checked == ru.pass)
+    if looks_male(lot):
+        _bump(stats, "reject_girl")
+        return
+
+    _bump(stats, "ru_checked")
+    ru = is_russian(lot)
+    if ru is False:
+        _bump(stats, "ru_reject")
+        _bump(stats, "reject_ru")
+        return
+    if ru is None:
+        _bump(stats, "reject_incomplete")
+        return
+    _bump(stats, "ru_pass")
+
+    _bump(stats, "girl_checked")
     girl = female_reason(lot)
     if girl:
+        _bump(stats, "girl_reject")
+        _bump(stats, "reject_girl")
         return
-    funnel["girl"] += 1
-    if passes_free_dm(lot) is False:
+    _bump(stats, "girl_pass")
+
+    _bump(stats, "dm_checked")
+    dm = passes_free_dm(lot)
+    if dm is False:
+        _bump(stats, "dm_reject")
+        _bump(stats, "reject_dm")
         return
-    funnel["dm"] += 1
-    if passes_level(lot, config.MAX_ACCOUNT_LEVEL) is False:
+    _bump(stats, "dm_pass")
+
+    _bump(stats, "level_checked")
+    lvl = passes_level(lot, config.MAX_ACCOUNT_LEVEL)
+    if lvl is False:
+        _bump(stats, "level_reject")
+        _bump(stats, "reject_level")
         return
-    funnel["level"] += 1
-    if passes_nfts(lot, config.MAX_NFTS) is False:
+    _bump(stats, "level_pass")
+
+    _bump(stats, "nft_checked")
+    nfts = passes_nfts(lot, config.MAX_NFTS)
+    if nfts is False:
+        _bump(stats, "nft_reject")
+        _bump(stats, "reject_nft")
         return
-    funnel["nft"] += 1
+    _bump(stats, "nft_pass")
+
     if reason in {"дубль", "дубль продавца"}:
-        funnel["duplicate"] += 1
+        # редкий post-enrich seller dup — не путать с enqueue dup
+        _bump(stats, "dup_seller")
+        _bump(stats, "reject_duplicate_seller")
         return
     if reason:
         return
-    funnel["enqueued"] += 1
+    # готов к send — send_attempt/sent считает worker отдельно
+
+
+def funnel_invariants(stats: dict[str, int]) -> list[str]:
+    """Мягкие проверки: вернуть список нарушений (пусто = ок)."""
+    errors: list[str] = []
+
+    def chk(name: str, checked: int, passed: int, rejected: int, *, exact: bool) -> None:
+        if passed > checked:
+            errors.append(f"{name}: pass({passed}) > checked({checked})")
+        if rejected > checked:
+            errors.append(f"{name}: reject({rejected}) > checked({checked})")
+        if exact and passed + rejected != checked:
+            errors.append(
+                f"{name}: pass+reject({passed + rejected}) != checked({checked})"
+            )
+
+    chk(
+        "price",
+        stats.get("price_checked", 0),
+        stats.get("price_pass", 0),
+        stats.get("price_reject", 0),
+        exact=True,
+    )
+    chk(
+        "seen",
+        stats.get("seen_checked", 0),
+        stats.get("seen_pass", 0),
+        stats.get("seen_reject", 0),
+        exact=True,
+    )
+    # ru: reject_incomplete тоже «уходит» из checked без ru_pass/ru_reject
+    ru_c = stats.get("ru_checked", 0)
+    ru_p = stats.get("ru_pass", 0)
+    ru_r = stats.get("ru_reject", 0)
+    inc = stats.get("reject_incomplete", 0)
+    if ru_p + ru_r + inc != ru_c:
+        errors.append(
+            f"ru: pass+reject+incomplete({ru_p + ru_r + inc}) != checked({ru_c})"
+        )
+    for name in ("girl", "dm", "level", "nft"):
+        chk(
+            name,
+            stats.get(f"{name}_checked", 0),
+            stats.get(f"{name}_pass", 0),
+            stats.get(f"{name}_reject", 0),
+            exact=True,
+        )
+    # girl.checked == ru.pass (male уходит в reject_girl до ru)
+    if stats.get("girl_checked", 0) != stats.get("ru_pass", 0):
+        errors.append(
+            f"girl.checked({stats.get('girl_checked', 0)}) != ru.pass({stats.get('ru_pass', 0)})"
+        )
+    return errors
+
+
+def format_funnel_report(stats: dict[str, int]) -> str:
+    """Человекочитаемый отчёт последовательной воронки."""
+    lines = [
+        "PIPELINE",
+        f"fresh_detected: {stats.get('fresh_detected', 0)}",
+        "",
+        "price:",
+        f"  checked: {stats.get('price_checked', 0)}",
+        f"  passed: {stats.get('price_pass', 0)}",
+        f"  rejected: {stats.get('price_reject', 0)}",
+        "",
+        "seen:",
+        f"  checked: {stats.get('seen_checked', 0)}",
+        f"  passed: {stats.get('seen_pass', 0)}",
+        f"  rejected: {stats.get('seen_reject', 0)}",
+        "",
+        "duplicates:",
+        f"  seller: {stats.get('dup_seller', 0)}",
+        f"  listing: {stats.get('dup_listing', 0)}",
+        f"  work_in: {stats.get('work_in', 0)}",
+        f"  dequeued: {stats.get('dequeued', 0)}",
+        "",
+        "ru:",
+        f"  checked: {stats.get('ru_checked', 0)}",
+        f"  passed: {stats.get('ru_pass', 0)}",
+        f"  rejected: {stats.get('ru_reject', 0)}",
+        f"  incomplete: {stats.get('reject_incomplete', 0)}",
+        "",
+        "girl:",
+        f"  checked: {stats.get('girl_checked', 0)}",
+        f"  passed: {stats.get('girl_pass', 0)}",
+        f"  rejected: {stats.get('girl_reject', 0)}",
+        "",
+        "dm:",
+        f"  checked: {stats.get('dm_checked', 0)}",
+        f"  passed: {stats.get('dm_pass', 0)}",
+        f"  rejected: {stats.get('dm_reject', 0)}",
+        "",
+        "level:",
+        f"  checked: {stats.get('level_checked', 0)}",
+        f"  passed: {stats.get('level_pass', 0)}",
+        f"  rejected: {stats.get('level_reject', 0)}",
+        "",
+        "nft:",
+        f"  checked: {stats.get('nft_checked', 0)}",
+        f"  passed: {stats.get('nft_pass', 0)}",
+        f"  rejected: {stats.get('nft_reject', 0)}",
+        "",
+        f"send_attempt: {stats.get('send_attempt', 0)}",
+        f"sent: {stats.get('sent', 0)}",
+        f"failed: {stats.get('failed', 0)}",
+    ]
+    return "\n".join(lines)
+
+
+def sync_funnel_aliases(stats: dict[str, int]) -> None:
+    """Короткие ключи для /status одной строкой."""
+    stats["fresh"] = stats.get("fresh_detected", 0)
+    stats["price"] = stats.get("price_pass", 0)
+    stats["ru"] = stats.get("ru_pass", 0)
+    stats["girl"] = stats.get("girl_pass", 0)
+    stats["dm"] = stats.get("dm_pass", 0)
+    stats["level"] = stats.get("level_pass", 0)
+    stats["nft"] = stats.get("nft_pass", 0)
+    stats["duplicate"] = stats.get("dup_seller", 0) + stats.get("dup_listing", 0)
+    stats["enqueued"] = stats.get("nft_pass", 0)  # прошли все фильтры → к send
 
 
 def debug_lot_line(lot: Lot, stage: str, reason: str) -> str:
@@ -557,7 +794,7 @@ class PostQueue:
                 if lot.id in self._inflight:
                     hit.append("inflight")
                 classify_skip("дубль лота", self.runtime.skip_total)
-                self.runtime.funnel["dup_listing"] += 1
+                record_enqueue_dup(self.runtime.funnel, "listing")
                 if config.DEBUG_FILTERS:
                     logger.info(
                         debug_lot_line(
@@ -578,7 +815,7 @@ class PostQueue:
                     ",".join(overlap)[:80],
                 )
                 classify_skip("дубль продавца", self.runtime.skip_total)
-                self.runtime.funnel["duplicate"] += 1
+                record_enqueue_dup(self.runtime.funnel, "seller")
                 if config.DEBUG_FILTERS:
                     logger.info(
                         debug_lot_line(
@@ -592,9 +829,7 @@ class PostQueue:
             self._items.append(lot)
             batch_owners |= keys
             added += 1
-            # work_in = на worker после цены, ещё НЕ все фильтры
-            self.runtime.funnel["work_in"] += 1
-            self.runtime.funnel["queue_enqueued"] += 1
+            record_work_in(self.runtime.funnel)
             logger.info(
                 "[pipeline] work_in %s · %s⭐ · q=%s",
                 lot.slug or lot.id,
@@ -602,7 +837,7 @@ class PostQueue:
                 len(self._items),
             )
             if config.DEBUG_FILTERS:
-                logger.info(debug_lot_line(lot, "work_in", "price only, filters later"))
+                logger.info(debug_lot_line(lot, "work_in", "price+seen ok, filters later"))
         if added:
             self._event.set()
         self.runtime.queue = len(self._items)
@@ -643,9 +878,8 @@ class PostQueue:
                 continue
             try:
                 tag = lot.slug or lot.id
-                self.runtime.funnel["dequeued"] += 1
-                self.runtime.funnel["queue_dequeued"] += 1
-                self.runtime.funnel["worker_processed"] += 1
+                _bump(self.runtime.funnel, "dequeued")
+                _bump(self.runtime.funnel, "worker_processed")
                 self.runtime.funnel["queue_remaining"] = len(self._items)
                 pre = filter_lot(
                     lot,
@@ -684,8 +918,8 @@ class PostQueue:
                     )
                     if config.DEBUG_FILTERS:
                         logger.info(debug_lot_line(lot, "pre-filter", pre))
-                    count_filter_stages(self.runtime.funnel, lot, pre)
-                    self.runtime.funnel["worker_filtered"] += 1
+                    record_worker_filter(self.runtime.funnel, lot, pre)
+                    _bump(self.runtime.funnel, "worker_filtered")
                     self.seen[lot.id] = now
                     self.market_ids.add(lot.id)
                     self.state["market_ids"] = list(self.market_ids)
@@ -745,8 +979,8 @@ class PostQueue:
                     )
                     if config.DEBUG_FILTERS:
                         logger.info(debug_lot_line(lot, "final-filter", reason))
-                    count_filter_stages(self.runtime.funnel, lot, reason)
-                    self.runtime.funnel["worker_filtered"] += 1
+                    record_worker_filter(self.runtime.funnel, lot, reason)
+                    _bump(self.runtime.funnel, "worker_filtered")
                     incomplete = reason in {
                         "нет данных",
                         "нет продавца",
@@ -767,8 +1001,8 @@ class PostQueue:
                     continue
                 if config.DEBUG_FILTERS:
                     logger.info(debug_lot_line(lot, "final-filter", "ok"))
-                count_filter_stages(self.runtime.funnel, lot, "")
-                self.runtime.funnel["send_attempt"] += 1
+                record_worker_filter(self.runtime.funnel, lot, "")
+                _bump(self.runtime.funnel, "send_attempt")
                 logger.info("[pipeline] send %s …", lot.slug or lot.id)
                 via = await self.sender.send(lot)
                 self.runtime.post_via = via
@@ -782,7 +1016,7 @@ class PostQueue:
                 self.state["market_ids"] = list(self.market_ids)
                 save_state(self.state_file, self.state)
                 self.runtime.posted += 1
-                self.runtime.funnel["sent"] += 1
+                _bump(self.runtime.funnel, "sent")
                 self._last_title = lot.title or ""
                 logger.info(
                     "[pipeline] send ok %s за %s⭐ · lvl %s · via=%s · очередь %s",
@@ -795,10 +1029,10 @@ class PostQueue:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Ошибка worker/send %s", lot.id)
                 self.runtime.last_error = str(exc)
-                self.runtime.funnel["failed"] += 1
-                self.runtime.funnel["worker_failed"] += 1
+                _bump(self.runtime.funnel, "failed")
+                _bump(self.runtime.funnel, "worker_failed")
                 if "FloodWait" in type(exc).__name__ or "flood" in str(exc).lower():
-                    self.runtime.funnel["flood_wait"] += 1
+                    _bump(self.runtime.funnel, "flood_wait")
             finally:
                 self._inflight.discard(lot.id)
                 self._inflight_sellers = set()
@@ -955,9 +1189,16 @@ async def scanner_loop(
                 for lot in lots:
                     if lot.id in known:
                         continue
-                    runtime.funnel["fresh"] += 1
-                    if config.MIN_STARS <= float(lot.stars) <= config.MAX_STARS:
-                        runtime.funnel["price"] += 1
+                    price_ok = config.MIN_STARS <= float(lot.stars) <= config.MAX_STARS
+                    already = lot.id in seen or bool(lot.slug and lot.slug in seen)
+                    record_fresh_price_seen(
+                        runtime.funnel,
+                        fresh=True,
+                        price_ok=price_ok,
+                        already_seen=already,
+                    )
+                    if already:
+                        seen_skip += 1
             new_page, chunk = fresh_from_page(
                 prev,
                 lots,
@@ -965,14 +1206,6 @@ async def scanner_loop(
                 config.MIN_STARS,
                 config.MAX_STARS,
             )
-            seen_skip += len([
-                lot for lot in lots
-                if lot.id not in set(prev or [])
-                and (
-                    lot.id in seen
-                    or (lot.slug and lot.slug in seen)
-                )
-            ])
             if new_page:
                 pages[key] = new_page
             if chunk:
@@ -1002,50 +1235,35 @@ async def scanner_loop(
         runtime.last_fresh = queued
         runtime.snapshot = len(pages)
         fn = runtime.funnel
+        sync_funnel_aliases(fn)
         runtime.last_funnel = dict(fn)
+        inv = funnel_invariants(fn)
+        if inv:
+            logger.warning("[pipeline] FUNNEL invariants: %s", "; ".join(inv))
         logger.info(
-            "[pipeline] pass #%s API=%s fresh=%s price=%s work_in=%s seller_dup=%s "
-            "dequeued=%s enqueued=%s send_attempt=%s sent=%s failed=%s q=%s skip=%s",
+            "[pipeline] pass #%s API=%s fresh=%s price_pass=%s seen_pass=%s "
+            "dup_seller=%s dup_listing=%s work_in=%s dequeued=%s "
+            "ru_pass=%s girl_pass=%s nft_pass=%s send=%s/%s q=%s",
             pass_no,
             api_n,
-            fn["fresh"],
-            fn["price"],
-            fn["work_in"],
-            fn["duplicate"],
-            fn["dequeued"],
-            fn["enqueued"],
-            fn["send_attempt"],
-            fn["sent"],
-            fn["failed"],
+            fn.get("fresh_detected", 0),
+            fn.get("price_pass", 0),
+            fn.get("seen_pass", 0),
+            fn.get("dup_seller", 0),
+            fn.get("dup_listing", 0),
+            fn.get("work_in", 0),
+            fn.get("dequeued", 0),
+            fn.get("ru_pass", 0),
+            fn.get("girl_pass", 0),
+            fn.get("nft_pass", 0),
+            fn.get("sent", 0),
+            fn.get("send_attempt", 0),
             len(queue._items),
-            dict(queue.runtime.skip_total),
         )
-        logger.info(
-            "[pipeline] FUNNEL fresh=%s price=%s ru=%s girl=%s dm=%s level=%s nft=%s "
-            "duplicate=%s enqueued=%s dequeued=%s send_attempt=%s sent=%s failed=%s "
-            "work_in=%s worker_started=%s worker_processed=%s worker_filtered=%s "
-            "worker_failed=%s flood_wait=%s queue_remaining=%s",
-            fn["fresh"],
-            fn["price"],
-            fn["ru"],
-            fn["girl"],
-            fn["dm"],
-            fn["level"],
-            fn["nft"],
-            fn["duplicate"],
-            fn["enqueued"],
-            fn["dequeued"],
-            fn["send_attempt"],
-            fn["sent"],
-            fn["failed"],
-            fn["work_in"],
-            fn["worker_started"],
-            fn["worker_processed"],
-            fn["worker_filtered"],
-            fn["worker_failed"],
-            fn["flood_wait"],
-            fn["queue_remaining"],
-        )
+        # Полный отчёт — раз в 8 проходов или когда есть sent
+        if pass_no == 1 or pass_no % 8 == 0 or fn.get("sent", 0):
+            for line in format_funnel_report(fn).splitlines():
+                logger.info("[pipeline] %s", line)
         if queued:
             logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))
         elif pass_no % 16 == 0:

@@ -269,7 +269,7 @@ class ControlBot:
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
             f"Фильтры: русские девочки · ≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
-            "Обход: кольцо #1 · только что выставили",
+            "Обход: новые id сверху · не всплытие старых",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"
@@ -277,7 +277,7 @@ class ControlBot:
                 coll += f" (мало, нужно ≥{config.MIN_COLLECTIONS})"
             lines.extend(
                 [
-                    f"Головы: {'готовы' if rt.snapshot_ready else 'синхрон'} ({rt.snapshot})",
+                    f"Страницы: {'готовы' if rt.snapshot_ready else 'синхрон'} ({rt.snapshot})",
                     f"Проходов: {rt.passes}",
                     coll,
                     f"Отправлено: {rt.posted}",

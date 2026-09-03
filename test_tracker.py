@@ -14,7 +14,7 @@ from market import (
     ids_from_json_payload,
     merge_ids,
 )
-from tracker import format_lot, fresh_from_head
+from tracker import format_lot, fresh_from_page
 
 
 def _lot(**kwargs) -> Lot:
@@ -127,8 +127,8 @@ def test_hardcoded_filters() -> None:
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == 36
-    assert config.PAGE_LIMIT == 3
-    assert config.TRACKER_VERSION == "5.0.0"
+    assert config.PAGE_LIMIT == 8
+    assert config.TRACKER_VERSION == "5.1.0"
     assert config.MIN_COLLECTIONS == 50
 
 
@@ -286,24 +286,25 @@ def test_skips_persian_and_latin_boys() -> None:
     assert filter_lot(boy, min_stars=4500, max_stars=27000) == "мужской"
 
 
-def test_fresh_from_head_only_new_listings() -> None:
+def test_fresh_from_page_only_new_listings() -> None:
     old = _lot(id="old", stars=10000)
     mid = _lot(id="mid", stars=9000)
     new = _lot(id="new", stars=8000)
     expensive = _lot(id="exp", stars=99_000)
-    head, fresh = fresh_from_head(None, [new], {}, 4500, 27000)
-    assert head == "new"
+    bubbled = _lot(id="mid", stars=9000)
+    page, fresh = fresh_from_page(None, [new], {}, 4500, 27000)
+    assert page == ["new"]
     assert fresh == []
-    head, fresh = fresh_from_head("new", [new, old], {}, 4500, 27000)
-    assert head == "new"
+    page, fresh = fresh_from_page(["new", "old"], [new, old], {}, 4500, 27000)
     assert fresh == []
-    head, fresh = fresh_from_head("old", [new, mid, old], {}, 4500, 27000)
-    assert head == "new"
+    page, fresh = fresh_from_page(["old"], [new, mid, old], {}, 4500, 27000)
     assert [x.id for x in fresh] == ["new", "mid"]
-    head, fresh = fresh_from_head("old", [expensive, mid, old], {}, 4500, 27000)
-    assert head == "exp"
+    page, fresh = fresh_from_page(["old"], [expensive, mid, old], {}, 4500, 27000)
     assert [x.id for x in fresh] == ["mid"]
-    head, fresh = fresh_from_head("old", [new], {"new": 1.0}, 4500, 27000)
+    # #1 купили — mid всплыл, он уже был на странице
+    page, fresh = fresh_from_page(["old", "mid"], [bubbled, old], {}, 4500, 27000)
+    assert fresh == []
+    page, fresh = fresh_from_page(["old"], [new], {"new": 1.0}, 4500, 27000)
     assert fresh == []
 
 
@@ -332,6 +333,7 @@ def test_state_schema_clears_seller_bans() -> None:
         assert data["schema"] == STATE_SCHEMA
         assert data["seen"]["lot1"] == 1.0
         assert data["market_ids"] == ["old"]
+        assert data["pages"] == {}
         assert data["seen_sellers"] == {"spammer": 1.0}
 
 
@@ -359,7 +361,7 @@ def main() -> None:
         test_count_unique_nfts_skips_unlimited,
         test_latin_girl_with_russian_bio,
         test_skips_persian_and_latin_boys,
-        test_fresh_from_head_only_new_listings,
+        test_fresh_from_page_only_new_listings,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

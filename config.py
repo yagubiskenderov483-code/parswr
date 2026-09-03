@@ -28,15 +28,15 @@ TON_RATE = 0.0102
 TZ_OFFSET = 3.0  # МСК
 
 POLL_INTERVAL = 0.05
-PAGE_LIMIT = 3  # только голова newest — только что выставили
-SCAN_BATCH = 36  # кольцо ~4с на полный круг 131 коллекции
+PAGE_LIMIT = 8  # верх newest: новый id спереди = только что выставили
+SCAN_BATCH = 36  # кольцо коллекций
 SCAN_PARALLEL = 8
 REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 5.0
 ENRICH_TIMEOUT = 4.0
 MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
 
-TRACKER_VERSION = "5.0.0"
+TRACKER_VERSION = "5.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 

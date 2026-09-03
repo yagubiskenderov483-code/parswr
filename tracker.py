@@ -28,7 +28,7 @@ _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
 SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
-STATE_SCHEMA = 8
+STATE_SCHEMA = 9
 MIN_SNAPSHOT = 0
 
 
@@ -243,6 +243,7 @@ def load_state(path: Path) -> dict:
             data.setdefault("skip_sellers", {})
             data.setdefault("market_ids", [])
             data.setdefault("heads", {})
+            data.setdefault("pages", {})
             schema = 0
             try:
                 schema = int(data.get("schema", 0) or 0)
@@ -250,11 +251,13 @@ def load_state(path: Path) -> dict:
                 schema = 0
             if schema < STATE_SCHEMA:
                 logger.warning(
-                    "Схема %s→%s: сброс skip_sellers, дальше ловим смену #1",
+                    "Схема %s→%s: сброс страниц — старые #1 больше не постим",
                     schema,
                     STATE_SCHEMA,
                 )
                 data["skip_sellers"] = {}
+                data["heads"] = {}
+                data["pages"] = {}
                 data["schema"] = STATE_SCHEMA
             return data
     except (OSError, ValueError):
@@ -265,6 +268,7 @@ def load_state(path: Path) -> dict:
         "skip_sellers": {},
         "market_ids": [],
         "heads": {},
+        "pages": {},
         "schema": STATE_SCHEMA,
     }
 
@@ -423,7 +427,12 @@ class PostQueue:
         incoming = list(lots)
         batch_owners: set[str] = set()
         for lot in incoming:
-            if lot.id in self.seen or lot.id in self._queued or lot.id in self._inflight:
+            if (
+                lot.id in self.seen
+                or lot.id in self._queued
+                or lot.id in self._inflight
+                or (lot.slug and lot.slug in self.seen)
+            ):
                 continue
             keys = seller_keys(lot)
             if keys and (keys & posted or keys & batch_owners):
@@ -477,7 +486,6 @@ class PostQueue:
                 )
                 hard = {
                     "мужской",
-                    "не русский",
                     "цена",
                     "платные ЛС",
                     "level",
@@ -544,6 +552,8 @@ class PostQueue:
                         )
                         continue
                     self.seen[lot.id] = now
+                    if lot.slug:
+                        self.seen[lot.slug] = now
                     self.market_ids.add(lot.id)
                     self._retries.pop(lot.id, None)
                     self.state["market_ids"] = list(self.market_ids)
@@ -552,6 +562,8 @@ class PostQueue:
                 via = await self.sender.send(lot)
                 self.runtime.post_via = via
                 self.seen[lot.id] = now
+                if lot.slug:
+                    self.seen[lot.slug] = now
                 self.market_ids.add(lot.id)
                 for k in keys:
                     self.seen_sellers[k] = now
@@ -575,38 +587,42 @@ class PostQueue:
                 self.runtime.queue = len(self._items)
 
 
-def fresh_from_head(
-    prev: str | None,
+def fresh_from_page(
+    prev_ids: list[str] | None,
     lots: list[Lot],
     seen: dict[str, float] | set[str],
     min_stars: float,
     max_stars: float,
-) -> tuple[str | None, list[Lot]]:
-    """Новые лоты после смены #1. Старую голову не постим."""
-    if not lots:
-        return prev, []
-    new_head = lots[0].id
-    if prev is None or new_head == prev:
-        return new_head, []
+) -> tuple[list[str], list[Lot]]:
+    """Только id, которых не было на предыдущей странице.
+
+    Если купили #1, бывший #2 всплывает — он уже был на странице, не постим.
+    """
+    page = [lot.id for lot in lots]
+    if not lots or not prev_ids:
+        return page, []
+    known = set(prev_ids)
     out: list[Lot] = []
     for lot in lots:
-        if lot.id == prev or lot.id in seen:
+        if lot.id in known:
             break
+        if lot.id in seen or (lot.slug and lot.slug in seen):
+            continue
         if min_stars <= float(lot.stars) <= max_stars:
             out.append(lot)
-    return new_head, out
+    return page, out
 
 
-async def sync_heads(
+async def sync_pages(
     market: TelegramMarket,
     gift_ids: list[int],
-    heads: dict[str, str],
+    pages: dict[str, list[str]],
     runtime: Runtime,
 ) -> None:
-    """Запомнить текущий #1 каждой коллекции. В канал не постим."""
+    """Запомнить верх newest каждой коллекции. В канал не постим."""
     ids = list(gift_ids)
     random.shuffle(ids)
-    logger.info("Синхрон #1 · %s коллекций — дальше только смена головы", len(ids))
+    logger.info("Синхрон страниц · %s коллекций — дальше только новые id сверху", len(ids))
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
@@ -615,7 +631,7 @@ async def sync_heads(
             try:
                 lots = await market.fetch_page(
                     gid,
-                    limit=1,
+                    limit=config.PAGE_LIMIT,
                     timeout=config.REQUEST_TIMEOUT,
                     gap=config.REQUEST_GAP,
                     sort_by_price=False,
@@ -635,17 +651,17 @@ async def sync_heads(
                 continue
             gid, lots = part
             if lots:
-                heads[str(gid)] = lots[0].id
-        runtime.snapshot = len(heads)
-        logger.info("Головы %s/%s · %s", min(i + len(batch), len(ids)), len(ids), len(heads))
-    logger.info("Головы готовы: %s. Жду только что выставленные", len(heads))
+                pages[str(gid)] = [lot.id for lot in lots]
+        runtime.snapshot = len(pages)
+        logger.info("Страницы %s/%s · %s", min(i + len(batch), len(ids)), len(ids), len(pages))
+    logger.info("Страницы готовы: %s. Жду только что выставленные", len(pages))
 
 
 async def scanner_loop(
     market: TelegramMarket,
     gift_ids: list[int],
     seen: dict[str, float],
-    heads: dict[str, str],
+    pages: dict[str, list[str]],
     queue: PostQueue,
     runtime: Runtime,
     state: dict,
@@ -653,7 +669,7 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: смена #1 · %s–%s⭐ · русские девочки · ≤%s дорогих NFT · lvl≤%s · free ЛС · пост/%sс",
+        "Сканер: новые id сверху · %s–%s⭐ · русские девочки · ≤%s дорогих NFT · lvl≤%s · free ЛС · пост/%sс",
         config.MIN_STARS,
         config.MAX_STARS,
         config.MAX_NFTS,
@@ -707,16 +723,16 @@ async def scanner_loop(
         def absorb(gid: int, lots: list[Lot]) -> None:
             nonlocal found, queued
             key = str(gid)
-            prev = heads.get(key)
-            new_head, chunk = fresh_from_head(
+            prev = pages.get(key)
+            new_page, chunk = fresh_from_page(
                 prev,
                 lots,
                 seen,
                 config.MIN_STARS,
                 config.MAX_STARS,
             )
-            if new_head:
-                heads[key] = new_head
+            if new_page:
+                pages[key] = new_page
             if not chunk:
                 return
             found += len(chunk)
@@ -732,17 +748,17 @@ async def scanner_loop(
             absorb(gid, lots)
         runtime.last_found = found
         runtime.last_fresh = queued
-        runtime.snapshot = len(heads)
+        runtime.snapshot = len(pages)
         if queued:
             logger.info("⚡ выставили %s → очередь %s", queued, len(queue._items))
         elif pass_no % 16 == 0:
             logger.info(
-                "Проход #%s: %s колл · голов %s · новых 0",
+                "Проход #%s: %s колл · страниц %s · новых 0",
                 pass_no,
                 len(batch),
-                len(heads),
+                len(pages),
             )
-        state["heads"] = heads
+        state["pages"] = pages
         save_state(state_file, state)
         spent = time.monotonic() - started
         await asyncio.sleep(max(config.POLL_INTERVAL - spent, 0.02))
@@ -755,10 +771,10 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.setdefault("seen_sellers", {})
     market_ids: set[str] = set(state.get("market_ids") or [])
-    heads: dict[str, str] = state.setdefault("heads", {})
-    if not isinstance(heads, dict):
-        heads = {}
-        state["heads"] = heads
+    pages: dict[str, list[str]] = state.setdefault("pages", {})
+    if not isinstance(pages, dict):
+        pages = {}
+        state["pages"] = pages
 
     client, control = await _client_and_bot()
     chat_id = config.channel_id()
@@ -819,18 +835,16 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    if gift_ids and len(heads) < max(10, len(gift_ids) // 2):
+    if gift_ids:
         try:
-            await sync_heads(market, gift_ids, heads, runtime)
-            state["heads"] = heads
+            await sync_pages(market, gift_ids, pages, runtime)
+            state["pages"] = pages
             save_state(state_file, state)
         except Exception as exc:  # noqa: BLE001
-            logger.error("головы: %s", exc)
+            logger.error("страницы: %s", exc)
             runtime.last_error = str(exc)
-    elif heads:
-        logger.info("Головы уже есть (%s) — жду смену #1", len(heads))
     runtime.snapshot_ready = True
-    runtime.snapshot = len(heads)
+    runtime.snapshot = len(pages)
 
     try:
         while True:
@@ -839,7 +853,7 @@ async def run() -> None:
                     market,
                     gift_ids,
                     seen,
-                    heads,
+                    pages,
                     queue,
                     runtime,
                     state,

@@ -267,9 +267,11 @@ class ControlBot:
             f"Аккаунт: {self.account_name if self.authorized else 'не вошёл'}",
             f"Канал: <code>{config.CHANNEL_ID}</code>",
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
-            f"Фильтры: русские девочки · ≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
+            f"Фильтры: русские девочки (score≥{config.GIRL_MIN_SCORE}) · "
+            f"≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
-            "Обход: новые id сверху · не всплытие старых",
+            f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
+            f"page={config.PAGE_LIMIT} (detection≠post)",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"

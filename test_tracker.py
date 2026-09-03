@@ -86,14 +86,14 @@ def test_girl_keeps_latin_name() -> None:
     lot = _lot(first_name="Kristina", about="🌸", seller="kris_shop")
     assert is_girl(lot) is True
     assert is_russian(lot) is True
-    assert filter_lot(lot, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(lot, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_skips_boy() -> None:
     lot = _lot(first_name="Никита", about="торгую гифтами", seller="nikita_gifts")
     assert is_girl(lot) is False
     assert looks_male(lot) is True
-    assert filter_lot(lot, min_stars=4500, max_stars=27000) == "мужской"
+    assert filter_lot(lot, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "мужской"
 
 
 def test_skips_male_nick() -> None:
@@ -103,30 +103,32 @@ def test_skips_male_nick() -> None:
 
 def test_price_range() -> None:
     ok = _lot(stars=5000)
-    assert filter_lot(ok, min_stars=4500, max_stars=27000) == ""
-    low = _lot(stars=4499)
-    assert filter_lot(low, min_stars=4500, max_stars=27000) == "цена"
-    high = _lot(stars=27001)
-    assert filter_lot(high, min_stars=4500, max_stars=27000) == "цена"
+    assert filter_lot(ok, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    ok2 = _lot(stars=25000)
+    assert filter_lot(ok2, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    low = _lot(stars=4999)
+    assert filter_lot(low, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "цена"
+    high = _lot(stars=25001)
+    assert filter_lot(high, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "цена"
 
 
 def test_level_max_2() -> None:
-    assert filter_lot(_lot(account_level=2), min_stars=4500, max_stars=27000) == ""
-    assert filter_lot(_lot(account_level=3), min_stars=4500, max_stars=27000) == "level"
+    assert filter_lot(_lot(account_level=2), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    assert filter_lot(_lot(account_level=3), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "level"
     # Telegram часто не отдаёт stars_rating — None не сжигает лот как «level»
-    assert filter_lot(_lot(account_level=None), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(account_level=None), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_max_12_nfts() -> None:
-    assert filter_lot(_lot(gifts_count=6), min_stars=4500, max_stars=27000) == ""
-    assert filter_lot(_lot(gifts_count=7), min_stars=4500, max_stars=27000) == "много NFT"
-    assert filter_lot(_lot(gifts_count=None), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(gifts_count=6), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    assert filter_lot(_lot(gifts_count=7), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "много NFT"
+    assert filter_lot(_lot(gifts_count=None), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_free_dm_only() -> None:
-    assert filter_lot(_lot(free_dm=True), min_stars=4500, max_stars=27000) == ""
-    assert filter_lot(_lot(free_dm=False), min_stars=4500, max_stars=27000) == "платные ЛС"
-    assert filter_lot(_lot(free_dm=None), min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(_lot(free_dm=True), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    assert filter_lot(_lot(free_dm=False), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "платные ЛС"
+    assert filter_lot(_lot(free_dm=None), min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_girl_from_bio_emoji() -> None:
@@ -137,8 +139,8 @@ def test_girl_from_bio_emoji() -> None:
 
 
 def test_hardcoded_filters() -> None:
-    assert config.MIN_STARS == 4500
-    assert config.MAX_STARS == 27000
+    assert config.MIN_STARS == 5000
+    assert config.MAX_STARS == 25000
     assert config.MAX_ACCOUNT_LEVEL == 2
     assert config.MAX_NFTS == 6
     assert config.POST_INTERVAL == 4.0
@@ -146,10 +148,12 @@ def test_hardcoded_filters() -> None:
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
-    assert config.SCAN_BATCH == 36
-    assert config.PAGE_LIMIT == 8
-    assert config.TRACKER_VERSION == "5.7.1"
+    assert config.SCAN_BATCH == 0
+    assert config.PAGE_LIMIT == 12
+    assert config.SCAN_PARALLEL == 12
+    assert config.TRACKER_VERSION == "5.8.0"
     assert config.MIN_COLLECTIONS == 50
+    assert config.GIRL_MIN_SCORE == 5
 
 
 def test_collect_ids_keeps_zero_resale() -> None:
@@ -216,7 +220,7 @@ def test_is_russian_empty_profile_is_unknown() -> None:
     empty.lang_code = ""
     assert is_russian(empty) is None
     assert "empty" in russian_why(empty)
-    assert filter_lot(empty, min_stars=4500, max_stars=27000) == "нет данных"
+    assert filter_lot(empty, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "нет данных"
 
 
 def test_is_russian_latin_shop_name_is_not_ru() -> None:
@@ -226,7 +230,7 @@ def test_is_russian_latin_shop_name_is_not_ru() -> None:
     why = russian_why(shop)
     assert "FAIL" in why
     assert "no cyrillic" in why
-    assert filter_lot(shop, min_stars=4500, max_stars=27000) == "не русский"
+    assert filter_lot(shop, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "не русский"
 
 
 def test_is_russian_female_username_counts() -> None:
@@ -256,11 +260,11 @@ def test_skips_non_russian() -> None:
     latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="en")
     assert is_girl(latin) is True
     assert is_russian(latin) is True
-    assert filter_lot(latin, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(latin, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
     iranian = _lot(first_name="Sara", about="hello", seller="sara_nft", lang_code="fa")
     assert is_russian(iranian) is False
     assert looks_male(iranian) is False
-    assert filter_lot(iranian, min_stars=4500, max_stars=27000) == "не русский"
+    assert filter_lot(iranian, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "не русский"
     assert is_russian(_lot()) is True
     cis_latin = _lot(first_name="Kristina", about="🌸", seller="kris_shop", lang_code="")
     assert is_russian(cis_latin) is True
@@ -291,7 +295,7 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     """@ynosleep / @Etalonkasexa пролезали из-за «девушке можно писать» в био."""
     yno = _lot(first_name="", about="девушке можно писать 💅", seller="ynosleep")
     assert is_girl(yno) is False
-    assert filter_lot(yno, min_stars=4500, max_stars=27000) == "нет женских признаков"
+    assert filter_lot(yno, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "нет женских признаков"
     boy = _lot(
         first_name="Алексей",
         about="девушке можно писать 💅 girl pink",
@@ -303,7 +307,7 @@ def test_bio_hints_do_not_make_a_girl() -> None:
     assert is_girl(sasha) is False
     nick = _lot(first_name="Shop", about="торгую гифтами", seller="masha_nft")
     assert is_girl(nick) is True
-    assert filter_lot(nick, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(nick, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_stars_level_reads_current_level() -> None:
@@ -346,32 +350,32 @@ def test_count_unique_nfts_skips_unlimited() -> None:
     saved = Saved([Item(cheap), Item(one), Item(two)])
     assert count_unique_star_gifts(saved) == 2
     whale = _lot(first_name="Мария", gifts_count=10)
-    assert filter_lot(whale, min_stars=4500, max_stars=27000) == "много NFT"
+    assert filter_lot(whale, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "много NFT"
     few = _lot(first_name="Мария", gifts_count=3)
-    assert filter_lot(few, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(few, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_latin_girl_with_russian_bio() -> None:
     lot = _lot(first_name="Kristina", about="привет, пишите", seller="kris_shop")
     assert is_russian(lot) is True
     assert is_girl(lot) is True
-    assert filter_lot(lot, min_stars=4500, max_stars=27000) == ""
+    assert filter_lot(lot, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
 
 
 def test_skips_persian_and_latin_boys() -> None:
     reza = _lot(first_name="Reza", about="", seller="reza_gifts", lang_code="fa")
     assert looks_male(reza) is True
     assert is_girl(reza) is False
-    assert filter_lot(reza, min_stars=4500, max_stars=27000) == "мужской"
+    assert filter_lot(reza, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "мужской"
     nima = _lot(first_name="Nima", about="nft", seller="nima_shop")
     assert looks_male(nima) is True
     amir = _lot(first_name="Shop", about="", seller="amir_nft")
     assert looks_male(amir) is True
-    assert filter_lot(amir, min_stars=4500, max_stars=27000) == "мужской"
+    assert filter_lot(amir, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "мужской"
     boy = _lot(first_name="Алексей", about="торгую", seller="lexa_gifts")
     assert looks_male(boy) is True
     assert is_girl(boy) is False
-    assert filter_lot(boy, min_stars=4500, max_stars=27000) == "мужской"
+    assert filter_lot(boy, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "мужской"
 
 
 def test_fresh_from_page_only_new_listings() -> None:
@@ -380,19 +384,19 @@ def test_fresh_from_page_only_new_listings() -> None:
     new = _lot(id="new", stars=8000)
     expensive = _lot(id="exp", stars=99_000)
     bubbled = _lot(id="mid", stars=9000)
-    page, fresh = fresh_from_page(None, [new], {}, 4500, 27000)
+    page, fresh = fresh_from_page(None, [new], {}, config.MIN_STARS, config.MAX_STARS)
     assert page == ["new"]
     assert fresh == []
-    page, fresh = fresh_from_page(["new", "old"], [new, old], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["new", "old"], [new, old], {}, config.MIN_STARS, config.MAX_STARS)
     assert fresh == []
-    page, fresh = fresh_from_page(["old"], [new, mid, old], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["old"], [new, mid, old], {}, config.MIN_STARS, config.MAX_STARS)
     assert [x.id for x in fresh] == ["new", "mid"]
-    page, fresh = fresh_from_page(["old"], [expensive, mid, old], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["old"], [expensive, mid, old], {}, config.MIN_STARS, config.MAX_STARS)
     assert [x.id for x in fresh] == ["mid"]
     # #1 купили — mid всплыл, он уже был на странице
-    page, fresh = fresh_from_page(["old", "mid"], [bubbled, old], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["old", "mid"], [bubbled, old], {}, config.MIN_STARS, config.MAX_STARS)
     assert fresh == []
-    page, fresh = fresh_from_page(["old"], [new], {"new": 1.0}, 4500, 27000)
+    page, fresh = fresh_from_page(["old"], [new], {"new": 1.0}, config.MIN_STARS, config.MAX_STARS)
     assert fresh == []
 
 
@@ -403,16 +407,16 @@ def test_fresh_from_page_ignores_api_order() -> None:
     c = _lot(id="C", stars=10000)
     new = _lot(id="NEW", stars=7000)
     # Telegram отдал не newest→oldest: известный B стоит перед новым
-    page, fresh = fresh_from_page(["A", "B", "C"], [b, new, a], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["A", "B", "C"], [b, new, a], {}, config.MIN_STARS, config.MAX_STARS)
     assert page == ["B", "NEW", "A"]
     assert [x.id for x in fresh] == ["NEW"]
     # пустой снимок — ничего не постим
-    page, fresh = fresh_from_page([], [new, a], {}, 4500, 27000)
+    page, fresh = fresh_from_page([], [new, a], {}, config.MIN_STARS, config.MAX_STARS)
     assert fresh == []
     # всплытие mid среди перемешанных известных
     mid = _lot(id="mid", stars=9000)
     old = _lot(id="old", stars=10000)
-    page, fresh = fresh_from_page(["old", "mid"], [mid, old, new], {}, 4500, 27000)
+    page, fresh = fresh_from_page(["old", "mid"], [mid, old, new], {}, config.MIN_STARS, config.MAX_STARS)
     assert [x.id for x in fresh] == ["NEW"]
 
 
@@ -589,6 +593,84 @@ def test_seller_dup_does_not_burn_to_seen() -> None:
     assert runtime.funnel["ru_checked"] == 0
 
 
+def test_snapshot_then_only_new_listings() -> None:
+    """Initial snapshot (prev empty) → no posts; later new id → detect."""
+    a = _lot(id="a", stars=8000)
+    b = _lot(id="b", stars=9000)
+    page, fresh = fresh_from_page(None, [a, b], {}, config.MIN_STARS, config.MAX_STARS)
+    assert page == ["a", "b"]
+    assert fresh == []
+    page, fresh = fresh_from_page(["a", "b"], [a, b], {}, config.MIN_STARS, config.MAX_STARS)
+    assert fresh == []
+    neu = _lot(id="new1", stars=7000)
+    page, fresh = fresh_from_page(
+        ["a", "b"], [neu, a, b], {}, config.MIN_STARS, config.MAX_STARS
+    )
+    assert [x.id for x in fresh] == ["new1"]
+
+
+def test_pagination_reorder_not_new() -> None:
+    a = _lot(id="a", stars=8000)
+    b = _lot(id="b", stars=9000)
+    c = _lot(id="c", stars=10000)
+    page, fresh = fresh_from_page(
+        ["a", "b", "c"], [c, a, b], {}, config.MIN_STARS, config.MAX_STARS
+    )
+    assert fresh == []
+
+
+def test_girl_multi_signal_rejects_bio_only() -> None:
+    from filters import female_score, has_female_identity
+
+    yno = _lot(first_name="", about="девушке можно писать 💅", seller="ynosleep")
+    assert has_female_identity(yno) is False
+    assert female_score(yno) >= 3
+    assert is_girl(yno) is False
+
+
+def test_girl_multi_signal_name_passes() -> None:
+    from filters import female_score
+
+    m = _lot(first_name="Мария", about="", has_photo=False)
+    assert female_score(m) >= config.GIRL_MIN_SCORE
+    assert is_girl(m) is True
+
+
+def test_uncertain_no_identity_rejects() -> None:
+    lot = _lot(first_name="Shop", about="🌸💖", seller="gift_xx", has_photo=True)
+    assert looks_male(lot) is False
+    assert is_girl(lot) is False
+
+
+def test_non_russian_girl_rejects() -> None:
+    lot = _lot(first_name="Sara", about="hello", seller="sara_g", lang_code="fa")
+    assert is_russian(lot) is False
+    assert filter_lot(lot, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "не русский"
+
+
+def test_scan_batch_zero_means_all_collections() -> None:
+    assert config.SCAN_BATCH == 0
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.gift_ids = list(range(1, 21))
+    market._cursor = 5
+    batch = market.next_batch(config.SCAN_BATCH)
+    assert sorted(batch) == list(range(1, 21))
+
+
+def test_post_interval_separate_from_poll() -> None:
+    assert config.POST_INTERVAL == 4.0
+    assert config.POLL_INTERVAL < config.POST_INTERVAL
+
+
+def test_seller_keys_username_found() -> None:
+    from filters import seller_keys
+
+    lot = _lot(seller="masha_shop", seller_id=42)
+    assert "masha_shop" in seller_keys(lot) or "u:masha_shop" in seller_keys(lot)
+    unknown = _lot(seller="", seller_id=99)
+    assert seller_keys(unknown) == {"id:99"}
+
+
 def test_state_schema_clears_seller_bans() -> None:
     import json
     import tempfile
@@ -657,6 +739,15 @@ def main() -> None:
         test_stats_post_enrich_seller_dup_no_nft_pass,
         test_stats_male_lot_separate_stage,
         test_stats_successful_lot,
+        test_snapshot_then_only_new_listings,
+        test_pagination_reorder_not_new,
+        test_girl_multi_signal_rejects_bio_only,
+        test_girl_multi_signal_name_passes,
+        test_uncertain_no_identity_rejects,
+        test_non_russian_girl_rejects,
+        test_scan_batch_zero_means_all_collections,
+        test_post_interval_separate_from_poll,
+        test_seller_keys_username_found,
         test_state_schema_clears_seller_bans,
     ]
     for fn in tests:

@@ -1155,11 +1155,26 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: новые id сверху · %s–%s⭐ · русские девочки · ≤%s дорогих NFT · lvl≤%s · free ЛС · пост/%sс",
+        "Сканер: detection≠post · batch=%s (0=все) parallel=%s page=%s · "
+        "%s–%s⭐ · girl_score≥%s · post/%sс",
+        config.SCAN_BATCH,
+        config.SCAN_PARALLEL,
+        config.PAGE_LIMIT,
         config.MIN_STARS,
         config.MAX_STARS,
-        config.MAX_NFTS,
-        config.MAX_ACCOUNT_LEVEL,
+        config.GIRL_MIN_SCORE,
+        int(config.POST_INTERVAL),
+    )
+    n_coll = max(len(gift_ids), 1)
+    batch_n = n_coll if config.SCAN_BATCH <= 0 else min(config.SCAN_BATCH, n_coll)
+    waves = max(1, (batch_n + config.SCAN_PARALLEL - 1) // config.SCAN_PARALLEL)
+    ring = max(1, (n_coll + batch_n - 1) // batch_n)
+    logger.info(
+        "Оценка detection: %s колл/проход · %s волн · полный круг ≈%s проход(а) · "
+        "цель revisit ~%sс при быстром API",
+        batch_n,
+        waves,
+        ring,
         int(config.POST_INTERVAL),
     )
     pass_no = 0

@@ -5,6 +5,27 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
+def env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 # @jsjeigiejwhnewbot
 BOT_USERNAME = "jsjeigiejwhnewbot"
 BOT_TOKEN = "8825465611:AAE8-3_hFqU32_-gUJLbvZC96i-MvDl3lNA"
@@ -16,28 +37,32 @@ API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 
 CHANNEL_ID = -1003784435307
 
-# Цель 5000–25000, с запасом чуть дешевле/дороже
-MIN_STARS = 4500
-MAX_STARS = 27000
-MAX_ACCOUNT_LEVEL = 2
-MAX_NFTS = 6  # уникальные/дорогие; дешёвые безлимитные не считаем
-POST_INTERVAL = 4.0
+# Цель 5000–25000 Stars (MIN_STARS / MAX_STARS через env)
+MIN_STARS = env_int("MIN_STARS", 5000)
+MAX_STARS = env_int("MAX_STARS", 25000)
+MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
+MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
+POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал
 
-# Курс для строки «X Stars / Y TON» (как в tracker market)
+# Женский confidence: имя даёт 4; нужен ≥5 (имя+фото/био/emoji/…)
+GIRL_MIN_SCORE = env_int("GIRL_MIN_SCORE", 5)
+# Без якоря (женское имя / отчество / female username) — reject (uncertain)
+GIRL_REQUIRE_IDENTITY = True
+
 TON_RATE = 0.0102
 TZ_OFFSET = 3.0  # МСК
 
-POLL_INTERVAL = 0.05
-PAGE_LIMIT = 8  # верх newest: новый id спереди = только что выставили
-SCAN_BATCH = 36  # кольцо коллекций
-SCAN_PARALLEL = 8
-REQUEST_GAP = 0.02
-REQUEST_TIMEOUT = 5.0
-ENRICH_TIMEOUT = 4.0
-MIN_COLLECTIONS = 50  # Bot API даёт ~11; полный NFT-каталог ~100+
+POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
+PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest
+# 0 = все коллекции каждый проход → detection ≈ один fetch-round
+SCAN_BATCH = env_int("SCAN_BATCH", 0)
+SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
+REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
+REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 4.0)
+ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
+MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.7.1"
-# Подробный лог каждого fresh-лота: поля профиля + причина отсева
+TRACKER_VERSION = "5.8.0"
 DEBUG_FILTERS = True
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -67,26 +92,6 @@ def state_path() -> Path:
 
 def catalog_path() -> Path:
     return data_dir() / "tracker_catalog.json"
-
-
-def env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def env_float(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
 
 
 def bot_token() -> str:

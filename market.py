@@ -872,6 +872,16 @@ class TelegramMarket:
             lot.seller_id = seller_id
             if seller_id in users:
                 fill_user(lot, users[seller_id])
+        # username всё ещё пуст — ещё одна попытка entity
+        if lot.seller_id and not lot.seller:
+            try:
+                await self._wait_flood()
+                ent = await asyncio.wait_for(
+                    self.client.get_entity(int(lot.seller_id)), timeout=timeout
+                )
+                fill_user(lot, ent)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def enrich_profile(self, lot: Lot, timeout: float = 5.0) -> None:
         if not lot.seller_id:
@@ -1004,6 +1014,18 @@ class TelegramMarket:
         except Exception:  # noqa: BLE001
             return
         lot.gifts_count = count_unique_star_gifts(saved)
+        # названия unique gifts — сигнал для female_score (без второго RPC)
+        if not lot.gifts_text:
+            titles: list[str] = []
+            for item in getattr(saved, "gifts", None) or []:
+                gift = getattr(item, "gift", None) or item
+                title = str(
+                    getattr(gift, "title", "") or getattr(gift, "slug", "") or ""
+                )
+                if title:
+                    titles.append(title)
+            if titles:
+                lot.gifts_text = " ".join(titles)[:400]
 
     async def check_free_dm(self, lot: Lot, timeout: float = 4.0) -> None:
         if lot.seller_id is None:
@@ -1047,9 +1069,46 @@ class TelegramMarket:
         if lot.seller_id is None:
             return
         await self.enrich_profile(lot, timeout=timeout)
+        # username мог появиться только в FullUser.users
+        if not lot.seller:
+            try:
+                await self._wait_flood()
+                ent = await asyncio.wait_for(
+                    self.client.get_entity(int(lot.seller_id)), timeout=timeout
+                )
+                fill_user(lot, ent)
+            except Exception:  # noqa: BLE001
+                pass
         await self.count_unique_gifts(lot, timeout=timeout)
+        # Stories — доп. сигнал; FloodWait глотаем внутри
+        if GetPeerStoriesRequest is not None and not lot.stories_text:
+            try:
+                await self._wait_flood()
+                ent = await asyncio.wait_for(
+                    self.client.get_input_entity(lot.seller_id), timeout=min(timeout, 3.0)
+                )
+                stories = await asyncio.wait_for(
+                    self.client(GetPeerStoriesRequest(peer=ent)),
+                    timeout=min(timeout, 3.0),
+                )
+                texts: list[str] = []
+                peer_stories = getattr(stories, "stories", None)
+                items = getattr(peer_stories, "stories", None) or []
+                for item in items:
+                    cap = str(getattr(item, "caption", "") or "")
+                    if cap:
+                        texts.append(cap)
+                if texts:
+                    lot.stories_text = " ".join(texts)[:400]
+            except Exception:  # noqa: BLE001
+                pass
         if lot.free_dm is None:
             await self.check_free_dm(lot, timeout=timeout)
+        cached = self._profile_cache.get(int(lot.seller_id))
+        if cached is not None:
+            cached.update(_cache_from(lot))
+        else:
+            self._profile_cache[int(lot.seller_id)] = _cache_from(lot)
 
 
 def _cache_from(lot: Lot) -> dict[str, Any]:

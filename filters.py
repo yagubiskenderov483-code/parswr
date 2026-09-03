@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import config
 from market import Lot
 
 _CYR_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
@@ -238,29 +239,38 @@ def _username_female_name(username: str) -> bool:
     return False
 
 
-def female_reason(lot: Lot) -> str:
-    """Женское имя в first/last/username ИЛИ female_score >= 3.
+def has_female_identity(lot: Lot) -> bool:
+    """Сильный якорь: женское имя / отчество / женский токен username."""
+    fn = _first_token(lot.first_name)
+    if is_cyrillic_female_name(fn) or is_latin_female_name(fn):
+        return True
+    ln = (lot.last_name or "").strip().lower()
+    if ln.endswith(("овна", "евна", "ична")):
+        return True
+    if _username_female_name(lot.seller) or _username_female(lot.seller):
+        return True
+    return False
 
-    Один сигнал из: Кирилл имя-ж + female emoji, bio hint + emoji, женский username
-    без имени, отчество -овна и т.п. — этого достаточно.
-    Блокирует мужское имя/признак даже при высоком score.
-    «девушке можно писать» в bio без имени — НЕ хватает (score=3 нужно ≥2 сигналов).
+
+def female_reason(lot: Lot) -> str:
+    """Confidence по нескольким сигналам (female_score), не «только имя».
+
+    Сильный reject: looks_male.
+    Без identity-якоря (имя/отчество/female nick) — uncertain → reject
+    (bio «девушке можно писать» само по себе не проходит).
+    С якорем: нужен female_score >= GIRL_MIN_SCORE (по умолчанию 5).
     """
     if looks_male(lot):
         return "мужской"
-    fn = _first_token(lot.first_name)
-    if is_cyrillic_female_name(fn) or is_latin_female_name(fn):
-        return ""
-    ln = (lot.last_name or "").strip().lower()
-    if ln.endswith(("овна", "евна", "ична")):
-        return ""
-    if _username_female_name(lot.seller):
-        return ""
-    # Без имени принимаем только если в нике есть явный женский паттерн
-    # (_FEMALE_USER_RE: anna, masha, girl, …) — bio-hint без имени не хватает.
-    if _username_female(lot.seller):
-        return ""
-    return "нет женских признаков"
+    score = female_score(lot)
+    identity = has_female_identity(lot)
+    require_id = bool(getattr(config, "GIRL_REQUIRE_IDENTITY", True))
+    min_score = int(getattr(config, "GIRL_MIN_SCORE", 5))
+    if require_id and not identity:
+        return "нет женских признаков"
+    if score < min_score:
+        return "нет женских признаков"
+    return ""
 
 
 def female_score(lot: Lot) -> int:
@@ -269,11 +279,13 @@ def female_score(lot: Lot) -> int:
     fn = _first_token(lot.first_name)
     ln = (lot.last_name or "").strip().lower()
     if fn and (is_cyrillic_female_name(fn) or is_latin_female_name(fn)):
-        score += 4
+        score += 5  # сильный якорь: женское имя
     if ln.endswith(("овна", "евна", "ична")):
-        score += 3
-    if _username_female(lot.seller):
-        score += 2
+        score += 4
+    if _username_female_name(lot.seller):
+        score += 5  # токен ника = женское имя (masha_nft)
+    elif _username_female(lot.seller):
+        score += 3  # girl/queen/… в нике
     blob = _blob(lot)
     if _FEMALE_HINT_RE.search(blob):
         score += 3

@@ -500,7 +500,7 @@ class Diagnostics:
                 f"girl diagnostics: pass={self.girl_pass} reject={self.girl_reject} "
                 f"identity={self.girl_identity_true}/{self.girl_identity_true + self.girl_identity_false} "
                 f"no_identity={self.girl_reject_no_identity} "
-                f"score<5={self.girl_reject_score_lt_min}"
+                f"score_lt_5={self.girl_reject_score_lt_min}"
             ),
             (
                 f"username: page={self.username_from_page} "

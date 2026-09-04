@@ -355,7 +355,8 @@ class ControlBot:
             diag = getattr(rt, "diag", None)
             if diag is not None:
                 lines.append("DIAGNOSTICS")
-                lines.extend(diag.status_lines())
+                # HTML parse_mode: экранируем динамику (< в score<5 ломало Telegram)
+                lines.extend(_esc(line) for line in diag.status_lines())
         else:
             lines.append("⏳ Сканер ещё поднимается — подожди пару секунд.")
         return "\n".join(lines)

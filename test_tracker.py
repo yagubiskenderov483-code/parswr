@@ -850,6 +850,113 @@ def test_fill_user_sets_username_source() -> None:
     assert lot.username_source == "resale_user"  # first wins
 
 
+def test_status_html_safe_diagnostics() -> None:
+    """Telegram HTML: «score<5=0» парсилось как тег 5=0 — /status падал."""
+    import re
+
+    from bot import ControlBot
+    from tracker import Runtime
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = True
+    rt.snapshot = 120
+    rt.passes = 4
+    rt.collections = 151
+    rt.posted = 2
+    rt.queue = 0
+    rt.last_found = 42
+    rt.last_fresh = 24
+    rt.funnel["fresh_detected"] = 936
+    rt.funnel["fresh"] = 936
+    rt.funnel["price_checked"] = 936
+    rt.funnel["price_pass"] = 157
+    rt.funnel["price_reject"] = 779
+    rt.funnel["seen_checked"] = 157
+    rt.funnel["seen_pass"] = 143
+    rt.funnel["seen_reject"] = 14
+    rt.funnel["dup_seller"] = 28
+    rt.funnel["work_in"] = 115
+    rt.funnel["dequeued"] = 115
+    rt.funnel["male_checked"] = 115
+    rt.funnel["male_reject"] = 31
+    rt.funnel["male_pass"] = 84
+    rt.funnel["ru_checked"] = 84
+    rt.funnel["ru_pass"] = 13
+    rt.funnel["ru_reject"] = 71
+    rt.funnel["girl_checked"] = 13
+    rt.funnel["girl_pass"] = 3
+    rt.funnel["girl_reject"] = 10
+    rt.funnel["dm_checked"] = 3
+    rt.funnel["dm_pass"] = 3
+    rt.funnel["level_checked"] = 3
+    rt.funnel["level_pass"] = 3
+    rt.funnel["nft_checked"] = 3
+    rt.funnel["nft_pass"] = 2
+    rt.funnel["nft_reject"] = 1
+    rt.funnel["send_attempt"] = 2
+    rt.funnel["sent"] = 2
+    rt.last_error = "FloodWait <tag> & more"
+    d = rt.diag
+    d.girl_reject_score_lt_min = 0
+    d.girl_reject_no_identity = 10
+    d.girl_pass = 3
+    d.girl_reject = 10
+    d.girl_identity_true = 3
+    d.girl_identity_false = 10
+    d.detection_latency_unknown = 42
+    d.ru_reject_no_cyrillic = 48
+    d.record_scan_round(
+        {
+            "pass": 4,
+            "round_started_at": 1.0,
+            "round_finished_at": 2.0,
+            "round_ms": 8420.0,
+            "collections_checked": 151,
+            "collections_success": 151,
+            "collections_failed": 0,
+            "api_fetch_count": 151,
+            "found_in_range": 42,
+            "fresh_detected": 37,
+            "queued": 24,
+            "duplicate_seller": 18,
+            "duplicate_listing": 0,
+            "flood_wait_count": 0,
+            "flood_wait_seconds": 0.0,
+            "timeout_count": 0,
+        }
+    )
+    d.record_enrich(120.0, ok=True)
+    text = ControlBot._status_text(ctrl)
+
+    assert "DIAGNOSTICS" in text
+    assert "scan p50:" in text
+    assert "detection_latency:" in text
+    assert "RU reject:" in text
+    assert "girl diagnostics:" in text
+    assert "username:" in text
+    assert "enrich:" in text
+    assert "floodwait:" in text
+    # корневая регрессия: сырой score<5=… ломает HTML
+    assert "score<5" not in text
+    assert "score_lt_5=" in text
+    # last_error экранирован
+    assert "<tag>" not in text
+    assert "&lt;tag&gt;" in text
+    # нет «тегов» вида <5=0> / <foo=
+    assert re.search(r"<\d", text) is None
+    allowed = {"code", "/code", "b", "/b"}
+    for raw in re.findall(r"</?([a-zA-Z0-9_=<]+)", text):
+        name = raw.split("=", 1)[0].rstrip("/")
+        assert name in allowed or f"/{name}" in allowed or name in {
+            "code",
+            "b",
+        }, raw
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -905,6 +1012,7 @@ def main() -> None:
         test_girl_forensics_no_identity_and_pass,
         test_username_and_floodwait_split,
         test_fill_user_sets_username_source,
+        test_status_html_safe_diagnostics,
     ]
     for fn in tests:
         fn()

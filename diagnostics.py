@@ -290,6 +290,23 @@ class Diagnostics:
         self.owner_id_missing = 0
         self.dup_owner_by_id = 0
         self.dup_owner_by_alias = 0
+        self.owner_dup_enqueue = 0
+        self.owner_dup_post_enrich = 0
+        self.owner_dup_send_guard = 0
+        self.owner_sent_persisted = 0
+
+        self.listing_checked = 0
+        self.listing_price_pass = 0
+        self.bad_model_value = 0
+        self.owner_duplicate = 0
+        self.candidate_model_count = 0
+        self.eligible_model_count = 0
+        self.model_floor_known = 0
+        self.model_floor_unknown = 0
+        self.collections_eligible = 0
+
+        self.enqueue_ms_samples: deque[float] = deque(maxlen=MS_SAMPLES_KEEP)
+        self.send_ms_samples: deque[float] = deque(maxlen=MS_SAMPLES_KEEP)
 
         self.ru_reject_foreign_lang = 0
         self.ru_reject_no_cyrillic = 0
@@ -445,6 +462,33 @@ class Diagnostics:
         else:
             self.dup_owner_by_alias += 1
 
+    def note_catalog(self, stats: dict[str, Any], collections_eligible: int) -> None:
+        self.candidate_model_count = int(stats.get("models_total") or 0)
+        self.eligible_model_count = int(stats.get("eligible_model_count") or 0)
+        self.model_floor_known = int(stats.get("model_floor_known") or 0)
+        self.model_floor_unknown = int(stats.get("model_floor_unknown") or 0)
+        self.collections_eligible = int(collections_eligible)
+
+    def record_enqueue_latency(self, lot: Lot) -> None:
+        started = float(getattr(lot, "discovered_at", 0) or 0)
+        if started <= 0:
+            return
+        ms = max(0.0, (time.time() - started) * 1000.0)
+        self.enqueue_ms_samples.append(ms)
+
+    def record_send_latency(self, lot: Lot) -> None:
+        started = float(getattr(lot, "discovered_at", 0) or 0)
+        if started <= 0:
+            return
+        ms = max(0.0, (time.time() - started) * 1000.0)
+        self.send_ms_samples.append(ms)
+
+    def enqueue_p50(self) -> float | None:
+        return percentile(list(self.enqueue_ms_samples), 50)
+
+    def send_p50(self) -> float | None:
+        return percentile(list(self.send_ms_samples), 50)
+
     def record_ru_reject(self, lot: Lot) -> None:
         code = russian_reject_code(lot)
         if code == "foreign_lang":
@@ -503,9 +547,19 @@ class Diagnostics:
                 f"to={last.get('timeout_count', 0)}"
             ),
             (
+                f"MODEL CATALOG models_total={self.candidate_model_count} "
+                f"models_eligible={self.eligible_model_count} "
+                f"floor_known={self.model_floor_known} "
+                f"floor_unknown={self.model_floor_unknown}"
+            ),
+            (
                 f"detection_latency: UNKNOWN={self.detection_latency_unknown} "
                 f"known={self.detection_latency_known} "
                 f"(API listing time: none)"
+            ),
+            (
+                f"detection_to_enqueue: {_fmt_ms(self.enqueue_p50())} "
+                f"detection_to_send: {_fmt_ms(self.send_p50())}"
             ),
             (
                 f"RU reject: foreign_lang={self.ru_reject_foreign_lang} "

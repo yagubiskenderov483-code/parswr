@@ -197,7 +197,9 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.9.1"
+    assert config.TRACKER_VERSION == "5.10.0"
+    assert config.MIN_MODEL_FLOOR == 4000
+    assert config.MAX_MODEL_FLOOR == 27000
     assert config.MIN_COLLECTIONS == 50
     assert config.GIRL_MIN_SCORE == 5
     assert config.REQUEST_TIMEOUT == 8.0
@@ -1361,6 +1363,270 @@ def test_status_html_safe_diagnostics() -> None:
             "code",
             "b",
         }, raw
+    assert "MODEL CATALOG" in text
+    assert "models_total=" in text
+    assert "collections_eligible=" in text
+    assert "bad_model_value=" in text
+    assert "OWNER" in text
+
+
+def test_listing_vs_model_floor_split() -> None:
+    from floors import listing_and_floor_reason, model_floor_verdict
+
+    assert model_floor_verdict(None) == "unknown"
+    assert model_floor_verdict(300) == "bad_model_value"
+    assert model_floor_verdict(6200) == "ok"
+    assert model_floor_verdict(80000) == "above_max"
+    # дешёвая модель, listing 8000 — не кандидат
+    assert listing_and_floor_reason(listing_stars=8000, floor=350) == "REJECT_BAD_MODEL_VALUE"
+    # нормальная модель
+    assert listing_and_floor_reason(listing_stars=7000, floor=6200) == ""
+    # UNKNOWN не притворяемся
+    assert listing_and_floor_reason(listing_stars=8000, floor=None) == "floor неизвестен"
+
+
+def test_cheap_model_high_listing_rejected_before_girl() -> None:
+    lot = _lot(stars=8000, model_id=111, model_floor=350.0)
+    assert filter_lot(
+        lot,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    ) == "REJECT_BAD_MODEL_VALUE"
+
+
+def test_unknown_floor_not_invented() -> None:
+    from floors import FloorCatalog
+
+    cat = FloorCatalog(path=None)
+    cat.observe_model(1, 99, "Cheap")
+    assert cat.get_floor(1, 99) is None
+    assert cat.stats()["model_floor_unknown"] == 1
+    assert cat.eligible_model_ids(1) == []
+
+
+def test_floor_catalog_min_price_is_floor() -> None:
+    from floors import FloorCatalog
+
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(10, 5, 9000, "Rare")
+    cat.observe_floor(10, 5, 6200, "Rare")
+    cat.observe_floor(10, 5, 8800, "Rare")
+    assert cat.get_floor(10, 5) == 6200
+    assert 10 in cat.scan_collection_ids()
+
+
+def test_floor_catalog_ttl_and_persist(tmp_path=None) -> None:
+    import tempfile
+    from pathlib import Path
+
+    from floors import FloorCatalog
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "floors.json"
+        cat = FloorCatalog(path)
+        cat.observe_floor(1, 2, 5000, "A")
+        cat.updated_at = 1.0
+        cat.save()
+        cat2 = FloorCatalog(path)
+        cat2.load()
+        assert cat2.get_floor(1, 2) == 5000
+        assert cat2.is_fresh(now=1.0 + config.FLOOR_CACHE_TTL + 10) is False
+        cat2.updated_at = time_module_now = __import__("time").time()
+        assert cat2.is_fresh() is True
+
+
+def test_apply_listing_floor_filters_paths() -> None:
+    from floors import FloorCatalog
+    from tracker import apply_listing_floor_filters, empty_funnel
+
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 10, 350, "Cheap")
+    cat.observe_floor(1, 20, 6200, "Rare")
+    cheap = _lot(id="c", slug="C-1", stars=8000, collection_id=1, model_id=10)
+    rare = _lot(id="r", slug="R-1", stars=7000, collection_id=1, model_id=20)
+    unknown = _lot(id="u", slug="U-1", stars=8000, collection_id=1, model_id=30)
+    fn = empty_funnel()
+    kept = apply_listing_floor_filters([cheap, rare, unknown], cat, fn)
+    assert [x.id for x in kept] == ["r"]
+    assert fn["bad_model_value"] == 1
+    assert fn["model_floor_pass"] == 1
+    assert fn["model_floor_unknown"] == 1
+
+
+def test_scan_ids_prioritize_listing_band() -> None:
+    from floors import FloorCatalog
+
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 1, 4500, "Low")  # eligible but below listing 5k
+    cat.observe_floor(2, 2, 8000, "Mid")  # in listing band
+    cat.observe_floor(3, 3, 200, "Junk")  # not eligible
+    ids = cat.scan_collection_ids([1, 2, 3])
+    assert 2 in ids
+    assert 1 in ids
+    assert 3 not in ids
+    assert ids[0] == 2
+
+
+def test_next_batch_rings_eligible_pool() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.gift_ids = list(range(100))
+    market._cursor = 0
+    pool = [10, 20, 30, 40]
+    a = market.next_batch(2, pool=pool)
+    b = market.next_batch(2, pool=pool)
+    assert a == [10, 20]
+    assert b == [30, 40]
+
+
+def test_parse_gift_sets_model_id() -> None:
+    from types import SimpleNamespace
+
+    from market import parse_gift
+
+    class StarGiftAttributeModel:
+        def __init__(self) -> None:
+            self.name = "Avatar"
+            self.document = SimpleNamespace(id=555)
+
+    class StarsAmt:
+        amount = 8000
+
+    gift = SimpleNamespace(
+        id=1,
+        slug="Gift-1",
+        title="Gift",
+        num=1,
+        resell_amount=[StarsAmt()],
+        attributes=[StarGiftAttributeModel()],
+        owner_id=9,
+        gift_id=77,
+    )
+    lot = parse_gift(gift)
+    assert lot is not None
+    assert lot.model == "Avatar"
+    assert lot.model_id == 555
+    assert lot.model_floor is None
+
+
+def test_owner_dup_enqueue_counter() -> None:
+    fn = empty_funnel()
+    record_enqueue_dup(fn, "seller")
+    assert fn["owner_dup_enqueue"] == 1
+    assert fn["owner_dup_post_enrich"] == 0
+    assert fn["owner_dup_send_guard"] == 0
+    assert fn["send_attempt"] == 0
+
+
+def test_owner_dup_post_enrich_counter() -> None:
+    fn = empty_funnel()
+    record_worker_filter(fn, _lot(first_name="Мария"), "дубль продавца")
+    assert fn["owner_dup_post_enrich"] == 1
+    assert fn["owner_dup_enqueue"] == 0
+    assert fn["send_attempt"] == 0
+
+
+def test_owner_dup_send_guard_no_send_attempt() -> None:
+    import time
+
+    from tracker import owner_dup_send_guard, persist_sent_owner
+
+    seen: dict = {}
+    first = _lot(id="A1", seller="alice", seller_id=77)
+    persist_sent_owner(seen, first, time.time())
+    later = _lot(id="B2", seller="alice_new", seller_id=77)
+    assert owner_dup_send_guard(later, seen) == "дубль продавца"
+    fn = empty_funnel()
+    _bump = __import__("tracker")._bump
+    _bump(fn, "owner_dup_send_guard")
+    assert fn["owner_dup_send_guard"] == 1
+    assert fn["send_attempt"] == 0
+
+
+def test_owner_sent_persisted_key_is_id() -> None:
+    import time
+
+    from tracker import persist_sent_owner
+
+    seen: dict = {}
+    persist_sent_owner(seen, _lot(seller="x", seller_id=42), time.time())
+    assert "id:42" in seen
+    assert seen["id:42"] > 0
+    fn = empty_funnel()
+    __import__("tracker")._bump(fn, "owner_sent_persisted")
+    assert fn["owner_sent_persisted"] == 1
+
+
+def test_reload_seen_sellers_from_disk() -> None:
+    import json
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from tracker import persist_sent_owner, reload_seen_sellers
+
+    lot = _lot(id="A", seller="ann", seller_id=9)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        persist_sent_owner({}, lot, time.time())  # warmup
+        payload = {"seen_sellers": {"id:9": time.time(), "u:ann": time.time()}}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        dest: dict = {}
+        reload_seen_sellers(path, dest)
+        other = _lot(id="B", slug="B-1", seller="renamed", seller_id=9)
+        q = _stub_queue(seen_sellers=dest)
+        assert q.enqueue([other]) == 0
+        assert q.runtime.funnel["owner_dup_enqueue"] == 1
+
+
+def test_post_enrich_stops_when_id_appears_after_enqueue() -> None:
+    import time
+
+    from tracker import owner_dup_after_enrich, persist_sent_owner
+
+    q = _stub_queue()
+    first = _lot(id="A", slug="A-1", seller="", seller_id=None)
+    second = _lot(id="B", slug="B-1", seller="", seller_id=None)
+    assert q.enqueue([first, second]) == 2
+    persist_sent_owner(q.seen_sellers, _lot(id="A", seller="", seller_id=55), time.time())
+    second.seller_id = 55
+    assert owner_dup_after_enrich(second, q.seen_sellers) == "дубль продавца"
+
+
+def test_same_nft_unknown_owner_not_resent() -> None:
+    q = _stub_queue(seen={"U1": 1.0})
+    again = _lot(id="U1", slug="Gift-1", seller="", seller_id=None)
+    assert q.enqueue([again]) == 0
+    assert q.runtime.funnel["dup_listing"] == 1
+
+
+def test_owner_id_missing_reason() -> None:
+    from tracker import owner_dup_after_enrich
+
+    lot = _lot(seller="", seller_id=None)
+    assert owner_dup_after_enrich(lot, {}) == "нет продавца"
+
+
+def test_fresh_from_page_semantics_unchanged_v510() -> None:
+    a = _lot(id="a", stars=8000)
+    b = _lot(id="b", stars=9000)
+    page, fresh = fresh_from_page(None, [a, b], {}, config.MIN_STARS, config.MAX_STARS)
+    assert fresh == []
+    neu = _lot(id="new1", stars=7000)
+    _, fresh = fresh_from_page(["a", "b"], [neu, a], {}, config.MIN_STARS, config.MAX_STARS)
+    assert [x.id for x in fresh] == ["new1"]
+    assert config.POST_INTERVAL == 4.0
+    assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
+    assert config.TRACKER_VERSION == "5.10.0"
+
+
+def test_config_floor_thresholds_from_env_defaults() -> None:
+    assert config.MIN_MODEL_FLOOR == 4000
+    assert config.MAX_MODEL_FLOOR == 27000
+    assert config.LISTING_PRICE_TOLERANCE == 0.0
+    assert config.FLOOR_CACHE_TTL == 1800.0
+    assert config.PAGE_LIMIT == 12
 
 
 def main() -> None:
@@ -1434,6 +1700,25 @@ def main() -> None:
         test_cached_entity_without_username_is_not_success,
         test_parse_gift_owner_id_raw_int,
         test_status_html_safe_diagnostics,
+        test_listing_vs_model_floor_split,
+        test_cheap_model_high_listing_rejected_before_girl,
+        test_unknown_floor_not_invented,
+        test_floor_catalog_min_price_is_floor,
+        test_floor_catalog_ttl_and_persist,
+        test_apply_listing_floor_filters_paths,
+        test_scan_ids_prioritize_listing_band,
+        test_next_batch_rings_eligible_pool,
+        test_parse_gift_sets_model_id,
+        test_owner_dup_enqueue_counter,
+        test_owner_dup_post_enrich_counter,
+        test_owner_dup_send_guard_no_send_attempt,
+        test_owner_sent_persisted_key_is_id,
+        test_reload_seen_sellers_from_disk,
+        test_post_enrich_stops_when_id_appears_after_enqueue,
+        test_same_nft_unknown_owner_not_resent,
+        test_owner_id_missing_reason,
+        test_fresh_from_page_semantics_unchanged_v510,
+        test_config_floor_thresholds_from_env_defaults,
     ]
     for fn in tests:
         fn()

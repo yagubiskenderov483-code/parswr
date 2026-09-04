@@ -37,6 +37,14 @@ import config
 
 logger = logging.getLogger("bot")
 
+
+def _fmt_ms_status(ms: float | None) -> str:
+    if ms is None:
+        return "—"
+    if ms >= 1000:
+        return f"{ms / 1000.0:.1f}s"
+    return f"{ms:.0f}ms"
+
 _MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/status"), KeyboardButton(text="/start")],
@@ -270,9 +278,11 @@ class ControlBot:
             f"Фильтры: русские девочки (score≥{config.GIRL_MIN_SCORE}) · "
             f"≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
-            f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
-            f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
-            f"(detection≠post, ring)",
+                    f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
+                    f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
+                    f"(detection≠post, ring)",
+                    f"Floor: {config.MIN_MODEL_FLOOR}–{config.MAX_MODEL_FLOOR}⭐ "
+                    f"listing ±{int(config.LISTING_PRICE_TOLERANCE)}",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"
@@ -355,6 +365,33 @@ class ControlBot:
                 lines.append(f"⚠️ {_esc(str(rt.last_error)[:160])}")
             diag = getattr(rt, "diag", None)
             if diag is not None:
+                fn = getattr(rt, "funnel", None) or {}
+                lines.extend(
+                    [
+                        "MODEL CATALOG",
+                        f"models_total={rt.models_total}",
+                        f"models_eligible={rt.models_eligible}",
+                        f"floor_known={rt.floor_known}",
+                        f"floor_unknown={rt.floor_unknown}",
+                        "SCANNER",
+                        f"scan_round={_fmt_ms_status(float(diag.last_round['round_ms']) if diag.last_round.get('round_ms') is not None else None)}",
+                        f"scan_p50={_fmt_ms_status(diag.scan_p50())}",
+                        f"scan_p95={_fmt_ms_status(diag.scan_p95())}",
+                        f"collections_total={rt.collections}",
+                        f"collections_eligible={rt.collections_eligible}",
+                        f"page_limit={config.PAGE_LIMIT}",
+                        "FILTER",
+                        f"listing_price={fn.get('listing_price_pass', 0)}/{fn.get('listing_checked', 0)}",
+                        f"model_floor={fn.get('model_floor_pass', 0)}",
+                        f"bad_model_value={fn.get('bad_model_value', 0)}",
+                        f"owner_duplicate={fn.get('owner_duplicate', 0)}",
+                        "OWNER",
+                        f"known={diag.owner_id_known}",
+                        f"missing={diag.owner_id_missing}",
+                        f"sent={fn.get('owner_sent_persisted', 0)}",
+                        f"duplicate={fn.get('owner_duplicate', 0)}",
+                    ]
+                )
                 lines.append("DIAGNOSTICS")
                 # HTML parse_mode: экранируем динамику (< в score<5 ломало Telegram)
                 lines.extend(_esc(line) for line in diag.status_lines())

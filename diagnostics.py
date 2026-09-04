@@ -27,13 +27,16 @@ from filters import (
     _norm,
     _username_female,
     _username_female_name,
+    female_confident,
     female_reason,
     female_score,
+    girl_reject_reason,
     has_female_identity,
     is_cyrillic_female_name,
     is_latin_female_name,
     is_russian,
     looks_male,
+    male_reject_reason,
     russian_why,
 )
 from floors import listing_price_range
@@ -267,18 +270,15 @@ def log_nft_reject(lot: Lot, details: dict[str, Any] | None = None) -> None:
 
 
 def girl_reject_code(lot: Lot) -> str:
-    """Код girl-reject. Порог/логика = female_reason (без изменений)."""
-    if looks_male(lot):
+    """Код girl-reject = girl_reject_reason (тот же gate)."""
+    code = girl_reject_reason(lot)
+    if code == "ok":
+        return "ok"
+    if code == "male":
         return "male"
-    identity = has_female_identity(lot)
-    score = female_score(lot)
-    require_id = bool(getattr(config, "GIRL_REQUIRE_IDENTITY", True))
-    min_score = int(getattr(config, "GIRL_MIN_SCORE", 5))
-    if require_id and not identity:
-        return "no_identity"
-    if score < min_score:
-        return "score_lt_min"
-    return "ok"
+    if code == "ambiguous":
+        return "ambiguous"
+    return "no_identity"
 
 
 def girl_forensics(lot: Lot) -> dict[str, Any]:
@@ -293,8 +293,10 @@ def girl_forensics(lot: Lot) -> dict[str, Any]:
         "signals": girl_signal_list(lot),
         "reject_reason": code if reason else "ok",
         "filter_reason": reason or "ok",
+        "female_confident": female_confident(lot),
         "male": looks_male(lot),
-        "male_reason": male_diag_reason(lot),
+        "male_reason": male_reject_reason(lot) or male_diag_reason(lot),
+        "girl_reject_reason": girl_reject_reason(lot),
         "ru": is_russian(lot),
         "ru_why": russian_why(lot),
         "ru_reject_code": (
@@ -417,6 +419,24 @@ class Diagnostics:
         self.girl_reject_score_lt_min = 0
         self.girl_reject_male = 0
         self.girl_reject_other = 0
+        self.female_pass = 0
+        self.female_reject = 0
+        self.male_explicit_reject = 0
+        self.male_name_reject = 0
+        self.male_username_reject = 0
+        self.male_bio_reject = 0
+        self.ambiguous_gender_reject = 0
+        self.no_identity_reject = 0
+
+        self.new_listing_seen = 0
+        self.old_listing_seen = 0
+        self.listing_page_depth = 0
+        self.listing_page_depth_max = 0
+        self.collections_scanned = 0
+        self.eligible_collections_scanned = 0
+        self.new_candidates_per_collection: Counter[str] = Counter()
+        self.owner_sent_total = 0
+        self.owner_duplicate_total = 0
 
         self.detection_latency_unknown = 0
         self.detection_latency_known = 0
@@ -557,6 +577,67 @@ class Diagnostics:
             self.dup_owner_by_id += 1
         else:
             self.dup_owner_by_alias += 1
+        self.owner_duplicate_total += 1
+
+    def note_owner_dup_stage(self, stage: str) -> None:
+        if stage == "enqueue":
+            self.owner_dup_enqueue += 1
+        elif stage == "post_enrich":
+            self.owner_dup_post_enrich += 1
+        elif stage == "send_guard":
+            self.owner_dup_send_guard += 1
+
+    def note_owner_sent(self) -> None:
+        self.owner_sent_total += 1
+        self.owner_sent_persisted += 1
+
+    def record_scan_discovery(
+        self,
+        gid: int,
+        *,
+        new_n: int = 0,
+        old_n: int = 0,
+        pages: int = 0,
+        models: int = 0,
+        fresh_candidates: int = 0,
+        depths: dict[str, int] | None = None,
+        eligible: bool = True,
+    ) -> None:
+        """Где теряются новые listings: new vs old vs page depth."""
+        self.new_listing_seen += int(new_n)
+        self.old_listing_seen += int(old_n)
+        self.collections_scanned += 1
+        if eligible:
+            self.eligible_collections_scanned += 1
+        if depths:
+            try:
+                deepest = max(int(x) for x in depths.values())
+            except (TypeError, ValueError):
+                deepest = 0
+            self.listing_page_depth = deepest
+            if deepest > self.listing_page_depth_max:
+                self.listing_page_depth_max = deepest
+        elif pages:
+            guess = max(0, int(pages) - 1) * max(1, int(config.PAGE_LIMIT))
+            if guess > self.listing_page_depth_max:
+                self.listing_page_depth_max = guess
+            self.listing_page_depth = max(self.listing_page_depth, guess)
+        if fresh_candidates:
+            self.note_new_candidates(gid, int(fresh_candidates))
+        _ = models  # logged via SCAN pass; kept for call-site compatibility
+
+    def note_new_candidates(self, collection_id: int, n: int) -> None:
+        if n:
+            self.new_candidates_per_collection[str(int(collection_id))] += int(n)
+
+    def new_candidates_summary(self) -> str:
+        total = int(sum(self.new_candidates_per_collection.values()))
+        if not total:
+            return "n=0 top=—"
+        top = ",".join(
+            f"{k}:{v}" for k, v in self.new_candidates_per_collection.most_common(5)
+        )
+        return f"n={total} top={top}"
 
     def note_catalog(self, stats: dict[str, Any], collections_eligible: int) -> None:
         self.candidate_model_count = int(stats.get("models_total") or 0)
@@ -601,10 +682,20 @@ class Diagnostics:
             self.seen_other += 1
 
     def record_male_reject(self, lot: Lot) -> None:
-        code = male_diag_reason(lot)
+        code = male_reject_reason(lot) or male_diag_reason(lot)
         if code == "pass":
             code = "male_other"
         self.male_reject_reasons[code] += 1
+        if code in {"male_explicit", "male_emoji"}:
+            self.male_explicit_reject += 1
+        elif code in {"male_name", "male_name_translit"}:
+            self.male_name_reject += 1
+        elif code == "male_username":
+            self.male_username_reject += 1
+        elif code in {"male_bio", "male_hint"}:
+            self.male_bio_reject += 1
+        else:
+            self.male_explicit_reject += 1
 
     def record_dm_reject(self) -> None:
         self.dm_paid += 1
@@ -649,13 +740,20 @@ class Diagnostics:
             self.girl_identity_false += 1
         if passed:
             self.girl_pass += 1
+            self.female_pass += 1
             return
         self.girl_reject += 1
+        self.female_reject += 1
         code = fx["reject_reason"]
         if code == "no_identity":
             self.girl_reject_no_identity += 1
+            self.no_identity_reject += 1
         elif code == "score_lt_min":
             self.girl_reject_score_lt_min += 1
+            self.no_identity_reject += 1
+        elif code == "ambiguous":
+            self.ambiguous_gender_reject += 1
+            self.girl_reject_other += 1
         elif code == "male":
             self.girl_reject_male += 1
         else:
@@ -713,6 +811,30 @@ class Diagnostics:
                 f"identity={self.girl_identity_true}/{self.girl_identity_true + self.girl_identity_false} "
                 f"no_identity={self.girl_reject_no_identity} "
                 f"score_lt_5={self.girl_reject_score_lt_min}"
+            ),
+            (
+                f"female pass={self.female_pass} reject={self.female_reject} "
+                f"male_explicit={self.male_explicit_reject} "
+                f"male_name={self.male_name_reject} "
+                f"male_username={self.male_username_reject} "
+                f"male_bio={self.male_bio_reject} "
+                f"ambiguous={self.ambiguous_gender_reject} "
+                f"no_identity={self.no_identity_reject}"
+            ),
+            (
+                f"scan new={self.new_listing_seen} old={self.old_listing_seen} "
+                f"depth={self.listing_page_depth_max} "
+                f"cols={self.collections_scanned} "
+                f"elig={self.eligible_collections_scanned} "
+                f"cand={self.new_candidates_summary()}"
+            ),
+            (
+                f"owner sent={self.owner_sent_total} "
+                f"dup={self.owner_duplicate_total} "
+                f"enq={self.owner_dup_enqueue} "
+                f"enrich={self.owner_dup_post_enrich} "
+                f"guard={self.owner_dup_send_guard} "
+                f"no_id={self.owner_id_missing}"
             ),
             (
                 f"username: page={self.username_from_page} "
@@ -793,7 +915,14 @@ class Diagnostics:
                 f"girl: no_identity={self.girl_reject_no_identity} "
                 f"score_below_threshold={self.girl_reject_score_lt_min} "
                 f"male={self.girl_reject_male} "
-                f"other={self.girl_reject_other}"
+                f"other={self.girl_reject_other} "
+                f"female_pass={self.female_pass} female_reject={self.female_reject} "
+                f"male_explicit={self.male_explicit_reject} "
+                f"male_name={self.male_name_reject} "
+                f"male_user={self.male_username_reject} "
+                f"male_bio={self.male_bio_reject} "
+                f"ambig={self.ambiguous_gender_reject} "
+                f"no_id={self.no_identity_reject}"
             ),
             f"dm: paid_dm={self.dm_paid}",
             (

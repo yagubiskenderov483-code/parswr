@@ -22,7 +22,7 @@ _FEMALE_HINT_RE = re.compile(
 )
 _MALE_HINT_RE = re.compile(
     r"(парень|мужчин|мальчик|пацан|boy\b|man\b|he/him|брат|бро\b|bro\b|"
-    r"мужик|дядя)",
+    r"мужик|дядя|батя|папа\b|отец|муж\b|сын\b|dude\b|guy\b)",
     re.IGNORECASE,
 )
 
@@ -36,9 +36,11 @@ _MALE_NAMES_RE = re.compile(
     r"савва|валера|слава|вова|лёша|леша|гоша|костя|артём|артем|макс|рома|"
     r"юра|тима|лёва|лева|сеня|федя|митя|боря|гена|стёпа|степа|кирилл|"
     r"егор|игорь|олег|влад|данил|даниил|андрей|алексей|сергей|павел|"
-    r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
-    r"александр|максим|дмитрий|владимир|николай|михаил|константин|"
-    r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|"
+        r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
+        r"александр|максим|дмитрий|владимир|николай|михаил|константин|"
+        r"данила|никола|саня|жека|толян|гриша|серёжа|сережа|колян|вован|"
+        r"димон|тоха|сашок|"
+        r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|"
     r"andrey|pavel|ilya|vlad|kirill|egor|igor|oleg|denis|anton|timur"
     r")$",
     re.IGNORECASE,
@@ -196,10 +198,16 @@ def _blob(lot: Lot) -> str:
     )
 
 
+def _api_gender_male(lot: Lot) -> bool:
+    g = str(getattr(lot, "api_gender", "") or "").strip().lower()
+    return g in {"male", "m", "man", "1"}
+
+
 def looks_male(lot: Lot) -> bool:
+    """Anti-male gate. Женское имя НЕ освобождает от мужского username/bio/API."""
+    if _api_gender_male(lot):
+        return True
     fn = _first_token(lot.first_name)
-    if fn and is_cyrillic_female_name(fn):
-        return False
     blob = _blob(lot)
     if _MALE_HINT_RE.search(blob) or _MALE_EMOJI_RE.search(blob):
         return True
@@ -207,7 +215,9 @@ def looks_male(lot: Lot) -> bool:
         latin = _latin_only(fn)
         if latin and _MALE_TRANSLIT_RE.match(latin):
             return True
-        if _MALE_NAMES_RE.search(fn) and fn not in _AMBIGUOUS:
+        if _MALE_NAMES_RE.search(fn):
+            return True
+        if _MALE_SHORT_NICK_RE.search(fn):
             return True
         if _CYR_RE.search(fn) and not is_cyrillic_female_name(fn):
             return True
@@ -215,7 +225,7 @@ def looks_male(lot: Lot) -> bool:
             if not fn.endswith(("ия", "ья")):
                 return True
     ln = (lot.last_name or "").strip().lower()
-    if ln.endswith(("ович", "евич", "ич")):
+    if ln.endswith(("ович", "евич", "ич")) and not ln.endswith(("овна", "евна", "ична")):
         return True
     seller = _norm(lot.seller)
     if seller and (_MALE_NAMES_RE.search(seller) or _MALE_TRANSLIT_RE.search(seller)):
@@ -225,6 +235,36 @@ def looks_male(lot: Lot) -> bool:
         if n and (_MALE_NAMES_RE.match(n) or _MALE_TRANSLIT_RE.match(n)):
             return True
     return False
+
+
+def male_reject_reason(lot: Lot) -> str:
+    """Код male-reject без PII. Пусто если не male."""
+    if not looks_male(lot):
+        return ""
+    if _api_gender_male(lot):
+        return "male_explicit"
+    blob = _blob(lot)
+    if _MALE_HINT_RE.search(blob):
+        return "male_bio"
+    if _MALE_EMOJI_RE.search(blob):
+        return "male_explicit"
+    fn = _first_token(lot.first_name)
+    if fn:
+        latin = _latin_only(fn)
+        if latin and _MALE_TRANSLIT_RE.match(latin):
+            return "male_name"
+        if _MALE_NAMES_RE.search(fn) or _MALE_SHORT_NICK_RE.search(fn):
+            return "male_name"
+        if _CYR_RE.search(fn) and not is_cyrillic_female_name(fn):
+            return "male_name"
+    seller = _norm(lot.seller)
+    if seller and (_MALE_NAMES_RE.search(seller) or _MALE_TRANSLIT_RE.search(seller)):
+        return "male_username"
+    for part in re.split(r"[_.\-]+", (lot.seller or "").lower().lstrip("@")):
+        n = _norm(part)
+        if n and (_MALE_NAMES_RE.match(n) or _MALE_TRANSLIT_RE.match(n)):
+            return "male_username"
+    return "male_explicit"
 
 
 def _username_female_name(username: str) -> bool:
@@ -239,72 +279,99 @@ def _username_female_name(username: str) -> bool:
     return False
 
 
+def is_ambiguous_gender(lot: Lot) -> bool:
+    """Саша/Женя без женского отчества/female-name в нике — не девушка."""
+    fn = _first_token(lot.first_name)
+    if not fn or fn not in _AMBIGUOUS:
+        return False
+    ln = (lot.last_name or "").strip().lower()
+    if ln.endswith(("овна", "евна", "ична")):
+        return False
+    if _username_female_name(lot.seller):
+        return False
+    return True
+
+
+def is_empty_profile(lot: Lot) -> bool:
+    if (lot.first_name or "").strip():
+        return False
+    if (lot.last_name or "").strip():
+        return False
+    if (lot.about or "").strip():
+        return False
+    if _username_female_name(lot.seller):
+        return False
+    return True
+
+
 def has_female_identity(lot: Lot) -> bool:
-    """Сильный якорь: женское имя / отчество / женский токен username."""
+    """Сильный якорь: женское имя / отчество / женское имя в токене username.
+
+    girl/queen в нике, эмодзи, подарки, аватар — не якорь.
+    """
     fn = _first_token(lot.first_name)
     if is_cyrillic_female_name(fn) or is_latin_female_name(fn):
         return True
     ln = (lot.last_name or "").strip().lower()
     if ln.endswith(("овна", "евна", "ична")):
         return True
-    if _username_female_name(lot.seller) or _username_female(lot.seller):
+    if _username_female_name(lot.seller):
         return True
     return False
 
 
-def female_reason(lot: Lot) -> str:
-    """Confidence по нескольким сигналам (female_score), не «только имя».
+def female_confident(lot: Lot) -> bool:
+    """Conservative gate: лучше пропустить сомнительную, чем отправить мужчину."""
+    if looks_male(lot):
+        return False
+    if is_ambiguous_gender(lot):
+        return False
+    if is_empty_profile(lot):
+        return False
+    if not has_female_identity(lot):
+        return False
+    return True
 
-    Сильный reject: looks_male.
-    Без identity-якоря (имя/отчество/female nick) — uncertain → reject
-    (bio «девушке можно писать» само по себе не проходит).
-    С якорем: нужен female_score >= GIRL_MIN_SCORE (по умолчанию 5).
-    """
+
+def girl_reject_reason(lot: Lot) -> str:
+    if looks_male(lot):
+        return "male"
+    if is_ambiguous_gender(lot):
+        return "ambiguous"
+    if is_empty_profile(lot) or not has_female_identity(lot):
+        return "no_identity"
+    if female_confident(lot):
+        return "ok"
+    return "no_identity"
+
+
+def female_reason(lot: Lot) -> str:
+    """Сначала anti-male, потом якорь. Эмодзи/подарки/фото не делают девушкой."""
     if looks_male(lot):
         return "мужской"
-    score = female_score(lot)
-    identity = has_female_identity(lot)
-    require_id = bool(getattr(config, "GIRL_REQUIRE_IDENTITY", True))
-    min_score = int(getattr(config, "GIRL_MIN_SCORE", 5))
-    if require_id and not identity:
+    if is_ambiguous_gender(lot):
         return "нет женских признаков"
-    if score < min_score:
+    if not female_confident(lot):
         return "нет женских признаков"
     return ""
 
 
 def female_score(lot: Lot) -> int:
-    """Сколько женских сигналов на профиле (ник, био, канал, подарки, сторис, эмодзи)."""
+    """Текстовые сигналы для логов. Не используется как единственный pass."""
     score = 0
     fn = _first_token(lot.first_name)
     ln = (lot.last_name or "").strip().lower()
     if fn and (is_cyrillic_female_name(fn) or is_latin_female_name(fn)):
-        score += 5  # сильный якорь: женское имя
+        score += 5
     if ln.endswith(("овна", "евна", "ична")):
         score += 4
     if _username_female_name(lot.seller):
-        score += 5  # токен ника = женское имя (masha_nft)
+        score += 5
     elif _username_female(lot.seller):
-        score += 3  # girl/queen/… в нике
+        score += 3
     blob = _blob(lot)
     if _FEMALE_HINT_RE.search(blob):
         score += 3
-    if _FEMALE_EMOJI_RE.search(blob) or _FEMALE_EMOJI_RE.search(lot.first_name or ""):
-        score += 2
-    if lot.emoji_status and _FEMALE_EMOJI_RE.search(lot.emoji_status):
-        score += 1
-    if lot.personal_channel and _FEMALE_HINT_RE.search(lot.personal_channel):
-        score += 1
-    gifts = (lot.gifts_text or "").lower()
-    if gifts:
-        words = set(re.findall(r"[a-zа-яё]{3,}", gifts))
-        if words & _FEMALE_GIFTS:
-            score += 2
-    stories = (lot.stories_text or "").lower()
-    if stories and (_FEMALE_HINT_RE.search(stories) or _FEMALE_EMOJI_RE.search(stories)):
-        score += 2
-    if lot.has_photo and score > 0:
-        score += 1
     return score
 
 

@@ -573,16 +573,29 @@ def apply_listing_floor_filters(
     return kept
 
 
-def record_enqueue_dup(stats: dict[str, int], kind: str) -> None:
-    """kind: listing | seller. Только на enqueue, до worker-фильтров."""
+def record_enqueue_dup(
+    stats: dict[str, int],
+    kind: str,
+    diag: Diagnostics | None = None,
+    *,
+    seen_kind: str | None = None,
+) -> None:
+    """kind: listing | seller. Только на enqueue, до worker-фильтров.
+
+    diag/seen_kind — только диагностика, воронка не меняется.
+    """
     if kind == "listing":
         _bump(stats, "dup_listing")
         _bump(stats, "reject_duplicate_listing")
+        if diag is not None:
+            diag.record_seen_reason(seen_kind or "other")
     elif kind == "seller":
         _bump(stats, "dup_seller")
         _bump(stats, "reject_duplicate_seller")
         _bump(stats, "owner_dup_enqueue")
         _bump(stats, "owner_duplicate")
+        if diag is not None:
+            diag.record_seen_reason("owner")
 
 
 def record_work_in(stats: dict[str, int]) -> None:
@@ -836,11 +849,20 @@ def debug_lot_line(lot: Lot, stage: str, reason: str) -> str:
 
 
 def _record_filter_diagnostics(diag: Diagnostics, lot: Lot, reason: str) -> None:
-    """Логи/счётчики male·ru·girl. Не влияет на решения фильтра."""
+    """Логи/счётчики причин. Не влияет на решения фильтра."""
     if reason in {"дубль", "дубль продавца"}:
+        diag.record_seen_reason("owner")
         return
+    if reason in {"REJECT_BAD_MODEL_VALUE", "floor неизвестен", "floor выше макс"}:
+        return
+    if reason == "цена":
+        diag.record_price_reject(float(lot.stars))
+        return
+
+    # Same stage order as record_worker_filter / filter_lot. Counters only.
     if looks_male(lot) or reason == "мужской":
         log_male_forensics(lot, rejected=True)
+        diag.record_male_reject(lot)
         return
     log_male_forensics(lot, rejected=False)
     ru = is_russian(lot)
@@ -859,6 +881,20 @@ def _record_filter_diagnostics(diag: Diagnostics, lot: Lot, reason: str) -> None
         return
     log_girl_forensics(lot, passed=True)
     diag.record_girl_outcome(lot, passed=True)
+
+    dm = passes_free_dm(lot)
+    if dm is False or reason == "платные ЛС":
+        diag.record_dm_reject()
+        return
+    lvl = passes_level(lot, config.MAX_ACCOUNT_LEVEL)
+    if lvl is False or reason == "level":
+        diag.record_level_outcome(lot, rejected=True)
+        return
+    # Observational: unknown level still passes the filter.
+    diag.record_level_outcome(lot, rejected=False)
+    nfts = passes_nfts(lot, config.MAX_NFTS)
+    if nfts is False or reason == "много NFT":
+        diag.record_nft_reject(lot)
 
 
 class Runtime:
@@ -1003,7 +1039,17 @@ class PostQueue:
                 if lot.id in self._inflight:
                     hit.append("inflight")
                 classify_skip("дубль лота", self.runtime.skip_total)
-                record_enqueue_dup(self.runtime.funnel, "listing")
+                seen_kind = (
+                    "listing"
+                    if (lot.id in self.seen or (lot.slug and lot.slug in self.seen))
+                    else "other"
+                )
+                record_enqueue_dup(
+                    self.runtime.funnel,
+                    "listing",
+                    getattr(self.runtime, "diag", None),
+                    seen_kind=seen_kind,
+                )
                 if config.DEBUG_FILTERS:
                     logger.info(
                         debug_lot_line(
@@ -1024,7 +1070,11 @@ class PostQueue:
                     ",".join(overlap)[:80],
                 )
                 classify_skip("дубль продавца", self.runtime.skip_total)
-                record_enqueue_dup(self.runtime.funnel, "seller")
+                record_enqueue_dup(
+                    self.runtime.funnel,
+                    "seller",
+                    getattr(self.runtime, "diag", None),
+                )
                 diag = getattr(self.runtime, "diag", None)
                 if diag is not None:
                     diag.record_owner_dup(overlap)
@@ -1136,8 +1186,7 @@ class PostQueue:
                     )
                     if config.DEBUG_FILTERS:
                         logger.info(debug_lot_line(lot, "pre-filter", pre))
-                    if pre == "мужской":
-                        log_male_forensics(lot, rejected=True)
+                    _record_filter_diagnostics(self.runtime.diag, lot, pre)
                     record_worker_filter(self.runtime.funnel, lot, pre)
                     _bump(self.runtime.funnel, "worker_filtered")
                     self.seen[lot.id] = now
@@ -1267,6 +1316,7 @@ class PostQueue:
                         diag = getattr(self.runtime, "diag", None)
                         if diag is not None:
                             diag.record_owner_dup(seller_keys(lot))
+                            diag.record_seen_reason("owner")
                     classify_skip(payload, self.runtime.skip_total)
                     _bump(self.runtime.funnel, "worker_filtered")
                     logger.info(
@@ -1547,6 +1597,10 @@ async def scanner_loop(
                         price_ok=price_ok,
                         already_seen=already,
                     )
+                    if price_ok is False:
+                        runtime.diag.record_price_reject(float(lot.stars))
+                    elif already:
+                        runtime.diag.record_seen_reason("listing")
                     if already:
                         seen_skip += 1
             new_page, chunk = fresh_from_page(

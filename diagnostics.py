@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import Any
 
 import config
@@ -36,6 +36,7 @@ from filters import (
     looks_male,
     russian_why,
 )
+from floors import listing_price_range
 from market import Lot
 
 logger = logging.getLogger("diagnostics")
@@ -185,6 +186,86 @@ def girl_signal_list(lot: Lot) -> list[str]:
         signals.append("channel:unavailable")
     return signals
 
+_MALE_REASON_KEYS = (
+    "male_hint",
+    "male_emoji",
+    "male_name_translit",
+    "male_name",
+    "male_username",
+    "male_other",
+)
+
+
+def price_reject_side(stars: float) -> str:
+    """below | above | other. Не меняет фильтр — только классификация."""
+    lo, hi = listing_price_range()
+    val = float(stars)
+    if val < lo:
+        return "below"
+    if val > hi:
+        return "above"
+    return "other"
+
+
+def nft_reject_details(lot: Lot, max_nfts: int | None = None) -> dict[str, Any]:
+    """Разбор NFT-отказа. Логика = passes_nfts, решение фильтра не меняем."""
+    limit = int(config.MAX_NFTS if max_nfts is None else max_nfts)
+    n = lot.gifts_count
+    if n is None:
+        return {
+            "rejects": False,
+            "reason": "unknown_count",
+            "nft_count": None,
+            "nft_limit": limit,
+            "condition": "gifts_count_is_None",
+            "passes": None,
+        }
+    if n > limit:
+        return {
+            "rejects": True,
+            "reason": "count_above_limit",
+            "nft_count": int(n),
+            "nft_limit": limit,
+            "condition": "gifts_count_gt_MAX_NFTS",
+            "passes": False,
+        }
+    return {
+        "rejects": False,
+        "reason": "within_limit",
+        "nft_count": int(n),
+        "nft_limit": limit,
+        "condition": "gifts_count_lte_MAX_NFTS",
+        "passes": True,
+    }
+
+
+def log_nft_reject(lot: Lot, details: dict[str, Any] | None = None) -> None:
+    """INFO без username/PII. listing = цена лота, не id."""
+    info = details or nft_reject_details(lot)
+    floor = getattr(lot, "model_floor", None)
+    if floor is None:
+        floor_s = "UNKNOWN"
+    else:
+        try:
+            floor_s = str(int(floor)) if float(floor).is_integer() else str(floor)
+        except (TypeError, ValueError):
+            floor_s = "UNKNOWN"
+    mid = getattr(lot, "model_id", None)
+    model_s = str(int(mid)) if mid is not None else "UNKNOWN"
+    logger.info(
+        "NFT_REJECT reason=%s listing=%s floor=%s model=%s owner_known=%s "
+        "nft_count=%s nft_limit=%s cond=%s",
+        info.get("reason") or "unknown",
+        int(lot.stars) if lot.stars is not None else 0,
+        floor_s,
+        model_s,
+        "true" if lot.seller_id is not None else "false",
+        info["nft_count"] if info.get("nft_count") is not None else "none",
+        info.get("nft_limit", config.MAX_NFTS),
+        info.get("condition") or "—",
+    )
+
+
 def girl_reject_code(lot: Lot) -> str:
     """Код girl-reject. Порог/логика = female_reason (без изменений)."""
     if looks_male(lot):
@@ -312,6 +393,21 @@ class Diagnostics:
         self.ru_reject_no_cyrillic = 0
         self.ru_reject_no_russian_signal = 0
         self.ru_reject_other = 0
+
+        # Aggregated rejection reasons (instrumentation only — does not change filters)
+        self.price_reject_below = 0
+        self.price_reject_above = 0
+        self.seen_listing = 0
+        self.seen_owner = 0
+        self.seen_other = 0
+        self.male_reject_reasons: Counter[str] = Counter()
+        self.dm_paid = 0
+        self.level_above_limit = 0
+        self.level_unknown = 0
+        self.nft_reject_reasons: Counter[str] = Counter()
+        self.nft_reject_counts: Counter[int] = Counter()
+        self.nft_reject_conditions: Counter[str] = Counter()
+        self.nft_limit_last: int | None = None
 
         self.girl_pass = 0
         self.girl_reject = 0
@@ -489,6 +585,51 @@ class Diagnostics:
     def send_p50(self) -> float | None:
         return percentile(list(self.send_ms_samples), 50)
 
+    def record_price_reject(self, stars: float) -> None:
+        side = price_reject_side(stars)
+        if side == "below":
+            self.price_reject_below += 1
+        elif side == "above":
+            self.price_reject_above += 1
+
+    def record_seen_reason(self, kind: str) -> None:
+        if kind == "listing":
+            self.seen_listing += 1
+        elif kind == "owner":
+            self.seen_owner += 1
+        else:
+            self.seen_other += 1
+
+    def record_male_reject(self, lot: Lot) -> None:
+        code = male_diag_reason(lot)
+        if code == "pass":
+            code = "male_other"
+        self.male_reject_reasons[code] += 1
+
+    def record_dm_reject(self) -> None:
+        self.dm_paid += 1
+
+    def record_level_outcome(self, lot: Lot, *, rejected: bool) -> None:
+        """Observational. unknown_level does not mean the filter rejected."""
+        if rejected:
+            self.level_above_limit += 1
+            return
+        if lot.account_level is None:
+            self.level_unknown += 1
+
+    def record_nft_reject(self, lot: Lot) -> None:
+        info = nft_reject_details(lot)
+        reason = str(info.get("reason") or "other")
+        self.nft_reject_reasons[reason] += 1
+        n = info.get("nft_count")
+        if n is not None:
+            self.nft_reject_counts[int(n)] += 1
+        limit = int(info.get("nft_limit") or config.MAX_NFTS)
+        self.nft_limit_last = limit
+        cond = str(info.get("condition") or "other")
+        self.nft_reject_conditions[cond] += 1
+        log_nft_reject(lot, info)
+
     def record_ru_reject(self, lot: Lot) -> None:
         code = russian_reject_code(lot)
         if code == "foreign_lang":
@@ -604,3 +745,63 @@ class Diagnostics:
             ),
         ]
         return lines
+
+    def rejection_reason_lines(self) -> list[str]:
+        """HTML-safe lines for /status REJECTION REASONS. No raw '<'."""
+        male_s = " ".join(
+            f"{k}={self.male_reject_reasons.get(k, 0)}" for k in _MALE_REASON_KEYS
+        )
+        nft_reason_s = (
+            " ".join(
+                f"{k}={v}"
+                for k, v in sorted(self.nft_reject_reasons.items())
+            )
+            or "none=0"
+        )
+        if self.nft_reject_counts:
+            nft_count_s = ",".join(
+                f"{n}x{c}" for n, c in sorted(self.nft_reject_counts.items())
+            )
+        else:
+            nft_count_s = "—"
+        nft_limit_s = (
+            str(self.nft_limit_last)
+            if self.nft_limit_last is not None
+            else str(int(config.MAX_NFTS))
+        )
+        if self.nft_reject_conditions:
+            nft_cond_s = ",".join(
+                f"{k}={v}"
+                for k, v in sorted(self.nft_reject_conditions.items())
+            )
+        else:
+            nft_cond_s = "—"
+        return [
+            f"price: below={self.price_reject_below} above={self.price_reject_above}",
+            (
+                f"seen: listing={self.seen_listing} "
+                f"owner={self.seen_owner} other={self.seen_other}"
+            ),
+            f"male: {male_s}",
+            (
+                f"ru: no_cyrillic={self.ru_reject_no_cyrillic} "
+                f"no_russian_signal={self.ru_reject_no_russian_signal} "
+                f"foreign={self.ru_reject_foreign_lang} "
+                f"other={self.ru_reject_other}"
+            ),
+            (
+                f"girl: no_identity={self.girl_reject_no_identity} "
+                f"score_below_threshold={self.girl_reject_score_lt_min} "
+                f"male={self.girl_reject_male} "
+                f"other={self.girl_reject_other}"
+            ),
+            f"dm: paid_dm={self.dm_paid}",
+            (
+                f"level: above_limit={self.level_above_limit} "
+                f"unknown_level={self.level_unknown}"
+            ),
+            (
+                f"nft: {nft_reason_s} nft_count={nft_count_s} "
+                f"nft_limit={nft_limit_s} cond={nft_cond_s}"
+            ),
+        ]

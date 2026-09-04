@@ -390,8 +390,10 @@ class ControlBot:
                         f"missing={diag.owner_id_missing}",
                         f"sent={fn.get('owner_sent_persisted', 0)}",
                         f"duplicate={fn.get('owner_duplicate', 0)}",
+                        "REJECTION REASONS",
                     ]
                 )
+                lines.extend(_esc(line) for line in diag.rejection_reason_lines())
                 lines.append("DIAGNOSTICS")
                 # HTML parse_mode: экранируем динамику (< в score<5 ломало Telegram)
                 lines.extend(_esc(line) for line in diag.status_lines())

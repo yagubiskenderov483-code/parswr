@@ -1368,6 +1368,11 @@ def test_status_html_safe_diagnostics() -> None:
     assert "collections_eligible=" in text
     assert "bad_model_value=" in text
     assert "OWNER" in text
+    assert "REJECTION REASONS" in text
+    assert "score_below_threshold=" in text
+    assert "paid_dm=" in text
+    assert "gifts_count_gt" not in text or "gifts_count_gt_MAX_NFTS" in text
+    assert "score<" not in text
 
 
 def test_listing_vs_model_floor_split() -> None:
@@ -1629,6 +1634,292 @@ def test_config_floor_thresholds_from_env_defaults() -> None:
     assert config.PAGE_LIMIT == 12
 
 
+def test_price_reject_below_and_above() -> None:
+    from diagnostics import Diagnostics, price_reject_side
+
+    assert price_reject_side(config.MIN_STARS - 1) == "below"
+    assert price_reject_side(config.MAX_STARS + 1) == "above"
+    assert price_reject_side(8000) == "other"
+    d = Diagnostics()
+    d.record_price_reject(100)
+    d.record_price_reject(80_000)
+    d.record_price_reject(8000)
+    assert d.price_reject_below == 1
+    assert d.price_reject_above == 1
+    lines = "\n".join(d.rejection_reason_lines())
+    assert "price: below=1 above=1" in lines
+    assert "<" not in lines
+
+
+def test_seen_reject_listing_owner_other() -> None:
+    from diagnostics import Diagnostics
+    from tracker import empty_funnel, record_enqueue_dup
+
+    d = Diagnostics()
+    d.record_seen_reason("listing")
+    d.record_seen_reason("listing")
+    fn = empty_funnel()
+    record_enqueue_dup(fn, "seller", d)
+    record_enqueue_dup(fn, "listing", d, seen_kind="other")
+    assert d.seen_listing == 2
+    assert d.seen_owner == 1
+    assert d.seen_other == 1
+    assert fn["dup_seller"] == 1
+    assert fn["dup_listing"] == 1
+    lines = "\n".join(d.rejection_reason_lines())
+    assert "seen: listing=2 owner=1 other=1" in lines
+
+
+def test_male_ru_girl_dm_level_reject_reasons() -> None:
+    from diagnostics import Diagnostics
+    from tracker import _record_filter_diagnostics, empty_funnel, record_worker_filter
+
+    d = Diagnostics()
+    fn = empty_funnel()
+    male = _lot(first_name="Алексей", seller="lexa")
+    _record_filter_diagnostics(d, male, "мужской")
+    record_worker_filter(fn, male, "мужской")
+    assert d.male_reject_reasons["male_name"] >= 1
+    assert fn["male_reject"] == 1
+    assert fn["ru_checked"] == 0
+
+    foreign = _lot(lang_code="fa", first_name="Shop", about="store", seller="gift_market_fa")
+    _record_filter_diagnostics(d, foreign, "не русский")
+    record_worker_filter(fn, foreign, "не русский")
+    assert d.ru_reject_foreign_lang == 1
+
+    no_cyr = _lot(first_name="GiftShop", last_name="", about="best deals", seller="shop99")
+    _record_filter_diagnostics(d, no_cyr, "не русский")
+    record_worker_filter(fn, no_cyr, "не русский")
+    assert d.ru_reject_no_cyrillic == 1
+
+    no_id = _lot(
+        first_name="Seller",
+        last_name="",
+        seller="nft_market",
+        about="привет 💅",
+        has_photo=True,
+        emoji_status="",
+        gifts_text="",
+        stories_text="",
+        personal_channel="",
+    )
+    _record_filter_diagnostics(d, no_id, "нет женских признаков")
+    record_worker_filter(fn, no_id, "нет женских признаков")
+    assert d.girl_reject_no_identity == 1
+
+    paid = _lot(first_name="Мария", free_dm=False, paid_dm_stars=50)
+    _record_filter_diagnostics(d, paid, "платные ЛС")
+    record_worker_filter(fn, paid, "платные ЛС")
+    assert d.dm_paid == 1
+    assert fn["dm_reject"] == 1
+    assert fn["nft_checked"] == 0
+
+    high = _lot(first_name="Мария", account_level=5)
+    _record_filter_diagnostics(d, high, "level")
+    record_worker_filter(fn, high, "level")
+    assert d.level_above_limit == 1
+    assert fn["level_reject"] == 1
+    assert fn["nft_pass"] == 0
+
+    unknown = _lot(first_name="Мария", account_level=None)
+    assert filter_lot(
+        unknown,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    ) == ""
+    fn2 = empty_funnel()
+    d2 = Diagnostics()
+    _record_filter_diagnostics(d2, unknown, "")
+    record_worker_filter(fn2, unknown, "")
+    assert d2.level_unknown == 1
+    assert d2.level_above_limit == 0
+    assert fn2["level_pass"] == 1
+    assert fn2["level_reject"] == 0
+    assert fn2["nft_pass"] == 1
+
+    lines = "\n".join(d.rejection_reason_lines())
+    assert "foreign=1" in lines
+    assert "no_cyrillic=1" in lines
+    assert "no_identity=1" in lines
+    assert "score_below_threshold=" in lines
+    assert "paid_dm=1" in lines
+    assert "above_limit=1" in lines
+    assert "<" not in lines
+
+
+def test_nft_reject_reason_count_limit_and_log() -> None:
+    import logging
+
+    from diagnostics import Diagnostics, nft_reject_details
+    from filters import passes_nfts
+    from tracker import _record_filter_diagnostics, empty_funnel, record_worker_filter
+
+    over = _lot(
+        first_name="Мария",
+        gifts_count=7,
+        stars=8000,
+        model_id=4242,
+        model_floor=6200.0,
+        seller="maria_ok",
+        seller_id=111,
+    )
+    assert passes_nfts(over, config.MAX_NFTS) is False
+    assert filter_lot(
+        over,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    ) == "много NFT"
+    info = nft_reject_details(over)
+    assert info["rejects"] is True
+    assert info["reason"] == "count_above_limit"
+    assert info["nft_count"] == 7
+    assert info["nft_limit"] == config.MAX_NFTS
+    assert info["condition"] == "gifts_count_gt_MAX_NFTS"
+
+    unknown = _lot(first_name="Мария", gifts_count=None)
+    assert passes_nfts(unknown, config.MAX_NFTS) is None
+    assert filter_lot(
+        unknown,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    ) == ""
+    uinfo = nft_reject_details(unknown)
+    assert uinfo["rejects"] is False
+    assert uinfo["reason"] == "unknown_count"
+
+    ok = _lot(first_name="Мария", gifts_count=6)
+    assert passes_nfts(ok, config.MAX_NFTS) is True
+
+    d = Diagnostics()
+    fn = empty_funnel()
+    records: list[logging.LogRecord] = []
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    h = _H()
+    h.setLevel(logging.INFO)
+    log = logging.getLogger("diagnostics")
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+    try:
+        _record_filter_diagnostics(d, over, "много NFT")
+        record_worker_filter(fn, over, "много NFT")
+    finally:
+        log.removeHandler(h)
+
+    assert fn["nft_reject"] == 1
+    assert fn["nft_pass"] == 0
+    assert d.nft_reject_reasons["count_above_limit"] == 1
+    assert d.nft_reject_counts[7] == 1
+    assert d.nft_limit_last == 6
+    assert d.nft_reject_conditions["gifts_count_gt_MAX_NFTS"] == 1
+    msgs = [r.getMessage() for r in records]
+    nft_logs = [m for m in msgs if m.startswith("NFT_REJECT ")]
+    assert len(nft_logs) == 1
+    msg = nft_logs[0]
+    assert "reason=count_above_limit" in msg
+    assert "listing=8000" in msg
+    assert "floor=6200" in msg
+    assert "model=4242" in msg
+    assert "owner_known=true" in msg
+    assert "nft_count=7" in msg
+    assert "nft_limit=6" in msg
+    assert "cond=gifts_count_gt_MAX_NFTS" in msg
+    assert "maria_ok" not in msg
+    assert "Мария" not in msg
+    assert "@" not in msg
+    lines = "\n".join(d.rejection_reason_lines())
+    assert "count_above_limit=1" in lines
+    assert "nft_count=7x1" in lines
+    assert "nft_limit=6" in lines
+    assert "gifts_count_gt_MAX_NFTS" in lines
+    assert "<" not in lines
+    hidden = _lot(
+        first_name="Мария",
+        gifts_count=12,
+        stars=9000,
+        model_id=None,
+        model_floor=None,
+        seller="",
+        seller_id=None,
+    )
+    d.record_nft_reject(hidden)
+    assert d.nft_reject_counts[12] == 1
+    lines2 = "\n".join(d.rejection_reason_lines())
+    assert "nft_count=7x1,12x1" in lines2
+
+
+def test_status_rejection_reasons_section() -> None:
+    import re
+
+    from bot import ControlBot
+    from tracker import Runtime, _record_filter_diagnostics
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = True
+    rt.snapshot = 10
+    rt.passes = 1
+    rt.collections = 151
+    rt.funnel["fresh_detected"] = 10
+    rt.funnel["fresh"] = 10
+    d = rt.diag
+    d.record_price_reject(100)
+    d.record_price_reject(99_000)
+    d.record_seen_reason("listing")
+    nft = _lot(first_name="Мария", gifts_count=9, stars=7777, model_id=1, model_floor=5000)
+    _record_filter_diagnostics(d, nft, "много NFT")
+    text = ControlBot._status_text(ctrl)
+    assert "REJECTION REASONS" in text
+    assert "price: below=1 above=1" in text
+    assert "seen: listing=1" in text
+    assert "count_above_limit=1" in text
+    assert "nft_limit=6" in text
+    assert "score_below_threshold=" in text
+    assert "paid_dm=" in text
+    assert "score<" not in text
+    assert re.search(r"<\d", text) is None
+
+
+def test_rejection_diagnostics_do_not_change_filters() -> None:
+    """Счётчики причин не ослабляют и не меняют filter_lot / passes_*."""
+    from filters import passes_free_dm, passes_level, passes_nfts
+
+    girl = _lot(first_name="Мария", gifts_count=4, account_level=1, free_dm=True)
+    assert filter_lot(
+        girl,
+        min_stars=config.MIN_STARS,
+        max_stars=config.MAX_STARS,
+        max_level=config.MAX_ACCOUNT_LEVEL,
+        max_nfts=config.MAX_NFTS,
+    ) == ""
+    assert passes_nfts(girl, 6) is True
+    assert passes_level(girl, 2) is True
+    assert passes_free_dm(girl) is True
+    none_nft = _lot(first_name="Мария", gifts_count=None)
+    assert passes_nfts(none_nft, 6) is None
+    none_lvl = _lot(first_name="Мария", account_level=None)
+    assert passes_level(none_lvl, 2) is None
+    paid = _lot(first_name="Мария", free_dm=False)
+    assert passes_free_dm(paid) is False
+    over = _lot(first_name="Мария", gifts_count=7)
+    assert passes_nfts(over, 6) is False
+    hi = _lot(first_name="Мария", account_level=3)
+    assert passes_level(hi, 2) is False
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -1719,6 +2010,12 @@ def main() -> None:
         test_owner_id_missing_reason,
         test_fresh_from_page_semantics_unchanged_v510,
         test_config_floor_thresholds_from_env_defaults,
+        test_price_reject_below_and_above,
+        test_seen_reject_listing_owner_other,
+        test_male_ru_girl_dm_level_reject_reasons,
+        test_nft_reject_reason_count_limit_and_log,
+        test_status_rejection_reasons_section,
+        test_rejection_diagnostics_do_not_change_filters,
     ]
     for fn in tests:
         fn()

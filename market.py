@@ -172,6 +172,7 @@ class Lot:
     username_source: str = ""
     model_id: int | None = None
     model_floor: float | None = None  # None = UNKNOWN; не выдумываем
+    api_gender: str = ""  # male/female из API, если есть; иначе ""
 
     @property
     def nft_url(self) -> str:
@@ -262,6 +263,33 @@ def _emoji_status_text(user: Any) -> str:
     return type(st).__name__
 
 
+def _user_api_gender(user: Any) -> str:
+    """Telegram gender, если слой API его отдаёт. Иначе пусто — не выдумываем."""
+    raw = getattr(user, "gender", None)
+    if raw is None:
+        raw = getattr(user, "sex", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, int):
+        if raw == 1:
+            return "male"
+        if raw == 2:
+            return "female"
+        return ""
+    s = str(raw).strip().lower()
+    name = type(raw).__name__.lower()
+    blob = f"{s} {name}"
+    if any(x in blob for x in ("male", "man")) and "female" not in blob:
+        return "male"
+    if "female" in blob or "woman" in blob:
+        return "female"
+    if s in {"m", "1"}:
+        return "male"
+    if s in {"f", "2"}:
+        return "female"
+    return ""
+
+
 def fill_user(lot: Lot, user: Any, *, username_source: str = "") -> None:
     username = _username_of(user)
     if username:
@@ -303,6 +331,9 @@ def fill_user(lot: Lot, user: Any, *, username_source: str = "") -> None:
             if paid is not None:
                 lot.paid_dm_stars = paid
                 lot.free_dm = paid <= 0
+    g = _user_api_gender(user)
+    if g:
+        lot.api_gender = g
 
 
 def _extract_stars(gift: Any) -> float | None:
@@ -462,6 +493,8 @@ class TelegramMarket:
         self.floors = FloorCatalog(config.floor_cache_path())
         self.floors.load()
         self.scan_ids: list[int] = []
+        self._model_cursors: dict[int, int] = {}
+        self.last_next_offset = ""
 
     @contextmanager
     def rpc_kind(self, kind: str) -> Iterator[None]:
@@ -741,6 +774,22 @@ class TelegramMarket:
         self._cursor = (self._cursor + take) % total
         return batch
 
+    def next_model_chunk(
+        self, gift_id: int, model_ids: list[int], chunk: int
+    ) -> list[int]:
+        """Ротация eligible model_id коллекции. chunk<=0 → все модели."""
+        models = [int(x) for x in model_ids if int(x) > 0]
+        if not models:
+            return []
+        n = int(chunk)
+        if n <= 0 or n >= len(models):
+            return list(models)
+        cur = int(self._model_cursors.get(int(gift_id), 0) or 0)
+        take = min(n, len(models))
+        out = [models[(cur + i) % len(models)] for i in range(take)]
+        self._model_cursors[int(gift_id)] = (cur + take) % len(models)
+        return out
+
     async def fetch_page(
         self,
         gift_id: int,
@@ -779,13 +828,87 @@ class TelegramMarket:
             )
         if result is None:
             self.last_fetch_ok = False
+            self.last_next_offset = ""
             return []
+        self.last_next_offset = str(getattr(result, "next_offset", "") or "")
         lots = parse_result(result)
         for lot in lots:
             lot.collection_id = int(gift_id)
             if lot.model_id is not None:
                 lot.model_floor = self.floors.get_floor(int(gift_id), int(lot.model_id))
         return lots
+
+    async def fetch_newest_until_known(
+        self,
+        gift_id: int,
+        *,
+        model_ids: list[int] | None,
+        known_ids: set[str],
+        seen: dict[str, float] | set[str],
+        max_pages: int = 2,
+        limit: int = 12,
+        timeout: float = 8.0,
+        gap: float = 0.02,
+    ) -> tuple[list[Lot], dict[str, Any]]:
+        """Newest pages с model filter. Стоп, если страница вся известна.
+
+        Не поднимает RPC_CONCURRENCY. max_pages ограничивает FloodWait.
+        """
+        offset = ""
+        collected: list[Lot] = []
+        seen_ids: set[str] = set()
+        new_n = 0
+        old_n = 0
+        pages_n = 0
+        depths: dict[str, int] = {}
+        cap = max(1, int(max_pages))
+        page_lim = max(1, int(limit))
+
+        def _old(lot: Lot) -> bool:
+            if lot.id in known_ids or lot.id in seen:
+                return True
+            if lot.slug and lot.slug in seen:
+                return True
+            return False
+
+        for _page in range(cap):
+            lots = await self.fetch_page(
+                gift_id,
+                limit=page_lim,
+                timeout=timeout,
+                gap=gap,
+                sort_by_price=False,
+                offset=offset,
+                model_ids=model_ids,
+            )
+            pages_n += 1
+            if not lots:
+                break
+            unknown = 0
+            for i, lot in enumerate(lots):
+                if lot.id in seen_ids:
+                    continue
+                seen_ids.add(lot.id)
+                depths[lot.id] = (_page * page_lim) + i
+                if _old(lot):
+                    old_n += 1
+                else:
+                    new_n += 1
+                    unknown += 1
+                collected.append(lot)
+            if unknown == 0:
+                break
+            nxt = str(self.last_next_offset or "")
+            if not nxt or nxt == offset:
+                break
+            offset = nxt
+        return collected, {
+            "pages": pages_n,
+            "new": new_n,
+            "old": old_n,
+            "depths": depths,
+            "models": len(model_ids or []),
+        }
 
     async def fetch_in_range(
         self,

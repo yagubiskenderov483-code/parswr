@@ -52,30 +52,34 @@ MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
 MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
 POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал, не scan round
 
-# Женский confidence: имя даёт 4; нужен ≥5 (имя+фото/био/emoji/…)
+# Женский gate: якорь имени/отчества/female-name в нике. Эмодзи/фото/подарки не пол.
 GIRL_MIN_SCORE = env_int("GIRL_MIN_SCORE", 5)
-# Без якоря (женское имя / отчество / female username) — reject (uncertain)
 GIRL_REQUIRE_IDENTITY = True
 
 TON_RATE = 0.0102
 TZ_OFFSET = 3.0  # МСК
 
 POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
-PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest
+PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest одной model-chunk страницы
 SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
 # Кольцо коллекций. Default = один wave SCAN_PARALLEL (не магическое 36/48).
 # SCAN_BATCH=0 — все коллекции за round (legacy shuffle). Env переопределяет.
 SCAN_BATCH = env_int("SCAN_BATCH", SCAN_PARALLEL)
-# Реальный in-flight GetResaleStarGifts. Было 2; 12 = 6× нагрузка.
-# Default 4 = 2× текущей, не выше SCAN_PARALLEL.
+# Реальный in-flight GetResaleStarGifts. Не поднимаем ради «быстрее» — FloodWait.
 RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 4), SCAN_PARALLEL))
+# Model-aware: за визит коллекции — chunk eligible model_id, не все сразу.
+SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 6)
+# Пагинация newest до страницы из известных id. 2 = глубже top-12 без шторма RPC.
+SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
+# Накопленный снимок id коллекции (не только последние 12) — меньше ложных fresh.
+PAGE_SNAPSHOT_KEEP = env_int("PAGE_SNAPSHOT_KEEP", 80)
 REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
 # 4s на GetResaleStarGifts давало retry-шторм (to≈90). 8s — тот же RPC, меньше таймаутов.
 REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.10.0"
+TRACKER_VERSION = "5.11.0"
 DEBUG_FILTERS = True
 BASE_DIR = Path(__file__).resolve().parent
 

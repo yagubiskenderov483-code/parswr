@@ -197,7 +197,10 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.10.0"
+    assert config.TRACKER_VERSION == "5.11.0"
+    assert config.SCAN_MODEL_CHUNK == 6
+    assert config.SCAN_MAX_PAGES == 2
+    assert config.PAGE_SNAPSHOT_KEEP == 80
     assert config.MIN_MODEL_FLOOR == 4000
     assert config.MAX_MODEL_FLOOR == 27000
     assert config.MIN_COLLECTIONS == 50
@@ -838,6 +841,9 @@ def test_girl_forensics_no_identity_and_pass() -> None:
     assert d.girl_pass == 1
     assert d.girl_reject_no_identity == 1
     assert d.girl_identity_false == 1
+    assert d.female_pass == 1
+    assert d.no_identity_reject == 1
+    assert fx2["female_confident"] is True
 
 
 def test_username_and_floodwait_split() -> None:
@@ -897,6 +903,22 @@ def test_fill_user_sets_username_source() -> None:
     assert lot.username_source == "resale_user"
     fill_user(lot, user, username_source="get_entity")
     assert lot.username_source == "resale_user"  # first wins
+    male_user = SimpleNamespace(
+        id=2,
+        username="ivan",
+        first_name="Иван",
+        last_name="",
+        premium=False,
+        lang_code="",
+        photo=None,
+        emoji_status=None,
+        stars_rating=None,
+        usernames=None,
+        gender="male",
+    )
+    male_lot = _lot(seller="")
+    fill_user(male_lot, male_user, username_source="resale_user")
+    assert male_lot.api_gender == "male"
 
 
 def test_extract_owner_user_id_peer_and_raw_int() -> None:
@@ -1623,7 +1645,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.10.0"
+    assert config.TRACKER_VERSION == "5.11.0"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -1920,6 +1942,337 @@ def test_rejection_diagnostics_do_not_change_filters() -> None:
     assert passes_level(hi, 2) is False
 
 
+def test_model_chunk_rotates_eligible_models() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    market._model_cursors = {}
+    models = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    a = market.next_model_chunk(7, models, 3)
+    b = market.next_model_chunk(7, models, 3)
+    c = market.next_model_chunk(7, models, 3)
+    assert a == [10, 20, 30]
+    assert b == [40, 50, 60]
+    assert c == [70, 80, 90]
+    d = market.next_model_chunk(7, models, 3)
+    assert d == [10, 20, 30]
+    all_models = market.next_model_chunk(8, models, 0)
+    assert all_models == models
+
+
+def test_fetch_newest_stops_when_page_all_known() -> None:
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0}
+
+    async def fp(*_a, **_k):
+        calls["n"] += 1
+        m.last_next_offset = "p2"
+        if calls["n"] == 1:
+            return [_lot(id="a", stars=8000), _lot(id="b", stars=8000)]
+        return [_lot(id="c", stars=8000)]
+
+    m.fetch_page = fp
+    m.last_next_offset = ""
+
+    async def run():
+        return await TelegramMarket.fetch_newest_until_known(
+            m,
+            1,
+            model_ids=[11],
+            known_ids={"a", "b"},
+            seen={},
+            max_pages=3,
+            limit=12,
+        )
+
+    lots, meta = asyncio.run(run())
+    assert calls["n"] == 1
+    assert meta["pages"] == 1
+    assert meta["old"] == 2
+    assert meta["new"] == 0
+    assert [x.id for x in lots] == ["a", "b"]
+
+
+def test_fetch_newest_depth_beyond_page_limit_can_be_new() -> None:
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0}
+
+    async def fp(*_a, offset="", **_k):
+        calls["n"] += 1
+        if not offset:
+            m.last_next_offset = "p2"
+            return [_lot(id=f"k{i}", stars=8000) for i in range(11)] + [
+                _lot(id="new0", stars=8000)
+            ]
+        m.last_next_offset = ""
+        return [_lot(id="new12", stars=9000)] + [
+            _lot(id=f"z{i}", stars=8000) for i in range(11)
+        ]
+
+    m.fetch_page = fp
+    m.last_next_offset = ""
+    known = {f"k{i}" for i in range(11)} | {f"z{i}" for i in range(11)}
+
+    async def run():
+        return await TelegramMarket.fetch_newest_until_known(
+            m,
+            1,
+            model_ids=[22],
+            known_ids=known,
+            seen={},
+            max_pages=2,
+            limit=12,
+        )
+
+    lots, meta = asyncio.run(run())
+    assert calls["n"] == 2
+    assert meta["pages"] == 2
+    assert meta["new"] == 2
+    assert meta["depths"]["new12"] >= 12
+    assert "new12" in {x.id for x in lots}
+
+
+def test_merge_page_snapshot_keeps_more_than_top12() -> None:
+    from tracker import merge_page_snapshot
+
+    prev = [f"old{i}" for i in range(20)]
+    page = [f"new{i}" for i in range(12)]
+    out = merge_page_snapshot(prev, page, keep=80)
+    assert len(out) == 32
+    assert out[:12] == page
+    assert "old0" in out
+    lots = [_lot(id="old0", stars=8000), _lot(id="brand_new", stars=8000)]
+    _, fresh = fresh_from_page(out, lots, {}, config.MIN_STARS, config.MAX_STARS)
+    assert [x.id for x in fresh] == ["brand_new"]
+
+
+def test_scan_discovery_metrics_show_where_new_listings_go() -> None:
+    from diagnostics import Diagnostics
+
+    d = Diagnostics()
+    d.record_scan_discovery(
+        101,
+        new_n=3,
+        old_n=9,
+        pages=2,
+        models=6,
+        fresh_candidates=2,
+        depths={"a": 0, "b": 4, "c": 15},
+        eligible=True,
+    )
+    d.note_new_candidates(101, 1)
+    assert d.new_listing_seen == 3
+    assert d.old_listing_seen == 9
+    assert d.listing_page_depth_max == 15
+    assert d.collections_scanned == 1
+    assert d.eligible_collections_scanned == 1
+    assert d.new_candidates_per_collection["101"] == 3
+    summary = d.new_candidates_summary()
+    assert "n=3" in summary
+    assert "<" not in summary
+
+
+def test_same_owner_simultaneous_workers_only_one_send() -> None:
+    import threading
+
+    from tracker import claim_owner_for_send
+
+    seen: dict[str, float] = {}
+    results: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def worker(lot: Lot) -> None:
+        barrier.wait()
+        results.append(claim_owner_for_send(lot, seen))
+
+    a = _lot(id="nft1", slug="A-1", seller="ann", seller_id=123)
+    b = _lot(id="nft2", slug="B-1", seller="ann_new", seller_id=123)
+    t1 = threading.Thread(target=worker, args=(a,))
+    t2 = threading.Thread(target=worker, args=(b,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert results.count("") == 1
+    assert results.count("дубль продавца") == 1
+    assert "id:123" in seen
+
+
+def test_same_owner_restart_second_nft_blocked() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from tracker import (
+        claim_owner_for_send,
+        persist_sent_owner,
+        reload_seen_sellers,
+        save_state,
+    )
+
+    first = _lot(id="nft1", slug="A-1", seller="ann", seller_id=777)
+    second = _lot(id="nft2", slug="B-1", seller="hidden", seller_id=777)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        seen: dict[str, float] = {}
+        assert claim_owner_for_send(first, seen) == ""
+        persist_sent_owner(seen, first)
+        save_state(path, {"seen": {}, "seen_sellers": seen, "market_ids": []})
+        restored: dict[str, float] = {}
+        reload_seen_sellers(path, restored)
+        assert claim_owner_for_send(second, restored) == "дубль продавца"
+
+
+def test_female_gate_rejects_male_name_plus_female_emoji() -> None:
+    from filters import female_confident, girl_reject_reason, male_reject_reason
+
+    lot = _lot(first_name="Алексей", about="💅🎀💖", seller="lexa_shop", has_photo=True)
+    assert looks_male(lot) is True
+    assert female_confident(lot) is False
+    assert is_girl(lot) is False
+    assert male_reject_reason(lot) == "male_name"
+    assert girl_reject_reason(lot) == "male"
+
+
+def test_female_gate_rejects_male_username_plus_female_bio() -> None:
+    from filters import female_confident, male_reject_reason
+
+    lot = _lot(
+        first_name="Shop",
+        about="девушка pink 💅",
+        seller="ivan_nft",
+        gifts_text="Rose Heart",
+        has_photo=True,
+    )
+    assert looks_male(lot) is True
+    assert female_confident(lot) is False
+    assert is_girl(lot) is False
+    assert male_reject_reason(lot) == "male_username"
+
+
+def test_female_gate_rejects_danila_despite_a_ending() -> None:
+    from filters import female_confident
+
+    lot = _lot(first_name="Данила", about="🎀 девушка", seller="danila_gift")
+    assert looks_male(lot) is True
+    assert female_confident(lot) is False
+    assert is_girl(lot) is False
+
+
+def test_female_gate_rejects_male_plus_devushka_word() -> None:
+    lot = _lot(first_name="Никита", about="девушка, пишите", seller="nikita")
+    assert looks_male(lot) is True
+    assert is_girl(lot) is False
+
+
+def test_female_gate_rejects_gifts_emoji_photo_only() -> None:
+    from filters import female_confident
+
+    lot = _lot(
+        first_name="Lee",
+        last_name="",
+        about="",
+        seller="lee_shop",
+        gifts_text="Rose Heart Perfume Bouquet",
+        stories_text="🌸",
+        has_photo=True,
+        emoji_status="💅",
+    )
+    assert looks_male(lot) is False
+    assert female_confident(lot) is False
+    assert is_girl(lot) is False
+
+
+def test_female_gate_rejects_empty_and_latin_nickname() -> None:
+    from filters import female_confident, girl_reject_reason
+
+    empty = _lot(first_name="", last_name="", about="", seller="xx_store")
+    empty.first_name = ""
+    empty.about = ""
+    assert female_confident(empty) is False
+    assert girl_reject_reason(empty) == "no_identity"
+    nick = _lot(first_name="Sunny", about="hi", seller="sunny_xx", lang_code="")
+    assert looks_male(nick) is False
+    assert female_confident(nick) is False
+    assert is_girl(nick) is False
+
+
+def test_female_gate_rejects_ambiguous_sasha() -> None:
+    from filters import female_confident, girl_reject_reason
+
+    lot = _lot(first_name="Саша", about="торгую гифтами 💅", seller="sasha_nft")
+    assert is_girl(lot) is False
+    assert female_confident(lot) is False
+    assert girl_reject_reason(lot) in {"male", "ambiguous"}
+
+
+def test_female_gate_api_gender_male_overrides_female_name() -> None:
+    from filters import female_confident, male_reject_reason
+
+    lot = _lot(first_name="Мария", about="привет", seller="masha_nft")
+    lot.api_gender = "male"
+    assert looks_male(lot) is True
+    assert female_confident(lot) is False
+    assert is_girl(lot) is False
+    assert male_reject_reason(lot) == "male_explicit"
+
+
+def test_female_gate_keeps_confident_maria() -> None:
+    from filters import female_confident, girl_reject_reason
+
+    lot = _lot()
+    assert female_confident(lot) is True
+    assert is_girl(lot) is True
+    assert girl_reject_reason(lot) == "ok"
+
+
+def test_status_includes_scan_owner_female_metrics() -> None:
+    from bot import ControlBot
+    from tracker import Runtime
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = True
+    rt.funnel["fresh_detected"] = 1
+    rt.funnel["fresh"] = 1
+    rt.funnel["new_listing_seen"] = 4
+    rt.funnel["old_listing_seen"] = 12
+    rt.funnel["listing_page_depth"] = 15
+    rt.funnel["collections_scanned"] = 8
+    rt.funnel["eligible_collections_scanned"] = 6
+    rt.funnel["owner_sent_total"] = 1
+    rt.funnel["owner_duplicate_total"] = 2
+    rt.funnel["owner_dup_enqueue"] = 1
+    rt.funnel["owner_dup_post_enrich"] = 1
+    rt.funnel["owner_dup_send_guard"] = 0
+    rt.funnel["owner_id_missing"] = 3
+    d = rt.diag
+    d.record_scan_discovery(5, new_n=4, old_n=12, pages=2, models=6, fresh_candidates=2)
+    d.female_pass = 1
+    d.female_reject = 2
+    d.male_name_reject = 1
+    text = ControlBot._status_text(ctrl)
+    assert "new_listing_seen=4" in text
+    assert "old_listing_seen=12" in text
+    assert "listing_page_depth=" in text
+    assert "collections_scanned=" in text
+    assert "eligible_collections_scanned=" in text
+    assert "new_candidates_per_collection=" in text
+    assert "owner_sent_total=1" in text
+    assert "owner_duplicate_total=2" in text
+    assert "owner_dup_enqueue=1" in text
+    assert "owner_dup_post_enrich=1" in text
+    assert "owner_dup_send_guard=0" in text
+    assert "owner_id_missing=" in text
+    assert "female_pass=1" in text
+    assert "male_name_reject=1" in text
+    assert "score<" not in text
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -2016,6 +2369,23 @@ def main() -> None:
         test_nft_reject_reason_count_limit_and_log,
         test_status_rejection_reasons_section,
         test_rejection_diagnostics_do_not_change_filters,
+        test_model_chunk_rotates_eligible_models,
+        test_fetch_newest_stops_when_page_all_known,
+        test_fetch_newest_depth_beyond_page_limit_can_be_new,
+        test_merge_page_snapshot_keeps_more_than_top12,
+        test_scan_discovery_metrics_show_where_new_listings_go,
+        test_same_owner_simultaneous_workers_only_one_send,
+        test_same_owner_restart_second_nft_blocked,
+        test_female_gate_rejects_male_name_plus_female_emoji,
+        test_female_gate_rejects_male_username_plus_female_bio,
+        test_female_gate_rejects_danila_despite_a_ending,
+        test_female_gate_rejects_male_plus_devushka_word,
+        test_female_gate_rejects_gifts_emoji_photo_only,
+        test_female_gate_rejects_empty_and_latin_nickname,
+        test_female_gate_rejects_ambiguous_sasha,
+        test_female_gate_api_gender_male_overrides_female_name,
+        test_female_gate_keeps_confident_maria,
+        test_status_includes_scan_owner_female_metrics,
     ]
     for fn in tests:
         fn()

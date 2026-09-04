@@ -42,7 +42,7 @@ MIN_STARS = env_int("MIN_STARS", 5000)
 MAX_STARS = env_int("MAX_STARS", 25000)
 MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
 MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
-POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал
+POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал, не scan round
 
 # Женский confidence: имя даёт 4; нужен ≥5 (имя+фото/био/emoji/…)
 GIRL_MIN_SCORE = env_int("GIRL_MIN_SCORE", 5)
@@ -54,15 +54,20 @@ TZ_OFFSET = 3.0  # МСК
 
 POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
 PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest
-# 0 = все коллекции каждый проход → detection ≈ один fetch-round
-SCAN_BATCH = env_int("SCAN_BATCH", 0)
 SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
+# Кольцо коллекций. Default = один wave SCAN_PARALLEL (не магическое 36/48).
+# SCAN_BATCH=0 — все коллекции за round (legacy shuffle). Env переопределяет.
+SCAN_BATCH = env_int("SCAN_BATCH", SCAN_PARALLEL)
+# Реальный in-flight GetResaleStarGifts. Было 2; 12 = 6× нагрузка.
+# Default 4 = 2× текущей, не выше SCAN_PARALLEL.
+RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 4), SCAN_PARALLEL))
 REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
-REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 4.0)
+# 4s на GetResaleStarGifts давало retry-шторм (to≈90). 8s — тот же RPC, меньше таймаутов.
+REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.9.0"
+TRACKER_VERSION = "5.9.1"
 DEBUG_FILTERS = True
 BASE_DIR = Path(__file__).resolve().parent
 

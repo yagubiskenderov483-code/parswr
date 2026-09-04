@@ -512,13 +512,44 @@ def classify_skip(reason: str, stats: dict[str, int]) -> None:
         stats["dup"] = stats.get("dup", 0) + 1
 
 
-def seller_keys(lot: Lot) -> set[str]:
+def canonical_owner_key(lot: Lot) -> str | None:
+    """Стабильный ключ владельца: Telegram user ID. Username сюда не входит."""
+    if lot.seller_id is None:
+        return None
+    try:
+        sid = int(lot.seller_id)
+    except (TypeError, ValueError):
+        return None
+    return f"id:{sid}"
+
+
+def owner_alias_keys(lot: Lot) -> set[str]:
+    """Username только как alias. Пустой / UNKNOWN ключа не даёт.
+
+    Голый username — lookup старых seen_sellers; новые записи пишут u:.
+    """
     keys: set[str] = set()
-    if lot.seller:
-        u = lot.seller.lower().lstrip("@").strip()
-        if u:
-            keys.add(u)
-            keys.add(f"u:{u}")
-    if lot.seller_id is not None:
-        keys.add(f"id:{int(lot.seller_id)}")
+    if not lot.seller:
+        return keys
+    u = lot.seller.lower().lstrip("@").strip()
+    if not u:
+        return keys
+    keys.add(f"u:{u}")
+    keys.add(u)
     return keys
+
+
+def seller_keys(lot: Lot) -> set[str]:
+    keys = owner_alias_keys(lot)
+    canon = canonical_owner_key(lot)
+    if canon:
+        keys.add(canon)
+    return keys
+
+
+def owner_is_blocked(lot: Lot, blocked: set[str]) -> bool:
+    """Пустые ключи (UNKNOWN без id и username) не схлопываются."""
+    keys = seller_keys(lot)
+    if not keys:
+        return False
+    return bool(keys & blocked)

@@ -58,6 +58,49 @@ def _lot(**kwargs) -> Lot:
     return Lot(**base)
 
 
+def _stub_queue(seen: dict | None = None, seen_sellers: dict | None = None):
+    import asyncio
+
+    from tracker import PostQueue, Runtime
+
+    q = PostQueue.__new__(PostQueue)
+    q.seen = seen if seen is not None else {}
+    q.seen_sellers = seen_sellers if seen_sellers is not None else {}
+    q.market_ids = set()
+    q._items = []
+    q._queued = set()
+    q._inflight = set()
+    q._inflight_sellers = set()
+    q._stop = False
+    q._event = asyncio.Event()
+    q._lock = asyncio.Lock()
+    q._retries = {}
+    q._last_title = ""
+    q.state = {}
+    q.state_file = None
+    q.runtime = Runtime()
+    return q
+
+
+def _fake_user(**kwargs):
+    from types import SimpleNamespace
+
+    base = dict(
+        id=1,
+        username="",
+        first_name="Мария",
+        last_name="",
+        premium=False,
+        lang_code="",
+        photo=None,
+        emoji_status=None,
+        stars_rating=None,
+        usernames=None,
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
 def test_card_matches_screenshot() -> None:
     lot = _lot()
     ts = datetime(2026, 9, 1, 20, 12, 17, tzinfo=timezone(timedelta(hours=3))).timestamp()
@@ -148,12 +191,16 @@ def test_hardcoded_filters() -> None:
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
-    assert config.SCAN_BATCH == 0
+    assert config.SCAN_BATCH == config.SCAN_PARALLEL
+    assert config.SCAN_BATCH > 0
+    assert config.RPC_CONCURRENCY == 4
+    assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.9.0"
+    assert config.TRACKER_VERSION == "5.9.1"
     assert config.MIN_COLLECTIONS == 50
     assert config.GIRL_MIN_SCORE == 5
+    assert config.REQUEST_TIMEOUT == 8.0
 
 
 def test_collect_ids_keeps_zero_resale() -> None:
@@ -649,11 +696,11 @@ def test_non_russian_girl_rejects() -> None:
 
 
 def test_scan_batch_zero_means_all_collections() -> None:
-    assert config.SCAN_BATCH == 0
+    """SCAN_BATCH=0 — escape hatch: все коллекции за round (не default)."""
     market = TelegramMarket.__new__(TelegramMarket)
     market.gift_ids = list(range(1, 21))
     market._cursor = 5
-    batch = market.next_batch(config.SCAN_BATCH)
+    batch = market.next_batch(0)
     assert sorted(batch) == list(range(1, 21))
 
 
@@ -850,6 +897,364 @@ def test_fill_user_sets_username_source() -> None:
     assert lot.username_source == "resale_user"  # first wins
 
 
+def test_extract_owner_user_id_peer_and_raw_int() -> None:
+    from types import SimpleNamespace
+
+    from market import extract_owner_user_id
+
+    assert extract_owner_user_id(SimpleNamespace(user_id=111)) == 111
+    assert extract_owner_user_id(555) == 555
+    assert extract_owner_user_id(SimpleNamespace(id=777)) == 777
+    assert extract_owner_user_id(None) is None
+    assert extract_owner_user_id(0) is None
+    assert extract_owner_user_id(SimpleNamespace(channel_id=999)) is None
+
+
+def test_next_batch_ring_advances_cursor() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.gift_ids = list(range(10))
+    market._cursor = 0
+    a = market.next_batch(3)
+    b = market.next_batch(3)
+    assert a == [0, 1, 2]
+    assert b == [3, 4, 5]
+    assert set(a).isdisjoint(b)
+    market._cursor = 8
+    wrapped = market.next_batch(3)
+    assert wrapped == [8, 9, 0]
+
+
+def test_scan_batch_default_is_parallel_wave_not_all() -> None:
+    """Default кольцо = SCAN_PARALLEL, не shuffle всех коллекций."""
+    assert config.SCAN_BATCH == config.SCAN_PARALLEL
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.gift_ids = list(range(40))
+    market._cursor = 0
+    batch = market.next_batch(config.SCAN_BATCH)
+    assert len(batch) == config.SCAN_PARALLEL
+    assert batch == list(range(config.SCAN_PARALLEL))
+
+
+def test_scan_scheduling_does_not_change_detection() -> None:
+    """Кольцо сканера не меняет snapshot / reorder semantics."""
+    a = _lot(id="a", stars=8000)
+    b = _lot(id="b", stars=9000)
+    neu = _lot(id="new1", stars=7000)
+    page, fresh = fresh_from_page(None, [a, b], {}, config.MIN_STARS, config.MAX_STARS)
+    assert page == ["a", "b"]
+    assert fresh == []
+    page, fresh = fresh_from_page(
+        ["a", "b"], [neu, a, b], {}, config.MIN_STARS, config.MAX_STARS
+    )
+    assert [x.id for x in fresh] == ["new1"]
+    page, fresh = fresh_from_page(
+        ["a", "b"], [b, a], {}, config.MIN_STARS, config.MAX_STARS
+    )
+    assert fresh == []
+    assert config.POST_INTERVAL == 4.0
+
+
+def test_two_lots_same_owner_id_only_first_enqueued() -> None:
+    q = _stub_queue()
+    a = _lot(id="A1", slug="Gift-1", seller="alice", seller_id=1001)
+    b = _lot(id="B2", slug="Gift-2", seller="alice", seller_id=1001)
+    added = q.enqueue([a, b])
+    assert added == 1
+    assert q._items[0].id == "A1"
+    assert q.runtime.funnel["dup_seller"] == 1
+    assert "B2" not in q.seen
+
+
+def test_same_owner_id_different_username_blocked() -> None:
+    q = _stub_queue()
+    first = _lot(id="A1", slug="Gift-1", seller="alice", seller_id=1001)
+    assert q.enqueue([first]) == 1
+    from tracker import persist_sent_owner
+    import time
+
+    persist_sent_owner(q.seen_sellers, first, time.time())
+    q._items.clear()
+    q._queued.clear()
+    second = _lot(id="B2", slug="Gift-2", seller="alice_new", seller_id=1001)
+    assert q.enqueue([second]) == 0
+    assert q.runtime.funnel["dup_seller"] == 1
+
+
+def test_hidden_username_known_owner_id_dedupes() -> None:
+    q = _stub_queue()
+    sent = _lot(id="A1", slug="Gift-1", seller="alice", seller_id=1001)
+    from tracker import persist_sent_owner
+    import time
+
+    persist_sent_owner(q.seen_sellers, sent, time.time())
+    hidden = _lot(id="B2", slug="Gift-2", seller="", seller_id=1001)
+    assert q.enqueue([hidden]) == 0
+    assert "id:1001" in q.seen_sellers
+
+
+def test_two_unknown_owners_without_id_not_merged() -> None:
+    q = _stub_queue()
+    u1 = _lot(id="U1", slug="Gift-1", seller="", seller_id=None)
+    u2 = _lot(id="U2", slug="Gift-2", seller="", seller_id=None)
+    added = q.enqueue([u1, u2])
+    assert added == 2
+    assert q.runtime.funnel["dup_seller"] == 0
+    from filters import seller_keys
+
+    assert seller_keys(u1) == set()
+    assert seller_keys(u2) == set()
+
+
+def test_persistent_seen_sellers_survives_reload() -> None:
+    import json
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from tracker import load_state, persist_sent_owner, save_state
+
+    lot = _lot(id="A1", seller="alice", seller_id=4242)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        state = {
+            "seen": {},
+            "seen_sellers": {},
+            "skip_sellers": {},
+            "market_ids": [],
+            "pages": {},
+            "schema": 9,
+        }
+        persist_sent_owner(state["seen_sellers"], lot, time.time())
+        save_state(path, state)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["seen_sellers"]["id:4242"]
+        assert "u:alice" in raw["seen_sellers"]
+        loaded = load_state(path)
+        q = _stub_queue(seen_sellers=loaded["seen_sellers"])
+        other = _lot(id="B2", slug="Other-2", seller="alice_renamed", seller_id=4242)
+        assert q.enqueue([other]) == 0
+
+
+def test_owner_dup_after_enrich_uses_id_not_username() -> None:
+    import time
+
+    from tracker import owner_dup_after_enrich, persist_sent_owner
+
+    seen: dict = {}
+    first = _lot(id="A1", seller="alice", seller_id=9)
+    persist_sent_owner(seen, first, time.time())
+    renamed = _lot(id="B2", seller="bob", seller_id=9)
+    assert owner_dup_after_enrich(renamed, seen) == "дубль продавца"
+    hidden = _lot(id="C3", seller="", seller_id=9)
+    assert owner_dup_after_enrich(hidden, seen) == "дубль продавца"
+    other = _lot(id="D4", seller="carol", seller_id=10)
+    assert owner_dup_after_enrich(other, seen) == ""
+    no_id = _lot(id="E5", seller="", seller_id=None)
+    assert owner_dup_after_enrich(no_id, seen) == "нет продавца"
+
+
+def test_hidden_owner_unique_gift_fallback() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from market import TelegramMarket
+
+    class FakeTG:
+        def __init__(self) -> None:
+            self.calls: list = []
+            self.entity = _fake_user(id=77, username="", first_name="Мария")
+            self.unique = SimpleNamespace(
+                gift=SimpleNamespace(owner_id=SimpleNamespace(user_id=77)),
+                users=[_fake_user(id=77, username="anna_nft", first_name="Анна")],
+            )
+
+        async def get_entity(self, uid):
+            self.calls.append(("get_entity", int(uid)))
+            return self.entity
+
+        async def get_input_entity(self, uid):
+            self.calls.append(("get_input_entity", int(uid)))
+            return SimpleNamespace(user_id=int(uid), access_hash=1)
+
+        async def __call__(self, req):
+            self.calls.append(type(req).__name__)
+            if type(req).__name__ == "GetUniqueStarGiftRequest":
+                return self.unique
+            raise AssertionError(type(req).__name__)
+
+    async def run() -> None:
+        m = TelegramMarket.__new__(TelegramMarket)
+        m.client = FakeTG()
+        m._flood_until = 0.0
+        m.diag = None
+        m._profile_cache = {}
+        lot = _lot(seller="", seller_id=None, slug="Gift-77")
+        lot.seller = ""
+        await m.resolve_owner(lot, timeout=1.0)
+        assert lot.seller_id == 77
+        assert lot.seller == "anna_nft"
+        assert lot.username_source == "unique_gift"
+        assert "GetUniqueStarGiftRequest" in m.client.calls
+
+    asyncio.run(run())
+
+
+def test_hidden_owner_fulluser_via_input_entity() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from market import TelegramMarket
+
+    class FakeTG:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        async def get_entity(self, uid):
+            self.calls.append(("get_entity", int(uid)))
+            return _fake_user(id=int(uid), username="", first_name="Мария")
+
+        async def get_input_entity(self, uid):
+            self.calls.append(("get_input_entity", int(uid)))
+            return SimpleNamespace(user_id=int(uid), access_hash=99)
+
+        async def __call__(self, req):
+            self.calls.append(type(req).__name__)
+            if type(req).__name__ == "GetFullUserRequest":
+                return SimpleNamespace(
+                    users=[_fake_user(id=88, username="from_full", first_name="Мария")],
+                    full_user=SimpleNamespace(about="привет", personal_channel_id=None, stars_rating=None),
+                )
+            if type(req).__name__ == "GetUniqueStarGiftRequest":
+                return SimpleNamespace(
+                    gift=SimpleNamespace(owner_id=SimpleNamespace(user_id=88)),
+                    users=[_fake_user(id=88, username="", first_name="Мария")],
+                )
+            raise AssertionError(type(req).__name__)
+
+    async def run() -> None:
+        m = TelegramMarket.__new__(TelegramMarket)
+        m.client = FakeTG()
+        m._flood_until = 0.0
+        m.diag = None
+        m._profile_cache = {}
+        lot = _lot(seller="", seller_id=88, slug="Gift-88")
+        lot.seller = ""
+        await m.enrich_profile(lot, timeout=1.0)
+        assert ("get_input_entity", 88) in m.client.calls
+        assert "GetFullUserRequest" in m.client.calls
+        assert lot.seller == "from_full"
+        assert lot.username_source == "full_user"
+
+    asyncio.run(run())
+
+
+def test_hidden_owner_stays_unknown_when_api_has_no_username() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from market import TelegramMarket
+
+    class FakeTG:
+        async def get_entity(self, uid):
+            return _fake_user(id=int(uid), username="", first_name="Shop")
+
+        async def get_input_entity(self, uid):
+            return SimpleNamespace(user_id=int(uid), access_hash=1)
+
+        async def __call__(self, req):
+            if type(req).__name__ == "GetUniqueStarGiftRequest":
+                return SimpleNamespace(
+                    gift=SimpleNamespace(owner_id=SimpleNamespace(user_id=5)),
+                    users=[_fake_user(id=5, username="", first_name="Shop")],
+                )
+            if type(req).__name__ == "GetFullUserRequest":
+                return SimpleNamespace(
+                    users=[_fake_user(id=5, username="", first_name="Shop")],
+                    full_user=SimpleNamespace(about="", personal_channel_id=None, stars_rating=None),
+                )
+            return SimpleNamespace()
+
+    async def run() -> None:
+        m = TelegramMarket.__new__(TelegramMarket)
+        m.client = FakeTG()
+        m._flood_until = 0.0
+        m.diag = None
+        m._profile_cache = {}
+        lot = _lot(seller="", seller_id=5, slug="Gift-5")
+        lot.seller = ""
+        await m.resolve_owner(lot, timeout=1.0)
+        await m.enrich_profile(lot, timeout=1.0)
+        assert lot.seller_id == 5
+        assert lot.seller == ""
+
+    asyncio.run(run())
+
+
+def test_cached_entity_without_username_is_not_success() -> None:
+    """Кэш User без username не обрывает fallback на UniqueStarGift."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from market import TelegramMarket
+
+    class FakeTG:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        async def get_entity(self, uid):
+            self.calls.append("get_entity")
+            return _fake_user(id=int(uid), username="", first_name="Мария")
+
+        async def __call__(self, req):
+            self.calls.append(type(req).__name__)
+            return SimpleNamespace(
+                gift=SimpleNamespace(owner_id=SimpleNamespace(user_id=3)),
+                users=[_fake_user(id=3, username="real_nick", first_name="Мария")],
+            )
+
+    async def run() -> None:
+        m = TelegramMarket.__new__(TelegramMarket)
+        m.client = FakeTG()
+        m._flood_until = 0.0
+        m.diag = None
+        lot = _lot(seller="", seller_id=3, slug="Gift-3")
+        lot.seller = ""
+        await m.resolve_owner(lot, timeout=1.0)
+        assert "get_entity" in m.client.calls
+        assert "GetUniqueStarGiftRequest" in m.client.calls
+        assert lot.seller == "real_nick"
+        assert lot.username_source == "unique_gift"
+
+    asyncio.run(run())
+
+
+def test_parse_gift_owner_id_raw_int() -> None:
+    from types import SimpleNamespace
+
+    from market import parse_gift
+
+    gift = SimpleNamespace(
+        id=99,
+        slug="Gift-99",
+        title="Gift",
+        num=1,
+        resell_amount=[SimpleNamespace(amount=8000)],
+        attributes=[],
+        owner_id=123456,
+        gift_id=1,
+    )
+    # StarsAmount-like: class name won't match, but amount>0 fallback in loop
+    class StarsAmt:
+        def __init__(self) -> None:
+            self.amount = 8000
+
+    gift.resell_amount = [StarsAmt()]
+    lot = parse_gift(gift, users=None)
+    assert lot is not None
+    assert lot.seller_id == 123456
+    assert lot.seller == ""
+
+
 def test_status_html_safe_diagnostics() -> None:
     """Telegram HTML: «score<5=0» парсилось как тег 5=0 — /status падал."""
     import re
@@ -938,6 +1343,7 @@ def test_status_html_safe_diagnostics() -> None:
     assert "RU reject:" in text
     assert "girl diagnostics:" in text
     assert "username:" in text
+    assert "owner_id:" in text
     assert "enrich:" in text
     assert "floodwait:" in text
     # корневая регрессия: сырой score<5=… ломает HTML
@@ -1012,6 +1418,21 @@ def main() -> None:
         test_girl_forensics_no_identity_and_pass,
         test_username_and_floodwait_split,
         test_fill_user_sets_username_source,
+        test_extract_owner_user_id_peer_and_raw_int,
+        test_next_batch_ring_advances_cursor,
+        test_scan_batch_default_is_parallel_wave_not_all,
+        test_scan_scheduling_does_not_change_detection,
+        test_two_lots_same_owner_id_only_first_enqueued,
+        test_same_owner_id_different_username_blocked,
+        test_hidden_username_known_owner_id_dedupes,
+        test_two_unknown_owners_without_id_not_merged,
+        test_persistent_seen_sellers_survives_reload,
+        test_owner_dup_after_enrich_uses_id_not_username,
+        test_hidden_owner_unique_gift_fallback,
+        test_hidden_owner_fulluser_via_input_entity,
+        test_hidden_owner_stays_unknown_when_api_has_no_username,
+        test_cached_entity_without_username_is_not_success,
+        test_parse_gift_owner_id_raw_int,
         test_status_html_safe_diagnostics,
     ]
     for fn in tests:

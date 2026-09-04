@@ -38,6 +38,8 @@ from filters import (
     passes_nfts,
     seller_keys,
     skip_stats,
+    canonical_owner_key,
+    owner_is_blocked,
 )
 from market import Lot, TelegramMarket, format_level
 
@@ -445,6 +447,35 @@ def record_fresh_price_seen(
     elif price_ok is False:
         _bump(stats, "price_reject")
         _bump(stats, "reject_price")
+
+
+def persist_sent_owner(
+    seen_sellers: dict[str, float], lot: Lot, now: float | None = None
+) -> None:
+    """После успешного send: canonical id: + username alias. Не пишет UNKNOWN."""
+    ts = time.time() if now is None else now
+    canon = canonical_owner_key(lot)
+    if canon:
+        seen_sellers[canon] = ts
+    if lot.seller:
+        u = lot.seller.lower().lstrip("@").strip()
+        if u:
+            seen_sellers[f"u:{u}"] = ts
+
+
+def owner_dup_after_enrich(
+    lot: Lot, seen_sellers: dict[str, float], now: float | None = None
+) -> str:
+    """'' = можно send. Иначе 'нет продавца' / 'дубль продавца'."""
+    if lot.seller_id is None:
+        return "нет продавца"
+    ts = time.time() if now is None else now
+    blocked = {
+        k for k, t in seen_sellers.items() if ts - float(t) < SELLER_TTL
+    }
+    if owner_is_blocked(lot, blocked):
+        return "дубль продавца"
+    return ""
 
 
 def record_enqueue_dup(stats: dict[str, int], kind: str) -> None:
@@ -869,7 +900,7 @@ class PostQueue:
                     )
                 continue
             keys = seller_keys(lot)
-            if keys and (keys & blocked or keys & batch_owners):
+            if owner_is_blocked(lot, blocked) or (keys and keys & batch_owners):
                 overlap = sorted(keys & (blocked | batch_owners))
                 # продавец уже опубликован / в очереди — НЕ пишем лот в seen
                 logger.info(
@@ -880,6 +911,9 @@ class PostQueue:
                 )
                 classify_skip("дубль продавца", self.runtime.skip_total)
                 record_enqueue_dup(self.runtime.funnel, "seller")
+                diag = getattr(self.runtime, "diag", None)
+                if diag is not None:
+                    diag.record_owner_dup(overlap)
                 if config.DEBUG_FILTERS:
                     logger.info(
                         debug_lot_line(
@@ -1018,7 +1052,6 @@ class PostQueue:
                     lot.lang_code or "—",
                 )
                 now = time.time()
-                keys = seller_keys(lot)
                 reason = filter_lot(
                     lot,
                     min_stars=config.MIN_STARS,
@@ -1033,16 +1066,11 @@ class PostQueue:
                     lot.account_level if lot.account_level is not None else "none",
                 )
                 if not reason:
-                    if lot.seller_id is None:
-                        reason = "нет продавца"
-                    else:
-                        blocked = {
-                            k
-                            for k, ts in self.seen_sellers.items()
-                            if now - float(ts) < SELLER_TTL
-                        }
-                        if keys & blocked:
-                            reason = "дубль продавца"
+                    reason = owner_dup_after_enrich(lot, self.seen_sellers, now)
+                    if reason == "дубль продавца":
+                        diag = getattr(self.runtime, "diag", None)
+                        if diag is not None:
+                            diag.record_owner_dup(seller_keys(lot))
                 stats = skip_stats()
                 if reason:
                     classify_skip(reason, stats)
@@ -1093,8 +1121,7 @@ class PostQueue:
                 if lot.slug:
                     self.seen[lot.slug] = now
                 self.market_ids.add(lot.id)
-                for k in keys:
-                    self.seen_sellers[k] = now
+                persist_sent_owner(self.seen_sellers, lot, now)
                 self.state["seen_sellers"] = self.seen_sellers
                 self.state["market_ids"] = list(self.market_ids)
                 save_state(self.state_file, self.state)
@@ -1213,10 +1240,11 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: detection≠post · batch=%s (0=все) parallel=%s page=%s · "
-        "%s–%s⭐ · girl_score≥%s · post/%sс",
+        "Сканер: detection≠post · batch=%s (0=все, иначе кольцо) "
+        "parallel=%s rpc=%s page=%s · %s–%s⭐ · girl_score≥%s · post/%sс",
         config.SCAN_BATCH,
         config.SCAN_PARALLEL,
+        config.RPC_CONCURRENCY,
         config.PAGE_LIMIT,
         config.MIN_STARS,
         config.MAX_STARS,
@@ -1228,8 +1256,8 @@ async def scanner_loop(
     waves = max(1, (batch_n + config.SCAN_PARALLEL - 1) // config.SCAN_PARALLEL)
     ring = max(1, (n_coll + batch_n - 1) // batch_n)
     logger.info(
-        "Оценка detection: %s колл/проход · %s волн · полный круг ≈%s проход(а) · "
-        "цель revisit ~%sс при быстром API",
+        "Кольцо: %s колл/проход · %s волн/проход · полный круг ≈%s проход(а) · "
+        "post interval %sс ≠ scan round",
         batch_n,
         waves,
         ring,

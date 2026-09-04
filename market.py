@@ -350,6 +350,22 @@ def _extract_stars(gift: Any) -> float | None:
     return None
 
 
+def extract_owner_user_id(owner: Any) -> int | None:
+    """Telegram user id из PeerUser / raw int. Channel peer и выдумки — нет."""
+    if owner is None or isinstance(owner, bool):
+        return None
+    if isinstance(owner, int):
+        return owner if owner > 0 else None
+    raw = getattr(owner, "user_id", None)
+    if raw is None and not hasattr(owner, "channel_id"):
+        raw = getattr(owner, "id", None)
+    try:
+        sid = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+    return sid if sid and sid > 0 else None
+
+
 def parse_gift(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
     gift_id = getattr(gift, "id", None)
     slug = str(getattr(gift, "slug", None) or "")
@@ -364,14 +380,7 @@ def parse_gift(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         name = str(getattr(attr, "name", "") or getattr(attr, "text", "") or "")
         if "model" in cls:
             model = name
-    seller_id: int | None = None
-    owner = getattr(gift, "owner_id", None)
-    if owner is not None:
-        raw = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-        try:
-            seller_id = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            seller_id = None
+    seller_id = extract_owner_user_id(getattr(gift, "owner_id", None))
     number_i = int(number) if number is not None else None
     collection_id: int | None = None
     raw_coll = getattr(gift, "gift_id", None)
@@ -434,7 +443,8 @@ class TelegramMarket:
         self._flood_until = 0.0
         self._gap_lock = asyncio.Lock()
         self._last_req = 0.0
-        self._rpc_sem = asyncio.Semaphore(2)
+        rpc_n = max(1, min(int(config.RPC_CONCURRENCY), int(config.SCAN_PARALLEL)))
+        self._rpc_sem = asyncio.Semaphore(rpc_n)
         self._profile_cache: dict[int, dict[str, Any]] = {}
         self.last_error = ""
         self.diag: Any | None = None
@@ -871,20 +881,21 @@ class TelegramMarket:
                 await asyncio.sleep(0.2 * (attempt + 1))
         return None
 
-    async def resolve_owner(self, lot: Lot, timeout: float = 4.0) -> None:
-        if lot.seller and lot.seller_id is not None:
+    async def _try_get_entity_user(self, lot: Lot, timeout: float) -> None:
+        """get_entity: пустой username — не успех, цепочку не обрываем."""
+        if not lot.seller_id:
             return
-        if lot.seller_id:
-            try:
-                await self._wait_flood()
-                ent = await asyncio.wait_for(
-                    self.client.get_entity(lot.seller_id), timeout=timeout
-                )
-                fill_user(lot, ent, username_source="get_entity")
-                if lot.seller:
-                    return
-            except Exception as exc:  # noqa: BLE001
-                self._note_exc(exc)
+        try:
+            await self._wait_flood()
+            ent = await asyncio.wait_for(
+                self.client.get_entity(int(lot.seller_id)), timeout=timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._note_exc(exc)
+            return
+        fill_user(lot, ent, username_source="get_entity")
+
+    async def _try_unique_star_gift(self, lot: Lot, timeout: float) -> None:
         if not lot.slug:
             return
         try:
@@ -902,40 +913,39 @@ class TelegramMarket:
             for u in (getattr(result, "users", None) or [])
             if getattr(u, "id", None) is not None
         }
-        owner = getattr(gift, "owner_id", None) if gift else None
-        seller_id = None
-        if owner is not None:
-            raw = getattr(owner, "user_id", None) or getattr(owner, "id", None)
-            try:
-                seller_id = int(raw) if raw is not None else None
-            except (TypeError, ValueError):
-                seller_id = None
+        seller_id = extract_owner_user_id(getattr(gift, "owner_id", None) if gift else None)
         if seller_id:
             lot.seller_id = seller_id
             if seller_id in users:
                 fill_user(lot, users[seller_id], username_source="unique_gift")
-        # username всё ещё пуст — ещё одна попытка entity
+
+    async def resolve_owner(self, lot: Lot, timeout: float = 4.0) -> None:
+        if lot.seller and lot.seller_id is not None:
+            return
         if lot.seller_id and not lot.seller:
-            try:
-                await self._wait_flood()
-                ent = await asyncio.wait_for(
-                    self.client.get_entity(int(lot.seller_id)), timeout=timeout
-                )
-                fill_user(lot, ent, username_source="get_entity")
-            except Exception as exc:  # noqa: BLE001
-                self._note_exc(exc)
+            await self._try_get_entity_user(lot, timeout)
+            if lot.seller:
+                return
+        if not lot.seller or lot.seller_id is None:
+            await self._try_unique_star_gift(lot, timeout)
+        if lot.seller_id and not lot.seller:
+            await self._try_get_entity_user(lot, timeout)
 
     async def enrich_profile(self, lot: Lot, timeout: float = 5.0) -> None:
         if not lot.seller_id:
             return
         cached = self._profile_cache.get(int(lot.seller_id))
-        if cached and cached.get("first_name"):
+        if cached:
             _apply_cache(lot, cached)
-            return
+            if lot.seller and lot.first_name:
+                return
         try:
             await self._wait_flood()
+            inp = await asyncio.wait_for(
+                self.client.get_input_entity(int(lot.seller_id)), timeout=timeout
+            )
             full = await asyncio.wait_for(
-                self.client(GetFullUserRequest(lot.seller_id)),
+                self.client(GetFullUserRequest(inp)),
                 timeout=timeout,
             )
         except Exception as exc:  # noqa: BLE001

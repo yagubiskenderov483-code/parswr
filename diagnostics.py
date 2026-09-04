@@ -285,6 +285,11 @@ class Diagnostics:
         self.username_from_unique_gift = 0
         self.username_unknown = 0
         self.username_checked = 0
+        self.username_fallback_attempted = 0
+        self.owner_id_known = 0
+        self.owner_id_missing = 0
+        self.dup_owner_by_id = 0
+        self.dup_owner_by_alias = 0
 
         self.ru_reject_foreign_lang = 0
         self.ru_reject_no_cyrillic = 0
@@ -405,6 +410,12 @@ class Diagnostics:
 
     def record_username(self, lot: Lot, *, had_before_enrich: bool) -> None:
         self.username_checked += 1
+        if lot.seller_id is not None:
+            self.owner_id_known += 1
+        else:
+            self.owner_id_missing += 1
+        if not had_before_enrich:
+            self.username_fallback_attempted += 1
         if had_before_enrich and lot.seller:
             self.username_from_page += 1
             src = getattr(lot, "username_source", "") or "resale_user"
@@ -427,6 +438,12 @@ class Diagnostics:
             self.username_from_page += 1
         else:
             self.username_unknown += 1
+
+    def record_owner_dup(self, overlap: list[str] | set[str]) -> None:
+        if any(str(x).startswith("id:") for x in overlap):
+            self.dup_owner_by_id += 1
+        else:
+            self.dup_owner_by_alias += 1
 
     def record_ru_reject(self, lot: Lot) -> None:
         code = russian_reject_code(lot)
@@ -510,6 +527,13 @@ class Diagnostics:
                 f"unique={self.username_from_unique_gift} "
                 f"unknown={self.username_unknown} "
                 f"(n={self.username_checked})"
+            ),
+            (
+                f"owner_id: known={self.owner_id_known} "
+                f"missing={self.owner_id_missing} "
+                f"fallback_try={self.username_fallback_attempted} "
+                f"dup_id={self.dup_owner_by_id} "
+                f"dup_alias={self.dup_owner_by_alias}"
             ),
             (
                 f"enrich: n={self.enrich_count} ok={self.enrich_success} "

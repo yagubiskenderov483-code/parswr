@@ -271,7 +271,8 @@ class ControlBot:
             f"≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
             f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
-            f"page={config.PAGE_LIMIT} (detection≠post)",
+            f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
+            f"(detection≠post, ring)",
         ]
         if rt:
             coll = f"Коллекций: {rt.collections}"

@@ -1862,7 +1862,6 @@ def test_status_rejection_reasons_section() -> None:
     import re
 
     from bot import ControlBot
-    from diagnostics import Diagnostics
     from tracker import Runtime, _record_filter_diagnostics
 
     ctrl = ControlBot.__new__(ControlBot)

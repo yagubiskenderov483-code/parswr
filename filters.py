@@ -450,9 +450,21 @@ def filter_lot(
 
     Неизвестные level / NFT / ЛС не режем: Telegram часто не отдаёт
     stars_rating, и лот с lvl=None нельзя сжигать как «level».
+    Floor модели проверяется только если scanner его проставил
+    (model_id / model_floor). Тесты без этих полей не меняются.
     """
     if not (min_stars <= float(lot.stars) <= max_stars):
         return "цена"
+    mid = getattr(lot, "model_id", None)
+    floor = getattr(lot, "model_floor", None)
+    if mid is not None or floor is not None:
+        from floors import listing_and_floor_reason
+
+        floor_reason = listing_and_floor_reason(
+            listing_stars=float(lot.stars), floor=floor
+        )
+        if floor_reason and floor_reason != "цена":
+            return floor_reason
     if looks_male(lot):
         return "мужской"
     ru = is_russian(lot)
@@ -489,6 +501,9 @@ def skip_stats() -> dict[str, int]:
         "dup_seller": 0,
         "dup_listing": 0,
         "incomplete": 0,
+        "bad_model": 0,
+        "floor_unknown": 0,
+        "floor_high": 0,
     }
 
 
@@ -505,6 +520,9 @@ def classify_skip(reason: str, stats: dict[str, int]) -> None:
         "дубль": "dup_seller",
         "дубль продавца": "dup_seller",
         "дубль лота": "dup_listing",
+        "REJECT_BAD_MODEL_VALUE": "bad_model",
+        "floor неизвестен": "floor_unknown",
+        "floor выше макс": "floor_high",
     }
     key = mapping.get(reason, "not_girl")
     stats[key] = stats.get(key, 0) + 1

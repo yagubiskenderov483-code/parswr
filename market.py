@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import config
+from floors import FloorCatalog, extract_model_attr
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -169,6 +170,8 @@ class Lot:
     listing_created_at: float | None = None
     discovery_round: int | None = None
     username_source: str = ""
+    model_id: int | None = None
+    model_floor: float | None = None  # None = UNKNOWN; не выдумываем
 
     @property
     def nft_url(self) -> str:
@@ -375,10 +378,15 @@ def parse_gift(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
     if stars is None or stars <= 0:
         return None
     model = ""
+    model_id: int | None = None
     for attr in getattr(gift, "attributes", None) or []:
+        name, mid = extract_model_attr(attr)
         cls = attr.__class__.__name__.lower()
-        name = str(getattr(attr, "name", "") or getattr(attr, "text", "") or "")
-        if "model" in cls:
+        if mid is not None:
+            model_id = mid
+            if name:
+                model = name
+        elif "model" in cls and name:
             model = name
     seller_id = extract_owner_user_id(getattr(gift, "owner_id", None))
     number_i = int(number) if number is not None else None
@@ -398,6 +406,7 @@ def parse_gift(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         model=model,
         seller_id=seller_id,
         collection_id=collection_id,
+        model_id=model_id,
     )
     if seller_id and users and seller_id in users:
         fill_user(lot, users[seller_id], username_source="resale_user")
@@ -450,6 +459,9 @@ class TelegramMarket:
         self.diag: Any | None = None
         self._rpc_kind = "scan"
         self.last_fetch_ok = True
+        self.floors = FloorCatalog(config.floor_cache_path())
+        self.floors.load()
+        self.scan_ids: list[int] = []
 
     @contextmanager
     def rpc_kind(self, kind: str) -> Iterator[None]:
@@ -714,17 +726,18 @@ class TelegramMarket:
             return merged
         return self.gift_ids
 
-    def next_batch(self, n: int) -> list[int]:
-        if not self.gift_ids:
+    def next_batch(self, n: int, pool: list[int] | None = None) -> list[int]:
+        ids = list(self.gift_ids if pool is None else pool)
+        if not ids:
             return []
-        total = len(self.gift_ids)
+        total = len(ids)
         if n <= 0 or n >= total:
             self._cursor = 0
-            ids = list(self.gift_ids)
-            random.shuffle(ids)
-            return ids
+            shuffled = list(ids)
+            random.shuffle(shuffled)
+            return shuffled
         take = min(max(1, n), total)
-        batch = [self.gift_ids[(self._cursor + i) % total] for i in range(take)]
+        batch = [ids[(self._cursor + i) % total] for i in range(take)]
         self._cursor = (self._cursor + take) % total
         return batch
 
@@ -737,6 +750,7 @@ class TelegramMarket:
         gap: float = 0.02,
         sort_by_price: bool = False,
         offset: str = "",
+        model_ids: list[int] | None = None,
     ) -> list[Lot]:
         stats = {"errors": 0, "floods": 0, "timeouts": 0}
         self.last_fetch_ok = True
@@ -749,6 +763,7 @@ class TelegramMarket:
             timeout,
             offset=offset,
             sort_by_price=sort_by_price,
+            model_ids=model_ids,
         )
         if result is None:
             result = await self._request(
@@ -760,6 +775,7 @@ class TelegramMarket:
                 timeout,
                 offset=offset,
                 sort_by_price=sort_by_price,
+                model_ids=model_ids,
             )
         if result is None:
             self.last_fetch_ok = False
@@ -767,6 +783,8 @@ class TelegramMarket:
         lots = parse_result(result)
         for lot in lots:
             lot.collection_id = int(gift_id)
+            if lot.model_id is not None:
+                lot.model_floor = self.floors.get_floor(int(gift_id), int(lot.model_id))
         return lots
 
     async def fetch_in_range(
@@ -832,6 +850,99 @@ class TelegramMarket:
             offset = next_off
         return collected
 
+    def rebuild_scan_ids(self) -> list[int]:
+        self.scan_ids = self.floors.scan_collection_ids(self.gift_ids)
+        self._cursor = 0
+        return self.scan_ids
+
+    async def _refresh_one_collection(self, gift_id: int) -> None:
+        """Price-sorted pages until listing > MAX_MODEL_FLOOR или конец/cap.
+
+        Первая увиденная цена модели = floor. Не выдумываем UNKNOWN.
+        """
+        offset = ""
+        stats = {"errors": 0, "floods": 0, "timeouts": 0}
+        max_pages = max(1, int(config.FLOOR_REFRESH_MAX_PAGES))
+        page_size = max(1, min(50, int(config.FLOOR_REFRESH_PAGE_SIZE)))
+        cap = float(config.MAX_MODEL_FLOOR)
+        for _ in range(max_pages):
+            result = await self._request(
+                gift_id,
+                page_size,
+                True,
+                stats,
+                config.REQUEST_GAP,
+                config.REQUEST_TIMEOUT,
+                offset=offset,
+                sort_by_price=True,
+            )
+            if result is None:
+                result = await self._request(
+                    gift_id,
+                    page_size,
+                    False,
+                    stats,
+                    config.REQUEST_GAP,
+                    config.REQUEST_TIMEOUT,
+                    offset=offset,
+                    sort_by_price=True,
+                )
+            if result is None:
+                break
+            lots = parse_result(result)
+            self.floors.ingest_result(int(gift_id), result, lots)
+            if not lots:
+                break
+            prices = [float(lot.stars) for lot in lots]
+            # sort_by_price=True — дешёвые первые. Дальше MAX — дороже не нужны.
+            if min(prices) > cap or max(prices) > cap:
+                break
+            next_off = str(getattr(result, "next_offset", "") or "")
+            if not next_off or next_off == offset:
+                break
+            offset = next_off
+
+    async def refresh_model_floors(
+        self, gift_ids: list[int] | None = None, *, force: bool = False
+    ) -> dict[str, int]:
+        ids = list(gift_ids if gift_ids is not None else self.gift_ids)
+        if not force and self.floors.is_fresh() and self.floors.models:
+            self.rebuild_scan_ids()
+            return self.floors.stats()
+        logger.info(
+            "Floor catalog refresh · collections=%s ttl=%ss pages≤%s",
+            len(ids),
+            int(config.FLOOR_CACHE_TTL),
+            int(config.FLOOR_REFRESH_MAX_PAGES),
+        )
+        sem = asyncio.Semaphore(max(1, int(config.RPC_CONCURRENCY)))
+
+        async def one(gid: int) -> None:
+            async with sem:
+                try:
+                    with self.rpc_kind("scan"):
+                        await self._refresh_one_collection(int(gid))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("floor refresh gid=%s: %s", gid, exc)
+
+        chunk = max(int(config.RPC_CONCURRENCY) * 4, 8)
+        for i in range(0, len(ids), chunk):
+            part = ids[i : i + chunk]
+            await asyncio.gather(*[one(g) for g in part], return_exceptions=True)
+        self.floors.updated_at = time.time()
+        self.floors.save()
+        self.rebuild_scan_ids()
+        st = self.floors.stats()
+        logger.info(
+            "Floor catalog · models=%s known=%s unknown=%s eligible=%s collections=%s",
+            st.get("models_total", 0),
+            st.get("model_floor_known", 0),
+            st.get("model_floor_unknown", 0),
+            st.get("eligible_model_count", 0),
+            len(self.scan_ids),
+        )
+        return st
+
     async def _request(
         self,
         gift_id: int,
@@ -843,7 +954,24 @@ class TelegramMarket:
         *,
         offset: str = "",
         sort_by_price: bool = False,
+        model_ids: list[int] | None = None,
     ) -> Any | None:
+        attr_objs = None
+        if model_ids:
+            from telethon.tl.types import StarGiftAttributeIdModel
+
+            attr_objs = []
+            seen: set[int] = set()
+            for raw in model_ids:
+                try:
+                    mid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if mid > 0 and mid not in seen:
+                    seen.add(mid)
+                    attr_objs.append(StarGiftAttributeIdModel(document_id=mid))
+            if not attr_objs:
+                attr_objs = None
         for attempt in range(2):
             try:
                 await self._wait_flood()
@@ -858,6 +986,7 @@ class TelegramMarket:
                                 limit=min(limit, 50),
                                 stars_only=True if stars_only else None,
                                 sort_by_price=True if sort_by_price else None,
+                                attributes=attr_objs,
                             )
                         ),
                         timeout=timeout,

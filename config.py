@@ -40,6 +40,14 @@ CHANNEL_ID = -1003784435307
 # Цель 5000–25000 Stars (MIN_STARS / MAX_STARS через env)
 MIN_STARS = env_int("MIN_STARS", 5000)
 MAX_STARS = env_int("MAX_STARS", 25000)
+# Допуск к цене КОНКРЕТНОГО лота (не floor модели). 0 = жёсткий диапазон.
+LISTING_PRICE_TOLERANCE = env_float("LISTING_PRICE_TOLERANCE", 0.0)
+# Реальный min resale модели/варианта. Дешёвая модель за 8000⭐ не проходит.
+MIN_MODEL_FLOOR = env_int("MIN_MODEL_FLOOR", 4000)
+MAX_MODEL_FLOOR = env_int("MAX_MODEL_FLOOR", 27000)
+FLOOR_CACHE_TTL = env_float("FLOOR_CACHE_TTL", 1800.0)  # сек; не на каждом scan round
+FLOOR_REFRESH_MAX_PAGES = env_int("FLOOR_REFRESH_MAX_PAGES", 20)
+FLOOR_REFRESH_PAGE_SIZE = env_int("FLOOR_REFRESH_PAGE_SIZE", 50)
 MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
 MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
 POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал, не scan round
@@ -67,7 +75,7 @@ REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.9.1"
+TRACKER_VERSION = "5.10.0"
 DEBUG_FILTERS = True
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -97,6 +105,10 @@ def state_path() -> Path:
 
 def catalog_path() -> Path:
     return data_dir() / "tracker_catalog.json"
+
+
+def floor_cache_path() -> Path:
+    return data_dir() / "model_floors.json"
 
 
 def bot_token() -> str:

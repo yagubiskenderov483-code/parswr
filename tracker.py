@@ -41,6 +41,11 @@ from filters import (
     canonical_owner_key,
     owner_is_blocked,
 )
+from floors import (
+    listing_price_ok,
+    listing_price_range,
+    model_floor_verdict,
+)
 from market import Lot, TelegramMarket, format_level
 
 logger = logging.getLogger("tracker")
@@ -49,7 +54,7 @@ _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
 SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
-STATE_SCHEMA = 9
+STATE_SCHEMA = 10
 MIN_SNAPSHOT = 0
 
 
@@ -208,47 +213,47 @@ class Sender:
                 self._owns_bot = True
 
     async def send(self, lot: Lot) -> str:
+        return await self.limiter.gated(lambda: self.deliver(lot))
+
+    async def deliver(self, lot: Lot) -> str:
+        """Пост в канал без RateLimiter. Вызывать только из gated send-guard."""
         text = format_lot(lot)
+        if self._bot is not None:
+            try:
+                from aiogram.types import LinkPreviewOptions
 
-        async def _do() -> str:
-            if self._bot is not None:
-                try:
-                    from aiogram.types import LinkPreviewOptions
-
-                    await self._bot.send_message(
-                        chat_id=self.chat_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=lot_keyboard_aiogram(lot),
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                await self._bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=lot_keyboard_aiogram(lot),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+                self.last_via = "bot"
+                return "bot"
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc).lower()
+                if not any(
+                    x in err
+                    for x in (
+                        "chat not found",
+                        "bot is not a member",
+                        "not enough rights",
+                        "have no rights",
+                        "forbidden",
                     )
-                    self.last_via = "bot"
-                    return "bot"
-                except Exception as exc:  # noqa: BLE001
-                    err = str(exc).lower()
-                    if not any(
-                        x in err
-                        for x in (
-                            "chat not found",
-                            "bot is not a member",
-                            "not enough rights",
-                            "have no rights",
-                            "forbidden",
-                        )
-                    ):
-                        raise
-                    logger.warning("Бот не может постить (%s) — шлю от аккаунта", exc)
-            await self.client.send_message(
-                self.chat_id,
-                text,
-                parse_mode="html",
-                link_preview=False,
-                buttons=lot_keyboard_telethon(lot),
-            )
-            self.last_via = "user"
-            return "user"
-
-        return await self.limiter.gated(_do)
+                ):
+                    raise
+                logger.warning("Бот не может постить (%s) — шлю от аккаунта", exc)
+        await self.client.send_message(
+            self.chat_id,
+            text,
+            parse_mode="html",
+            link_preview=False,
+            buttons=lot_keyboard_telethon(lot),
+        )
+        self.last_via = "user"
+        return "user"
 
     async def close(self) -> None:
         if self._owns_bot and self._bot is not None:
@@ -412,6 +417,20 @@ def empty_funnel() -> dict[str, int]:
         "nft",
         "duplicate",
         "enqueued",
+        "owner_dup_enqueue",
+        "owner_dup_post_enrich",
+        "owner_dup_send_guard",
+        "owner_sent_persisted",
+        "owner_id_missing",
+        "listing_checked",
+        "listing_price_pass",
+        "listing_price_reject",
+        "bad_model_value",
+        "model_floor_pass",
+        "model_floor_unknown",
+        "owner_duplicate",
+        "detection_to_enqueue_n",
+        "detection_to_send_n",
     ]
     return {k: 0 for k in keys}
 
@@ -463,6 +482,24 @@ def persist_sent_owner(
             seen_sellers[f"u:{u}"] = ts
 
 
+def reload_seen_sellers(path: Path | None, dest: dict[str, float]) -> None:
+    """Подтянуть seen_sellers с диска (другой процесс мог persist). Не трогает pages."""
+    if path is None:
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    incoming = data.get("seen_sellers") if isinstance(data, dict) else None
+    if not isinstance(incoming, dict):
+        return
+    for key, ts in incoming.items():
+        try:
+            dest[str(key)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+
+
 def owner_dup_after_enrich(
     lot: Lot, seen_sellers: dict[str, float], now: float | None = None
 ) -> str:
@@ -478,6 +515,64 @@ def owner_dup_after_enrich(
     return ""
 
 
+def owner_dup_send_guard(
+    lot: Lot, seen_sellers: dict[str, float], now: float | None = None
+) -> str:
+    """Тот же id-check, но внутри RateLimiter после reload с диска."""
+    return owner_dup_after_enrich(lot, seen_sellers, now)
+
+
+def apply_listing_floor_filters(
+    lots: list[Lot],
+    catalog: FloorCatalog,
+    stats: dict[str, int],
+) -> list[Lot]:
+    """MODEL FLOOR поверх уже прошедших listing-price fresh лотов.
+
+    UNKNOWN не выдаём за известную цену. Дешёвая модель + дорогой listing
+    → REJECT_BAD_MODEL_VALUE.
+    """
+    kept: list[Lot] = []
+    for lot in lots:
+        gid = lot.collection_id
+        mid = lot.model_id
+        floor = (
+            catalog.get_floor(gid, mid)
+            if gid is not None and mid is not None
+            else None
+        )
+        lot.model_floor = floor
+        verdict = model_floor_verdict(floor)
+        if verdict == "ok":
+            _bump(stats, "model_floor_pass")
+            kept.append(lot)
+            continue
+        if verdict == "bad_model_value":
+            _bump(stats, "bad_model_value")
+            logger.info(
+                "[pipeline] REJECT_BAD_MODEL_VALUE %s · MODEL FLOOR=%s⭐ LISTING=%s⭐",
+                lot.slug or lot.id,
+                int(floor) if floor is not None else 0,
+                int(lot.stars),
+            )
+            continue
+        if verdict == "unknown":
+            _bump(stats, "model_floor_unknown")
+            logger.info(
+                "[pipeline] floor UNKNOWN %s · LISTING=%s⭐",
+                lot.slug or lot.id,
+                int(lot.stars),
+            )
+            continue
+        logger.info(
+            "[pipeline] floor above_max %s · MODEL FLOOR=%s⭐ LISTING=%s⭐",
+            lot.slug or lot.id,
+            int(floor) if floor is not None else 0,
+            int(lot.stars),
+        )
+    return kept
+
+
 def record_enqueue_dup(stats: dict[str, int], kind: str) -> None:
     """kind: listing | seller. Только на enqueue, до worker-фильтров."""
     if kind == "listing":
@@ -486,6 +581,8 @@ def record_enqueue_dup(stats: dict[str, int], kind: str) -> None:
     elif kind == "seller":
         _bump(stats, "dup_seller")
         _bump(stats, "reject_duplicate_seller")
+        _bump(stats, "owner_dup_enqueue")
+        _bump(stats, "owner_duplicate")
 
 
 def record_work_in(stats: dict[str, int]) -> None:
@@ -506,6 +603,17 @@ def record_worker_filter(stats: dict[str, int], lot: Lot, reason: str) -> None:
         _bump(stats, "dup_seller")
         _bump(stats, "reject_duplicate_seller")
         _bump(stats, "dup_seller_post_enrich")
+        _bump(stats, "owner_dup_post_enrich")
+        _bump(stats, "owner_duplicate")
+        return
+
+    if reason == "REJECT_BAD_MODEL_VALUE":
+        _bump(stats, "bad_model_value")
+        return
+    if reason == "floor неизвестен":
+        _bump(stats, "model_floor_unknown")
+        return
+    if reason == "floor выше макс":
         return
 
     # BUG#2 fix: male — отдельная стадия, не girl / не ru
@@ -770,6 +878,12 @@ class Runtime:
         self.post_via = ""
         self.snapshot_ready = False
         self.diag: Diagnostics = Diagnostics()
+        self.models_total = 0
+        self.models_eligible = 0
+        self.floor_known = 0
+        self.floor_unknown = 0
+        self.collections_eligible = 0
+        self.catalog_updated_at = 0.0
 
 
 async def _client_and_bot() -> tuple[TelegramClient, ControlBot]:
@@ -928,6 +1042,9 @@ class PostQueue:
             batch_owners |= keys
             added += 1
             record_work_in(self.runtime.funnel)
+            diag = getattr(self.runtime, "diag", None)
+            if diag is not None:
+                diag.record_enqueue_latency(lot)
             logger.info(
                 "[pipeline] work_in %s · %s⭐ · q=%s",
                 lot.slug or lot.id,
@@ -1000,6 +1117,9 @@ class PostQueue:
                     "level",
                     "много NFT",
                     "дубль",
+                    "REJECT_BAD_MODEL_VALUE",
+                    "floor неизвестен",
+                    "floor выше макс",
                 }
                 if pre in hard:
                     now = time.time()
@@ -1051,6 +1171,7 @@ class PostQueue:
                     lot.gifts_count if lot.gifts_count is not None else "none",
                     lot.lang_code or "—",
                 )
+                self._inflight_sellers = seller_keys(lot)
                 now = time.time()
                 reason = filter_lot(
                     lot,
@@ -1071,6 +1192,8 @@ class PostQueue:
                         diag = getattr(self.runtime, "diag", None)
                         if diag is not None:
                             diag.record_owner_dup(seller_keys(lot))
+                    elif reason == "нет продавца":
+                        _bump(self.runtime.funnel, "owner_id_missing")
                 stats = skip_stats()
                 if reason:
                     classify_skip(reason, stats)
@@ -1113,21 +1236,58 @@ class PostQueue:
                     logger.info(debug_lot_line(lot, "final-filter", "ok"))
                 _record_filter_diagnostics(self.runtime.diag, lot, "")
                 record_worker_filter(self.runtime.funnel, lot, "")
-                _bump(self.runtime.funnel, "send_attempt")
                 logger.info("[pipeline] send %s …", lot.slug or lot.id)
-                via = await self.sender.send(lot)
+
+                async def _gated_send() -> tuple[str, str]:
+                    reload_seen_sellers(self.state_file, self.seen_sellers)
+                    guard = owner_dup_send_guard(lot, self.seen_sellers)
+                    if guard:
+                        return ("reject", guard)
+                    _bump(self.runtime.funnel, "send_attempt")
+                    via_inner = await self.sender.deliver(lot)
+                    now_sent = time.time()
+                    persist_sent_owner(self.seen_sellers, lot, now_sent)
+                    _bump(self.runtime.funnel, "owner_sent_persisted")
+                    self.seen[lot.id] = now_sent
+                    if lot.slug:
+                        self.seen[lot.slug] = now_sent
+                    self.market_ids.add(lot.id)
+                    self.state["seen_sellers"] = self.seen_sellers
+                    self.state["market_ids"] = list(self.market_ids)
+                    save_state(self.state_file, self.state)
+                    return ("ok", via_inner)
+
+                outcome, payload = await self.sender.limiter.gated(_gated_send)
+                if outcome == "reject":
+                    _bump(self.runtime.funnel, "owner_dup_send_guard")
+                    _bump(self.runtime.funnel, "owner_duplicate")
+                    if payload == "нет продавца":
+                        _bump(self.runtime.funnel, "owner_id_missing")
+                    else:
+                        diag = getattr(self.runtime, "diag", None)
+                        if diag is not None:
+                            diag.record_owner_dup(seller_keys(lot))
+                    classify_skip(payload, self.runtime.skip_total)
+                    _bump(self.runtime.funnel, "worker_filtered")
+                    logger.info(
+                        "[pipeline] REJECT_OWNER_ALREADY_SENT send_guard %s · %s",
+                        lot.slug or lot.id,
+                        payload,
+                    )
+                    if payload == "нет продавца":
+                        continue
+                    self.seen[lot.id] = now
+                    if lot.slug:
+                        self.seen[lot.slug] = now
+                    self.market_ids.add(lot.id)
+                    save_state(self.state_file, self.state)
+                    continue
+                via = payload
                 self.runtime.post_via = via
-                self.seen[lot.id] = now
-                if lot.slug:
-                    self.seen[lot.slug] = now
-                self.market_ids.add(lot.id)
-                persist_sent_owner(self.seen_sellers, lot, now)
-                self.state["seen_sellers"] = self.seen_sellers
-                self.state["market_ids"] = list(self.market_ids)
-                save_state(self.state_file, self.state)
                 self.runtime.posted += 1
                 _bump(self.runtime.funnel, "sent")
                 self._last_title = lot.title or ""
+                self.runtime.diag.record_send_latency(lot)
                 logger.info(
                     "[pipeline] send ok %s за %s⭐ · lvl %s · via=%s · очередь %s",
                     lot.title,
@@ -1193,19 +1353,23 @@ async def sync_pages(
     """Запомнить верх newest каждой коллекции. В канал не постим."""
     ids = list(gift_ids)
     random.shuffle(ids)
-    logger.info("Синхрон страниц · %s коллекций — дальше только новые id сверху", len(ids))
+    logger.info("Синхрон страниц · %s eligible коллекций — дальше только новые id сверху", len(ids))
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
     async def one(gid: int) -> tuple[int, list[Lot]]:
         async with sem:
             try:
+                model_ids = market.floors.eligible_model_ids(gid)
+                if not model_ids:
+                    return gid, []
                 lots = await market.fetch_page(
                     gid,
                     limit=config.PAGE_LIMIT,
                     timeout=config.REQUEST_TIMEOUT,
                     gap=config.REQUEST_GAP,
                     sort_by_price=False,
+                    model_ids=model_ids or None,
                 )
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
@@ -1228,6 +1392,17 @@ async def sync_pages(
     logger.info("Страницы готовы: %s. Жду только что выставленные", len(pages))
 
 
+def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
+    st = market.floors.stats()
+    runtime.models_total = int(st.get("models_total") or 0)
+    runtime.models_eligible = int(st.get("eligible_model_count") or 0)
+    runtime.floor_known = int(st.get("model_floor_known") or 0)
+    runtime.floor_unknown = int(st.get("model_floor_unknown") or 0)
+    runtime.collections_eligible = len(market.scan_ids)
+    runtime.catalog_updated_at = float(market.floors.updated_at or 0)
+    runtime.diag.note_catalog(st, runtime.collections_eligible)
+
+
 async def scanner_loop(
     market: TelegramMarket,
     gift_ids: list[int],
@@ -1240,27 +1415,19 @@ async def scanner_loop(
     bot: Any | None = None,
 ) -> None:
     logger.info(
-        "Сканер: detection≠post · batch=%s (0=все, иначе кольцо) "
-        "parallel=%s rpc=%s page=%s · %s–%s⭐ · girl_score≥%s · post/%sс",
+        "Сканер: allowlist models · batch=%s (0=все eligible) "
+        "parallel=%s rpc=%s page=%s · listing %s–%s⭐ ±%s · "
+        "floor %s–%s⭐ · girl_score≥%s · post/%sс",
         config.SCAN_BATCH,
         config.SCAN_PARALLEL,
         config.RPC_CONCURRENCY,
         config.PAGE_LIMIT,
         config.MIN_STARS,
         config.MAX_STARS,
+        int(config.LISTING_PRICE_TOLERANCE),
+        config.MIN_MODEL_FLOOR,
+        config.MAX_MODEL_FLOOR,
         config.GIRL_MIN_SCORE,
-        int(config.POST_INTERVAL),
-    )
-    n_coll = max(len(gift_ids), 1)
-    batch_n = n_coll if config.SCAN_BATCH <= 0 else min(config.SCAN_BATCH, n_coll)
-    waves = max(1, (batch_n + config.SCAN_PARALLEL - 1) // config.SCAN_PARALLEL)
-    ring = max(1, (n_coll + batch_n - 1) // batch_n)
-    logger.info(
-        "Кольцо: %s колл/проход · %s волн/проход · полный круг ≈%s проход(а) · "
-        "post interval %sс ≠ scan round",
-        batch_n,
-        waves,
-        ring,
         int(config.POST_INTERVAL),
     )
     pass_no = 0
@@ -1274,13 +1441,39 @@ async def scanner_loop(
         flood_s_before = diag.scan_floodwait_seconds
         timeout_before = diag.scan_timeout_count
         fn_before = dict(runtime.funnel)
-        batch = market.next_batch(config.SCAN_BATCH)
-        if not batch or len(gift_ids) < config.MIN_COLLECTIONS:
+        if not market.floors.is_fresh():
+            try:
+                await market.refresh_model_floors(gift_ids)
+                apply_catalog_stats(runtime, market)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("floor refresh: %s", exc)
+        scan_pool = list(market.scan_ids) or market.floors.scan_collection_ids(gift_ids)
+        market.scan_ids = scan_pool
+        n_coll = max(len(scan_pool), 1)
+        batch_n = n_coll if config.SCAN_BATCH <= 0 else min(config.SCAN_BATCH, n_coll)
+        if pass_no == 1:
+            waves = max(1, (batch_n + config.SCAN_PARALLEL - 1) // config.SCAN_PARALLEL)
+            ring = max(1, (n_coll + batch_n - 1) // batch_n)
+            logger.info(
+                "Кольцо eligible: %s колл · %s/проход · %s волн · круг ≈%s · "
+                "total collections=%s · post interval %sс ≠ scan round",
+                n_coll,
+                batch_n,
+                waves,
+                ring,
+                len(gift_ids),
+                int(config.POST_INTERVAL),
+            )
+        batch = market.next_batch(config.SCAN_BATCH, pool=scan_pool)
+        if not gift_ids or len(gift_ids) < config.MIN_COLLECTIONS:
             try:
                 fresh_ids = await market.load_collections(force=True, bot=bot)
                 if fresh_ids:
                     gift_ids[:] = list(fresh_ids)
                     runtime.collections = len(gift_ids)
+                    await market.refresh_model_floors(gift_ids, force=True)
+                    apply_catalog_stats(runtime, market)
+                    scan_pool = list(market.scan_ids)
                 if market.last_error and len(gift_ids) < config.MIN_COLLECTIONS:
                     runtime.last_error = market.last_error
             except Exception as exc:  # noqa: BLE001
@@ -1289,16 +1482,20 @@ async def scanner_loop(
             if not gift_ids:
                 await asyncio.sleep(5)
                 continue
-            batch = market.next_batch(config.SCAN_BATCH)
-            if not batch:
-                await asyncio.sleep(5)
-                continue
+            batch = market.next_batch(config.SCAN_BATCH, pool=scan_pool)
+        if not batch:
+            await asyncio.sleep(5)
+            continue
+        listing_lo, listing_hi = listing_price_range()
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
 
         async def one(gid: int) -> tuple[int, list[Lot], bool]:
             async with sem:
                 ok = True
                 try:
+                    model_ids = market.floors.eligible_model_ids(gid)
+                    if not model_ids:
+                        return gid, [], True
                     with market.rpc_kind("scan"):
                         lots = await market.fetch_page(
                             gid,
@@ -1306,6 +1503,7 @@ async def scanner_loop(
                             timeout=config.REQUEST_TIMEOUT,
                             gap=config.REQUEST_GAP,
                             sort_by_price=False,
+                            model_ids=model_ids or None,
                         )
                     if not market.last_fetch_ok:
                         ok = False
@@ -1328,6 +1526,12 @@ async def scanner_loop(
         def absorb(gid: int, lots: list[Lot]) -> None:
             nonlocal found, queued, api_n, seen_skip, seller_skip
             api_n += len(lots)
+            for lot in lots:
+                _bump(runtime.funnel, "listing_checked")
+                if listing_price_ok(float(lot.stars)):
+                    _bump(runtime.funnel, "listing_price_pass")
+                else:
+                    _bump(runtime.funnel, "listing_price_reject")
             key = str(gid)
             prev = pages.get(key)
             if prev:
@@ -1335,7 +1539,7 @@ async def scanner_loop(
                 for lot in lots:
                     if lot.id in known:
                         continue
-                    price_ok = config.MIN_STARS <= float(lot.stars) <= config.MAX_STARS
+                    price_ok = listing_lo <= float(lot.stars) <= listing_hi
                     already = lot.id in seen or bool(lot.slug and lot.slug in seen)
                     record_fresh_price_seen(
                         runtime.funnel,
@@ -1349,8 +1553,8 @@ async def scanner_loop(
                 prev,
                 lots,
                 seen,
-                config.MIN_STARS,
-                config.MAX_STARS,
+                listing_lo,
+                listing_hi,
             )
             if new_page:
                 pages[key] = new_page
@@ -1365,6 +1569,11 @@ async def scanner_loop(
                 for lot in chunk:
                     lot.discovery_round = pass_no
                     diag.record_detection(lot, pass_no=pass_no)
+            if not chunk:
+                return
+            chunk = apply_listing_floor_filters(
+                chunk, market.floors, runtime.funnel
+            )
             if not chunk:
                 return
             found += len(chunk)
@@ -1529,6 +1738,13 @@ async def run() -> None:
         except Exception as exc:  # noqa: BLE001
             runtime.last_error = str(exc)
     runtime.collections = len(gift_ids)
+    if gift_ids:
+        try:
+            await market.refresh_model_floors(gift_ids)
+            apply_catalog_stats(runtime, market)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("floor catalog: %s", exc)
+            runtime.last_error = str(exc)
     if not gift_ids:
         logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")
         runtime.last_error = market.last_error or "нет коллекций"
@@ -1538,9 +1754,10 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    if gift_ids:
+    sync_ids = list(market.scan_ids) or list(gift_ids)
+    if sync_ids:
         try:
-            await sync_pages(market, gift_ids, pages, runtime)
+            await sync_pages(market, sync_ids, pages, runtime)
             state["pages"] = pages
             save_state(state_file, state)
         except Exception as exc:  # noqa: BLE001

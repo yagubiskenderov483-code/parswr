@@ -46,7 +46,7 @@ LISTING_PRICE_TOLERANCE = env_float("LISTING_PRICE_TOLERANCE", 0.0)
 MIN_MODEL_FLOOR = env_int("MIN_MODEL_FLOOR", 4000)
 MAX_MODEL_FLOOR = env_int("MAX_MODEL_FLOOR", 27000)
 FLOOR_CACHE_TTL = env_float("FLOOR_CACHE_TTL", 1800.0)  # сек; не на каждом scan round
-FLOOR_REFRESH_MAX_PAGES = env_int("FLOOR_REFRESH_MAX_PAGES", 20)
+FLOOR_REFRESH_MAX_PAGES = env_int("FLOOR_REFRESH_MAX_PAGES", 6)
 FLOOR_REFRESH_PAGE_SIZE = env_int("FLOOR_REFRESH_PAGE_SIZE", 50)
 MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
 MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
@@ -62,12 +62,11 @@ TZ_OFFSET = 3.0  # МСК
 POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
 PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest одной страницы
 SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
-# Кольцо коллекций. Default = один wave SCAN_PARALLEL (не магическое 36/48).
-# SCAN_BATCH=0 — все коллекции за round (legacy shuffle). Env переопределяет.
-SCAN_BATCH = env_int("SCAN_BATCH", SCAN_PARALLEL)
+# 0 = все eligible коллекции за round. Env >0 — кольцо по N.
+SCAN_BATCH = env_int("SCAN_BATCH", 0)
 # Реальный in-flight GetResaleStarGifts. Не поднимаем ради «быстрее» — FloodWait.
 RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 6), SCAN_PARALLEL))
-# 0 = все eligible модели одним RPC (быстрее, новые лоты сразу наверху newest).
+# 0 = все eligible модели одним RPC (новые лоты сразу наверху newest).
 SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 0)
 # Live: newest-страницы до первого уже известного лота. 2 — если page1 вся новая.
 SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
@@ -81,7 +80,7 @@ REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.13.0"
+TRACKER_VERSION = "5.13.2"
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 3900
 DEBUG_FILTERS = True

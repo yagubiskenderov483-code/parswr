@@ -145,8 +145,39 @@ def extract_star_gift_ids(data: bytes) -> list[int]:
     return merge_ids(found)
 
 
+def prefer_parsed_gift_ids(
+    parsed: list[int], raw: list[int], *, min_n: int | None = None
+) -> list[int]:
+    """Живой GetStarGifts — источник правды.
+
+    Сырой TL-скан (ctor 0x313A9547) ловит лишние id внутри пакета
+    (вложенные гифты, ложные совпадения) → 151 вместо 149.
+    Raw только если распарсенный список пустой/короткий.
+    """
+    live = merge_ids(parsed)
+    floor = int(config.MIN_COLLECTIONS if min_n is None else min_n)
+    if len(live) >= max(1, floor):
+        return live
+    return merge_ids(live, raw)
+
+
+def choose_catalog_ids(
+    *,
+    live: list[int],
+    fallbacks: list[list[int]] | None = None,
+    min_n: int | None = None,
+) -> list[int]:
+    """Telegram user/bot API. Public/bundled/disk — только если live мало."""
+    chosen = merge_ids(live)
+    floor = int(config.MIN_COLLECTIONS if min_n is None else min_n)
+    if len(chosen) >= max(1, floor):
+        return chosen
+    extra = fallbacks or []
+    return merge_ids(chosen, *extra)
+
+
 class GetStarGiftsIdsRequest(GetStarGiftsRequest):
-    """getStarGifts: распарсенный список или id из сырых байт."""
+    """getStarGifts: распарсенный список; raw TL — fallback."""
 
     @staticmethod
     def read_result(reader):  # noqa: ANN001
@@ -161,7 +192,7 @@ class GetStarGiftsIdsRequest(GetStarGiftsRequest):
                 reader.set_position(len(reader.get_bytes()))
             except Exception:  # noqa: BLE001
                 pass
-        return merge_ids(parsed, extract_star_gift_ids(raw))
+        return prefer_parsed_gift_ids(parsed, extract_star_gift_ids(raw))
 
 
 @dataclass(slots=True)
@@ -521,6 +552,9 @@ class TelegramMarket:
         self.floors.load()
         self.scan_ids: list[int] = []
         self.eligible_scan_ids: list[int] = []
+        self.catalog_live = 0
+        self.catalog_dropped = 0
+        self.catalog_pruned_models = 0
         self._model_cursors: dict[int, int] = {}
         self.last_next_offset = ""
         self.runtime: Any = None
@@ -733,12 +767,16 @@ class TelegramMarket:
         self, force: bool = False, *, bot: Any | None = None
     ) -> list[int]:
         self._load_catalog()
-        if self.gift_ids and not force and len(self.gift_ids) >= config.MIN_COLLECTIONS:
-            return self.gift_ids
+        cached_ok = (
+            bool(self.gift_ids) and len(self.gift_ids) >= config.MIN_COLLECTIONS
+        )
+        # Диск не источник правды: 151 вместо 149 копилось union'ом. Live всегда.
         try:
             await self.ensure_connected()
         except Exception as exc:  # noqa: BLE001
             logger.warning("connect перед каталогом: %s", exc)
+            if cached_ok and not force:
+                return self.gift_ids
 
         via_bundled = self.load_from_bundled()
         via_public: list[int] = []
@@ -772,21 +810,42 @@ class TelegramMarket:
         if not isinstance(via_bot, list):
             via_bot = []
 
-        merged = merge_ids(via_user, via_public, via_bundled, via_bot)
-        if merged:
-            self.gift_ids = merged
+        cached = list(self.gift_ids)
+        live = merge_ids(via_user, via_bot)
+        chosen = choose_catalog_ids(
+            live=live,
+            fallbacks=[via_public, via_bundled, cached],
+        )
+        extra = len(merge_ids(live, via_public, via_bundled, cached)) - len(chosen)
+        if chosen:
+            self.gift_ids = chosen
+            self.catalog_live = len(chosen)
+            self.catalog_dropped = extra if live else 0
             self._save_catalog()
+            if live:
+                self.catalog_pruned_models = self.floors.prune_missing_collections(
+                    chosen
+                )
+                self.rebuild_scan_ids()
             logger.info(
-                "Каталог суммарно %s · user=%s public=%s bundled=%s bot=%s",
-                len(merged),
+                "Каталог live=%s (user=%s bot=%s) · public=%s bundled=%s cache=%s"
+                "%s%s",
+                len(live),
                 len(via_user),
+                len(via_bot),
                 len(via_public),
                 len(via_bundled),
-                len(via_bot),
+                len(cached),
+                f" · отброшено лишних {extra}" if extra > 0 and live else "",
+                (
+                    f" · prune моделей {self.catalog_pruned_models}"
+                    if self.catalog_pruned_models
+                    else ""
+                ),
             )
-            if len(merged) < config.MIN_COLLECTIONS:
-                self.last_error = f"мало коллекций: {len(merged)}"
-            return merged
+            if len(chosen) < config.MIN_COLLECTIONS:
+                self.last_error = f"мало коллекций: {len(chosen)}"
+            return chosen
         return self.gift_ids
 
     def next_batch(self, n: int, pool: list[int] | None = None) -> list[int]:
@@ -819,6 +878,24 @@ class TelegramMarket:
         out = [models[(cur + i) % len(models)] for i in range(take)]
         self._model_cursors[int(gift_id)] = (cur + take) % len(models)
         return out
+
+    def stable_model_chunks(
+        self, model_ids: list[int], chunk: int
+    ) -> list[list[int]]:
+        """Неподвижные чанки по sorted model_id. Каждый раунд — все чанки.
+
+        Ротация next_model_chunk пропускала модели до следующего круга
+        и каждый раз меняла request key → вечный UNPRIMED_SEED.
+        """
+        models = sorted({int(x) for x in model_ids if int(x) > 0})
+        if not models:
+            return []
+        n = int(chunk)
+        if n <= 0:
+            n = 12
+        if n >= len(models):
+            return [models]
+        return [models[i : i + n] for i in range(0, len(models), n)]
 
     async def fetch_page(
         self,
@@ -915,6 +992,7 @@ class TelegramMarket:
                 return True
             return False
 
+        pages_ok = 0
         for _page in range(cap):
             page_offset = offset
             lots = await self.fetch_page(
@@ -930,6 +1008,8 @@ class TelegramMarket:
             )
             pages_n += 1
             offsets.append(page_offset)
+            if getattr(self, "last_fetch_ok", True):
+                pages_ok += 1
             if not lots:
                 break
             unknown = 0
@@ -968,6 +1048,8 @@ class TelegramMarket:
             "model_ids": list(model_ids or []),
             "offsets": offsets,
             "hit_known": hit_known,
+            "ok": pages_ok > 0,
+            "pages_ok": pages_ok,
         }
 
     async def fetch_in_range(
@@ -1034,12 +1116,15 @@ class TelegramMarket:
         return collected
 
     def rebuild_scan_ids(self) -> list[int]:
+        """Только коллекции с eligible моделью (floor 4k–27k).
+
+        Скан всех 151 без фильтра: newest=дешёвый спам, round ~4 мин, to≈130,
+        5k–25k лоты тонут в таймаутах.
+        """
         catalog = [int(x) for x in self.gift_ids]
         eligible = self.floors.scan_collection_ids(catalog)
-        seen = {int(x) for x in eligible}
-        rest = [g for g in catalog if g not in seen]
         self.eligible_scan_ids = list(eligible)
-        self.scan_ids = list(eligible) + rest
+        self.scan_ids = list(eligible)
         self._cursor = 0
         return self.scan_ids
 

@@ -364,19 +364,34 @@ class ControlBot:
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
                     f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
                     f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
-                    f"(все коллекции, seed {int(config.SCAN_SEED_PAGES)}стр)",
+                    f"(eligible only, chunk={int(config.SCAN_MODEL_CHUNK)}, "
+                    f"seed {int(config.SCAN_SEED_PAGES)}стр)",
                     f"Floor: {config.MIN_MODEL_FLOOR}–{config.MAX_MODEL_FLOOR}⭐ "
                     f"listing ±{int(config.LISTING_PRICE_TOLERANCE)}",
         ]
         if rt:
-            coll = f"Коллекций: {rt.collections}"
+            coll = (
+                f"Коллекций: {int(getattr(rt, 'catalog_live', 0) or rt.collections)} live"
+            )
+            dropped = int(getattr(rt, "catalog_dropped", 0) or 0)
+            if dropped:
+                coll += f" · отброшено {dropped}"
+            coll += f" · скан {rt.collections_eligible} eligible"
             if rt.collections < config.MIN_COLLECTIONS:
                 coll += f" (мало, нужно ≥{config.MIN_COLLECTIONS})"
+            chunk = int(config.SCAN_MODEL_CHUNK)
+            models = (
+                f"Модели: парсим {int(getattr(rt, 'models_scan_round', 0) or 0)} этот проход"
+                f" · eligible {rt.models_eligible}"
+                f" · кэш {rt.models_total}"
+                f" · RPC {int(getattr(rt, 'models_rpc_jobs', 0) or 0)}×{chunk}"
+            )
             lines.extend(
                 [
                     f"Страницы: {'готовы' if rt.snapshot_ready else 'синхрон'} ({rt.snapshot})",
                     f"Проходов: {rt.passes}",
                     coll,
+                    models,
                     f"Отправлено: {rt.posted}",
                     f"В очереди: {rt.queue}",
                     f"Последний проход: выставили {getattr(rt, 'last_found', rt.last_fresh)} → очередь +{rt.last_fresh}",
@@ -402,6 +417,14 @@ class ControlBot:
                     "Режим: жду новые лоты с маркета. Старые не пощу. "
                     "Как выложат подходящий NFT — сразу в канал."
                 )
+                try:
+                    from tracker import scan_status_hint
+
+                    hint = scan_status_hint(rt)
+                    if hint:
+                        lines.append(f"Почему пусто: {hint}")
+                except Exception:  # noqa: BLE001
+                    pass
             skip = rt.skip_total or {}
             if any(skip.values()):
                 lines.append(
@@ -475,6 +498,11 @@ class ControlBot:
                         "MODEL CATALOG",
                         f"models_total={rt.models_total}",
                         f"models_eligible={rt.models_eligible}",
+                        f"models_scan_round={getattr(rt, 'models_scan_round', 0)}",
+                        f"models_rpc_jobs={getattr(rt, 'models_rpc_jobs', 0)}",
+                        f"model_chunk={int(config.SCAN_MODEL_CHUNK)}",
+                        f"catalog_dropped={int(getattr(rt, 'catalog_dropped', 0) or 0)}",
+                        f"catalog_pruned_models={int(getattr(rt, 'catalog_pruned_models', 0) or 0)}",
                         f"floor_known={rt.floor_known}",
                         f"floor_unknown={rt.floor_unknown}",
                         "SCANNER",
@@ -505,6 +533,8 @@ class ControlBot:
                         f"new_candidates_per_collection={diag.new_candidates_summary()}",
                         "FILTER",
                         f"listing_price={fn.get('listing_price_pass', 0)}/{fn.get('listing_checked', 0)}",
+                        f"listing_unprimed_in_range={fn.get('listing_unprimed_in_range', 0)}",
+                        f"listing_genuine_in_range={fn.get('listing_genuine_in_range', 0)}",
                         f"model_floor={fn.get('model_floor_pass', 0)}",
                         f"bad_model_value={fn.get('bad_model_value', 0)}",
                         f"owner_duplicate={fn.get('owner_duplicate', 0)}",

@@ -1563,6 +1563,26 @@ def model_request_key(collection_id: int, model_ids: list[int] | None) -> str:
     return f"{int(collection_id)}:{','.join(str(x) for x in mids)}"
 
 
+def collection_is_primed(
+    primed: dict[str, float],
+    collection_id: int,
+    req_key: str | None = None,
+) -> bool:
+    """Коллекция уже прогрета: этот ключ или любой другой запрос той же gid.
+
+    Смена model filter (`gid:1,2` → `gid:`) не должна заново UNPRIMED_SEED
+    и слить текущую книгу в канал.
+    """
+    if req_key and req_key in primed:
+        return True
+    cid = str(int(collection_id))
+    for key in primed:
+        left, sep, _rest = str(key).partition(":")
+        if sep and left == cid:
+            return True
+    return False
+
+
 def observed_contains(observed: dict[str, Any], lot: Lot) -> bool:
     if lot.id and lot.id in observed:
         return True
@@ -1675,10 +1695,12 @@ def detect_fresh_lots(
     forensic: list[dict[str, Any]] | None = None,
     request_ok: bool = True,
 ) -> tuple[list[Lot], list[dict[str, Any]]]:
-    """Классификация freshness: GENUINE_NEW только если listing_id никогда не видели
-    И запрос (collection+models) уже primed.
+    """Классификация freshness: GENUINE_NEW если listing_id никогда не видели
+    и коллекция уже primed (этот ключ или любой запрос той же gid).
 
-    Не «нет в текущей page/snapshot». Первый визит ключа — UNPRIMED_SEED, без постов.
+    Не «нет в текущей page/snapshot». Первый визит коллекции — UNPRIMED_SEED.
+    Unknown ниже уже известного id на той же странице — тоже GENUINE_NEW:
+    лента не строго newest-first, hit_anchor выкидывал живые лоты.
     """
     with _FRESHNESS_LOCK:
         return _detect_fresh_lots_locked(
@@ -1720,12 +1742,11 @@ def _detect_fresh_lots_locked(
     lo = config.MIN_STARS if min_stars is None else float(min_stars)
     hi = config.MAX_STARS if max_stars is None else float(max_stars)
     req_key = model_request_key(collection_id, model_ids)
-    primed_before = req_key in primed
+    primed_before = collection_is_primed(primed, collection_id, req_key)
     snapshot_ids = set(pages.get(req_key) or [])
     verdicts: list[dict[str, Any]] = []
     genuine: list[Lot] = []
     page_ids: list[str] = []
-    hit_anchor = False
 
     for lot in lots:
         if stats is not None:
@@ -1761,31 +1782,22 @@ def _detect_fresh_lots_locked(
         if lid:
             round_hits.setdefault(lid, []).append((int(collection_id), mid))
 
-        # Newest-first: после первого уже виденного лота остальные unknown —
-        # старый рынок, всплывший снизу. Не постить.
+        # Already-seen / same-round dup = OLD. Unknown id на той же странице
+        # ниже известного — GENUINE_NEW (observed всё ещё режет текущую книгу).
         if dup_round:
             reason = "OLD"
             is_new = False
-            hit_anchor = True
             if stats is not None:
                 _bump(stats, "fresh_repeated")
                 _bump(stats, "observed_old")
         elif observed_before or seen_before:
             reason = "OLD"
             is_new = False
-            hit_anchor = True
             if stats is not None:
                 _bump(stats, "unique_listing_ids")
                 _bump(stats, "observed_old")
                 if snapshot_before is False:
                     _bump(stats, "fresh_repeated")
-        elif hit_anchor:
-            reason = "OLD"
-            is_new = False
-            if stats is not None:
-                _bump(stats, "unique_listing_ids")
-                _bump(stats, "observed_old")
-                _bump(stats, "old_after_anchor")
         elif not primed_before:
             reason = "UNPRIMED_SEED"
             is_new = False
@@ -1975,7 +1987,9 @@ def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
     runtime.models_eligible = int(st.get("eligible_model_count") or 0)
     runtime.floor_known = int(st.get("model_floor_known") or 0)
     runtime.floor_unknown = int(st.get("model_floor_unknown") or 0)
-    runtime.collections_eligible = len(market.scan_ids)
+    runtime.collections_eligible = len(
+        getattr(market, "eligible_scan_ids", None) or market.scan_ids
+    )
     runtime.catalog_updated_at = float(market.floors.updated_at or 0)
     runtime.diag.note_catalog(st, runtime.collections_eligible)
 
@@ -2098,7 +2112,9 @@ async def scanner_loop(
                     used_models = chunk_ids or model_ids
                     req_key = model_request_key(gid, used_models)
                     prev_ids = pages.get(req_key) or []
-                    primed_already = req_key in primed_store
+                    primed_already = collection_is_primed(
+                        primed_store, gid, req_key
+                    )
                     live_pages = max(1, int(config.SCAN_MAX_PAGES))
                     seed_pages = max(live_pages, int(config.SCAN_SEED_PAGES))
                     max_pages = live_pages if primed_already else seed_pages

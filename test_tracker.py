@@ -31,6 +31,7 @@ from tracker import (
     fresh_from_page,
     funnel_invariants,
     load_state,
+    collection_is_primed,
     model_request_key,
     record_enqueue_dup,
     record_fresh_price_seen,
@@ -196,13 +197,12 @@ def test_hardcoded_filters() -> None:
     assert config.BOT_TOKEN == "8825465611:AAGVEabGitYdpQeACvJDkN3pkmrGqK9Ze5g"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
-    assert config.SCAN_BATCH == config.SCAN_PARALLEL
-    assert config.SCAN_BATCH > 0
+    assert config.SCAN_BATCH == 0
     assert config.RPC_CONCURRENCY == 6
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.13.1"
+    assert config.TRACKER_VERSION == "5.13.2"
     assert config.SCAN_MODEL_CHUNK == 0
     assert config.SCAN_MAX_PAGES == 2
     assert config.SCAN_SEED_PAGES == 8
@@ -707,7 +707,7 @@ def test_non_russian_girl_rejects() -> None:
 
 
 def test_scan_batch_zero_means_all_collections() -> None:
-    """SCAN_BATCH=0 — escape hatch: все коллекции за round (не default)."""
+    """SCAN_BATCH=0 — все eligible коллекции за round."""
     market = TelegramMarket.__new__(TelegramMarket)
     market.gift_ids = list(range(1, 21))
     market._cursor = 5
@@ -955,15 +955,14 @@ def test_next_batch_ring_advances_cursor() -> None:
     assert wrapped == [8, 9, 0]
 
 
-def test_scan_batch_default_is_parallel_wave_not_all() -> None:
-    """Default кольцо = SCAN_PARALLEL, не shuffle всех коллекций."""
-    assert config.SCAN_BATCH == config.SCAN_PARALLEL
+def test_scan_batch_default_is_all_collections() -> None:
+    """Default SCAN_BATCH=0 — все id пула за round."""
+    assert config.SCAN_BATCH == 0
     market = TelegramMarket.__new__(TelegramMarket)
     market.gift_ids = list(range(40))
     market._cursor = 0
     batch = market.next_batch(config.SCAN_BATCH)
-    assert len(batch) == config.SCAN_PARALLEL
-    assert batch == list(range(config.SCAN_PARALLEL))
+    assert sorted(batch) == list(range(40))
 
 
 def test_scan_scheduling_does_not_change_detection() -> None:
@@ -1652,7 +1651,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.13.1"
+    assert config.TRACKER_VERSION == "5.13.2"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2927,6 +2926,7 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "male_name_reject=1" in text
     assert "score<" not in text
     assert "жду новые лоты с маркета" in text
+    assert "eligible newest, unknown id = new" in text
 
 
 def test_status_warmup_shows_progress() -> None:
@@ -3019,8 +3019,8 @@ def test_status_chunks_fit_telegram_limit() -> None:
     assert "message is too long" not in text
 
 
-def test_old_after_anchor_not_posted() -> None:
-    """Старый лот после известного в newest-ленте не GENUINE_NEW."""
+def test_unknown_after_known_is_genuine_new() -> None:
+    """Unknown id ниже известного на той же странице — GENUINE_NEW."""
     keep = _lot(id="keep", stars=8000)
     observed: dict = {}
     primed: dict = {}
@@ -3044,10 +3044,46 @@ def test_old_after_anchor_not_posted() -> None:
         model_ids=[11],
         stats=empty_funnel(),
     )
+    assert [x.id for x in fresh] == ["brand", "old_float"]
+    assert stats["genuine_new"] == 2
+    assert stats["old_after_anchor"] == 0
+    assert stats["observed_old"] >= 1
+
+
+def test_collection_prime_covers_other_model_key() -> None:
+    """Смена model filter той же коллекции не UNPRIMED_SEED."""
+    keep = _lot(id="keep", stars=8000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect(
+        [keep],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+    )
+    assert collection_is_primed(primed, 9, "9:") is True
+    neu = _lot(id="brand", slug="Brand-1", stars=7000)
+    fresh, *_rest, stats = _detect(
+        [neu, keep],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[],
+        stats=empty_funnel(),
+    )
     assert [x.id for x in fresh] == ["brand"]
+    assert stats["unprimed_seed"] == 0
     assert stats["genuine_new"] == 1
-    assert stats["old_after_anchor"] == 1
-    assert stats["observed_old"] >= 2
+
+
+def test_collection_prime_does_not_match_other_gid() -> None:
+    primed = {model_request_key(90, [1]): 1.0}
+    assert collection_is_primed(primed, 9, "9:") is False
+    assert collection_is_primed(primed, 90, "90:1") is True
 
 
 def test_fetch_live_stops_at_first_known() -> None:
@@ -3158,7 +3194,7 @@ def main() -> None:
         test_fill_user_sets_username_source,
         test_extract_owner_user_id_peer_and_raw_int,
         test_next_batch_ring_advances_cursor,
-        test_scan_batch_default_is_parallel_wave_not_all,
+        test_scan_batch_default_is_all_collections,
         test_scan_scheduling_does_not_change_detection,
         test_two_lots_same_owner_id_only_first_enqueued,
         test_same_owner_id_different_username_blocked,
@@ -3218,7 +3254,9 @@ def main() -> None:
         test_telegram_unauthorized_detected,
         test_split_telegram_html_under_limit,
         test_status_chunks_fit_telegram_limit,
-        test_old_after_anchor_not_posted,
+        test_unknown_after_known_is_genuine_new,
+        test_collection_prime_covers_other_model_key,
+        test_collection_prime_does_not_match_other_gid,
         test_fetch_live_stops_at_first_known,
         test_owners_do_not_repeat_in_queue,
         test_new_listing_seen_is_not_page_absence,

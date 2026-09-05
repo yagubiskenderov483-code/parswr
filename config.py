@@ -37,9 +37,9 @@ API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 
 CHANNEL_ID = -1003784435307
 
-# Цель 5000–25000 Stars (MIN_STARS / MAX_STARS через env)
-MIN_STARS = env_int("MIN_STARS", 5000)
-MAX_STARS = env_int("MAX_STARS", 25000)
+# Лимит выдачи: 5000–25000 Stars (жёстко, env не перебивает)
+MIN_STARS = 5000
+MAX_STARS = 25000
 # Допуск к цене КОНКРЕТНОГО лота (не floor модели). 0 = жёсткий диапазон.
 LISTING_PRICE_TOLERANCE = env_float("LISTING_PRICE_TOLERANCE", 0.0)
 # Реальный min resale модели/варианта. Дешёвая модель за 8000⭐ не проходит.
@@ -79,7 +79,7 @@ REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.12.0"
+TRACKER_VERSION = "5.12.1"
 DEBUG_FILTERS = True
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -128,4 +128,4 @@ def api_hash() -> str:
 
 
 def channel_id() -> int:
-    return env_int("CHANNEL_ID", CHANNEL_ID)
+    return int(CHANNEL_ID)

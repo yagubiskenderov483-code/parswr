@@ -201,7 +201,7 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.12.0"
+    assert config.TRACKER_VERSION == "5.12.1"
     assert config.SCAN_MODEL_CHUNK == 6
     assert config.SCAN_MAX_PAGES == 2
     assert config.PAGE_SNAPSHOT_KEEP == 80
@@ -1650,7 +1650,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.12.0"
+    assert config.TRACKER_VERSION == "5.12.1"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:

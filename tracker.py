@@ -727,11 +727,7 @@ def apply_listing_floor_filters(
             continue
         if verdict == "unknown":
             _bump(stats, "model_floor_unknown")
-            logger.info(
-                "[pipeline] floor UNKNOWN %s · LISTING=%s⭐",
-                lot.slug or lot.id,
-                int(lot.stars),
-            )
+            kept.append(lot)
             continue
         logger.info(
             "[pipeline] floor above_max %s · MODEL FLOOR=%s⭐ LISTING=%s⭐",
@@ -2138,12 +2134,12 @@ async def scanner_loop(
                 }
                 try:
                     model_ids = market.floors.eligible_model_ids(gid)
-                    if not model_ids:
-                        return gid, [], True, meta
-                    chunk_ids = market.next_model_chunk(
-                        gid, model_ids, int(config.SCAN_MODEL_CHUNK)
-                    )
-                    used_models = chunk_ids or model_ids
+                    used_models: list[int] = []
+                    if model_ids:
+                        chunk_ids = market.next_model_chunk(
+                            gid, model_ids, int(config.SCAN_MODEL_CHUNK)
+                        )
+                        used_models = chunk_ids or model_ids
                     req_key = model_request_key(gid, used_models)
                     prev_ids = pages.get(req_key) or []
                     primed_already = collection_is_primed(
@@ -2157,7 +2153,7 @@ async def scanner_loop(
                     with market.rpc_kind("scan"):
                         lots, meta = await market.fetch_newest_until_known(
                             gid,
-                            model_ids=used_models,
+                            model_ids=used_models or None,
                             known_ids=known,
                             seen=seen,
                             max_pages=max_pages,

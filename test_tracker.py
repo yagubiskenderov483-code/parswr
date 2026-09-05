@@ -202,7 +202,7 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.13.0"
+    assert config.TRACKER_VERSION == "5.13.1"
     assert config.SCAN_MODEL_CHUNK == 0
     assert config.SCAN_MAX_PAGES == 2
     assert config.SCAN_SEED_PAGES == 8
@@ -1652,7 +1652,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.13.0"
+    assert config.TRACKER_VERSION == "5.13.1"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2926,6 +2926,25 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "female_pass=1" in text
     assert "male_name_reject=1" in text
     assert "score<" not in text
+    assert "жду новые лоты с маркета" in text
+
+
+def test_status_warmup_shows_progress() -> None:
+    from bot import ControlBot
+    from tracker import Runtime
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = False
+    rt.warmup_stage = "floors"
+    rt.warmup_done = 24
+    rt.warmup_total = 151
+    text = ControlBot._status_text(ctrl)
+    assert "Прогрев: каталог floor 24/151" in text
+    assert "в канал не пощу" in text
 
 
 def test_telegram_unauthorized_detected() -> None:
@@ -3195,6 +3214,7 @@ def main() -> None:
         test_female_gate_api_gender_male_overrides_female_name,
         test_female_gate_keeps_confident_maria,
         test_status_includes_scan_owner_female_metrics,
+        test_status_warmup_shows_progress,
         test_telegram_unauthorized_detected,
         test_split_telegram_html_under_limit,
         test_status_chunks_fit_telegram_limit,

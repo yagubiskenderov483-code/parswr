@@ -498,6 +498,7 @@ class TelegramMarket:
         self.scan_ids: list[int] = []
         self._model_cursors: dict[int, int] = {}
         self.last_next_offset = ""
+        self.runtime: Any = None
 
     @contextmanager
     def rpc_kind(self, kind: str) -> Iterator[None]:
@@ -1074,9 +1075,32 @@ class TelegramMarket:
                     logger.warning("floor refresh gid=%s: %s", gid, exc)
 
         chunk = max(int(config.RPC_CONCURRENCY) * 4, 8)
+        rt = getattr(self, "runtime", None)
+        if rt is not None:
+            rt.warmup_stage = "floors"
+            rt.warmup_total = len(ids)
+            rt.warmup_done = 0
+        done = 0
         for i in range(0, len(ids), chunk):
             part = ids[i : i + chunk]
             await asyncio.gather(*[one(g) for g in part], return_exceptions=True)
+            done += len(part)
+            self.rebuild_scan_ids()
+            if rt is not None:
+                rt.warmup_done = done
+                st_mid = self.floors.stats()
+                rt.models_total = int(st_mid.get("models_total") or 0)
+                rt.models_eligible = int(st_mid.get("eligible_model_count") or 0)
+                rt.floor_known = int(st_mid.get("model_floor_known") or 0)
+                rt.floor_unknown = int(st_mid.get("model_floor_unknown") or 0)
+                rt.collections_eligible = len(self.scan_ids)
+            logger.info(
+                "Floor refresh %s/%s · models=%s eligible_coll=%s",
+                done,
+                len(ids),
+                len(self.floors.models),
+                len(self.scan_ids),
+            )
         self.floors.updated_at = time.time()
         self.floors.save()
         self.rebuild_scan_ids()

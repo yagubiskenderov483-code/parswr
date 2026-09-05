@@ -382,6 +382,26 @@ class ControlBot:
                     f"Последний проход: выставили {getattr(rt, 'last_found', rt.last_fresh)} → очередь +{rt.last_fresh}",
                 ]
             )
+            if not rt.snapshot_ready:
+                stage = str(getattr(rt, "warmup_stage", "") or "прогрев")
+                labels = {
+                    "start": "старт",
+                    "collections": "коллекции",
+                    "floors": "каталог floor",
+                    "snapshot": "снимок рынка",
+                }
+                done = int(getattr(rt, "warmup_done", 0) or 0)
+                total = int(getattr(rt, "warmup_total", 0) or 0)
+                frac = f"{done}/{total}" if total else "…"
+                lines.append(
+                    f"⏳ Прогрев: {labels.get(stage, stage)} {frac}. "
+                    "Сейчас запоминаю рынок — в канал не пощу."
+                )
+            else:
+                lines.append(
+                    "Режим: жду новые лоты с маркета. Старые не пощу. "
+                    "Как выложат подходящий NFT — сразу в канал."
+                )
             skip = rt.skip_total or {}
             if any(skip.values()):
                 lines.append(

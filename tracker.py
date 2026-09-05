@@ -1101,6 +1101,9 @@ class Runtime:
         self.floor_unknown = 0
         self.collections_eligible = 0
         self.catalog_updated_at = 0.0
+        self.warmup_stage = "start"
+        self.warmup_done = 0
+        self.warmup_total = 0
 
 
 async def _client_and_bot() -> tuple[TelegramClient, ControlBot]:
@@ -1902,6 +1905,9 @@ async def sync_pages(
         "Синхрон observed · %s eligible коллекций — merge only, без постов",
         len(ids),
     )
+    runtime.warmup_stage = "snapshot"
+    runtime.warmup_total = len(ids)
+    runtime.warmup_done = 0
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
@@ -1953,6 +1959,7 @@ async def sync_pages(
                     keep=int(config.PAGE_SNAPSHOT_KEEP),
                 )
         runtime.snapshot = len(store)
+        runtime.warmup_done = min(i + len(batch), len(ids))
         logger.info(
             "Observed %s/%s · %s ids",
             min(i + len(batch), len(ids)),
@@ -2373,6 +2380,8 @@ async def run() -> None:
     sender = Sender(client, chat_id, limiter, bot=control.aiogram_bot)
     market = TelegramMarket(client, config.catalog_path())
     market.diag = runtime.diag
+    market.runtime = runtime
+    runtime.warmup_stage = "collections"
     gift_ids: list[int] = []
     for attempt in range(8):
         try:
@@ -2433,6 +2442,7 @@ async def run() -> None:
             runtime.last_error = str(exc)
     runtime.snapshot_ready = True
     runtime.snapshot = len(observed)
+    runtime.warmup_stage = "scan"
 
     try:
         while True:

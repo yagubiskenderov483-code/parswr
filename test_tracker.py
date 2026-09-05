@@ -202,10 +202,12 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.13.2"
+    assert config.TRACKER_VERSION == "5.13.3"
     assert config.SCAN_MODEL_CHUNK == 0
     assert config.SCAN_MAX_PAGES == 2
-    assert config.SCAN_SEED_PAGES == 8
+    assert config.SCAN_SEED_PAGES == 2
+    assert config.FLOOR_START_PAGES == 1
+    assert config.REQUEST_ATTEMPTS_LIVE == 1
     assert config.PAGE_SNAPSHOT_KEEP == 120
     assert config.MIN_MODEL_FLOOR == 4000
     assert config.MAX_MODEL_FLOOR == 27000
@@ -1651,7 +1653,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.13.2"
+    assert config.TRACKER_VERSION == "5.13.3"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2926,7 +2928,7 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "male_name_reject=1" in text
     assert "score<" not in text
     assert "жду новые лоты с маркета" in text
-    assert "eligible newest, unknown id = new" in text
+    assert "fast start, seed 2стр" in text
 
 
 def test_status_warmup_shows_progress() -> None:
@@ -3084,6 +3086,81 @@ def test_collection_prime_does_not_match_other_gid() -> None:
     primed = {model_request_key(90, [1]): 1.0}
     assert collection_is_primed(primed, 9, "9:") is False
     assert collection_is_primed(primed, 90, "90:1") is True
+
+
+def test_should_block_on_floor_catalog_only_when_empty() -> None:
+    from floors import FloorCatalog
+    from tracker import should_block_on_floor_catalog
+
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.floors = FloorCatalog(path=None)
+    assert should_block_on_floor_catalog(market) is True
+    market.floors.observe_floor(1, 1, 8000, "Mid")
+    assert should_block_on_floor_catalog(market) is False
+
+
+def test_schedule_floor_refresh_skips_when_fresh() -> None:
+    import asyncio
+    import time
+
+    from floors import FloorCatalog
+    from tracker import Runtime, schedule_floor_refresh
+
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.floors = FloorCatalog(path=None)
+    market.floors.observe_floor(1, 1, 8000, "Mid")
+    market.floors.updated_at = time.time()
+    market.scan_ids = [1]
+    market.eligible_scan_ids = [1]
+    market.gift_ids = [1, 2]
+    market._floor_refresh_task = None
+    called = {"n": 0}
+
+    async def fake(*_a, **_k):
+        called["n"] += 1
+        return {}
+
+    market.refresh_model_floors = fake
+
+    async def run():
+        t1 = schedule_floor_refresh(market, [1, 2], Runtime())
+        assert t1 is None
+        market.floors.updated_at = 0.0
+        t2 = schedule_floor_refresh(market, [1, 2], Runtime())
+        t3 = schedule_floor_refresh(market, [1, 2], Runtime())
+        assert t2 is not None
+        assert t3 is t2
+        await asyncio.sleep(0.01)
+        await t2
+
+    asyncio.run(run())
+    assert called["n"] == 1
+
+
+def test_fetch_page_live_single_attempt() -> None:
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0}
+
+    async def req(*_a, **_k):
+        calls["n"] += 1
+        attempts = _k.get("attempts")
+        assert attempts == 1
+        return None
+
+    m._request = req
+    m.last_next_offset = ""
+
+    async def run():
+        return await TelegramMarket.fetch_page(
+            m, 1, attempts=1, stars_only_fallback=False
+        )
+
+    lots = asyncio.run(run())
+    assert lots == []
+    assert calls["n"] == 1
+    assert m.last_fetch_ok is False
 
 
 def test_fetch_live_stops_at_first_known() -> None:
@@ -3257,6 +3334,9 @@ def main() -> None:
         test_unknown_after_known_is_genuine_new,
         test_collection_prime_covers_other_model_key,
         test_collection_prime_does_not_match_other_gid,
+        test_should_block_on_floor_catalog_only_when_empty,
+        test_schedule_floor_refresh_skips_when_fresh,
+        test_fetch_page_live_single_attempt,
         test_fetch_live_stops_at_first_known,
         test_owners_do_not_repeat_in_queue,
         test_new_listing_seen_is_not_page_absence,

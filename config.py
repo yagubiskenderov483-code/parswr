@@ -48,6 +48,8 @@ MAX_MODEL_FLOOR = env_int("MAX_MODEL_FLOOR", 27000)
 FLOOR_CACHE_TTL = env_float("FLOOR_CACHE_TTL", 1800.0)  # сек; не на каждом scan round
 FLOOR_REFRESH_MAX_PAGES = env_int("FLOOR_REFRESH_MAX_PAGES", 6)
 FLOOR_REFRESH_PAGE_SIZE = env_int("FLOOR_REFRESH_PAGE_SIZE", 50)
+# Холодный старт без кэша: 1 price-page, дальше floor в фоне. Не ждём 10–20 мин.
+FLOOR_START_PAGES = env_int("FLOOR_START_PAGES", 1)
 MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
 MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
 POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал, не scan round
@@ -70,17 +72,19 @@ RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 6), SCAN_PARALLEL))
 SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 0)
 # Live: newest-страницы до первого уже известного лота. 2 — если page1 вся новая.
 SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
-# Первый обход коллекции / sync: глубже снимок, чтобы старые лоты не всплыли как NEW.
-SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 8)
+# Первый визит коллекции (без блокирующего sync на старте). 2 стр ≈ 1–2с, не 8×8с.
+SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 2)
 # Накопленный снимок id коллекции (не только последние 12) — меньше ложных fresh.
 PAGE_SNAPSHOT_KEEP = env_int("PAGE_SNAPSHOT_KEEP", 120)
 REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
 # 4s на GetResaleStarGifts давало retry-шторм (to≈90). 8s — тот же RPC, меньше таймаутов.
 REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
+# Live scan: 1 попытка. Второй 8s-retry раздувал round до 50с при to=30.
+REQUEST_ATTEMPTS_LIVE = env_int("REQUEST_ATTEMPTS_LIVE", 1)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.13.2"
+TRACKER_VERSION = "5.13.3"
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 3900
 DEBUG_FILTERS = True

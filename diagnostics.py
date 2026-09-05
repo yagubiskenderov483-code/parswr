@@ -903,8 +903,11 @@ class Diagnostics:
                 f"enrich={self.enrich_floodwait_count}/{self.enrich_floodwait_seconds:.0f}s "
                 f"send={self.send_floodwait_count}/{self.send_floodwait_seconds:.0f}s"
             ),
+            (
+                f"freshness: genuine={self.genuine_new} unprimed={self.unprimed_seed} "
+                f"new={self.new_listing_seen} old={self.old_listing_seen}"
+            ),
         ]
-        lines.extend(self.freshness_forensics_lines())
         return lines
 
     def rejection_reason_lines(self) -> list[str]:

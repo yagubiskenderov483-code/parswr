@@ -37,6 +37,50 @@ import config
 
 logger = logging.getLogger("bot")
 
+TELEGRAM_TEXT_LIMIT = int(getattr(config, "TELEGRAM_TEXT_LIMIT", 4096))
+TELEGRAM_SAFE_LIMIT = int(getattr(config, "TELEGRAM_SAFE_LIMIT", 3900))
+
+
+def split_telegram_html(text: str, limit: int | None = None) -> list[str]:
+    """Режет текст на куски ≤ Telegram 4096. Не рвёт строки, если можно."""
+    cap = int(limit if limit is not None else TELEGRAM_SAFE_LIMIT)
+    cap = max(64, min(cap, TELEGRAM_TEXT_LIMIT))
+    raw = text or ""
+    if len(raw) <= cap:
+        return [raw]
+    chunks: list[str] = []
+    buf: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal buf, size
+        if buf:
+            chunks.append("\n".join(buf))
+            buf = []
+            size = 0
+
+    def hard_split(line: str) -> None:
+        start = 0
+        while start < len(line):
+            piece = line[start : start + cap]
+            chunks.append(piece)
+            start += cap
+
+    for line in raw.split("\n"):
+        if len(line) > cap:
+            flush()
+            hard_split(line)
+            continue
+        extra = len(line) + (1 if buf else 0)
+        if buf and size + extra > cap:
+            flush()
+        if buf:
+            size += 1
+        buf.append(line)
+        size += len(line)
+    flush()
+    return chunks or [""]
+
 
 def _fmt_ms_status(ms: float | None) -> str:
     if ms is None:
@@ -427,6 +471,7 @@ class ControlBot:
                 lines.extend(_esc(line) for line in diag.rejection_reason_lines())
                 lines.append("DIAGNOSTICS")
                 # HTML parse_mode: экранируем динамику (< в score<5 ломало Telegram)
+                # Forensic dump (FRESHNESS last20) в логи, не в /status — иначе 4096.
                 lines.extend(_esc(line) for line in diag.status_lines())
         else:
             lines.append("⏳ Сканер ещё поднимается — подожди пару секунд.")
@@ -467,16 +512,36 @@ class ControlBot:
                 logger.exception("cmd_start")
                 await message.answer(f"⚠️ {exc}")
 
+        async def _send_status(message: Message) -> None:
+            text = self._status_text()
+            parts = split_telegram_html(text)
+            for i, part in enumerate(parts):
+                if not part:
+                    continue
+                markup = _MENU if i == 0 else None
+                try:
+                    await message.answer(part, reply_markup=markup)
+                except Exception as exc:  # noqa: BLE001
+                    err = str(exc).lower()
+                    if "too long" not in err and "message is too long" not in err:
+                        raise
+                    tiny = split_telegram_html(part, limit=1800)
+                    for j, bit in enumerate(tiny):
+                        await message.answer(
+                            bit,
+                            reply_markup=markup if j == 0 and i == 0 else None,
+                        )
+
         @router.message(Command("status"))
         async def cmd_status(message: Message) -> None:
             try:
                 if not self.authorized:
                     await message.answer("❌ Не авторизован — /start")
                     return
-                await message.answer(self._status_text(), reply_markup=_MENU)
+                await _send_status(message)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("cmd_status")
-                await message.answer(f"⚠️ {exc}")
+                await message.answer(f"⚠️ {_esc(str(exc)[:200])}")
 
         @router.message(F.text.lower().in_({"старт", "start", "статус", "status"}))
         async def cmd_aliases(message: Message, state: FSMContext) -> None:

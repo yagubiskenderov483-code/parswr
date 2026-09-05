@@ -197,14 +197,15 @@ def test_hardcoded_filters() -> None:
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
     assert config.SCAN_BATCH == config.SCAN_PARALLEL
     assert config.SCAN_BATCH > 0
-    assert config.RPC_CONCURRENCY == 4
+    assert config.RPC_CONCURRENCY == 6
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.12.1"
-    assert config.SCAN_MODEL_CHUNK == 6
+    assert config.TRACKER_VERSION == "5.13.0"
+    assert config.SCAN_MODEL_CHUNK == 0
     assert config.SCAN_MAX_PAGES == 2
-    assert config.PAGE_SNAPSHOT_KEEP == 80
+    assert config.SCAN_SEED_PAGES == 8
+    assert config.PAGE_SNAPSHOT_KEEP == 120
     assert config.MIN_MODEL_FLOOR == 4000
     assert config.MAX_MODEL_FLOOR == 27000
     assert config.MIN_COLLECTIONS == 50
@@ -1650,7 +1651,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.12.1"
+    assert config.TRACKER_VERSION == "5.13.0"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2926,6 +2927,152 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "score<" not in text
 
 
+def test_split_telegram_html_under_limit() -> None:
+    from bot import split_telegram_html
+
+    short = "ok"
+    assert split_telegram_html(short, limit=100) == ["ok"]
+    lines = [f"line-{i:04d} " + ("x" * 40) for i in range(200)]
+    blob = "\n".join(lines)
+    parts = split_telegram_html(blob, limit=3900)
+    assert len(parts) >= 2
+    assert all(len(p) <= 3900 for p in parts)
+    assert "\n".join(parts) == blob
+    huge = "a" * 5000
+    parts = split_telegram_html(huge, limit=3900)
+    assert all(len(p) <= 3900 for p in parts)
+    assert "".join(parts) == huge
+
+
+def test_status_chunks_fit_telegram_limit() -> None:
+    """/status больше не падает с message is too long."""
+    from bot import ControlBot, split_telegram_html
+    from tracker import Runtime
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = True
+    rt.snapshot = 99999
+    rt.passes = 80
+    rt.collections = 160
+    rt.posted = 12
+    rt.funnel["fresh_detected"] = 500
+    rt.funnel["fresh"] = 500
+    for key in rt.funnel:
+        if isinstance(rt.funnel[key], int) and rt.funnel[key] == 0:
+            rt.funnel[key] = 3
+    d = rt.diag
+    d.girl_reject_score_lt_min = 0
+    for i in range(20):
+        d.record_freshness_verdict(
+            {
+                "listing_id": f"very-long-listing-id-{i}-" + ("z" * 40),
+                "collection_id": 12_345_678,
+                "model_id": 99_888_777,
+                "listing_price": 12345,
+                "first_seen_at": 1_700_000_000.123,
+                "previous_seen_at": 1_700_000_111.456,
+                "snapshot_contains_before": True,
+                "seen_contains_before": False,
+                "page_number": 2,
+                "offset": "offset-token-" + ("n" * 80),
+                "source_request": "scan:collection=1:models=1,2,3,4,5,6:page=2:offset=" + ("o" * 60),
+                "reason": "UNPRIMED_SEED",
+            }
+        )
+    text = ControlBot._status_text(ctrl)
+    assert "FRESHNESS last20" not in text
+    parts = split_telegram_html(text)
+    assert parts
+    assert all(len(p) <= 4096 for p in parts)
+    assert "message is too long" not in text
+
+
+def test_old_after_anchor_not_posted() -> None:
+    """Старый лот после известного в newest-ленте не GENUINE_NEW."""
+    keep = _lot(id="keep", stars=8000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect(
+        [keep],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+    )
+    neu = _lot(id="brand", slug="Brand-1", stars=7000)
+    floater = _lot(id="old_float", slug="Old-9", stars=6500)
+    fresh, *_rest, stats = _detect(
+        [neu, keep, floater],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=empty_funnel(),
+    )
+    assert [x.id for x in fresh] == ["brand"]
+    assert stats["genuine_new"] == 1
+    assert stats["old_after_anchor"] == 1
+    assert stats["observed_old"] >= 2
+
+
+def test_fetch_live_stops_at_first_known() -> None:
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0}
+
+    async def fp(*_a, offset="", **_k):
+        calls["n"] += 1
+        if not offset:
+            m.last_next_offset = "p2"
+            return [
+                _lot(id="new1", stars=8000),
+                _lot(id="old1", stars=8000),
+                _lot(id="float1", stars=8000),
+            ]
+        m.last_next_offset = ""
+        return [_lot(id="should_not_fetch", stars=8000)]
+
+    m.fetch_page = fp
+    m.last_next_offset = ""
+
+    async def run():
+        return await TelegramMarket.fetch_newest_until_known(
+            m,
+            1,
+            model_ids=[22],
+            known_ids={"old1"},
+            seen={},
+            max_pages=3,
+            limit=12,
+            stop_at_first_known=True,
+        )
+
+    lots, meta = asyncio.run(run())
+    assert calls["n"] == 1
+    assert meta["pages"] == 1
+    assert meta["hit_known"] is True
+    assert "should_not_fetch" not in {x.id for x in lots}
+    assert [x.id for x in lots] == ["new1", "old1", "float1"]
+
+
+def test_owners_do_not_repeat_in_queue() -> None:
+    import time
+
+    q = _stub_queue(seen_sellers={"id:1001": time.time()})
+    a = _lot(id="A1", slug="Gift-1", seller="alice", seller_id=1001, stars=8000)
+    b = _lot(id="B2", slug="Gift-2", seller="alice", seller_id=1001, stars=9000)
+    assert q.enqueue([a, b]) == 0
+    assert q._items == []
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -3039,6 +3186,11 @@ def main() -> None:
         test_female_gate_api_gender_male_overrides_female_name,
         test_female_gate_keeps_confident_maria,
         test_status_includes_scan_owner_female_metrics,
+        test_split_telegram_html_under_limit,
+        test_status_chunks_fit_telegram_limit,
+        test_old_after_anchor_not_posted,
+        test_fetch_live_stops_at_first_known,
+        test_owners_do_not_repeat_in_queue,
         test_new_listing_seen_is_not_page_absence,
         test_a_old_listing_after_restart,
         test_b_old_listing_on_next_page,

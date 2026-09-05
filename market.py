@@ -852,10 +852,13 @@ class TelegramMarket:
         limit: int = 12,
         timeout: float = 8.0,
         gap: float = 0.02,
+        stop_at_first_known: bool = False,
     ) -> tuple[list[Lot], dict[str, Any]]:
-        """Newest pages с model filter. Стоп, если страница вся известна.
+        """Newest pages с model filter.
 
-        Не поднимает RPC_CONCURRENCY. max_pages ограничивает FloodWait.
+        Live (stop_at_first_known): newest-first — после первого известного лота
+        дальше только старый рынок, следующую страницу не берём.
+        Seed: пагинируем вглубь, чтобы старые id не всплыли позже как NEW.
         """
         offset = ""
         collected: list[Lot] = []
@@ -868,6 +871,7 @@ class TelegramMarket:
         cap = max(1, int(max_pages))
         page_lim = max(1, int(limit))
         mid_blob = ",".join(str(int(x)) for x in (model_ids or []) if int(x) > 0)
+        hit_known = False
 
         def _old(lot: Lot) -> bool:
             # new_listing_seen = не в known_ids (observed ∪ snapshot) и не в pipeline seen.
@@ -907,11 +911,14 @@ class TelegramMarket:
                 )
                 if _old(lot):
                     old_n += 1
+                    hit_known = True
                 else:
                     new_n += 1
                     unknown += 1
                 collected.append(lot)
             if unknown == 0:
+                break
+            if stop_at_first_known and hit_known:
                 break
             nxt = str(self.last_next_offset or "")
             if not nxt or nxt == offset:
@@ -925,6 +932,7 @@ class TelegramMarket:
             "models": len(model_ids or []),
             "model_ids": list(model_ids or []),
             "offsets": offsets,
+            "hit_known": hit_known,
         }
 
     async def fetch_in_range(

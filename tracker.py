@@ -55,7 +55,7 @@ _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
 SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
-STATE_SCHEMA = 11
+STATE_SCHEMA = 12
 MIN_SNAPSHOT = 0
 OBSERVED_TTL = 30 * 24 * 3600
 OBSERVED_MAX = 400_000
@@ -386,7 +386,7 @@ def load_state(path: Path) -> dict:
             if schema < STATE_SCHEMA:
                 logger.warning(
                     "Схема %s→%s: pages collection-key → observed; "
-                    "старые listing id не станут fresh",
+                    "re-prime без постов, старые listing id не станут fresh",
                     schema,
                     STATE_SCHEMA,
                 )
@@ -395,6 +395,7 @@ def load_state(path: Path) -> dict:
                 # Старые pages были keyed только collection_id — несовместимы
                 # с model-chunk запросами. IDs уже в observed.
                 data["pages"] = {}
+                data["primed_models"] = {}
                 data["schema"] = STATE_SCHEMA
             return data
     except (OSError, ValueError):
@@ -576,6 +577,7 @@ def empty_funnel() -> dict[str, int]:
         "unprimed_seed",
         "genuine_new",
         "genuine_new_listings",
+        "old_after_anchor",
     ]
     return {k: 0 for k in keys}
 
@@ -930,6 +932,7 @@ def format_funnel_report(stats: dict[str, int]) -> str:
         f"unique_listing_ids: {stats.get('unique_listing_ids', 0)}",
         f"observed_old: {stats.get('observed_old', 0)}",
         f"unprimed_seed: {stats.get('unprimed_seed', 0)}",
+        f"old_after_anchor: {stats.get('old_after_anchor', 0)}",
         f"fresh_detected: {stats.get('fresh_detected', 0)}",
         "",
         "price:",
@@ -1719,6 +1722,7 @@ def _detect_fresh_lots_locked(
     verdicts: list[dict[str, Any]] = []
     genuine: list[Lot] = []
     page_ids: list[str] = []
+    hit_anchor = False
 
     for lot in lots:
         if stats is not None:
@@ -1754,20 +1758,31 @@ def _detect_fresh_lots_locked(
         if lid:
             round_hits.setdefault(lid, []).append((int(collection_id), mid))
 
+        # Newest-first: после первого уже виденного лота остальные unknown —
+        # старый рынок, всплывший снизу. Не постить.
         if dup_round:
             reason = "OLD"
             is_new = False
+            hit_anchor = True
             if stats is not None:
                 _bump(stats, "fresh_repeated")
                 _bump(stats, "observed_old")
         elif observed_before or seen_before:
             reason = "OLD"
             is_new = False
+            hit_anchor = True
             if stats is not None:
                 _bump(stats, "unique_listing_ids")
                 _bump(stats, "observed_old")
                 if snapshot_before is False:
                     _bump(stats, "fresh_repeated")
+        elif hit_anchor:
+            reason = "OLD"
+            is_new = False
+            if stats is not None:
+                _bump(stats, "unique_listing_ids")
+                _bump(stats, "observed_old")
+                _bump(stats, "old_after_anchor")
         elif not primed_before:
             reason = "UNPRIMED_SEED"
             is_new = False
@@ -1901,10 +1916,11 @@ async def sync_pages(
                     model_ids=model_ids,
                     known_ids=set(store),
                     seen={},
-                    max_pages=max(1, int(config.SCAN_MAX_PAGES)),
+                    max_pages=max(1, int(config.SCAN_SEED_PAGES)),
                     limit=config.PAGE_LIMIT,
                     timeout=config.REQUEST_TIMEOUT,
                     gap=config.REQUEST_GAP,
+                    stop_at_first_known=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
@@ -1971,13 +1987,16 @@ async def scanner_loop(
     primed: dict[str, float] | None = None,
 ) -> None:
     logger.info(
-        "Сканер: allowlist models · batch=%s (0=все eligible) "
-        "parallel=%s rpc=%s page=%s · listing %s–%s⭐ ±%s · "
+        "Сканер: newest с маркета · batch=%s (0=все eligible) "
+        "parallel=%s rpc=%s page=%s · seed_pages=%s live_pages=%s · "
+        "listing %s–%s⭐ ±%s · "
         "floor %s–%s⭐ · girl_score≥%s · post/%sс",
         config.SCAN_BATCH,
         config.SCAN_PARALLEL,
         config.RPC_CONCURRENCY,
         config.PAGE_LIMIT,
+        int(config.SCAN_SEED_PAGES),
+        int(config.SCAN_MAX_PAGES),
         config.MIN_STARS,
         config.MAX_STARS,
         int(config.LISTING_PRICE_TOLERANCE),
@@ -2072,6 +2091,10 @@ async def scanner_loop(
                     used_models = chunk_ids or model_ids
                     req_key = model_request_key(gid, used_models)
                     prev_ids = pages.get(req_key) or []
+                    primed_already = req_key in primed_store
+                    live_pages = max(1, int(config.SCAN_MAX_PAGES))
+                    seed_pages = max(live_pages, int(config.SCAN_SEED_PAGES))
+                    max_pages = live_pages if primed_already else seed_pages
                     # known = глобальный observed, не «текущая page коллекции»
                     known = set(observed_store) | set(prev_ids)
                     with market.rpc_kind("scan"):
@@ -2080,10 +2103,11 @@ async def scanner_loop(
                             model_ids=used_models,
                             known_ids=known,
                             seen=seen,
-                            max_pages=max(1, int(config.SCAN_MAX_PAGES)),
+                            max_pages=max_pages,
                             limit=config.PAGE_LIMIT,
                             timeout=config.REQUEST_TIMEOUT,
                             gap=config.REQUEST_GAP,
+                            stop_at_first_known=primed_already,
                         )
                     meta["model_ids"] = list(used_models)
                     meta["request_key"] = req_key

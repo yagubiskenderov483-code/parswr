@@ -1994,6 +1994,40 @@ def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
     runtime.diag.note_catalog(st, runtime.collections_eligible)
 
 
+def should_block_on_floor_catalog(market: TelegramMarket) -> bool:
+    """Полный floor refresh на старте только если кэша нет. Иначе сразу скан."""
+    return not bool(getattr(market.floors, "models", None))
+
+
+def schedule_floor_refresh(
+    market: TelegramMarket,
+    gift_ids: list[int],
+    runtime: Runtime,
+    *,
+    force: bool = False,
+) -> asyncio.Task | None:
+    """Floor catalog в фоне — не останавливает поиск лотов на 10–20 мин."""
+    if not gift_ids:
+        return None
+    if not force and market.floors.is_fresh() and market.floors.models:
+        return None
+    task = getattr(market, "_floor_refresh_task", None)
+    if task is not None and not task.done():
+        return task
+
+    async def _run() -> None:
+        try:
+            await market.refresh_model_floors(gift_ids, force=True)
+            apply_catalog_stats(runtime, market)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("background floor refresh: %s", exc)
+
+    created = asyncio.create_task(_run())
+    market._floor_refresh_task = created
+    logger.info("Floor refresh в фоне · коллекции=%s (сканер не ждёт)", len(gift_ids))
+    return created
+
+
 async def scanner_loop(
     market: TelegramMarket,
     gift_ids: list[int],
@@ -2040,11 +2074,7 @@ async def scanner_loop(
         timeout_before = diag.scan_timeout_count
         fn_before = dict(runtime.funnel)
         if not market.floors.is_fresh():
-            try:
-                await market.refresh_model_floors(gift_ids)
-                apply_catalog_stats(runtime, market)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("floor refresh: %s", exc)
+            schedule_floor_refresh(market, gift_ids, runtime)
         scan_pool = list(market.scan_ids) or market.floors.scan_collection_ids(gift_ids)
         market.scan_ids = scan_pool
         n_coll = max(len(scan_pool), 1)
@@ -2072,7 +2102,11 @@ async def scanner_loop(
                 if fresh_ids:
                     gift_ids[:] = list(fresh_ids)
                     runtime.collections = len(gift_ids)
-                    await market.refresh_model_floors(gift_ids, force=True)
+                    if should_block_on_floor_catalog(market):
+                        await market.refresh_model_floors(
+                            gift_ids, max_pages=int(config.FLOOR_START_PAGES)
+                        )
+                    schedule_floor_refresh(market, gift_ids, runtime, force=True)
                     apply_catalog_stats(runtime, market)
                     scan_pool = list(market.scan_ids)
                 if market.last_error and len(gift_ids) < config.MIN_COLLECTIONS:
@@ -2131,6 +2165,8 @@ async def scanner_loop(
                             timeout=config.REQUEST_TIMEOUT,
                             gap=config.REQUEST_GAP,
                             stop_at_first_known=primed_already,
+                            attempts=int(config.REQUEST_ATTEMPTS_LIVE),
+                            stars_only_fallback=False,
                         )
                     meta["model_ids"] = list(used_models)
                     meta["request_key"] = req_key
@@ -2428,12 +2464,20 @@ async def run() -> None:
             runtime.last_error = str(exc)
     runtime.collections = len(gift_ids)
     if gift_ids:
-        try:
-            await market.refresh_model_floors(gift_ids)
-            apply_catalog_stats(runtime, market)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("floor catalog: %s", exc)
-            runtime.last_error = str(exc)
+        market.rebuild_scan_ids()
+        apply_catalog_stats(runtime, market)
+        if should_block_on_floor_catalog(market):
+            try:
+                await market.refresh_model_floors(
+                    gift_ids, max_pages=int(config.FLOOR_START_PAGES)
+                )
+                apply_catalog_stats(runtime, market)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("floor catalog: %s", exc)
+                runtime.last_error = str(exc)
+            schedule_floor_refresh(market, gift_ids, runtime, force=True)
+        else:
+            schedule_floor_refresh(market, gift_ids, runtime)
     if not gift_ids:
         logger.error("Коллекций нет — бот жив, сканер будет пробовать снова")
         runtime.last_error = market.last_error or "нет коллекций"
@@ -2443,19 +2487,18 @@ async def run() -> None:
     queue.start()
     control.queue = queue
 
-    sync_ids = list(market.scan_ids) or list(gift_ids)
-    if sync_ids:
-        try:
-            await sync_pages(
-                market, sync_ids, pages, runtime, observed=observed, primed=primed
-            )
-            state["pages"] = pages
-            state["observed"] = observed
-            state["primed_models"] = primed
-            save_state(state_file, state)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("страницы: %s", exc)
-            runtime.last_error = str(exc)
+    # Не блокируем 8-страничным sync: первый визит коллекции = UNPRIMED_SEED.
+    if observed:
+        logger.info(
+            "Observed с диска: %s id · primed=%s — сразу ищу новые лоты",
+            len(observed),
+            len(primed),
+        )
+    else:
+        logger.info(
+            "Снимок с диска пуст — seed %s стр на первом визите, без 10–20 мин прогрева",
+            int(config.SCAN_SEED_PAGES),
+        )
     runtime.snapshot_ready = True
     runtime.snapshot = len(observed)
     runtime.warmup_stage = "scan"

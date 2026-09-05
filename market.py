@@ -500,6 +500,7 @@ class TelegramMarket:
         self._model_cursors: dict[int, int] = {}
         self.last_next_offset = ""
         self.runtime: Any = None
+        self._floor_refresh_task: asyncio.Task | None = None
 
     @contextmanager
     def rpc_kind(self, kind: str) -> Iterator[None]:
@@ -805,9 +806,12 @@ class TelegramMarket:
         sort_by_price: bool = False,
         offset: str = "",
         model_ids: list[int] | None = None,
+        attempts: int | None = None,
+        stars_only_fallback: bool = True,
     ) -> list[Lot]:
         stats = {"errors": 0, "floods": 0, "timeouts": 0}
         self.last_fetch_ok = True
+        n_try = max(1, int(attempts if attempts is not None else 2))
         result = await self._request(
             gift_id,
             limit,
@@ -818,8 +822,9 @@ class TelegramMarket:
             offset=offset,
             sort_by_price=sort_by_price,
             model_ids=model_ids,
+            attempts=n_try,
         )
-        if result is None:
+        if result is None and stars_only_fallback:
             result = await self._request(
                 gift_id,
                 limit,
@@ -830,6 +835,7 @@ class TelegramMarket:
                 offset=offset,
                 sort_by_price=sort_by_price,
                 model_ids=model_ids,
+                attempts=n_try,
             )
         if result is None:
             self.last_fetch_ok = False
@@ -855,6 +861,8 @@ class TelegramMarket:
         timeout: float = 8.0,
         gap: float = 0.02,
         stop_at_first_known: bool = False,
+        attempts: int | None = None,
+        stars_only_fallback: bool = True,
     ) -> tuple[list[Lot], dict[str, Any]]:
         """Newest pages с model filter.
 
@@ -893,6 +901,8 @@ class TelegramMarket:
                 sort_by_price=False,
                 offset=offset,
                 model_ids=model_ids,
+                attempts=attempts,
+                stars_only_fallback=stars_only_fallback,
             )
             pages_n += 1
             offsets.append(page_offset)
@@ -1005,17 +1015,26 @@ class TelegramMarket:
         self._cursor = 0
         return self.scan_ids
 
-    async def _refresh_one_collection(self, gift_id: int) -> None:
+    async def _refresh_one_collection(
+        self, gift_id: int, *, max_pages: int | None = None
+    ) -> None:
         """Price-sorted pages until listing > MAX_MODEL_FLOOR или конец/cap.
 
         Первая увиденная цена модели = floor. Не выдумываем UNKNOWN.
         """
         offset = ""
         stats = {"errors": 0, "floods": 0, "timeouts": 0}
-        max_pages = max(1, int(config.FLOOR_REFRESH_MAX_PAGES))
+        page_cap = max(
+            1,
+            int(
+                max_pages
+                if max_pages is not None
+                else config.FLOOR_REFRESH_MAX_PAGES
+            ),
+        )
         page_size = max(1, min(50, int(config.FLOOR_REFRESH_PAGE_SIZE)))
         cap = float(config.MAX_MODEL_FLOOR)
-        for _ in range(max_pages):
+        for _ in range(page_cap):
             result = await self._request(
                 gift_id,
                 page_size,
@@ -1053,17 +1072,29 @@ class TelegramMarket:
             offset = next_off
 
     async def refresh_model_floors(
-        self, gift_ids: list[int] | None = None, *, force: bool = False
+        self,
+        gift_ids: list[int] | None = None,
+        *,
+        force: bool = False,
+        max_pages: int | None = None,
     ) -> dict[str, int]:
         ids = list(gift_ids if gift_ids is not None else self.gift_ids)
         if not force and self.floors.is_fresh() and self.floors.models:
             self.rebuild_scan_ids()
             return self.floors.stats()
+        page_cap = max(
+            1,
+            int(
+                max_pages
+                if max_pages is not None
+                else config.FLOOR_REFRESH_MAX_PAGES
+            ),
+        )
         logger.info(
             "Floor catalog refresh · collections=%s ttl=%ss pages≤%s",
             len(ids),
             int(config.FLOOR_CACHE_TTL),
-            int(config.FLOOR_REFRESH_MAX_PAGES),
+            page_cap,
         )
         sem = asyncio.Semaphore(max(1, int(config.RPC_CONCURRENCY)))
 
@@ -1071,7 +1102,9 @@ class TelegramMarket:
             async with sem:
                 try:
                     with self.rpc_kind("scan"):
-                        await self._refresh_one_collection(int(gid))
+                        await self._refresh_one_collection(
+                            int(gid), max_pages=page_cap
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("floor refresh gid=%s: %s", gid, exc)
 
@@ -1128,6 +1161,7 @@ class TelegramMarket:
         offset: str = "",
         sort_by_price: bool = False,
         model_ids: list[int] | None = None,
+        attempts: int | None = None,
     ) -> Any | None:
         attr_objs = None
         if model_ids:
@@ -1145,7 +1179,7 @@ class TelegramMarket:
                     attr_objs.append(StarGiftAttributeIdModel(document_id=mid))
             if not attr_objs:
                 attr_objs = None
-        for attempt in range(2):
+        for attempt in range(max(1, int(attempts if attempts is not None else 2))):
             try:
                 await self._wait_flood()
                 await self.ensure_connected()

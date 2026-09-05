@@ -45,6 +45,30 @@ except ImportError:
 
 logger = logging.getLogger("market")
 
+
+def apply_contact_requirement(lot: Lot, req: Any) -> None:
+    """Платные ЛС = звёзды за сообщение. Premium-only контакт — не paid."""
+    if req is None:
+        lot.free_dm = True
+        return
+    name = type(req).__name__
+    if isinstance(req, RequirementToContactPaidMessages) or name == (
+        "RequirementToContactPaidMessages"
+    ):
+        try:
+            paid = int(getattr(req, "stars_amount", 0) or 0)
+        except (TypeError, ValueError):
+            paid = 1
+        lot.paid_dm_stars = paid
+        lot.free_dm = paid <= 0
+        return
+    if isinstance(req, RequirementToContactPremium) or name == (
+        "RequirementToContactPremium"
+    ):
+        lot.free_dm = True
+        return
+    lot.free_dm = True
+
 STAR_GIFT_CTOR = 0x313A9547
 _PUBLIC_CATALOG_URLS = (
     "https://api.changes.tg/ids",
@@ -1010,8 +1034,12 @@ class TelegramMarket:
         return collected
 
     def rebuild_scan_ids(self) -> list[int]:
-        self.scan_ids = self.floors.scan_collection_ids(self.gift_ids)
-        self.eligible_scan_ids = list(self.scan_ids)
+        catalog = [int(x) for x in self.gift_ids]
+        eligible = self.floors.scan_collection_ids(catalog)
+        seen = {int(x) for x in eligible}
+        rest = [g for g in catalog if g not in seen]
+        self.eligible_scan_ids = list(eligible)
+        self.scan_ids = list(eligible) + rest
         self._cursor = 0
         return self.scan_ids
 
@@ -1436,24 +1464,7 @@ class TelegramMarket:
         if not reqs:
             lot.free_dm = True
             return
-        req = reqs[0]
-        name = req.__class__.__name__
-        if isinstance(req, RequirementToContactPaidMessages) or name == (
-            "RequirementToContactPaidMessages"
-        ):
-            try:
-                paid = int(getattr(req, "stars_amount", 0) or 0)
-            except (TypeError, ValueError):
-                paid = 1
-            lot.paid_dm_stars = paid
-            lot.free_dm = paid <= 0
-            return
-        if isinstance(req, RequirementToContactPremium) or name == (
-            "RequirementToContactPremium"
-        ):
-            lot.free_dm = False
-            return
-        lot.free_dm = True
+        apply_contact_requirement(lot, reqs[0])
 
     async def enrich_lot(self, lot: Lot, timeout: float = 5.0) -> None:
         with self.rpc_kind("enrich"):

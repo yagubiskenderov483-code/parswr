@@ -202,7 +202,7 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.13.3"
+    assert config.TRACKER_VERSION == "5.13.4"
     assert config.SCAN_MODEL_CHUNK == 0
     assert config.SCAN_MAX_PAGES == 2
     assert config.SCAN_SEED_PAGES == 2
@@ -1416,8 +1416,8 @@ def test_listing_vs_model_floor_split() -> None:
     assert listing_and_floor_reason(listing_stars=8000, floor=350) == "REJECT_BAD_MODEL_VALUE"
     # нормальная модель
     assert listing_and_floor_reason(listing_stars=7000, floor=6200) == ""
-    # UNKNOWN не притворяемся
-    assert listing_and_floor_reason(listing_stars=8000, floor=None) == "floor неизвестен"
+    # UNKNOWN не выдумываем floor и не режем listing в диапазоне
+    assert listing_and_floor_reason(listing_stars=8000, floor=None) == ""
 
 
 def test_cheap_model_high_listing_rejected_before_girl() -> None:
@@ -1484,7 +1484,7 @@ def test_apply_listing_floor_filters_paths() -> None:
     unknown = _lot(id="u", slug="U-1", stars=8000, collection_id=1, model_id=30)
     fn = empty_funnel()
     kept = apply_listing_floor_filters([cheap, rare, unknown], cat, fn)
-    assert [x.id for x in kept] == ["r"]
+    assert [x.id for x in kept] == ["r", "u"]
     assert fn["bad_model_value"] == 1
     assert fn["model_floor_pass"] == 1
     assert fn["model_floor_unknown"] == 1
@@ -1653,7 +1653,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.13.3"
+    assert config.TRACKER_VERSION == "5.13.4"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2928,7 +2928,7 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "male_name_reject=1" in text
     assert "score<" not in text
     assert "жду новые лоты с маркета" in text
-    assert "fast start, seed 2стр" in text
+    assert "все коллекции, seed 2стр" in text
 
 
 def test_status_warmup_shows_progress() -> None:
@@ -3137,6 +3137,37 @@ def test_schedule_floor_refresh_skips_when_fresh() -> None:
     assert called["n"] == 1
 
 
+def test_premium_contact_is_not_paid_dm() -> None:
+    from market import apply_contact_requirement
+
+    prem = _lot(first_name="Мария", free_dm=None)
+    apply_contact_requirement(prem, type("RequirementToContactPremium", (), {})())
+    assert prem.free_dm is True
+    paid = _lot(first_name="Мария", free_dm=None)
+    req = type("RequirementToContactPaidMessages", (), {"stars_amount": 50})()
+    apply_contact_requirement(paid, req)
+    assert paid.free_dm is False
+    assert paid.paid_dm_stars == 50
+    assert filter_lot(prem, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == ""
+    assert filter_lot(paid, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "платные ЛС"
+
+
+def test_rebuild_scan_ids_includes_ineligible_collections() -> None:
+    from floors import FloorCatalog
+
+    market = TelegramMarket.__new__(TelegramMarket)
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 1, 8000, "Mid")
+    cat.observe_floor(2, 2, 200, "Junk")
+    market.floors = cat
+    market.gift_ids = [1, 2, 3]
+    market._cursor = 0
+    ids = market.rebuild_scan_ids()
+    assert ids[0] == 1
+    assert 2 in ids and 3 in ids
+    assert market.eligible_scan_ids == [1]
+
+
 def test_fetch_page_live_single_attempt() -> None:
     import asyncio
 
@@ -3334,6 +3365,8 @@ def main() -> None:
         test_unknown_after_known_is_genuine_new,
         test_collection_prime_covers_other_model_key,
         test_collection_prime_does_not_match_other_gid,
+        test_premium_contact_is_not_paid_dm,
+        test_rebuild_scan_ids_includes_ineligible_collections,
         test_should_block_on_floor_catalog_only_when_empty,
         test_schedule_floor_refresh_skips_when_fresh,
         test_fetch_page_live_single_attempt,

@@ -360,11 +360,11 @@ class ControlBot:
             f"Канал: <code>{config.CHANNEL_ID}</code>",
             f"Диапазон: {config.MIN_STARS}–{config.MAX_STARS}⭐ (цель 5k–25k)",
             f"Фильтры: русские девочки (score≥{config.GIRL_MIN_SCORE}) · "
-            f"≤{config.MAX_NFTS} дорогих NFT · free ЛС · "
+            f"≤{config.MAX_NFTS} дорогих NFT · free ЛС (не ⭐) · "
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
                     f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
                     f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
-                    f"(fast start, seed {int(config.SCAN_SEED_PAGES)}стр)",
+                    f"(все коллекции, seed {int(config.SCAN_SEED_PAGES)}стр)",
                     f"Floor: {config.MIN_MODEL_FLOOR}–{config.MAX_MODEL_FLOOR}⭐ "
                     f"listing ±{int(config.LISTING_PRICE_TOLERANCE)}",
         ]

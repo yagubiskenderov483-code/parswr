@@ -91,7 +91,8 @@ def listing_and_floor_reason(*, listing_stars: float, floor: float | None) -> st
         return "REJECT_BAD_MODEL_VALUE"
     if verdict == "above_max":
         return "floor выше макс"
-    return "floor неизвестен"
+    # UNKNOWN не выдумываем цену и не режем: listing уже в 5k–25k.
+    return ""
 
 
 class FloorCatalog:

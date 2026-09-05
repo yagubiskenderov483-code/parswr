@@ -364,7 +364,8 @@ class ControlBot:
             f"lvl≤{config.MAX_ACCOUNT_LEVEL} · пост/{int(config.POST_INTERVAL)}с",
                     f"Скан: batch={config.SCAN_BATCH} parallel={config.SCAN_PARALLEL} "
                     f"rpc={config.RPC_CONCURRENCY} page={config.PAGE_LIMIT} "
-                    f"(все коллекции, seed {int(config.SCAN_SEED_PAGES)}стр)",
+                    f"(eligible only, chunk={int(config.SCAN_MODEL_CHUNK)}, "
+                    f"seed {int(config.SCAN_SEED_PAGES)}стр)",
                     f"Floor: {config.MIN_MODEL_FLOOR}–{config.MAX_MODEL_FLOOR}⭐ "
                     f"listing ±{int(config.LISTING_PRICE_TOLERANCE)}",
         ]
@@ -402,6 +403,14 @@ class ControlBot:
                     "Режим: жду новые лоты с маркета. Старые не пощу. "
                     "Как выложат подходящий NFT — сразу в канал."
                 )
+                try:
+                    from tracker import scan_status_hint
+
+                    hint = scan_status_hint(rt)
+                    if hint:
+                        lines.append(f"Почему пусто: {hint}")
+                except Exception:  # noqa: BLE001
+                    pass
             skip = rt.skip_total or {}
             if any(skip.values()):
                 lines.append(

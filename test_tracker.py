@@ -26,6 +26,7 @@ from market import (
 from tracker import (
     detect_fresh_lots,
     empty_funnel,
+    eligible_scan_pool,
     format_funnel_report,
     format_lot,
     fresh_from_page,
@@ -38,6 +39,7 @@ from tracker import (
     record_work_in,
     record_worker_filter,
     save_state,
+    scan_status_hint,
 )
 
 
@@ -202,10 +204,10 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.13.4"
-    assert config.SCAN_MODEL_CHUNK == 0
+    assert config.TRACKER_VERSION == "5.14.0"
+    assert config.SCAN_MODEL_CHUNK == 12
     assert config.SCAN_MAX_PAGES == 2
-    assert config.SCAN_SEED_PAGES == 2
+    assert config.SCAN_SEED_PAGES == 4
     assert config.FLOOR_START_PAGES == 1
     assert config.REQUEST_ATTEMPTS_LIVE == 1
     assert config.PAGE_SNAPSHOT_KEEP == 120
@@ -1653,7 +1655,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.13.4"
+    assert config.TRACKER_VERSION == "5.14.0"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -1964,6 +1966,18 @@ def test_model_chunk_rotates_eligible_models() -> None:
     assert d == [10, 20, 30]
     all_models = market.next_model_chunk(8, models, 0)
     assert all_models == models
+
+
+def test_stable_model_chunks_covers_all_and_caps_zero() -> None:
+    market = TelegramMarket.__new__(TelegramMarket)
+    models = [90, 10, 20, 30, 40, 50, 60, 70, 80]
+    chunks = market.stable_model_chunks(models, 3)
+    assert chunks == [[10, 20, 30], [40, 50, 60], [70, 80, 90]]
+    again = market.stable_model_chunks(models, 3)
+    assert again == chunks
+    capped = market.stable_model_chunks(list(range(1, 30)), 0)
+    assert all(len(c) <= 12 for c in capped)
+    assert [x for c in capped for x in c] == list(range(1, 30))
 
 
 def test_fetch_newest_stops_when_page_all_known() -> None:
@@ -2928,7 +2942,7 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "male_name_reject=1" in text
     assert "score<" not in text
     assert "жду новые лоты с маркета" in text
-    assert "все коллекции, seed 2стр" in text
+    assert "eligible only, chunk=12" in text
 
 
 def test_status_warmup_shows_progress() -> None:
@@ -3021,8 +3035,8 @@ def test_status_chunks_fit_telegram_limit() -> None:
     assert "message is too long" not in text
 
 
-def test_unknown_after_known_is_genuine_new() -> None:
-    """Unknown id ниже известного на той же странице — GENUINE_NEW."""
+def test_unknown_after_known_is_old_after_anchor() -> None:
+    """Unknown id ниже известного в newest-ленте — старый рынок, не пост."""
     keep = _lot(id="keep", stars=8000)
     observed: dict = {}
     primed: dict = {}
@@ -3046,10 +3060,10 @@ def test_unknown_after_known_is_genuine_new() -> None:
         model_ids=[11],
         stats=empty_funnel(),
     )
-    assert [x.id for x in fresh] == ["brand", "old_float"]
-    assert stats["genuine_new"] == 2
-    assert stats["old_after_anchor"] == 0
-    assert stats["observed_old"] >= 1
+    assert [x.id for x in fresh] == ["brand"]
+    assert stats["genuine_new"] == 1
+    assert stats["old_after_anchor"] == 1
+    assert stats["observed_old"] >= 2
 
 
 def test_collection_prime_covers_other_model_key() -> None:
@@ -3152,7 +3166,7 @@ def test_premium_contact_is_not_paid_dm() -> None:
     assert filter_lot(paid, min_stars=config.MIN_STARS, max_stars=config.MAX_STARS) == "платные ЛС"
 
 
-def test_rebuild_scan_ids_includes_ineligible_collections() -> None:
+def test_rebuild_scan_ids_eligible_only() -> None:
     from floors import FloorCatalog
 
     market = TelegramMarket.__new__(TelegramMarket)
@@ -3163,9 +3177,10 @@ def test_rebuild_scan_ids_includes_ineligible_collections() -> None:
     market.gift_ids = [1, 2, 3]
     market._cursor = 0
     ids = market.rebuild_scan_ids()
-    assert ids[0] == 1
-    assert 2 in ids and 3 in ids
+    assert ids == [1]
+    assert 2 not in ids and 3 not in ids
     assert market.eligible_scan_ids == [1]
+    assert market.scan_ids == [1]
 
 
 def test_fetch_page_live_single_attempt() -> None:
@@ -3243,6 +3258,79 @@ def test_owners_do_not_repeat_in_queue() -> None:
     b = _lot(id="B2", slug="Gift-2", seller="alice", seller_id=1001, stars=9000)
     assert q.enqueue([a, b]) == 0
     assert q._items == []
+
+
+def test_partial_request_still_primes() -> None:
+    lot = _lot(id="p1", stars=8000)
+    fresh, _obs, primed, _pages, stats = _detect(
+        [lot], collection_id=1, model_ids=[10], request_ok=False
+    )
+    assert fresh == []
+    assert stats["unprimed_seed"] == 1
+    assert model_request_key(1, [10]) in primed
+
+
+def test_fetch_newest_ok_when_second_page_times_out() -> None:
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0}
+
+    async def fp(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            m.last_fetch_ok = True
+            m.last_next_offset = "p2"
+            return [_lot(id="a", stars=8000), _lot(id="b", stars=8000)]
+        m.last_fetch_ok = False
+        m.last_next_offset = ""
+        return []
+
+    m.fetch_page = fp
+    m.last_next_offset = ""
+    m.last_fetch_ok = True
+
+    async def run():
+        return await TelegramMarket.fetch_newest_until_known(
+            m,
+            1,
+            model_ids=[11],
+            known_ids=set(),
+            seen={},
+            max_pages=2,
+            limit=12,
+        )
+
+    lots, meta = asyncio.run(run())
+    assert [x.id for x in lots] == ["a", "b"]
+    assert meta["ok"] is True
+    assert meta["pages_ok"] == 1
+
+
+def test_eligible_scan_pool_skips_junk() -> None:
+    from floors import FloorCatalog
+
+    market = TelegramMarket.__new__(TelegramMarket)
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 1, 8000, "Mid")
+    cat.observe_floor(2, 2, 200, "Junk")
+    market.floors = cat
+    market.gift_ids = [1, 2, 3]
+    market._cursor = 0
+    pool = eligible_scan_pool(market, [1, 2, 3])
+    assert pool == [1]
+
+
+def test_scan_status_hint_price_below() -> None:
+    from tracker import Runtime
+
+    rt = Runtime()
+    rt.funnel["sent"] = 0
+    rt.funnel["fresh_detected"] = 22
+    rt.funnel["price_reject"] = 22
+    rt.funnel["price_pass"] = 0
+    hint = scan_status_hint(rt)
+    assert "5000" in hint
 
 
 def main() -> None:
@@ -3362,11 +3450,11 @@ def main() -> None:
         test_telegram_unauthorized_detected,
         test_split_telegram_html_under_limit,
         test_status_chunks_fit_telegram_limit,
-        test_unknown_after_known_is_genuine_new,
+        test_unknown_after_known_is_old_after_anchor,
         test_collection_prime_covers_other_model_key,
         test_collection_prime_does_not_match_other_gid,
         test_premium_contact_is_not_paid_dm,
-        test_rebuild_scan_ids_includes_ineligible_collections,
+        test_rebuild_scan_ids_eligible_only,
         test_should_block_on_floor_catalog_only_when_empty,
         test_schedule_floor_refresh_skips_when_fresh,
         test_fetch_page_live_single_attempt,
@@ -3391,6 +3479,11 @@ def main() -> None:
         test_e_genuine_new_exactly_once,
         test_two_scanner_workers_one_genuine_new,
         test_business_filters_unchanged_in_pr56,
+        test_stable_model_chunks_covers_all_and_caps_zero,
+        test_partial_request_still_primes,
+        test_fetch_newest_ok_when_second_page_times_out,
+        test_eligible_scan_pool_skips_junk,
+        test_scan_status_hint_price_below,
     ]
     for fn in tests:
         fn()

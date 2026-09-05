@@ -820,6 +820,24 @@ class TelegramMarket:
         self._model_cursors[int(gift_id)] = (cur + take) % len(models)
         return out
 
+    def stable_model_chunks(
+        self, model_ids: list[int], chunk: int
+    ) -> list[list[int]]:
+        """Неподвижные чанки по sorted model_id. Каждый раунд — все чанки.
+
+        Ротация next_model_chunk пропускала модели до следующего круга
+        и каждый раз меняла request key → вечный UNPRIMED_SEED.
+        """
+        models = sorted({int(x) for x in model_ids if int(x) > 0})
+        if not models:
+            return []
+        n = int(chunk)
+        if n <= 0:
+            n = 12
+        if n >= len(models):
+            return [models]
+        return [models[i : i + n] for i in range(0, len(models), n)]
+
     async def fetch_page(
         self,
         gift_id: int,
@@ -915,6 +933,7 @@ class TelegramMarket:
                 return True
             return False
 
+        pages_ok = 0
         for _page in range(cap):
             page_offset = offset
             lots = await self.fetch_page(
@@ -930,6 +949,8 @@ class TelegramMarket:
             )
             pages_n += 1
             offsets.append(page_offset)
+            if getattr(self, "last_fetch_ok", True):
+                pages_ok += 1
             if not lots:
                 break
             unknown = 0
@@ -968,6 +989,8 @@ class TelegramMarket:
             "model_ids": list(model_ids or []),
             "offsets": offsets,
             "hit_known": hit_known,
+            "ok": pages_ok > 0,
+            "pages_ok": pages_ok,
         }
 
     async def fetch_in_range(
@@ -1034,12 +1057,15 @@ class TelegramMarket:
         return collected
 
     def rebuild_scan_ids(self) -> list[int]:
+        """Только коллекции с eligible моделью (floor 4k–27k).
+
+        Скан всех 151 без фильтра: newest=дешёвый спам, round ~4 мин, to≈130,
+        5k–25k лоты тонут в таймаутах.
+        """
         catalog = [int(x) for x in self.gift_ids]
         eligible = self.floors.scan_collection_ids(catalog)
-        seen = {int(x) for x in eligible}
-        rest = [g for g in catalog if g not in seen]
         self.eligible_scan_ids = list(eligible)
-        self.scan_ids = list(eligible) + rest
+        self.scan_ids = list(eligible)
         self._cursor = 0
         return self.scan_ids
 

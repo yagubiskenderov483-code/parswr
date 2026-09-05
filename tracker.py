@@ -1743,6 +1743,7 @@ def _detect_fresh_lots_locked(
     verdicts: list[dict[str, Any]] = []
     genuine: list[Lot] = []
     page_ids: list[str] = []
+    hit_anchor = False
 
     for lot in lots:
         if stats is not None:
@@ -1778,22 +1779,31 @@ def _detect_fresh_lots_locked(
         if lid:
             round_hits.setdefault(lid, []).append((int(collection_id), mid))
 
-        # Already-seen / same-round dup = OLD. Unknown id на той же странице
-        # ниже известного — GENUINE_NEW (observed всё ещё режет текущую книгу).
+        # Newest-first: после первого уже виденного лота остальные unknown —
+        # старый рынок ниже seed, не постить.
         if dup_round:
             reason = "OLD"
             is_new = False
+            hit_anchor = True
             if stats is not None:
                 _bump(stats, "fresh_repeated")
                 _bump(stats, "observed_old")
         elif observed_before or seen_before:
             reason = "OLD"
             is_new = False
+            hit_anchor = True
             if stats is not None:
                 _bump(stats, "unique_listing_ids")
                 _bump(stats, "observed_old")
                 if snapshot_before is False:
                     _bump(stats, "fresh_repeated")
+        elif hit_anchor:
+            reason = "OLD"
+            is_new = False
+            if stats is not None:
+                _bump(stats, "unique_listing_ids")
+                _bump(stats, "observed_old")
+                _bump(stats, "old_after_anchor")
         elif not primed_before:
             reason = "UNPRIMED_SEED"
             is_new = False
@@ -1841,7 +1851,9 @@ def _detect_fresh_lots_locked(
             if price_ok and not seen_before:
                 genuine.append(lot)
 
-    if request_ok:
+    # Первая успешная страница праймит даже если следующая ушла в таймаут.
+    # Иначе коллекция вечно UNPRIMED_SEED и новые лоты глотаются как seed.
+    if request_ok or page_ids:
         primed[req_key] = ts
         if page_ids:
             pages[req_key] = merge_page_snapshot(
@@ -1925,22 +1937,29 @@ async def sync_pages(
                 model_ids = market.floors.eligible_model_ids(gid)
                 if not model_ids:
                     return gid, [], []
-                lots, _meta = await market.fetch_newest_until_known(
-                    gid,
-                    model_ids=model_ids,
-                    known_ids=set(store),
-                    seen={},
-                    max_pages=max(1, int(config.SCAN_SEED_PAGES)),
-                    limit=config.PAGE_LIMIT,
-                    timeout=config.REQUEST_TIMEOUT,
-                    gap=config.REQUEST_GAP,
-                    stop_at_first_known=False,
-                )
+                lots_all: list[Lot] = []
+                for chunk_ids in market.stable_model_chunks(
+                    model_ids, int(config.SCAN_MODEL_CHUNK)
+                ):
+                    lots, _meta = await market.fetch_newest_until_known(
+                        gid,
+                        model_ids=chunk_ids,
+                        known_ids=set(store),
+                        seen={},
+                        max_pages=max(1, int(config.SCAN_SEED_PAGES)),
+                        limit=config.PAGE_LIMIT,
+                        timeout=config.REQUEST_TIMEOUT,
+                        gap=config.REQUEST_GAP,
+                        stop_at_first_known=False,
+                    )
+                    lots_all.extend(lots)
+                    req_key = model_request_key(gid, chunk_ids)
+                    primed_store[req_key] = time.time()
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
-                lots = []
+                lots_all = []
                 model_ids = []
-            return gid, lots, list(model_ids or [])
+            return gid, lots_all, list(model_ids or [])
 
     now = time.time()
     chunk = max(parallel * 4, 16)
@@ -1988,6 +2007,45 @@ def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
     )
     runtime.catalog_updated_at = float(market.floors.updated_at or 0)
     runtime.diag.note_catalog(st, runtime.collections_eligible)
+
+
+def eligible_scan_pool(market: TelegramMarket, gift_ids: list[int]) -> list[int]:
+    """Только коллекции с floor в диапазоне. Никогда не 151 дешёвых."""
+    market.rebuild_scan_ids()
+    pool = list(getattr(market, "eligible_scan_ids", None) or [])
+    if pool:
+        return pool
+    return market.floors.scan_collection_ids(gift_ids)
+
+
+def scan_status_hint(runtime: Runtime) -> str:
+    """Одна строка для /status, почему канал пустой."""
+    fn = runtime.funnel or {}
+    if int(fn.get("sent") or 0) > 0:
+        return ""
+    fresh = int(fn.get("fresh_detected") or 0)
+    price_r = int(fn.get("price_reject") or 0)
+    price_p = int(fn.get("price_pass") or 0)
+    unprimed = int(fn.get("unprimed_seed") or 0)
+    genuine = int(fn.get("genuine_new") or 0)
+    last = getattr(getattr(runtime, "diag", None), "last_round", None) or {}
+    to = int(last.get("timeout_count") or 0)
+    if to >= 20:
+        return (
+            f"скан тонул в таймаутах ({to}/проход). "
+            "Теперь только eligible + чанки моделей."
+        )
+    if fresh and price_r >= fresh and price_p == 0:
+        return (
+            "свежие лоты были, все дешевле 5000⭐ "
+            "(скан дешёвых коллекций выключен)."
+        )
+    if unprimed > 50 and genuine == 0:
+        return (
+            "лоты уходили в seed из‑за таймаутов (не праймилась коллекция). "
+            "Прайм с первой страницы."
+        )
+    return ""
 
 
 def should_block_on_floor_catalog(market: TelegramMarket) -> bool:
@@ -2071,7 +2129,7 @@ async def scanner_loop(
         fn_before = dict(runtime.funnel)
         if not market.floors.is_fresh():
             schedule_floor_refresh(market, gift_ids, runtime)
-        scan_pool = list(market.scan_ids) or market.floors.scan_collection_ids(gift_ids)
+        scan_pool = eligible_scan_pool(market, gift_ids)
         market.scan_ids = scan_pool
         n_coll = max(len(scan_pool), 1)
         batch_n = n_coll if config.SCAN_BATCH <= 0 else min(config.SCAN_BATCH, n_coll)
@@ -2104,7 +2162,7 @@ async def scanner_loop(
                         )
                     schedule_floor_refresh(market, gift_ids, runtime, force=True)
                     apply_catalog_stats(runtime, market)
-                    scan_pool = list(market.scan_ids)
+                    scan_pool = eligible_scan_pool(market, gift_ids)
                 if market.last_error and len(gift_ids) < config.MIN_COLLECTIONS:
                     runtime.last_error = market.last_error
             except Exception as exc:  # noqa: BLE001
@@ -2120,7 +2178,26 @@ async def scanner_loop(
         listing_lo, listing_hi = listing_price_range()
         sem = asyncio.Semaphore(config.SCAN_PARALLEL)
 
-        async def one(gid: int) -> tuple[int, list[Lot], bool, dict[str, Any]]:
+        jobs: list[tuple[int, list[int]]] = []
+        for gid in batch:
+            model_ids = market.floors.eligible_model_ids(gid)
+            if not model_ids:
+                continue
+            for chunk_ids in market.stable_model_chunks(
+                model_ids, int(config.SCAN_MODEL_CHUNK)
+            ):
+                jobs.append((gid, list(chunk_ids)))
+        if not jobs:
+            logger.info(
+                "Проход #%s: eligible коллекций 0 — жду floor catalog",
+                pass_no,
+            )
+            await asyncio.sleep(max(float(config.POLL_INTERVAL), 0.5))
+            continue
+
+        async def one(
+            gid: int, used_models: list[int]
+        ) -> tuple[int, list[Lot], bool, dict[str, Any]]:
             async with sem:
                 ok = True
                 meta: dict[str, Any] = {
@@ -2129,17 +2206,10 @@ async def scanner_loop(
                     "old": 0,
                     "depths": {},
                     "models": 0,
-                    "model_ids": [],
-                    "request_key": model_request_key(gid, []),
+                    "model_ids": list(used_models),
+                    "request_key": model_request_key(gid, used_models),
                 }
                 try:
-                    model_ids = market.floors.eligible_model_ids(gid)
-                    used_models: list[int] = []
-                    if model_ids:
-                        chunk_ids = market.next_model_chunk(
-                            gid, model_ids, int(config.SCAN_MODEL_CHUNK)
-                        )
-                        used_models = chunk_ids or model_ids
                     req_key = model_request_key(gid, used_models)
                     prev_ids = pages.get(req_key) or []
                     primed_already = collection_is_primed(
@@ -2148,12 +2218,11 @@ async def scanner_loop(
                     live_pages = max(1, int(config.SCAN_MAX_PAGES))
                     seed_pages = max(live_pages, int(config.SCAN_SEED_PAGES))
                     max_pages = live_pages if primed_already else seed_pages
-                    # known = глобальный observed, не «текущая page коллекции»
                     known = set(observed_store) | set(prev_ids)
                     with market.rpc_kind("scan"):
                         lots, meta = await market.fetch_newest_until_known(
                             gid,
-                            model_ids=used_models or None,
+                            model_ids=used_models,
                             known_ids=known,
                             seen=seen,
                             max_pages=max_pages,
@@ -2166,8 +2235,7 @@ async def scanner_loop(
                         )
                     meta["model_ids"] = list(used_models)
                     meta["request_key"] = req_key
-                    if not market.last_fetch_ok:
-                        ok = False
+                    ok = bool(meta.get("ok")) or bool(lots)
                 except Exception as exc:  # noqa: BLE001
                     runtime.last_error = str(exc)
                     lots = []
@@ -2184,6 +2252,7 @@ async def scanner_loop(
         seen_skip = 0
         seller_skip = 0
         round_hits: dict[str, list[tuple[int, int | None]]] = {}
+        scanned_gids: set[int] = set()
 
         def absorb(
             gid: int,
@@ -2194,9 +2263,11 @@ async def scanner_loop(
             nonlocal found, queued, api_n, seen_skip, seller_skip
             info = meta or {}
             api_n += len(lots)
-            _bump(runtime.funnel, "collections_scanned")
-            if market.floors.eligible_model_ids(gid):
-                _bump(runtime.funnel, "eligible_collections_scanned")
+            if gid not in scanned_gids:
+                scanned_gids.add(gid)
+                _bump(runtime.funnel, "collections_scanned")
+                if market.floors.eligible_model_ids(gid):
+                    _bump(runtime.funnel, "eligible_collections_scanned")
             new_n = int(info.get("new") or 0)
             old_n = int(info.get("old") or 0)
             _bump(runtime.funnel, "new_listing_seen", new_n)
@@ -2282,7 +2353,7 @@ async def scanner_loop(
             seller_skip += len(chunk) - enqueued
             queued += enqueued
 
-        tasks = [asyncio.create_task(one(g)) for g in batch]
+        tasks = [asyncio.create_task(one(gid, mids)) for gid, mids in jobs]
         for fut in asyncio.as_completed(tasks):
             try:
                 gid, lots, ok, meta = await fut
@@ -2337,6 +2408,15 @@ async def scanner_loop(
                 "timeout_count": timeout_count,
             }
         )
+        if timeout_count:
+            logger.warning(
+                "[pipeline] pass #%s timeouts=%s round=%.1fs jobs=%s eligible=%s",
+                pass_no,
+                timeout_count,
+                round_ms / 1000.0,
+                len(jobs),
+                len(scan_pool),
+            )
         logger.info(
             "[pipeline] pass #%s API=%s unique=%s GENUINE_NEW=%s "
             "fresh=%s price_pass=%s seen_pass=%s "

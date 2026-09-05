@@ -64,16 +64,17 @@ TZ_OFFSET = 3.0  # МСК
 POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
 PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest одной страницы
 SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
-# 0 = все eligible коллекции за round. Env >0 — кольцо по N.
+# 0 = все eligible коллекции за round (не 151 дешёвых). Env >0 — кольцо по N.
 SCAN_BATCH = env_int("SCAN_BATCH", 0)
 # Реальный in-flight GetResaleStarGifts. Не поднимаем ради «быстрее» — FloodWait.
 RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 6), SCAN_PARALLEL))
-# 0 = все eligible модели одним RPC (новые лоты сразу наверху newest).
-SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 0)
+# Сколько model_id в одном GetResaleStarGifts. 0 = все (таймауты на 40+ моделях).
+# 12 — RPC <1с, новые лоты всё ещё наверху newest внутри чанка.
+SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 12)
 # Live: newest-страницы до первого уже известного лота. 2 — если page1 вся новая.
 SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
-# Первый визит коллекции (без блокирующего sync на старте). 2 стр ≈ 1–2с, не 8×8с.
-SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 2)
+# Первый визит коллекции. 4 стр при eligible-only; 2 стр оставляли дыры → ложный seed.
+SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 4)
 # Накопленный снимок id коллекции (не только последние 12) — меньше ложных fresh.
 PAGE_SNAPSHOT_KEEP = env_int("PAGE_SNAPSHOT_KEEP", 120)
 REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
@@ -84,7 +85,7 @@ REQUEST_ATTEMPTS_LIVE = env_int("REQUEST_ATTEMPTS_LIVE", 1)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.13.4"
+TRACKER_VERSION = "5.14.0"
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 3900
 DEBUG_FILTERS = True

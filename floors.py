@@ -226,6 +226,36 @@ class FloorCatalog:
             "candidate_model_count": known,
         }
 
+    def prune_missing_collections(self, live_ids: list[int] | set[int]) -> int:
+        """Убрать модели коллекций, которых нет в live GetStarGifts (149, не 151)."""
+        allowed: set[int] = set()
+        for raw in live_ids:
+            try:
+                gid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if gid > 0:
+                allowed.add(gid)
+        if not allowed:
+            return 0
+        drop: list[str] = []
+        for key, row in self.models.items():
+            try:
+                gid = int(row.get("gift_id") or 0)
+            except (TypeError, ValueError):
+                gid = 0
+            if gid not in allowed:
+                drop.append(key)
+        for key in drop:
+            self.models.pop(key, None)
+        if drop:
+            logger.info(
+                "Floor prune: убрано %s моделей не из live-каталога",
+                len(drop),
+            )
+            self.save()
+        return len(drop)
+
     def eligible_keys(self) -> list[str]:
         out: list[str] = []
         for key, row in self.models.items():

@@ -73,8 +73,9 @@ RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 6), SCAN_PARALLEL))
 SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 12)
 # Live: newest-страницы до первого уже известного лота. 2 — если page1 вся новая.
 SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
-# Первый визит коллекции. 4 стр при eligible-only; 2 стр оставляли дыры → ложный seed.
-SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 4)
+# Первый визит: 2 newest-стр. 4 стр × чанки = таймаут-шторм (116 to / 224с).
+# Прайм с первой успешной страницы; hit_anchor режет старое ниже известного.
+SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 2)
 # Накопленный снимок id коллекции (не только последние 12) — меньше ложных fresh.
 PAGE_SNAPSHOT_KEEP = env_int("PAGE_SNAPSHOT_KEEP", 120)
 REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
@@ -85,7 +86,7 @@ REQUEST_ATTEMPTS_LIVE = env_int("REQUEST_ATTEMPTS_LIVE", 1)
 ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
 MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
 
-TRACKER_VERSION = "5.14.1"
+TRACKER_VERSION = "5.14.2"
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 3900
 DEBUG_FILTERS = True

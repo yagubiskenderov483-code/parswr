@@ -552,6 +552,9 @@ class TelegramMarket:
         self.floors.load()
         self.scan_ids: list[int] = []
         self.eligible_scan_ids: list[int] = []
+        self.catalog_live = 0
+        self.catalog_dropped = 0
+        self.catalog_pruned_models = 0
         self._model_cursors: dict[int, int] = {}
         self.last_next_offset = ""
         self.runtime: Any = None
@@ -816,10 +819,17 @@ class TelegramMarket:
         extra = len(merge_ids(live, via_public, via_bundled, cached)) - len(chosen)
         if chosen:
             self.gift_ids = chosen
+            self.catalog_live = len(chosen)
+            self.catalog_dropped = extra if live else 0
             self._save_catalog()
+            if live:
+                self.catalog_pruned_models = self.floors.prune_missing_collections(
+                    chosen
+                )
+                self.rebuild_scan_ids()
             logger.info(
                 "Каталог live=%s (user=%s bot=%s) · public=%s bundled=%s cache=%s"
-                "%s",
+                "%s%s",
                 len(live),
                 len(via_user),
                 len(via_bot),
@@ -827,6 +837,11 @@ class TelegramMarket:
                 len(via_bundled),
                 len(cached),
                 f" · отброшено лишних {extra}" if extra > 0 and live else "",
+                (
+                    f" · prune моделей {self.catalog_pruned_models}"
+                    if self.catalog_pruned_models
+                    else ""
+                ),
             )
             if len(chosen) < config.MIN_COLLECTIONS:
                 self.last_error = f"мало коллекций: {len(chosen)}"

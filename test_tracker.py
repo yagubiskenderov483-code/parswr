@@ -26,6 +26,7 @@ from market import (
     _stars_level,
 )
 from tracker import (
+    apply_catalog_stats,
     detect_fresh_lots,
     empty_funnel,
     eligible_scan_pool,
@@ -206,10 +207,10 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.14.1"
+    assert config.TRACKER_VERSION == "5.14.2"
     assert config.SCAN_MODEL_CHUNK == 12
     assert config.SCAN_MAX_PAGES == 2
-    assert config.SCAN_SEED_PAGES == 4
+    assert config.SCAN_SEED_PAGES == 2
     assert config.FLOOR_START_PAGES == 1
     assert config.REQUEST_ATTEMPTS_LIVE == 1
     assert config.PAGE_SNAPSHOT_KEEP == 120
@@ -1421,6 +1422,9 @@ def test_status_html_safe_diagnostics() -> None:
     assert "MODEL CATALOG" in text
     assert "models_total=" in text
     assert "collections_eligible=" in text
+    assert "Модели: парсим" in text
+    assert "listing_unprimed_in_range=" in text
+    assert "listing_genuine_in_range=" in text
     assert "bad_model_value=" in text
     assert "OWNER" in text
     assert "REJECTION REASONS" in text
@@ -1678,7 +1682,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.14.1"
+    assert config.TRACKER_VERSION == "5.14.2"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -3356,6 +3360,121 @@ def test_scan_status_hint_price_below() -> None:
     assert "5000" in hint
 
 
+def test_prune_missing_collections_drops_stale() -> None:
+    from floors import FloorCatalog
+
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 10, 8000, "Keep")
+    cat.observe_floor(2, 20, 9000, "Drop")
+    assert cat.prune_missing_collections([]) == 0
+    assert len(cat.models) == 2
+    n = cat.prune_missing_collections([1])
+    assert n == 1
+    assert cat.eligible_model_ids(1) == [10]
+    assert cat.eligible_model_ids(2) == []
+
+
+def test_apply_catalog_stats_copies_catalog_meta() -> None:
+    from floors import FloorCatalog
+    from tracker import Runtime
+
+    market = TelegramMarket.__new__(TelegramMarket)
+    cat = FloorCatalog(path=None)
+    cat.observe_floor(1, 1, 8000, "Mid")
+    market.floors = cat
+    market.gift_ids = [1]
+    market.eligible_scan_ids = [1]
+    market.scan_ids = [1]
+    market.catalog_live = 149
+    market.catalog_dropped = 2
+    market.catalog_pruned_models = 8
+    rt = Runtime()
+    apply_catalog_stats(rt, market)
+    assert rt.catalog_live == 149
+    assert rt.catalog_dropped == 2
+    assert rt.catalog_pruned_models == 8
+    assert rt.models_eligible == 1
+
+
+def test_unprimed_in_range_counter() -> None:
+    cheap = _lot(id="cheap", slug="Cheap-1", stars=800)
+    mid = _lot(id="mid", slug="Mid-1", stars=8000)
+    fresh, _obs, primed, _pages, stats = _detect(
+        [cheap, mid], collection_id=1, model_ids=[10]
+    )
+    assert fresh == []
+    assert stats["unprimed_seed"] == 2
+    assert stats["listing_unprimed_in_range"] == 1
+    assert stats["listing_genuine_in_range"] == 0
+    neu = _lot(id="neu", slug="Neu-1", stars=9000)
+    fresh2, _o2, _p2, _pg2, stats2 = _detect(
+        [neu],
+        primed=dict(primed),
+        collection_id=1,
+        model_ids=[10],
+    )
+    assert [x.id for x in fresh2] == ["neu"]
+    assert stats2["listing_genuine_in_range"] == 1
+
+
+def test_scan_status_hint_timeouts_mention_in_range() -> None:
+    from tracker import Runtime
+
+    rt = Runtime()
+    rt.funnel["sent"] = 0
+    rt.funnel["listing_price_pass"] = 391
+    rt.funnel["listing_unprimed_in_range"] = 350
+    rt.diag.last_round = {"timeout_count": 116}
+    hint = scan_status_hint(rt)
+    assert "116" in hint
+    assert "391" in hint
+    assert "seed" in hint
+
+
+def test_scan_status_hint_ru_only() -> None:
+    from tracker import Runtime
+
+    rt = Runtime()
+    rt.funnel["sent"] = 0
+    rt.funnel["fresh_detected"] = 33
+    rt.funnel["price_pass"] = 1
+    rt.funnel["price_reject"] = 32
+    rt.funnel["ru_reject"] = 1
+    rt.funnel["girl_checked"] = 0
+    rt.funnel["send_attempt"] = 0
+    rt.funnel["unprimed_seed"] = 10
+    rt.diag.last_round = {"timeout_count": 0}
+    hint = scan_status_hint(rt)
+    assert "не русский" in hint
+
+
+def test_status_shows_live_models_and_dropped() -> None:
+    from bot import ControlBot
+    from tracker import Runtime
+
+    ctrl = ControlBot.__new__(ControlBot)
+    ctrl.authorized = True
+    ctrl.account_name = "tester"
+    ctrl.runtime = Runtime()
+    rt = ctrl.runtime
+    rt.snapshot_ready = True
+    rt.collections = 149
+    rt.catalog_live = 149
+    rt.catalog_dropped = 2
+    rt.collections_eligible = 23
+    rt.models_total = 2257
+    rt.models_eligible = 464
+    rt.models_scan_round = 464
+    rt.models_rpc_jobs = 39
+    text = ControlBot._status_text(ctrl)
+    assert "Коллекций: 149 live · отброшено 2 · скан 23 eligible" in text
+    assert "Модели: парсим 464 этот проход · eligible 464 · кэш 2257 · RPC 39×12" in text
+    assert "v5.14.2" in text
+    rt.catalog_dropped = 0
+    text2 = ControlBot._status_text(ctrl)
+    assert "отброшено" not in text2.split("Коллекций:", 1)[1].split("\n", 1)[0]
+
+
 def main() -> None:
     tests = [
         test_card_matches_screenshot,
@@ -3509,6 +3628,12 @@ def main() -> None:
         test_fetch_newest_ok_when_second_page_times_out,
         test_eligible_scan_pool_skips_junk,
         test_scan_status_hint_price_below,
+        test_prune_missing_collections_drops_stale,
+        test_apply_catalog_stats_copies_catalog_meta,
+        test_unprimed_in_range_counter,
+        test_scan_status_hint_timeouts_mention_in_range,
+        test_scan_status_hint_ru_only,
+        test_status_shows_live_models_and_dropped,
     ]
     for fn in tests:
         fn()

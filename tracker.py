@@ -575,6 +575,8 @@ def empty_funnel() -> dict[str, int]:
         "observed_duplicate_same_round",
         "observed_duplicate_cross_model",
         "unprimed_seed",
+        "listing_unprimed_in_range",
+        "listing_genuine_in_range",
         "genuine_new",
         "genuine_new_listings",
         "old_after_anchor",
@@ -1099,6 +1101,9 @@ class Runtime:
         self.catalog_updated_at = 0.0
         self.models_scan_round = 0
         self.models_rpc_jobs = 0
+        self.catalog_live = 0
+        self.catalog_dropped = 0
+        self.catalog_pruned_models = 0
         self.warmup_stage = "start"
         self.warmup_done = 0
         self.warmup_total = 0
@@ -1697,8 +1702,8 @@ def detect_fresh_lots(
     и коллекция уже primed (этот ключ или любой запрос той же gid).
 
     Не «нет в текущей page/snapshot». Первый визит коллекции — UNPRIMED_SEED.
-    Unknown ниже уже известного id на той же странице — тоже GENUINE_NEW:
-    лента не строго newest-first, hit_anchor выкидывал живые лоты.
+    Unknown ниже уже известного id на newest-странице — OLD (hit_anchor):
+    иначе в канал сыплется старая книга.
     """
     with _FRESHNESS_LOCK:
         return _detect_fresh_lots_locked(
@@ -1812,6 +1817,11 @@ def _detect_fresh_lots_locked(
             if stats is not None:
                 _bump(stats, "unique_listing_ids")
                 _bump(stats, "unprimed_seed")
+                try:
+                    if lo <= float(lot.stars) <= hi:
+                        _bump(stats, "listing_unprimed_in_range")
+                except (TypeError, ValueError):
+                    pass
         else:
             reason = "NEW"
             is_new = True
@@ -1820,6 +1830,11 @@ def _detect_fresh_lots_locked(
                 _bump(stats, "genuine_new")
                 _bump(stats, "genuine_new_listings")
                 _bump(stats, "fresh_unique")
+                try:
+                    if lo <= float(lot.stars) <= hi:
+                        _bump(stats, "listing_genuine_in_range")
+                except (TypeError, ValueError):
+                    pass
 
         row = freshness_verdict_dict(
             lot,
@@ -2008,6 +2023,13 @@ def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
         getattr(market, "eligible_scan_ids", None) or market.scan_ids
     )
     runtime.catalog_updated_at = float(market.floors.updated_at or 0)
+    runtime.catalog_live = int(
+        getattr(market, "catalog_live", 0) or runtime.collections
+    )
+    runtime.catalog_dropped = int(getattr(market, "catalog_dropped", 0) or 0)
+    runtime.catalog_pruned_models = int(
+        getattr(market, "catalog_pruned_models", 0) or 0
+    )
     runtime.diag.note_catalog(st, runtime.collections_eligible)
 
 
@@ -2030,12 +2052,28 @@ def scan_status_hint(runtime: Runtime) -> str:
     price_p = int(fn.get("price_pass") or 0)
     unprimed = int(fn.get("unprimed_seed") or 0)
     genuine = int(fn.get("genuine_new") or 0)
+    listing_ok = int(fn.get("listing_price_pass") or 0)
+    unprimed_band = int(fn.get("listing_unprimed_in_range") or 0)
+    genuine_band = int(fn.get("listing_genuine_in_range") or 0)
+    ru_r = int(fn.get("ru_reject") or 0)
     last = getattr(getattr(runtime, "diag", None), "last_round", None) or {}
     to = int(last.get("timeout_count") or 0)
     if to >= 20:
+        extra = ""
+        stuck = unprimed_band or listing_ok
+        if stuck:
+            extra = (
+                f" На страницах {listing_ok} лотов 5k–25k, "
+                f"{unprimed_band} из них ушли в seed."
+            )
         return (
-            f"скан тонул в таймаутах ({to}/проход). "
+            f"скан тонул в таймаутах ({to}/проход).{extra} "
             "Теперь только eligible + чанки моделей."
+        )
+    if unprimed_band > 10 and genuine_band == 0 and unprimed > 50:
+        return (
+            f"{unprimed_band} лотов 5k–25k увидели, но коллекция не праймилась "
+            "— в канал не пошли. Прайм с первой страницы."
         )
     if fresh and price_r >= fresh and price_p == 0:
         return (
@@ -2046,6 +2084,16 @@ def scan_status_hint(runtime: Runtime) -> str:
         return (
             "лоты уходили в seed из‑за таймаутов (не праймилась коллекция). "
             "Прайм с первой страницы."
+        )
+    if (
+        price_p > 0
+        and ru_r >= price_p
+        and int(fn.get("girl_checked") or 0) == 0
+        and int(fn.get("send_attempt") or 0) == 0
+    ):
+        return (
+            f"до фильтров дошёл {price_p} лот в диапазоне — "
+            "продавец не русский (нет кириллицы)."
         )
     return ""
 

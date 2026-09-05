@@ -24,15 +24,19 @@ from market import (
     _stars_level,
 )
 from tracker import (
+    detect_fresh_lots,
     empty_funnel,
     format_funnel_report,
     format_lot,
     fresh_from_page,
     funnel_invariants,
+    load_state,
+    model_request_key,
     record_enqueue_dup,
     record_fresh_price_seen,
     record_work_in,
     record_worker_filter,
+    save_state,
 )
 
 
@@ -197,7 +201,7 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.11.0"
+    assert config.TRACKER_VERSION == "5.12.0"
     assert config.SCAN_MODEL_CHUNK == 6
     assert config.SCAN_MAX_PAGES == 2
     assert config.PAGE_SNAPSHOT_KEEP == 80
@@ -750,6 +754,7 @@ def test_state_schema_clears_seller_bans() -> None:
         assert data["market_ids"] == ["old"]
         assert data["pages"] == {}
         assert data["seen_sellers"] == {"spammer": 1.0}
+        assert "lot1" in data["observed"]
 
 
 def test_percentile_and_scan_round_metrics() -> None:
@@ -1645,7 +1650,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.11.0"
+    assert config.TRACKER_VERSION == "5.12.0"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -2227,6 +2232,649 @@ def test_female_gate_keeps_confident_maria() -> None:
     assert girl_reject_reason(lot) == "ok"
 
 
+def _detect(
+    lots: list[Lot],
+    *,
+    observed: dict | None = None,
+    primed: dict | None = None,
+    pages: dict | None = None,
+    seen: dict | None = None,
+    collection_id: int = 1,
+    model_ids: list[int] | None = None,
+    round_hits: dict | None = None,
+    stats: dict | None = None,
+    request_ok: bool = True,
+) -> tuple[list[Lot], dict, dict, dict, dict]:
+    observed = observed if observed is not None else {}
+    primed = primed if primed is not None else {}
+    pages = pages if pages is not None else {}
+    seen = seen if seen is not None else {}
+    round_hits = round_hits if round_hits is not None else {}
+    stats = stats if stats is not None else empty_funnel()
+    fresh, _verdicts = detect_fresh_lots(
+        lots,
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        seen=seen,
+        collection_id=collection_id,
+        model_ids=model_ids if model_ids is not None else [10],
+        round_hits=round_hits,
+        stats=stats,
+        request_ok=request_ok,
+    )
+    return fresh, observed, primed, pages, stats
+
+
+def test_new_listing_seen_is_not_page_absence() -> None:
+    """new_listing_seen / GENUINE_NEW ≠ «нет в текущей page snapshot»."""
+    from market import TelegramMarket
+
+    m = TelegramMarket.__new__(TelegramMarket)
+
+    def _old(lot: Lot, known_ids: set[str], seen: dict) -> bool:
+        if lot.id in known_ids or lot.id in seen:
+            return True
+        if lot.slug and lot.slug in seen:
+            return True
+        return False
+
+    lot = _lot(id="oldA", slug="OldA-1", stars=8000)
+    # Нет в текущей page snapshot, но уже observed → OLD, не NEW
+    assert _old(lot, known_ids={"other"}, seen={}) is False
+    fresh, observed, primed, pages, stats = _detect(
+        [lot], observed={"oldA": {"first": 1.0, "last": 1.0}}, primed={"1:10": 1.0}
+    )
+    assert fresh == []
+    assert stats["genuine_new"] == 0
+    assert stats["observed_old"] == 1
+    _ = m
+
+
+def test_a_old_listing_after_restart() -> None:
+    """A) scan#1 listing A; restart; scan#3 — A не fresh."""
+    import tempfile
+    from pathlib import Path
+
+    a = _lot(id="A", slug="Gift-A", stars=8000, collection_id=7, model_id=10)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    seen: dict = {}
+    fresh, observed, primed, pages, stats = _detect(
+        [a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        seen=seen,
+        collection_id=7,
+        model_ids=[10],
+    )
+    assert fresh == []
+    assert stats["unprimed_seed"] == 1
+    assert stats["genuine_new"] == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        save_state(
+            path,
+            {
+                "seen": seen,
+                "seen_sellers": {},
+                "skip_sellers": {},
+                "market_ids": [],
+                "heads": {},
+                "pages": pages,
+                "observed": observed,
+                "primed_models": primed,
+            },
+        )
+        loaded = load_state(path)
+    fresh2, *_rest = _detect(
+        [a],
+        observed=loaded["observed"],
+        primed=loaded["primed_models"],
+        pages=loaded["pages"],
+        seen=loaded["seen"],
+        collection_id=7,
+        model_ids=[10],
+    )
+    assert fresh2 == []
+    assert "A" in loaded["observed"]
+
+
+def test_b_old_listing_on_next_page() -> None:
+    """B) listing на странице 2 после seed не становится NEW."""
+    p1 = [_lot(id="p1a", stars=8000, scan_page=1, scan_offset="")]
+    p2 = [_lot(id="p2c", stars=9000, scan_page=2, scan_offset="off2")]
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect(
+        p1 + p2,
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=3,
+        model_ids=[4],
+    )
+    fresh, *_ = _detect(
+        p2,
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=3,
+        model_ids=[4],
+    )
+    assert fresh == []
+
+
+def test_c_same_listing_two_model_queries() -> None:
+    """C) один listing_id в двух model queries — второй OLD."""
+    lot = _lot(id="X", slug="X-1", stars=8000, model_id=1)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    stats = empty_funnel()
+    _detect(
+        [lot],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=5,
+        model_ids=[1],
+        stats=stats,
+    )
+    lot_b = _lot(id="X", slug="X-1", stars=8000, model_id=2)
+    primed[model_request_key(5, [2])] = 1.0
+    fresh, *_rest, stats2 = _detect(
+        [lot_b],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=5,
+        model_ids=[2],
+        stats=empty_funnel(),
+    )
+    assert fresh == []
+    assert stats2["observed_old"] == 1
+    assert stats2["genuine_new"] == 0
+
+
+def test_d_same_listing_two_collections() -> None:
+    """D) один listing_id в двух collection/request — второй OLD."""
+    lot = _lot(id="Z", stars=8000, collection_id=1)
+    observed: dict = {}
+    primed: dict = {}
+    _detect(
+        [lot],
+        observed=observed,
+        primed=primed,
+        collection_id=1,
+        model_ids=[8],
+    )
+    primed[model_request_key(2, [8])] = 1.0
+    fresh, *_rest, stats = _detect(
+        [_lot(id="Z", stars=8000, collection_id=2)],
+        observed=observed,
+        primed=primed,
+        collection_id=2,
+        model_ids=[8],
+        stats=empty_funnel(),
+    )
+    assert fresh == []
+    assert stats["observed_old"] == 1
+
+
+def test_e_new_listing_between_scan1_and_scan2() -> None:
+    """E) новый listing между scan #1 и #2 — GENUINE_NEW."""
+    a = _lot(id="keep", stars=8000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect(
+        [a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+    )
+    neu = _lot(id="brand", slug="Brand-1", stars=7000)
+    fresh, *_rest, stats = _detect(
+        [neu, a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=empty_funnel(),
+    )
+    assert [x.id for x in fresh] == ["brand"]
+    assert stats["genuine_new"] == 1
+    assert stats["genuine_new_listings"] == 1
+    assert stats["fresh_unique"] == 1
+    assert stats["fresh_detected"] == 1
+
+
+def test_f_reorder_existing_no_false_positive() -> None:
+    """F) reorder существующих listings без false positive."""
+    a = _lot(id="a", stars=8000)
+    b = _lot(id="b", stars=9000)
+    c = _lot(id="c", stars=10000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect(
+        [a, b, c],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=1,
+        model_ids=[1],
+    )
+    fresh, *_rest, stats = _detect(
+        [c, a, b],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=1,
+        model_ids=[1],
+        stats=empty_funnel(),
+    )
+    assert fresh == []
+    assert stats["genuine_new"] == 0
+    assert stats["observed_old"] == 3
+
+
+def test_g_pagination_next_offset() -> None:
+    """G) scanner берёт page 2 по next_offset; page2 seed ≠ NEW позже."""
+    import asyncio
+
+    m = TelegramMarket.__new__(TelegramMarket)
+    calls = {"n": 0, "offsets": []}
+
+    async def fp(*_a, offset="", **_k):
+        calls["n"] += 1
+        calls["offsets"].append(offset)
+        if not offset:
+            m.last_next_offset = "p2"
+            return [_lot(id=f"k{i}", stars=8000) for i in range(12)]
+        assert offset == "p2"
+        m.last_next_offset = ""
+        return [_lot(id=f"p2_{i}", stars=8000) for i in range(12)]
+
+    m.fetch_page = fp
+    m.last_next_offset = ""
+
+    async def run():
+        return await TelegramMarket.fetch_newest_until_known(
+            m,
+            1,
+            model_ids=[22],
+            known_ids=set(),
+            seen={},
+            max_pages=2,
+            limit=12,
+        )
+
+    lots, meta = asyncio.run(run())
+    assert calls["n"] == 2
+    assert calls["offsets"] == ["", "p2"]
+    assert meta["pages"] == 2
+    assert lots[-1].scan_page == 2
+    assert lots[-1].scan_offset == "p2"
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    fresh1, *_ = _detect(
+        lots,
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=1,
+        model_ids=[22],
+    )
+    assert fresh1 == []
+    page2 = [x for x in lots if x.scan_page == 2]
+    fresh2, *_rest, stats = _detect(
+        page2,
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=1,
+        model_ids=[22],
+        stats=empty_funnel(),
+    )
+    assert fresh2 == []
+    assert stats["genuine_new"] == 0
+
+
+def test_h_snapshot_persistence() -> None:
+    """H) observed + primed переживают save/load и schema migrate."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from tracker import STATE_SCHEMA
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "seen": {"legacy": 10.0},
+                    "seen_sellers": {},
+                    "pages": {"99": ["snap1", "snap2"]},
+                    "schema": 10,
+                }
+            ),
+            encoding="utf-8",
+        )
+        data = load_state(path)
+        assert data["schema"] == STATE_SCHEMA
+        assert "legacy" in data["observed"]
+        assert "snap1" in data["observed"]
+        assert "snap2" in data["observed"]
+        assert data["pages"] == {}
+        save_state(path, data)
+        again = load_state(path)
+        assert "snap1" in again["observed"]
+        assert again["schema"] == STATE_SCHEMA
+
+
+def test_round_dedup_same_listing_two_requests() -> None:
+    lot = _lot(id="DUP", stars=8000, model_id=1)
+    observed: dict = {}
+    primed: dict = {"1:1": 1.0, "1:2": 1.0}
+    round_hits: dict = {}
+    stats = empty_funnel()
+    fresh1, *_ = _detect(
+        [lot],
+        observed=observed,
+        primed=primed,
+        collection_id=1,
+        model_ids=[1],
+        round_hits=round_hits,
+        stats=stats,
+    )
+    # primed + never observed → genuine first time
+    assert [x.id for x in fresh1] == ["DUP"]
+    lot2 = _lot(id="DUP", stars=8000, model_id=2)
+    fresh2, *_ = _detect(
+        [lot2],
+        observed=observed,
+        primed=primed,
+        collection_id=1,
+        model_ids=[2],
+        round_hits=round_hits,
+        stats=stats,
+    )
+    assert fresh2 == []
+    assert stats["duplicate_listing_ids_same_round"] == 1
+    assert stats["duplicate_listing_ids_across_models"] == 1
+
+
+def test_forensic_verdict_fields() -> None:
+    from diagnostics import Diagnostics
+
+    lot = _lot(
+        id="F1",
+        stars=6400,
+        collection_id=12,
+        model_id=33,
+        scan_page=2,
+        scan_offset="off9",
+        scan_source="scan:collection=12:models=33:page=2:offset=off9",
+    )
+    observed: dict = {}
+    primed: dict = {}
+    verdicts: list = []
+    detect_fresh_lots(
+        [lot],
+        observed=observed,
+        primed=primed,
+        pages={},
+        seen={},
+        collection_id=12,
+        model_ids=[33],
+        round_hits={},
+        forensic=verdicts,
+    )
+    assert len(verdicts) == 1
+    row = verdicts[0]
+    for key in (
+        "collection_id",
+        "model_id",
+        "listing_id",
+        "listing_price",
+        "first_seen_at",
+        "previous_seen_at",
+        "snapshot_contains_before",
+        "seen_contains_before",
+        "page_number",
+        "offset",
+        "source_request",
+        "reason",
+    ):
+        assert key in row
+    assert row["listing_id"] == "F1"
+    assert row["reason"] == "UNPRIMED_SEED"
+    assert row["page_number"] == 2
+    assert row["offset"] == "off9"
+    d = Diagnostics()
+    d.record_freshness_verdict(row)
+    text = "\n".join(d.freshness_forensics_lines())
+    assert "id=F1" in text
+    assert "reason=UNPRIMED_SEED" in text
+
+
+def test_1_old_listing_before_start_not_sent() -> None:
+    """1) Старый listing до запуска — первый scan не отправляет."""
+    lot = _lot(id="preexist", slug="Pre-1", stars=8000)
+    q = _stub_queue()
+    fresh, *_rest, stats = _detect([lot], collection_id=1, model_ids=[10])
+    assert fresh == []
+    assert stats["unprimed_seed"] == 1
+    assert stats["genuine_new"] == 0
+    assert q.enqueue(fresh) == 0
+    assert q._items == []
+
+
+def test_8_unprimed_seed_never_enqueued() -> None:
+    """8) UNPRIMED_SEED никогда не попадает в очередь."""
+    lots = [
+        _lot(id="u1", slug="U-1", stars=8000),
+        _lot(id="u2", slug="U-2", stars=9000),
+        _lot(id="u3", slug="U-3", stars=12000),
+    ]
+    q = _stub_queue()
+    fresh, _obs, primed, _pages, stats = _detect(
+        lots, collection_id=4, model_ids=[7, 8]
+    )
+    assert fresh == []
+    assert stats["unprimed_seed"] == 3
+    assert stats["genuine_new_listings"] == 0
+    assert model_request_key(4, [7, 8]) in primed
+    assert q.enqueue(fresh) == 0
+    assert q._items == []
+
+
+def test_5_same_listing_page1_and_page2_one_genuine() -> None:
+    """5) Один listing на page 1 и page 2 — ровно один GENUINE_NEW."""
+    lot_p1 = _lot(id="SAME", slug="Same-1", stars=8000, scan_page=1, scan_offset="")
+    lot_p2 = _lot(id="SAME", slug="Same-1", stars=8000, scan_page=2, scan_offset="p2")
+    primed = {model_request_key(1, [10]): 1.0}
+    stats = empty_funnel()
+    fresh, *_ = _detect(
+        [lot_p1, lot_p2],
+        primed=primed,
+        collection_id=1,
+        model_ids=[10],
+        stats=stats,
+    )
+    assert [x.id for x in fresh] == ["SAME"]
+    assert stats["genuine_new"] == 1
+    assert stats["duplicate_listing_ids_same_round"] == 1
+
+
+def test_7_sync_pages_second_query_keeps_ids() -> None:
+    """7) Второй sync_pages merge, не затирает ранее накопленные IDs."""
+    import asyncio
+
+    from tracker import Runtime, sync_pages
+
+    observed: dict = {
+        "keepA": {"first": 1.0, "last": 1.0, "c": 1, "m": 1},
+        "keepB": {"first": 1.0, "last": 1.0, "c": 1, "m": 1},
+    }
+    primed: dict = {}
+    pages = {"1:11": ["keepA", "keepB"]}
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.floors = type("F", (), {"eligible_model_ids": staticmethod(lambda gid: [11])})()
+    market.last_next_offset = ""
+
+    async def fp(*_a, **_k):
+        market.last_next_offset = ""
+        return [_lot(id="newC", stars=8000, collection_id=1, model_id=11)]
+
+    market.fetch_page = fp
+
+    async def run():
+        await sync_pages(
+            market, [1], pages, Runtime(), observed=observed, primed=primed
+        )
+
+    asyncio.run(run())
+    assert "keepA" in observed
+    assert "keepB" in observed
+    assert "newC" in observed
+    assert "keepA" in pages["1:11"]
+    assert "keepB" in pages["1:11"]
+    assert "newC" in pages["1:11"]
+
+
+def test_10_genuine_new_excludes_seen_and_observed() -> None:
+    """10) GENUINE_NEW_LISTINGS не включает already seen/observed."""
+    primed = {model_request_key(1, [10]): 1.0}
+    seen_lot = _lot(id="seen1", slug="Seen-1", stars=8000)
+    obs_lot = _lot(id="obs1", slug="Obs-1", stars=9000)
+    fresh_seen, *_rest, stats_s = _detect(
+        [seen_lot],
+        primed=dict(primed),
+        seen={"seen1": 1.0},
+        stats=empty_funnel(),
+    )
+    fresh_obs, *_rest, stats_o = _detect(
+        [obs_lot],
+        observed={"obs1": {"first": 1.0, "last": 1.0}},
+        primed=dict(primed),
+        stats=empty_funnel(),
+    )
+    assert fresh_seen == []
+    assert fresh_obs == []
+    assert stats_s["genuine_new"] == 0
+    assert stats_s["genuine_new_listings"] == 0
+    assert stats_o["genuine_new"] == 0
+    assert stats_o["observed_old"] == 1
+
+
+def test_e_genuine_new_exactly_once() -> None:
+    """3) Появление между scan#1 и #2 — GENUINE_NEW ровно один раз, scan#3 OLD."""
+    a = _lot(id="keep", stars=8000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect([a], observed=observed, primed=primed, pages=pages, collection_id=9, model_ids=[11])
+    neu = _lot(id="brand", slug="Brand-1", stars=7000)
+    stats2 = empty_funnel()
+    fresh2, *_ = _detect(
+        [neu, a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=stats2,
+    )
+    stats3 = empty_funnel()
+    fresh3, *_ = _detect(
+        [neu, a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=stats3,
+    )
+    assert [x.id for x in fresh2] == ["brand"]
+    assert stats2["genuine_new"] == 1
+    assert fresh3 == []
+    assert stats3["genuine_new"] == 0
+
+
+def test_two_scanner_workers_one_genuine_new() -> None:
+    """Два worker одновременно увидели один новый listing → один GENUINE_NEW."""
+    import threading
+
+    lot_a = _lot(id="RACE", slug="Race-1", stars=8000, model_id=1)
+    lot_b = _lot(id="RACE", slug="Race-1", stars=8000, model_id=2)
+    observed: dict = {}
+    primed = {model_request_key(1, [1]): 1.0, model_request_key(1, [2]): 1.0}
+    pages: dict = {}
+    seen: dict = {}
+    round_hits: dict = {}
+    barrier = threading.Barrier(2)
+    results: list[list[str]] = []
+
+    def worker(lot: Lot, models: list[int]) -> None:
+        barrier.wait()
+        fresh, _v = detect_fresh_lots(
+            [lot],
+            observed=observed,
+            primed=primed,
+            pages=pages,
+            seen=seen,
+            collection_id=1,
+            model_ids=models,
+            round_hits=round_hits,
+        )
+        results.append([x.id for x in fresh])
+
+    t1 = threading.Thread(target=worker, args=(lot_a, [1]))
+    t2 = threading.Thread(target=worker, args=(lot_b, [2]))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert results.count(["RACE"]) == 1
+    assert results.count([]) == 1
+    q = _stub_queue()
+    sent = []
+    for chunk in results:
+        if chunk:
+            sent.extend(chunk)
+            q.enqueue([_lot(id="RACE", slug="Race-1", stars=8000)])
+    assert sent == ["RACE"]
+    assert len(q._items) == 1
+
+
+def test_business_filters_unchanged_in_pr56() -> None:
+    """PR #56 не меняет female / price / floor / owner / post interval."""
+    assert config.MIN_STARS == 5000
+    assert config.MAX_STARS == 25000
+    assert config.MIN_MODEL_FLOOR == 4000
+    assert config.MAX_MODEL_FLOOR == 27000
+    assert config.POST_INTERVAL == 4.0
+    assert config.GIRL_MIN_SCORE == 5
+    assert config.GIRL_REQUIRE_IDENTITY is True
+    assert config.LISTING_PRICE_TOLERANCE == 0.0
+    girl = _lot()
+    assert is_girl(girl) is True
+    assert filter_lot(girl, min_stars=5000, max_stars=25000) == ""
+    boy = _lot(first_name="Никита", about="торгую гифтами", seller="nikita_gifts")
+    assert filter_lot(boy, min_stars=5000, max_stars=25000) == "мужской"
+
+
 def test_status_includes_scan_owner_female_metrics() -> None:
     from bot import ControlBot
     from tracker import Runtime
@@ -2241,6 +2889,9 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     rt.funnel["fresh"] = 1
     rt.funnel["new_listing_seen"] = 4
     rt.funnel["old_listing_seen"] = 12
+    rt.funnel["genuine_new"] = 2
+    rt.funnel["genuine_new_listings"] = 2
+    rt.funnel["unique_listing_ids"] = 9
     rt.funnel["listing_page_depth"] = 15
     rt.funnel["collections_scanned"] = 8
     rt.funnel["eligible_collections_scanned"] = 6
@@ -2258,6 +2909,8 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     text = ControlBot._status_text(ctrl)
     assert "new_listing_seen=4" in text
     assert "old_listing_seen=12" in text
+    assert "GENUINE_NEW_LISTINGS=2" in text
+    assert "unique_listing_ids=9" in text
     assert "listing_page_depth=" in text
     assert "collections_scanned=" in text
     assert "eligible_collections_scanned=" in text
@@ -2386,6 +3039,25 @@ def main() -> None:
         test_female_gate_api_gender_male_overrides_female_name,
         test_female_gate_keeps_confident_maria,
         test_status_includes_scan_owner_female_metrics,
+        test_new_listing_seen_is_not_page_absence,
+        test_a_old_listing_after_restart,
+        test_b_old_listing_on_next_page,
+        test_c_same_listing_two_model_queries,
+        test_d_same_listing_two_collections,
+        test_e_new_listing_between_scan1_and_scan2,
+        test_f_reorder_existing_no_false_positive,
+        test_g_pagination_next_offset,
+        test_h_snapshot_persistence,
+        test_round_dedup_same_listing_two_requests,
+        test_forensic_verdict_fields,
+        test_1_old_listing_before_start_not_sent,
+        test_8_unprimed_seed_never_enqueued,
+        test_5_same_listing_page1_and_page2_one_genuine,
+        test_7_sync_pages_second_query_keeps_ids,
+        test_10_genuine_new_excludes_seen_and_observed,
+        test_e_genuine_new_exactly_once,
+        test_two_scanner_workers_one_genuine_new,
+        test_business_filters_unchanged_in_pr56,
     ]
     for fn in tests:
         fn()

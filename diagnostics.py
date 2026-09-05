@@ -430,6 +430,9 @@ class Diagnostics:
 
         self.new_listing_seen = 0
         self.old_listing_seen = 0
+        self.genuine_new = 0
+        self.unprimed_seed = 0
+        self.freshness_forensics: deque[dict[str, Any]] = deque(maxlen=20)
         self.listing_page_depth = 0
         self.listing_page_depth_max = 0
         self.collections_scanned = 0
@@ -625,6 +628,40 @@ class Diagnostics:
         if fresh_candidates:
             self.note_new_candidates(gid, int(fresh_candidates))
         _ = models  # logged via SCAN pass; kept for call-site compatibility
+
+    def record_freshness_verdict(self, row: dict[str, Any]) -> None:
+        self.freshness_forensics.append(dict(row))
+        if row.get("genuine_new"):
+            self.genuine_new += 1
+        if row.get("reason") == "UNPRIMED_SEED":
+            self.unprimed_seed += 1
+
+    def freshness_forensics_lines(self) -> list[str]:
+        if not self.freshness_forensics:
+            return ["FRESHNESS last20: —"]
+        lines = ["FRESHNESS last20"]
+        for row in list(self.freshness_forensics)[-20:]:
+            lines.append(
+                "id={listing_id} c={collection_id} m={model_id} "
+                "p={listing_price} first={first_seen_at} prev={previous_seen_at} "
+                "snap={snapshot_contains_before} seen={seen_contains_before} "
+                "page={page_number} off={offset} src={source_request} "
+                "reason={reason}".format(
+                    listing_id=row.get("listing_id"),
+                    collection_id=row.get("collection_id"),
+                    model_id=row.get("model_id"),
+                    listing_price=row.get("listing_price"),
+                    first_seen_at=row.get("first_seen_at"),
+                    previous_seen_at=row.get("previous_seen_at"),
+                    snapshot_contains_before=row.get("snapshot_contains_before"),
+                    seen_contains_before=row.get("seen_contains_before"),
+                    page_number=row.get("page_number"),
+                    offset=row.get("offset") or "0",
+                    source_request=row.get("source_request"),
+                    reason=row.get("reason"),
+                )
+            )
+        return lines
 
     def note_new_candidates(self, collection_id: int, n: int) -> None:
         if n:
@@ -823,6 +860,7 @@ class Diagnostics:
             ),
             (
                 f"scan new={self.new_listing_seen} old={self.old_listing_seen} "
+                f"genuine_new={self.genuine_new} unprimed={self.unprimed_seed} "
                 f"depth={self.listing_page_depth_max} "
                 f"cols={self.collections_scanned} "
                 f"elig={self.eligible_collections_scanned} "
@@ -866,6 +904,7 @@ class Diagnostics:
                 f"send={self.send_floodwait_count}/{self.send_floodwait_seconds:.0f}s"
             ),
         ]
+        lines.extend(self.freshness_forensics_lines())
         return lines
 
     def rejection_reason_lines(self) -> list[str]:

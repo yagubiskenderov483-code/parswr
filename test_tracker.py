@@ -2668,6 +2668,213 @@ def test_forensic_verdict_fields() -> None:
     assert "reason=UNPRIMED_SEED" in text
 
 
+def test_1_old_listing_before_start_not_sent() -> None:
+    """1) Старый listing до запуска — первый scan не отправляет."""
+    lot = _lot(id="preexist", slug="Pre-1", stars=8000)
+    q = _stub_queue()
+    fresh, *_rest, stats = _detect([lot], collection_id=1, model_ids=[10])
+    assert fresh == []
+    assert stats["unprimed_seed"] == 1
+    assert stats["genuine_new"] == 0
+    assert q.enqueue(fresh) == 0
+    assert q._items == []
+
+
+def test_8_unprimed_seed_never_enqueued() -> None:
+    """8) UNPRIMED_SEED никогда не попадает в очередь."""
+    lots = [
+        _lot(id="u1", slug="U-1", stars=8000),
+        _lot(id="u2", slug="U-2", stars=9000),
+        _lot(id="u3", slug="U-3", stars=12000),
+    ]
+    q = _stub_queue()
+    fresh, _obs, primed, _pages, stats = _detect(
+        lots, collection_id=4, model_ids=[7, 8]
+    )
+    assert fresh == []
+    assert stats["unprimed_seed"] == 3
+    assert stats["genuine_new_listings"] == 0
+    assert model_request_key(4, [7, 8]) in primed
+    assert q.enqueue(fresh) == 0
+    assert q._items == []
+
+
+def test_5_same_listing_page1_and_page2_one_genuine() -> None:
+    """5) Один listing на page 1 и page 2 — ровно один GENUINE_NEW."""
+    lot_p1 = _lot(id="SAME", slug="Same-1", stars=8000, scan_page=1, scan_offset="")
+    lot_p2 = _lot(id="SAME", slug="Same-1", stars=8000, scan_page=2, scan_offset="p2")
+    primed = {model_request_key(1, [10]): 1.0}
+    stats = empty_funnel()
+    fresh, *_ = _detect(
+        [lot_p1, lot_p2],
+        primed=primed,
+        collection_id=1,
+        model_ids=[10],
+        stats=stats,
+    )
+    assert [x.id for x in fresh] == ["SAME"]
+    assert stats["genuine_new"] == 1
+    assert stats["duplicate_listing_ids_same_round"] == 1
+
+
+def test_7_sync_pages_second_query_keeps_ids() -> None:
+    """7) Второй sync_pages merge, не затирает ранее накопленные IDs."""
+    import asyncio
+
+    from tracker import Runtime, sync_pages
+
+    observed: dict = {
+        "keepA": {"first": 1.0, "last": 1.0, "c": 1, "m": 1},
+        "keepB": {"first": 1.0, "last": 1.0, "c": 1, "m": 1},
+    }
+    primed: dict = {}
+    pages = {"1:11": ["keepA", "keepB"]}
+    market = TelegramMarket.__new__(TelegramMarket)
+    market.floors = type("F", (), {"eligible_model_ids": staticmethod(lambda gid: [11])})()
+    market.last_next_offset = ""
+
+    async def fp(*_a, **_k):
+        market.last_next_offset = ""
+        return [_lot(id="newC", stars=8000, collection_id=1, model_id=11)]
+
+    market.fetch_page = fp
+
+    async def run():
+        await sync_pages(
+            market, [1], pages, Runtime(), observed=observed, primed=primed
+        )
+
+    asyncio.run(run())
+    assert "keepA" in observed
+    assert "keepB" in observed
+    assert "newC" in observed
+    assert "keepA" in pages["1:11"]
+    assert "keepB" in pages["1:11"]
+    assert "newC" in pages["1:11"]
+
+
+def test_10_genuine_new_excludes_seen_and_observed() -> None:
+    """10) GENUINE_NEW_LISTINGS не включает already seen/observed."""
+    primed = {model_request_key(1, [10]): 1.0}
+    seen_lot = _lot(id="seen1", slug="Seen-1", stars=8000)
+    obs_lot = _lot(id="obs1", slug="Obs-1", stars=9000)
+    fresh_seen, *_rest, stats_s = _detect(
+        [seen_lot],
+        primed=dict(primed),
+        seen={"seen1": 1.0},
+        stats=empty_funnel(),
+    )
+    fresh_obs, *_rest, stats_o = _detect(
+        [obs_lot],
+        observed={"obs1": {"first": 1.0, "last": 1.0}},
+        primed=dict(primed),
+        stats=empty_funnel(),
+    )
+    assert fresh_seen == []
+    assert fresh_obs == []
+    assert stats_s["genuine_new"] == 0
+    assert stats_s["genuine_new_listings"] == 0
+    assert stats_o["genuine_new"] == 0
+    assert stats_o["observed_old"] == 1
+
+
+def test_e_genuine_new_exactly_once() -> None:
+    """3) Появление между scan#1 и #2 — GENUINE_NEW ровно один раз, scan#3 OLD."""
+    a = _lot(id="keep", stars=8000)
+    observed: dict = {}
+    primed: dict = {}
+    pages: dict = {}
+    _detect([a], observed=observed, primed=primed, pages=pages, collection_id=9, model_ids=[11])
+    neu = _lot(id="brand", slug="Brand-1", stars=7000)
+    stats2 = empty_funnel()
+    fresh2, *_ = _detect(
+        [neu, a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=stats2,
+    )
+    stats3 = empty_funnel()
+    fresh3, *_ = _detect(
+        [neu, a],
+        observed=observed,
+        primed=primed,
+        pages=pages,
+        collection_id=9,
+        model_ids=[11],
+        stats=stats3,
+    )
+    assert [x.id for x in fresh2] == ["brand"]
+    assert stats2["genuine_new"] == 1
+    assert fresh3 == []
+    assert stats3["genuine_new"] == 0
+
+
+def test_two_scanner_workers_one_genuine_new() -> None:
+    """Два worker одновременно увидели один новый listing → один GENUINE_NEW."""
+    import threading
+
+    lot_a = _lot(id="RACE", slug="Race-1", stars=8000, model_id=1)
+    lot_b = _lot(id="RACE", slug="Race-1", stars=8000, model_id=2)
+    observed: dict = {}
+    primed = {model_request_key(1, [1]): 1.0, model_request_key(1, [2]): 1.0}
+    pages: dict = {}
+    seen: dict = {}
+    round_hits: dict = {}
+    barrier = threading.Barrier(2)
+    results: list[list[str]] = []
+
+    def worker(lot: Lot, models: list[int]) -> None:
+        barrier.wait()
+        fresh, _v = detect_fresh_lots(
+            [lot],
+            observed=observed,
+            primed=primed,
+            pages=pages,
+            seen=seen,
+            collection_id=1,
+            model_ids=models,
+            round_hits=round_hits,
+        )
+        results.append([x.id for x in fresh])
+
+    t1 = threading.Thread(target=worker, args=(lot_a, [1]))
+    t2 = threading.Thread(target=worker, args=(lot_b, [2]))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert results.count(["RACE"]) == 1
+    assert results.count([]) == 1
+    q = _stub_queue()
+    sent = []
+    for chunk in results:
+        if chunk:
+            sent.extend(chunk)
+            q.enqueue([_lot(id="RACE", slug="Race-1", stars=8000)])
+    assert sent == ["RACE"]
+    assert len(q._items) == 1
+
+
+def test_business_filters_unchanged_in_pr56() -> None:
+    """PR #56 не меняет female / price / floor / owner / post interval."""
+    assert config.MIN_STARS == 5000
+    assert config.MAX_STARS == 25000
+    assert config.MIN_MODEL_FLOOR == 4000
+    assert config.MAX_MODEL_FLOOR == 27000
+    assert config.POST_INTERVAL == 4.0
+    assert config.GIRL_MIN_SCORE == 5
+    assert config.GIRL_REQUIRE_IDENTITY is True
+    assert config.LISTING_PRICE_TOLERANCE == 0.0
+    girl = _lot()
+    assert is_girl(girl) is True
+    assert filter_lot(girl, min_stars=5000, max_stars=25000) == ""
+    boy = _lot(first_name="Никита", about="торгую гифтами", seller="nikita_gifts")
+    assert filter_lot(boy, min_stars=5000, max_stars=25000) == "мужской"
+
+
 def test_status_includes_scan_owner_female_metrics() -> None:
     from bot import ControlBot
     from tracker import Runtime
@@ -2843,6 +3050,14 @@ def main() -> None:
         test_h_snapshot_persistence,
         test_round_dedup_same_listing_two_requests,
         test_forensic_verdict_fields,
+        test_1_old_listing_before_start_not_sent,
+        test_8_unprimed_seed_never_enqueued,
+        test_5_same_listing_page1_and_page2_one_genuine,
+        test_7_sync_pages_second_query_keeps_ids,
+        test_10_genuine_new_excludes_seen_and_observed,
+        test_e_genuine_new_exactly_once,
+        test_two_scanner_workers_one_genuine_new,
+        test_business_filters_unchanged_in_pr56,
     ]
     for fn in tests:
         fn()

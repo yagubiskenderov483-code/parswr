@@ -62,6 +62,7 @@ OBSERVED_MAX = 400_000
 FORENSIC_KEEP = 20
 _OWNER_CLAIM_LOCK = threading.Lock()
 _STATE_IO_LOCK = threading.Lock()
+_FRESHNESS_LOCK = threading.Lock()
 
 
 def format_lot(lot: Lot, ts: float | None = None) -> str:
@@ -1673,6 +1674,42 @@ def detect_fresh_lots(
 
     Не «нет в текущей page/snapshot». Первый визит ключа — UNPRIMED_SEED, без постов.
     """
+    with _FRESHNESS_LOCK:
+        return _detect_fresh_lots_locked(
+            lots,
+            observed=observed,
+            primed=primed,
+            pages=pages,
+            seen=seen,
+            collection_id=collection_id,
+            model_ids=model_ids,
+            round_hits=round_hits,
+            now=now,
+            min_stars=min_stars,
+            max_stars=max_stars,
+            stats=stats,
+            forensic=forensic,
+            request_ok=request_ok,
+        )
+
+
+def _detect_fresh_lots_locked(
+    lots: list[Lot],
+    *,
+    observed: dict[str, Any],
+    primed: dict[str, float],
+    pages: dict[str, list[str]],
+    seen: dict[str, float] | set[str],
+    collection_id: int,
+    model_ids: list[int] | None,
+    round_hits: dict[str, list[tuple[int, int | None]]],
+    now: float | None,
+    min_stars: float | None,
+    max_stars: float | None,
+    stats: dict[str, int] | None,
+    forensic: list[dict[str, Any]] | None,
+    request_ok: bool,
+) -> tuple[list[Lot], list[dict[str, Any]]]:
     ts = time.time() if now is None else float(now)
     lo = config.MIN_STARS if min_stars is None else float(min_stars)
     hi = config.MAX_STARS if max_stars is None else float(max_stars)

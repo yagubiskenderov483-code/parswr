@@ -145,8 +145,39 @@ def extract_star_gift_ids(data: bytes) -> list[int]:
     return merge_ids(found)
 
 
+def prefer_parsed_gift_ids(
+    parsed: list[int], raw: list[int], *, min_n: int | None = None
+) -> list[int]:
+    """Живой GetStarGifts — источник правды.
+
+    Сырой TL-скан (ctor 0x313A9547) ловит лишние id внутри пакета
+    (вложенные гифты, ложные совпадения) → 151 вместо 149.
+    Raw только если распарсенный список пустой/короткий.
+    """
+    live = merge_ids(parsed)
+    floor = int(config.MIN_COLLECTIONS if min_n is None else min_n)
+    if len(live) >= max(1, floor):
+        return live
+    return merge_ids(live, raw)
+
+
+def choose_catalog_ids(
+    *,
+    live: list[int],
+    fallbacks: list[list[int]] | None = None,
+    min_n: int | None = None,
+) -> list[int]:
+    """Telegram user/bot API. Public/bundled/disk — только если live мало."""
+    chosen = merge_ids(live)
+    floor = int(config.MIN_COLLECTIONS if min_n is None else min_n)
+    if len(chosen) >= max(1, floor):
+        return chosen
+    extra = fallbacks or []
+    return merge_ids(chosen, *extra)
+
+
 class GetStarGiftsIdsRequest(GetStarGiftsRequest):
-    """getStarGifts: распарсенный список или id из сырых байт."""
+    """getStarGifts: распарсенный список; raw TL — fallback."""
 
     @staticmethod
     def read_result(reader):  # noqa: ANN001
@@ -161,7 +192,7 @@ class GetStarGiftsIdsRequest(GetStarGiftsRequest):
                 reader.set_position(len(reader.get_bytes()))
             except Exception:  # noqa: BLE001
                 pass
-        return merge_ids(parsed, extract_star_gift_ids(raw))
+        return prefer_parsed_gift_ids(parsed, extract_star_gift_ids(raw))
 
 
 @dataclass(slots=True)
@@ -733,12 +764,16 @@ class TelegramMarket:
         self, force: bool = False, *, bot: Any | None = None
     ) -> list[int]:
         self._load_catalog()
-        if self.gift_ids and not force and len(self.gift_ids) >= config.MIN_COLLECTIONS:
-            return self.gift_ids
+        cached_ok = (
+            bool(self.gift_ids) and len(self.gift_ids) >= config.MIN_COLLECTIONS
+        )
+        # Диск не источник правды: 151 вместо 149 копилось union'ом. Live всегда.
         try:
             await self.ensure_connected()
         except Exception as exc:  # noqa: BLE001
             logger.warning("connect перед каталогом: %s", exc)
+            if cached_ok and not force:
+                return self.gift_ids
 
         via_bundled = self.load_from_bundled()
         via_public: list[int] = []
@@ -772,21 +807,30 @@ class TelegramMarket:
         if not isinstance(via_bot, list):
             via_bot = []
 
-        merged = merge_ids(via_user, via_public, via_bundled, via_bot)
-        if merged:
-            self.gift_ids = merged
+        cached = list(self.gift_ids)
+        live = merge_ids(via_user, via_bot)
+        chosen = choose_catalog_ids(
+            live=live,
+            fallbacks=[via_public, via_bundled, cached],
+        )
+        extra = len(merge_ids(live, via_public, via_bundled, cached)) - len(chosen)
+        if chosen:
+            self.gift_ids = chosen
             self._save_catalog()
             logger.info(
-                "Каталог суммарно %s · user=%s public=%s bundled=%s bot=%s",
-                len(merged),
+                "Каталог live=%s (user=%s bot=%s) · public=%s bundled=%s cache=%s"
+                "%s",
+                len(live),
                 len(via_user),
+                len(via_bot),
                 len(via_public),
                 len(via_bundled),
-                len(via_bot),
+                len(cached),
+                f" · отброшено лишних {extra}" if extra > 0 and live else "",
             )
-            if len(merged) < config.MIN_COLLECTIONS:
-                self.last_error = f"мало коллекций: {len(merged)}"
-            return merged
+            if len(chosen) < config.MIN_COLLECTIONS:
+                self.last_error = f"мало коллекций: {len(chosen)}"
+            return chosen
         return self.gift_ids
 
     def next_batch(self, n: int, pool: list[int] | None = None) -> list[int]:

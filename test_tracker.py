@@ -17,10 +17,12 @@ from filters import (
 from market import (
     Lot,
     TelegramMarket,
+    choose_catalog_ids,
     count_unique_star_gifts,
     extract_star_gift_ids,
     ids_from_json_payload,
     merge_ids,
+    prefer_parsed_gift_ids,
     _stars_level,
 )
 from tracker import (
@@ -204,7 +206,7 @@ def test_hardcoded_filters() -> None:
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
     assert config.PAGE_LIMIT == 12
     assert config.SCAN_PARALLEL == 12
-    assert config.TRACKER_VERSION == "5.14.0"
+    assert config.TRACKER_VERSION == "5.14.1"
     assert config.SCAN_MODEL_CHUNK == 12
     assert config.SCAN_MAX_PAGES == 2
     assert config.SCAN_SEED_PAGES == 4
@@ -265,6 +267,27 @@ def test_extract_star_gift_ids() -> None:
         + b"yyyy"
     )
     assert extract_star_gift_ids(blob) == [gid]
+
+
+def test_prefer_parsed_gift_ids_drops_raw_extras() -> None:
+    parsed = list(range(10**12 + 1, 10**12 + 150))
+    raw = parsed + [10**12 + 900, 10**12 + 901]
+    out = prefer_parsed_gift_ids(parsed, raw, min_n=50)
+    assert len(out) == 149
+    assert 10**12 + 900 not in out
+    tiny = prefer_parsed_gift_ids([10**12 + 1], [10**12 + 2], min_n=50)
+    assert 10**12 + 1 in tiny and 10**12 + 2 in tiny
+
+
+def test_choose_catalog_ids_live_wins() -> None:
+    live = list(range(10**12 + 1, 10**12 + 150))
+    stale = live + [10**12 + 800, 10**12 + 801]
+    out = choose_catalog_ids(live=live, fallbacks=[stale], min_n=50)
+    assert len(out) == 149
+    empty = choose_catalog_ids(
+        live=[], fallbacks=[[10**12 + 1], [10**12 + 2]], min_n=50
+    )
+    assert empty == [10**12 + 1, 10**12 + 2]
 
 
 def test_bundled_catalog_has_enough() -> None:
@@ -1655,7 +1678,7 @@ def test_fresh_from_page_semantics_unchanged_v510() -> None:
     assert [x.id for x in fresh] == ["new1"]
     assert config.POST_INTERVAL == 4.0
     assert config.RPC_CONCURRENCY <= config.SCAN_PARALLEL
-    assert config.TRACKER_VERSION == "5.14.0"
+    assert config.TRACKER_VERSION == "5.14.1"
 
 
 def test_config_floor_thresholds_from_env_defaults() -> None:
@@ -3350,6 +3373,8 @@ def main() -> None:
         test_next_batch_all_collections,
         test_merge_and_json_catalog,
         test_extract_star_gift_ids,
+        test_prefer_parsed_gift_ids_drops_raw_extras,
+        test_choose_catalog_ids_live_wins,
         test_bundled_catalog_has_enough,
         test_is_russian_empty_profile_is_unknown,
         test_is_russian_latin_shop_name_is_not_ru,

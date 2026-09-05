@@ -370,7 +370,10 @@ class ControlBot:
                     f"listing ±{int(config.LISTING_PRICE_TOLERANCE)}",
         ]
         if rt:
-            coll = f"Коллекций: {rt.collections}"
+            coll = (
+                f"Коллекций: {rt.collections} live · "
+                f"скан {rt.collections_eligible} eligible"
+            )
             if rt.collections < config.MIN_COLLECTIONS:
                 coll += f" (мало, нужно ≥{config.MIN_COLLECTIONS})"
             lines.extend(
@@ -484,6 +487,9 @@ class ControlBot:
                         "MODEL CATALOG",
                         f"models_total={rt.models_total}",
                         f"models_eligible={rt.models_eligible}",
+                        f"models_scan_round={getattr(rt, 'models_scan_round', 0)}",
+                        f"models_rpc_jobs={getattr(rt, 'models_rpc_jobs', 0)}",
+                        f"model_chunk={int(config.SCAN_MODEL_CHUNK)}",
                         f"floor_known={rt.floor_known}",
                         f"floor_unknown={rt.floor_unknown}",
                         "SCANNER",

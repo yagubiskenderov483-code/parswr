@@ -1097,6 +1097,8 @@ class Runtime:
         self.floor_unknown = 0
         self.collections_eligible = 0
         self.catalog_updated_at = 0.0
+        self.models_scan_round = 0
+        self.models_rpc_jobs = 0
         self.warmup_stage = "start"
         self.warmup_done = 0
         self.warmup_total = 0
@@ -2192,8 +2194,15 @@ async def scanner_loop(
                 "Проход #%s: eligible коллекций 0 — жду floor catalog",
                 pass_no,
             )
+            runtime.models_scan_round = 0
+            runtime.models_rpc_jobs = 0
             await asyncio.sleep(max(float(config.POLL_INTERVAL), 0.5))
             continue
+        uniq_models: set[int] = set()
+        for _gid, mids in jobs:
+            uniq_models.update(int(x) for x in mids)
+        runtime.models_scan_round = len(uniq_models)
+        runtime.models_rpc_jobs = len(jobs)
 
         async def one(
             gid: int, used_models: list[int]

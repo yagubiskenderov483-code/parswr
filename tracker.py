@@ -55,9 +55,13 @@ _esc = html.escape
 SEEN_TTL = 7 * 24 * 3600
 SELLER_TTL = 90 * 24 * 3600
 SKIP_SELLER_TTL = 3 * 3600  # только явные мальчики
-STATE_SCHEMA = 10
+STATE_SCHEMA = 11
 MIN_SNAPSHOT = 0
+OBSERVED_TTL = 30 * 24 * 3600
+OBSERVED_MAX = 400_000
+FORENSIC_KEEP = 20
 _OWNER_CLAIM_LOCK = threading.Lock()
+_STATE_IO_LOCK = threading.Lock()
 
 
 def format_lot(lot: Lot, ts: float | None = None) -> str:
@@ -262,6 +266,104 @@ class Sender:
             await self._bot.session.close()
 
 
+def _empty_state() -> dict:
+    return {
+        "seen": {},
+        "seen_sellers": {},
+        "skip_sellers": {},
+        "market_ids": [],
+        "heads": {},
+        "pages": {},
+        "observed": {},
+        "primed_models": {},
+        "schema": STATE_SCHEMA,
+    }
+
+
+def normalize_observed_record(raw: Any, now: float | None = None) -> dict[str, Any]:
+    ts = time.time() if now is None else float(now)
+    if isinstance(raw, dict):
+        try:
+            first = float(raw.get("first") or raw.get("first_seen_at") or ts)
+        except (TypeError, ValueError):
+            first = ts
+        try:
+            last = float(raw.get("last") or raw.get("last_seen_at") or first)
+        except (TypeError, ValueError):
+            last = first
+        return {
+            "first": first,
+            "last": last,
+            "c": raw.get("c", raw.get("collection_id")),
+            "m": raw.get("m", raw.get("model_id")),
+        }
+    try:
+        prev = float(raw)
+    except (TypeError, ValueError):
+        prev = ts
+    return {"first": prev, "last": prev, "c": None, "m": None}
+
+
+def seed_observed_id(
+    observed: dict[str, Any],
+    listing_id: str,
+    *,
+    now: float | None = None,
+    collection_id: int | None = None,
+    model_id: int | None = None,
+) -> None:
+    lid = str(listing_id or "").strip()
+    if not lid:
+        return
+    ts = time.time() if now is None else float(now)
+    rec = observed.get(lid)
+    if rec is None:
+        observed[lid] = {
+            "first": ts,
+            "last": ts,
+            "c": collection_id,
+            "m": model_id,
+        }
+        return
+    rec = normalize_observed_record(rec, ts)
+    rec["last"] = ts
+    if collection_id is not None:
+        rec["c"] = collection_id
+    if model_id is not None:
+        rec["m"] = model_id
+    observed[lid] = rec
+
+
+def migrate_observed_from_legacy(data: dict, *, now: float | None = None) -> None:
+    """Перенести listing id из pages/seen в глобальный observed. Не постим их снова."""
+    ts = time.time() if now is None else float(now)
+    observed = data.setdefault("observed", {})
+    if not isinstance(observed, dict):
+        observed = {}
+        data["observed"] = observed
+    for lid, raw in list(observed.items()):
+        observed[str(lid)] = normalize_observed_record(raw, ts)
+    for lid, raw in (data.get("seen") or {}).items():
+        seed_observed_id(observed, str(lid), now=ts)
+        try:
+            seen_ts = float(raw)
+        except (TypeError, ValueError):
+            seen_ts = ts
+        rec = observed.get(str(lid))
+        if rec and seen_ts < float(rec.get("first") or seen_ts):
+            rec["first"] = seen_ts
+    pages = data.get("pages") or {}
+    if isinstance(pages, dict):
+        for ids in pages.values():
+            if not isinstance(ids, list):
+                continue
+            for lid in ids:
+                seed_observed_id(observed, str(lid), now=ts)
+    data.setdefault("primed_models", {})
+    if not isinstance(data["primed_models"], dict):
+        data["primed_models"] = {}
+
+
 def load_state(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -272,54 +374,74 @@ def load_state(path: Path) -> dict:
             data.setdefault("market_ids", [])
             data.setdefault("heads", {})
             data.setdefault("pages", {})
+            data.setdefault("observed", {})
+            data.setdefault("primed_models", {})
             schema = 0
             try:
                 schema = int(data.get("schema", 0) or 0)
             except (TypeError, ValueError):
                 schema = 0
+            migrate_observed_from_legacy(data)
             if schema < STATE_SCHEMA:
                 logger.warning(
-                    "Схема %s→%s: сброс страниц — старые #1 больше не постим",
+                    "Схема %s→%s: pages collection-key → observed; "
+                    "старые listing id не станут fresh",
                     schema,
                     STATE_SCHEMA,
                 )
                 data["skip_sellers"] = {}
                 data["heads"] = {}
+                # Старые pages были keyed только collection_id — несовместимы
+                # с model-chunk запросами. IDs уже в observed.
                 data["pages"] = {}
                 data["schema"] = STATE_SCHEMA
             return data
     except (OSError, ValueError):
         pass
-    return {
-        "seen": {},
-        "seen_sellers": {},
-        "skip_sellers": {},
-        "market_ids": [],
-        "heads": {},
-        "pages": {},
-        "schema": STATE_SCHEMA,
-    }
+    return _empty_state()
+
+
+def _prune_observed(observed: dict[str, Any], now: float) -> dict[str, Any]:
+    if not isinstance(observed, dict):
+        return {}
+    if len(observed) <= OBSERVED_MAX:
+        return observed
+    cutoff = now - OBSERVED_TTL
+    kept: list[tuple[str, dict[str, Any], float]] = []
+    for key, raw in observed.items():
+        rec = normalize_observed_record(raw, now)
+        last = float(rec.get("last") or now)
+        if last >= cutoff:
+            kept.append((str(key), rec, last))
+    kept.sort(key=lambda x: x[2], reverse=True)
+    if len(kept) > OBSERVED_MAX:
+        kept = kept[:OBSERVED_MAX]
+    return {key: rec for key, rec, _last in kept}
 
 
 def save_state(path: Path, state: dict) -> None:
     now = time.time()
-    state["schema"] = STATE_SCHEMA
-    seen = state.get("seen", {})
-    if len(seen) > 200_000:
-        state["seen"] = {k: v for k, v in seen.items() if now - float(v) < SEEN_TTL}
-    sellers = state.get("seen_sellers", {})
-    if len(sellers) > 100_000:
-        state["seen_sellers"] = {
-            k: v for k, v in sellers.items() if now - float(v) < SELLER_TTL
+    with _STATE_IO_LOCK:
+        state["schema"] = STATE_SCHEMA
+        seen = state.get("seen", {})
+        if len(seen) > 200_000:
+            state["seen"] = {k: v for k, v in seen.items() if now - float(v) < SEEN_TTL}
+        sellers = state.get("seen_sellers", {})
+        if len(sellers) > 100_000:
+            state["seen_sellers"] = {
+                k: v for k, v in sellers.items() if now - float(v) < SELLER_TTL
+            }
+        skipped = state.get("skip_sellers", {})
+        state["skip_sellers"] = {
+            k: v for k, v in skipped.items() if now - float(v) < SKIP_SELLER_TTL
         }
-    skipped = state.get("skip_sellers", {})
-    state["skip_sellers"] = {
-        k: v for k, v in skipped.items() if now - float(v) < SKIP_SELLER_TTL
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    tmp.replace(path)
+        observed = state.get("observed", {})
+        if isinstance(observed, dict) and len(observed) > OBSERVED_MAX:
+            state["observed"] = _prune_observed(observed, now)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(path)
 
 
 def load_session() -> str:
@@ -440,6 +562,19 @@ def empty_funnel() -> dict[str, int]:
         "eligible_collections_scanned",
         "owner_sent_total",
         "owner_duplicate_total",
+        "api_observations",
+        "unique_listing_ids",
+        "duplicate_listing_ids_same_round",
+        "duplicate_listing_ids_across_models",
+        "duplicate_listing_ids_across_collections",
+        "fresh_unique",
+        "fresh_repeated",
+        "observed_old",
+        "observed_duplicate_same_round",
+        "observed_duplicate_cross_model",
+        "unprimed_seed",
+        "genuine_new",
+        "genuine_new_listings",
     ]
     return {k: 0 for k in keys}
 
@@ -455,11 +590,7 @@ def record_fresh_price_seen(
     price_ok: bool | None,
     already_seen: bool,
 ) -> None:
-    """Один новый id относительно prev page (вызывается один раз на объект).
-
-    fresh=True → объект обнаружен как новый относительно предыдущей страницы.
-    Дальше: price → (если price_ok) seen.
-    """
+    """Один GENUINE_NEW listing (не page-diff). Дальше: price → seen."""
     if not fresh:
         return
     _bump(stats, "fresh_detected")
@@ -793,6 +924,11 @@ def format_funnel_report(stats: dict[str, int]) -> str:
     """Человекочитаемый отчёт последовательной воронки."""
     lines = [
         "PIPELINE",
+        f"GENUINE_NEW_LISTINGS: {stats.get('genuine_new_listings', stats.get('genuine_new', 0))}",
+        f"api_observations: {stats.get('api_observations', 0)}",
+        f"unique_listing_ids: {stats.get('unique_listing_ids', 0)}",
+        f"observed_old: {stats.get('observed_old', 0)}",
+        f"unprimed_seed: {stats.get('unprimed_seed', 0)}",
         f"fresh_detected: {stats.get('fresh_detected', 0)}",
         "",
         "price:",
@@ -853,6 +989,7 @@ def format_funnel_report(stats: dict[str, int]) -> str:
 def sync_funnel_aliases(stats: dict[str, int]) -> None:
     """Короткие ключи для /status одной строкой."""
     stats["fresh"] = stats.get("fresh_detected", 0)
+    stats["genuine_new_listings"] = stats.get("genuine_new", 0)
     stats["price"] = stats.get("price_pass", 0)
     stats["ru"] = stats.get("ru_pass", 0)
     stats["girl"] = stats.get("girl_pass", 0)
@@ -1413,10 +1550,249 @@ class PostQueue:
                 self.runtime.funnel["queue_remaining"] = len(self._items)
 
 
+def model_request_key(collection_id: int, model_ids: list[int] | None) -> str:
+    """Ключ запроса: collection_id + отсортированные model_id этого RPC."""
+    mids = sorted({int(x) for x in (model_ids or []) if int(x) > 0})
+    return f"{int(collection_id)}:{','.join(str(x) for x in mids)}"
+
+
+def observed_contains(observed: dict[str, Any], lot: Lot) -> bool:
+    if lot.id and lot.id in observed:
+        return True
+    if lot.slug and lot.slug in observed:
+        return True
+    return False
+
+
+def observed_record(observed: dict[str, Any], lot: Lot) -> dict[str, Any] | None:
+    raw = None
+    if lot.id and lot.id in observed:
+        raw = observed.get(lot.id)
+    elif lot.slug and lot.slug in observed:
+        raw = observed.get(lot.slug)
+    if raw is None:
+        return None
+    return normalize_observed_record(raw)
+
+
+def remember_listing(
+    observed: dict[str, Any],
+    lot: Lot,
+    *,
+    now: float,
+    collection_id: int | None = None,
+) -> None:
+    cid = collection_id if collection_id is not None else lot.collection_id
+    seed_observed_id(
+        observed,
+        lot.id,
+        now=now,
+        collection_id=cid,
+        model_id=lot.model_id,
+    )
+    if lot.slug and lot.slug != lot.id:
+        seed_observed_id(
+            observed,
+            lot.slug,
+            now=now,
+            collection_id=cid,
+            model_id=lot.model_id,
+        )
+
+
+def freshness_verdict_dict(
+    lot: Lot,
+    *,
+    reason: str,
+    genuine_new: bool,
+    first_seen_at: float | None,
+    previous_seen_at: float | None,
+    snapshot_contains_before: bool,
+    seen_contains_before: bool,
+    page_number: int,
+    offset: str,
+    source_request: str,
+    collection_id: int | None,
+) -> dict[str, Any]:
+    return {
+        "collection_id": collection_id,
+        "model_id": lot.model_id,
+        "listing_id": lot.id,
+        "listing_price": float(lot.stars),
+        "first_seen_at": first_seen_at,
+        "previous_seen_at": previous_seen_at,
+        "snapshot_contains_before": snapshot_contains_before,
+        "seen_contains_before": seen_contains_before,
+        "page_number": page_number,
+        "offset": offset,
+        "source_request": source_request,
+        "reason": reason,
+        "genuine_new": genuine_new,
+    }
+
+
+def log_freshness_forensic(row: dict[str, Any]) -> None:
+    logger.info(
+        "FRESHNESS listing_id=%s collection_id=%s model_id=%s price=%s "
+        "first_seen_at=%s previous_seen_at=%s snapshot_contains_before=%s "
+        "seen_contains_before=%s page_number=%s offset=%s source=%s reason=%s",
+        row.get("listing_id"),
+        row.get("collection_id"),
+        row.get("model_id"),
+        row.get("listing_price"),
+        row.get("first_seen_at"),
+        row.get("previous_seen_at"),
+        row.get("snapshot_contains_before"),
+        row.get("seen_contains_before"),
+        row.get("page_number"),
+        row.get("offset") or "0",
+        row.get("source_request"),
+        row.get("reason"),
+    )
+
+
+def detect_fresh_lots(
+    lots: list[Lot],
+    *,
+    observed: dict[str, Any],
+    primed: dict[str, float],
+    pages: dict[str, list[str]],
+    seen: dict[str, float] | set[str],
+    collection_id: int,
+    model_ids: list[int] | None,
+    round_hits: dict[str, list[tuple[int, int | None]]],
+    now: float | None = None,
+    min_stars: float | None = None,
+    max_stars: float | None = None,
+    stats: dict[str, int] | None = None,
+    forensic: list[dict[str, Any]] | None = None,
+    request_ok: bool = True,
+) -> tuple[list[Lot], list[dict[str, Any]]]:
+    """Классификация freshness: GENUINE_NEW только если listing_id никогда не видели
+    И запрос (collection+models) уже primed.
+
+    Не «нет в текущей page/snapshot». Первый визит ключа — UNPRIMED_SEED, без постов.
+    """
+    ts = time.time() if now is None else float(now)
+    lo = config.MIN_STARS if min_stars is None else float(min_stars)
+    hi = config.MAX_STARS if max_stars is None else float(max_stars)
+    req_key = model_request_key(collection_id, model_ids)
+    primed_before = req_key in primed
+    snapshot_ids = set(pages.get(req_key) or [])
+    verdicts: list[dict[str, Any]] = []
+    genuine: list[Lot] = []
+    page_ids: list[str] = []
+
+    for lot in lots:
+        if stats is not None:
+            _bump(stats, "api_observations")
+        lid = str(lot.id)
+        if lid:
+            page_ids.append(lid)
+        rec_before = observed_record(observed, lot)
+        observed_before = rec_before is not None
+        snapshot_before = lid in snapshot_ids
+        seen_before = bool(lid and lid in seen) or bool(lot.slug and lot.slug in seen)
+        first_seen = float(rec_before["first"]) if rec_before else None
+        prev_seen = float(rec_before["last"]) if rec_before else None
+        mid = lot.model_id
+        prior = list(round_hits.get(lid) or [])
+        page_no = int(getattr(lot, "scan_page", 0) or 0)
+        offset = str(getattr(lot, "scan_offset", "") or "")
+        source = str(getattr(lot, "scan_source", "") or "") or (
+            f"scan:collection={collection_id}:models={req_key.split(':', 1)[-1]}"
+            f":page={page_no or 1}:offset={offset or '0'}"
+        )
+
+        dup_round = bool(prior)
+        if dup_round and stats is not None:
+            _bump(stats, "duplicate_listing_ids_same_round")
+            _bump(stats, "observed_duplicate_same_round")
+            if any(p_mid != mid for _gid, p_mid in prior):
+                _bump(stats, "duplicate_listing_ids_across_models")
+                _bump(stats, "observed_duplicate_cross_model")
+            if any(int(p_gid) != int(collection_id) for p_gid, _mid in prior):
+                _bump(stats, "duplicate_listing_ids_across_collections")
+
+        if lid:
+            round_hits.setdefault(lid, []).append((int(collection_id), mid))
+
+        if dup_round:
+            reason = "OLD"
+            is_new = False
+            if stats is not None:
+                _bump(stats, "fresh_repeated")
+                _bump(stats, "observed_old")
+        elif observed_before or seen_before:
+            reason = "OLD"
+            is_new = False
+            if stats is not None:
+                _bump(stats, "unique_listing_ids")
+                _bump(stats, "observed_old")
+                if snapshot_before is False:
+                    _bump(stats, "fresh_repeated")
+        elif not primed_before:
+            reason = "UNPRIMED_SEED"
+            is_new = False
+            if stats is not None:
+                _bump(stats, "unique_listing_ids")
+                _bump(stats, "unprimed_seed")
+        else:
+            reason = "NEW"
+            is_new = True
+            if stats is not None:
+                _bump(stats, "unique_listing_ids")
+                _bump(stats, "genuine_new")
+                _bump(stats, "genuine_new_listings")
+                _bump(stats, "fresh_unique")
+
+        row = freshness_verdict_dict(
+            lot,
+            reason=reason,
+            genuine_new=is_new,
+            first_seen_at=first_seen if first_seen is not None else ts,
+            previous_seen_at=prev_seen,
+            snapshot_contains_before=snapshot_before,
+            seen_contains_before=seen_before,
+            page_number=page_no,
+            offset=offset,
+            source_request=source,
+            collection_id=collection_id,
+        )
+        verdicts.append(row)
+        if forensic is not None:
+            forensic.append(row)
+            if len(forensic) > FORENSIC_KEEP:
+                del forensic[:-FORENSIC_KEEP]
+        remember_listing(observed, lot, now=ts, collection_id=collection_id)
+
+        if is_new:
+            price_ok = lo <= float(lot.stars) <= hi
+            if stats is not None:
+                record_fresh_price_seen(
+                    stats,
+                    fresh=True,
+                    price_ok=price_ok,
+                    already_seen=seen_before,
+                )
+            if price_ok and not seen_before:
+                genuine.append(lot)
+
+    if request_ok:
+        primed[req_key] = ts
+        if page_ids:
+            pages[req_key] = merge_page_snapshot(
+                pages.get(req_key),
+                page_ids,
+                keep=int(config.PAGE_SNAPSHOT_KEEP),
+            )
+    return genuine, verdicts
+
+
 def merge_page_snapshot(
     prev: list[str] | None, page_ids: list[str], *, keep: int = 80
 ) -> list[str]:
-    """Накопленные listing id коллекции. Порядок: сначала текущая страница."""
+    """Накопленные listing id запроса collection+models. Порядок: текущая страница."""
     out: list[str] = []
     seen: set[str] = set()
     for item in list(page_ids) + list(prev or []):
@@ -1436,11 +1812,11 @@ def fresh_from_page(
     min_stars: float,
     max_stars: float,
 ) -> tuple[list[str], list[Lot]]:
-    """Новые id = разность с предыдущей страницей и seen.
+    """LEGACY page-diff. Scanner больше не использует это как единственный freshness.
 
-    Порядок ответа API не обязан быть newest→oldest: известный id
-    больше не обрывает страницу. Всплытие старого #2 после покупки #1
-    не постим — id уже был в prev_ids. Первый снимок (prev пустой) — без постов.
+    GENUINE_NEW считается в detect_fresh_lots: listing_id никогда не observed
+    И (collection+models) уже primed. Пустой prev здесь = «не постить», но
+    отсутствие id только в текущей page/snapshot НЕ делает listing новым.
     """
     page = [lot.id for lot in lots]
     if not lots or not prev_ids:
@@ -1462,24 +1838,31 @@ async def sync_pages(
     gift_ids: list[int],
     pages: dict[str, list[str]],
     runtime: Runtime,
+    observed: dict[str, Any] | None = None,
+    primed: dict[str, float] | None = None,
 ) -> None:
-    """Запомнить верх newest каждой коллекции. В канал не постим."""
+    """Прогрев observed. НЕ затирает накопленный snapshot и НЕ постит."""
     ids = list(gift_ids)
     random.shuffle(ids)
-    logger.info("Синхрон страниц · %s eligible коллекций — дальше только новые id сверху", len(ids))
+    store = observed if observed is not None else {}
+    primed_store = primed if primed is not None else {}
+    logger.info(
+        "Синхрон observed · %s eligible коллекций — merge only, без постов",
+        len(ids),
+    )
     parallel = max(2, int(config.SCAN_PARALLEL))
     sem = asyncio.Semaphore(parallel)
 
-    async def one(gid: int) -> tuple[int, list[Lot]]:
+    async def one(gid: int) -> tuple[int, list[Lot], list[int]]:
         async with sem:
             try:
                 model_ids = market.floors.eligible_model_ids(gid)
                 if not model_ids:
-                    return gid, []
+                    return gid, [], []
                 lots, _meta = await market.fetch_newest_until_known(
                     gid,
                     model_ids=model_ids,
-                    known_ids=set(),
+                    known_ids=set(store),
                     seen={},
                     max_pages=max(1, int(config.SCAN_MAX_PAGES)),
                     limit=config.PAGE_LIMIT,
@@ -1489,8 +1872,10 @@ async def sync_pages(
             except Exception as exc:  # noqa: BLE001
                 runtime.last_error = str(exc)
                 lots = []
-            return gid, lots
+                model_ids = []
+            return gid, lots, list(model_ids or [])
 
+    now = time.time()
     chunk = max(parallel * 4, 16)
     for i in range(0, len(ids), chunk):
         batch = ids[i : i + chunk]
@@ -1499,12 +1884,29 @@ async def sync_pages(
             if not isinstance(part, tuple):
                 runtime.last_error = str(part)
                 continue
-            gid, lots = part
-            if lots:
-                pages[str(gid)] = [lot.id for lot in lots]
-        runtime.snapshot = len(pages)
-        logger.info("Страницы %s/%s · %s", min(i + len(batch), len(ids)), len(ids), len(pages))
-    logger.info("Страницы готовы: %s. Жду только что выставленные", len(pages))
+            gid, lots, model_ids = part
+            if not lots:
+                continue
+            for lot in lots:
+                remember_listing(store, lot, now=now, collection_id=gid)
+            # All-models warmup ≠ per-chunk prime: не помечаем chunk-ключи.
+            req_key = model_request_key(gid, model_ids)
+            primed_store[req_key] = now
+            page_ids = [lot.id for lot in lots if lot.id]
+            if page_ids:
+                pages[req_key] = merge_page_snapshot(
+                    pages.get(req_key),
+                    page_ids,
+                    keep=int(config.PAGE_SNAPSHOT_KEEP),
+                )
+        runtime.snapshot = len(store)
+        logger.info(
+            "Observed %s/%s · %s ids",
+            min(i + len(batch), len(ids)),
+            len(ids),
+            len(store),
+        )
+    logger.info("Observed готов: %s id. Жду только genuinely new", len(store))
 
 
 def apply_catalog_stats(runtime: Runtime, market: TelegramMarket) -> None:
@@ -1528,6 +1930,8 @@ async def scanner_loop(
     state: dict,
     state_file: Path,
     bot: Any | None = None,
+    observed: dict[str, Any] | None = None,
+    primed: dict[str, float] | None = None,
 ) -> None:
     logger.info(
         "Сканер: allowlist models · batch=%s (0=все eligible) "
@@ -1545,6 +1949,8 @@ async def scanner_loop(
         config.GIRL_MIN_SCORE,
         int(config.POST_INTERVAL),
     )
+    observed_store = observed if observed is not None else state.setdefault("observed", {})
+    primed_store = primed if primed is not None else state.setdefault("primed_models", {})
     pass_no = 0
     while True:
         round_started_at = time.time()
@@ -1616,6 +2022,8 @@ async def scanner_loop(
                     "old": 0,
                     "depths": {},
                     "models": 0,
+                    "model_ids": [],
+                    "request_key": model_request_key(gid, []),
                 }
                 try:
                     model_ids = market.floors.eligible_model_ids(gid)
@@ -1624,12 +2032,15 @@ async def scanner_loop(
                     chunk_ids = market.next_model_chunk(
                         gid, model_ids, int(config.SCAN_MODEL_CHUNK)
                     )
-                    prev_ids = pages.get(str(gid)) or []
-                    known = set(prev_ids)
+                    used_models = chunk_ids or model_ids
+                    req_key = model_request_key(gid, used_models)
+                    prev_ids = pages.get(req_key) or []
+                    # known = глобальный observed, не «текущая page коллекции»
+                    known = set(observed_store) | set(prev_ids)
                     with market.rpc_kind("scan"):
                         lots, meta = await market.fetch_newest_until_known(
                             gid,
-                            model_ids=chunk_ids or model_ids,
+                            model_ids=used_models,
                             known_ids=known,
                             seen=seen,
                             max_pages=max(1, int(config.SCAN_MAX_PAGES)),
@@ -1637,6 +2048,8 @@ async def scanner_loop(
                             timeout=config.REQUEST_TIMEOUT,
                             gap=config.REQUEST_GAP,
                         )
+                    meta["model_ids"] = list(used_models)
+                    meta["request_key"] = req_key
                     if not market.last_fetch_ok:
                         ok = False
                 except Exception as exc:  # noqa: BLE001
@@ -1654,8 +2067,14 @@ async def scanner_loop(
 
         seen_skip = 0
         seller_skip = 0
+        round_hits: dict[str, list[tuple[int, int | None]]] = {}
 
-        def absorb(gid: int, lots: list[Lot], meta: dict[str, Any] | None = None) -> None:
+        def absorb(
+            gid: int,
+            lots: list[Lot],
+            meta: dict[str, Any] | None = None,
+            ok: bool = True,
+        ) -> None:
             nonlocal found, queued, api_n, seen_skip, seller_skip
             info = meta or {}
             api_n += len(lots)
@@ -1693,43 +2112,39 @@ async def scanner_loop(
                     _bump(runtime.funnel, "listing_price_pass")
                 else:
                     _bump(runtime.funnel, "listing_price_reject")
-            key = str(gid)
-            prev = pages.get(key)
-            if prev:
-                known = set(prev)
-                for lot in lots:
-                    if lot.id in known:
-                        continue
-                    price_ok = listing_lo <= float(lot.stars) <= listing_hi
-                    already = lot.id in seen or bool(lot.slug and lot.slug in seen)
-                    record_fresh_price_seen(
-                        runtime.funnel,
-                        fresh=True,
-                        price_ok=price_ok,
-                        already_seen=already,
-                    )
+            used_models = list(info.get("model_ids") or [])
+            chunk, verdicts = detect_fresh_lots(
+                lots,
+                observed=observed_store,
+                primed=primed_store,
+                pages=pages,
+                seen=seen,
+                collection_id=gid,
+                model_ids=used_models,
+                round_hits=round_hits,
+                min_stars=listing_lo,
+                max_stars=listing_hi,
+                stats=runtime.funnel,
+                request_ok=ok,
+            )
+            for row in verdicts:
+                runtime.diag.record_freshness_verdict(row)
+                if row.get("genuine_new"):
+                    log_freshness_forensic(row)
+            for row in verdicts:
+                if row.get("genuine_new") and row.get("listing_price") is not None:
+                    price_ok = listing_lo <= float(row["listing_price"]) <= listing_hi
+                    already = bool(row.get("seen_contains_before"))
                     if price_ok is False:
-                        runtime.diag.record_price_reject(float(lot.stars))
+                        runtime.diag.record_price_reject(float(row["listing_price"]))
                     elif already:
                         runtime.diag.record_seen_reason("listing")
-                    if already:
                         seen_skip += 1
-            new_page, chunk = fresh_from_page(
-                prev,
-                lots,
-                seen,
-                listing_lo,
-                listing_hi,
-            )
-            if new_page:
-                pages[key] = merge_page_snapshot(
-                    prev, new_page, keep=int(config.PAGE_SNAPSHOT_KEEP)
-                )
             runtime.diag.note_new_candidates(gid, len(chunk))
             if chunk:
                 slugs = ",".join((x.slug or x.id)[:22] for x in chunk[:8])
                 logger.info(
-                    "[pipeline] fresh detected gid=%s n=%s pages=%s models=%s %s",
+                    "[pipeline] GENUINE_NEW gid=%s n=%s pages=%s models=%s %s",
                     gid,
                     len(chunk),
                     info.get("pages", 0),
@@ -1764,10 +2179,10 @@ async def scanner_loop(
                 collections_success += 1
             else:
                 collections_failed += 1
-            absorb(gid, lots, meta)
+            absorb(gid, lots, meta, ok)
         runtime.last_found = found
         runtime.last_fresh = queued
-        runtime.snapshot = len(pages)
+        runtime.snapshot = len(observed_store)
         fn = runtime.funnel
         sync_funnel_aliases(fn)
         runtime.last_funnel = dict(fn)
@@ -1807,14 +2222,21 @@ async def scanner_loop(
             }
         )
         logger.info(
-            "[pipeline] pass #%s API=%s fresh=%s price_pass=%s seen_pass=%s "
+            "[pipeline] pass #%s API=%s unique=%s GENUINE_NEW=%s "
+            "fresh=%s price_pass=%s seen_pass=%s "
+            "observed_old=%s unprimed=%s dup_round=%s "
             "dup_seller=%s dup_listing=%s work_in=%s dequeued=%s "
             "ru_pass=%s girl_pass=%s nft_pass=%s send=%s/%s q=%s",
             pass_no,
-            api_n,
+            fn.get("api_observations", api_n),
+            fn.get("unique_listing_ids", 0),
+            fn.get("genuine_new", 0),
             fn.get("fresh_detected", 0),
             fn.get("price_pass", 0),
             fn.get("seen_pass", 0),
+            fn.get("observed_old", 0),
+            fn.get("unprimed_seed", 0),
+            fn.get("duplicate_listing_ids_same_round", 0),
             fn.get("dup_seller", 0),
             fn.get("dup_listing", 0),
             fn.get("work_in", 0),
@@ -1840,6 +2262,8 @@ async def scanner_loop(
                 len(pages),
             )
         state["pages"] = pages
+        state["observed"] = observed_store
+        state["primed_models"] = primed_store
         save_state(state_file, state)
         spent = time.monotonic() - started
         await asyncio.sleep(max(config.POLL_INTERVAL - spent, 0.02))
@@ -1856,6 +2280,15 @@ async def run() -> None:
     if not isinstance(pages, dict):
         pages = {}
         state["pages"] = pages
+    observed: dict[str, Any] = state.setdefault("observed", {})
+    if not isinstance(observed, dict):
+        observed = {}
+        state["observed"] = observed
+    primed: dict[str, float] = state.setdefault("primed_models", {})
+    if not isinstance(primed, dict):
+        primed = {}
+        state["primed_models"] = primed
+    migrate_observed_from_legacy(state)
 
     client, control = await _client_and_bot()
     chat_id = config.channel_id()
@@ -1927,14 +2360,18 @@ async def run() -> None:
     sync_ids = list(market.scan_ids) or list(gift_ids)
     if sync_ids:
         try:
-            await sync_pages(market, sync_ids, pages, runtime)
+            await sync_pages(
+                market, sync_ids, pages, runtime, observed=observed, primed=primed
+            )
             state["pages"] = pages
+            state["observed"] = observed
+            state["primed_models"] = primed
             save_state(state_file, state)
         except Exception as exc:  # noqa: BLE001
             logger.error("страницы: %s", exc)
             runtime.last_error = str(exc)
     runtime.snapshot_ready = True
-    runtime.snapshot = len(pages)
+    runtime.snapshot = len(observed)
 
     try:
         while True:
@@ -1949,6 +2386,8 @@ async def run() -> None:
                     state,
                     state_file,
                     bot=control.aiogram_bot,
+                    observed=observed,
+                    primed=primed,
                 )
             except asyncio.CancelledError:
                 raise

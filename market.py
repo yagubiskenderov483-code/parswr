@@ -173,6 +173,9 @@ class Lot:
     model_id: int | None = None
     model_floor: float | None = None  # None = UNKNOWN; не выдумываем
     api_gender: str = ""  # male/female из API, если есть; иначе ""
+    scan_page: int = 0
+    scan_offset: str = ""
+    scan_source: str = ""
 
     @property
     def nft_url(self) -> str:
@@ -861,10 +864,14 @@ class TelegramMarket:
         old_n = 0
         pages_n = 0
         depths: dict[str, int] = {}
+        offsets: list[str] = []
         cap = max(1, int(max_pages))
         page_lim = max(1, int(limit))
+        mid_blob = ",".join(str(int(x)) for x in (model_ids or []) if int(x) > 0)
 
         def _old(lot: Lot) -> bool:
+            # new_listing_seen = не в known_ids (observed ∪ snapshot) и не в pipeline seen.
+            # Это НЕ «впервые на маркете»: known_ids должен быть глобальным observed.
             if lot.id in known_ids or lot.id in seen:
                 return True
             if lot.slug and lot.slug in seen:
@@ -872,6 +879,7 @@ class TelegramMarket:
             return False
 
         for _page in range(cap):
+            page_offset = offset
             lots = await self.fetch_page(
                 gift_id,
                 limit=page_lim,
@@ -882,6 +890,7 @@ class TelegramMarket:
                 model_ids=model_ids,
             )
             pages_n += 1
+            offsets.append(page_offset)
             if not lots:
                 break
             unknown = 0
@@ -890,6 +899,12 @@ class TelegramMarket:
                     continue
                 seen_ids.add(lot.id)
                 depths[lot.id] = (_page * page_lim) + i
+                lot.scan_page = _page + 1
+                lot.scan_offset = page_offset
+                lot.scan_source = (
+                    f"scan:collection={gift_id}:models={mid_blob}"
+                    f":page={_page + 1}:offset={page_offset or '0'}"
+                )
                 if _old(lot):
                     old_n += 1
                 else:
@@ -908,6 +923,8 @@ class TelegramMarket:
             "old": old_n,
             "depths": depths,
             "models": len(model_ids or []),
+            "model_ids": list(model_ids or []),
+            "offsets": offsets,
         }
 
     async def fetch_in_range(

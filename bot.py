@@ -35,6 +35,9 @@ from telethon.sessions import StringSession
 
 import config
 
+logger = logging.getLogger("bot")
+
+
 def is_telegram_unauthorized(exc: BaseException) -> bool:
     blob = f"{type(exc).__name__} {exc}".lower()
     return "unauthorized" in blob

@@ -2928,6 +2928,14 @@ def test_status_includes_scan_owner_female_metrics() -> None:
     assert "score<" not in text
 
 
+def test_telegram_unauthorized_detected() -> None:
+    from bot import is_telegram_unauthorized
+
+    assert is_telegram_unauthorized(RuntimeError("Telegram server says - Unauthorized"))
+    assert is_telegram_unauthorized(RuntimeError("Unauthorized"))
+    assert is_telegram_unauthorized(RuntimeError("polling упал")) is False
+
+
 def test_split_telegram_html_under_limit() -> None:
     from bot import split_telegram_html
 
@@ -3187,6 +3195,7 @@ def main() -> None:
         test_female_gate_api_gender_male_overrides_female_name,
         test_female_gate_keeps_confident_maria,
         test_status_includes_scan_owner_female_metrics,
+        test_telegram_unauthorized_detected,
         test_split_telegram_html_under_limit,
         test_status_chunks_fit_telegram_limit,
         test_old_after_anchor_not_posted,

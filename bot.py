@@ -35,7 +35,14 @@ from telethon.sessions import StringSession
 
 import config
 
-logger = logging.getLogger("bot")
+def is_telegram_unauthorized(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return "unauthorized" in blob
+
+
+def _token_tail() -> str:
+    raw = config.bot_token()
+    return raw[-4:] if len(raw) >= 4 else "?"
 
 TELEGRAM_TEXT_LIMIT = int(getattr(config, "TELEGRAM_TEXT_LIMIT", 4096))
 TELEGRAM_SAFE_LIMIT = int(getattr(config, "TELEGRAM_SAFE_LIMIT", 3900))
@@ -261,23 +268,45 @@ class ControlBot:
         self._login_done.set()
 
     async def start(self) -> None:
+        token_ok = False
         try:
             me = await asyncio.wait_for(self._bot.get_me(), timeout=15.0)
+            token_ok = True
             if me.username:
                 self.bot_username = me.username
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("bot get_me: %s", exc)
-        try:
-            await self._bot.set_my_commands(
-                [
-                    BotCommand(command="start", description="Старт / вход"),
-                    BotCommand(command="status", description="Статус трекера"),
-                ]
+            logger.info(
+                "Bot API ok @%s token=…%s",
+                self.bot_username,
+                _token_tail(),
             )
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            if is_telegram_unauthorized(exc):
+                logger.error(
+                    "Токен бота недействителен (Unauthorized, …%s). "
+                    "BotFather отозвал старый ключ — Bothost должен деплоить "
+                    "актуальный BOT_TOKEN из config.py (смержи ветку в main и рестарт).",
+                    _token_tail(),
+                )
+            else:
+                logger.warning("bot get_me: %s", exc)
+        if token_ok:
+            try:
+                await self._bot.set_my_commands(
+                    [
+                        BotCommand(command="start", description="Старт / вход"),
+                        BotCommand(command="status", description="Статус трекера"),
+                    ]
+                )
+            except Exception:  # noqa: BLE001
+                pass
         self._task = asyncio.create_task(self._poll_loop(), name="control-bot")
-        logger.info("Бот @%s слушает команды", self.bot_username)
+        if token_ok:
+            logger.info("Бот @%s слушает команды", self.bot_username)
+        else:
+            logger.error(
+                "Бот НЕ слушает команды: Telegram отклонил токен …%s",
+                _token_tail(),
+            )
 
     async def _poll_loop(self) -> None:
         while True:
@@ -294,6 +323,14 @@ class ControlBot:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if is_telegram_unauthorized(exc):
+                    logger.error(
+                        "polling Unauthorized (токен …%s). Жду 60с, не ддосю Telegram. "
+                        "Нужен актуальный BOT_TOKEN в задеплоенном config.py.",
+                        _token_tail(),
+                    )
+                    await asyncio.sleep(60.0)
+                    continue
                 logger.error("polling упал: %s — рестарт через 3с", exc)
                 await asyncio.sleep(3.0)
 

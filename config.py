@@ -28,7 +28,7 @@ def env_float(name: str, default: float) -> float:
 
 # @jsjeigiejwhnewbot
 BOT_USERNAME = "jsjeigiejwhnewbot"
-BOT_TOKEN = "8825465611:AAE8-3_hFqU32_-gUJLbvZC96i-MvDl3lNA"
+BOT_TOKEN = "8825465611:AAGVEabGitYdpQeACvJDkN3pkmrGqK9Ze5g"
 
 # User API (my.telegram.org) — из реп Stars / ParserUs / Zayavki
 # старый 36101343 (ParserGift) забанен

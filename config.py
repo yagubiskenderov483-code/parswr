@@ -5,27 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
-def env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def env_float(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
 # @jsjeigiejwhnewbot
 BOT_USERNAME = "jsjeigiejwhnewbot"
 BOT_TOKEN = "8825465611:AAGVEabGitYdpQeACvJDkN3pkmrGqK9Ze5g"
@@ -37,57 +16,25 @@ API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
 
 CHANNEL_ID = -1003784435307
 
-# Лимит выдачи: 5000–25000 Stars (жёстко, env не перебивает)
-MIN_STARS = 5000
+MIN_STARS = 3000
 MAX_STARS = 25000
-# Допуск к цене КОНКРЕТНОГО лота (не floor модели). 0 = жёсткий диапазон.
-LISTING_PRICE_TOLERANCE = env_float("LISTING_PRICE_TOLERANCE", 0.0)
-# Реальный min resale модели/варианта. Дешёвая модель за 8000⭐ не проходит.
-MIN_MODEL_FLOOR = env_int("MIN_MODEL_FLOOR", 4000)
-MAX_MODEL_FLOOR = env_int("MAX_MODEL_FLOOR", 27000)
-FLOOR_CACHE_TTL = env_float("FLOOR_CACHE_TTL", 1800.0)  # сек; не на каждом scan round
-FLOOR_REFRESH_MAX_PAGES = env_int("FLOOR_REFRESH_MAX_PAGES", 6)
-FLOOR_REFRESH_PAGE_SIZE = env_int("FLOOR_REFRESH_PAGE_SIZE", 50)
-# Холодный старт без кэша: 1 price-page, дальше floor в фоне. Не ждём 10–20 мин.
-FLOOR_START_PAGES = env_int("FLOOR_START_PAGES", 1)
-MAX_ACCOUNT_LEVEL = env_int("MAX_ACCOUNT_LEVEL", 2)
-MAX_NFTS = env_int("MAX_NFTS", 6)  # уникальные/дорогие; дешёвые безлимитные не считаем
-POST_INTERVAL = env_float("POST_INTERVAL", 4.0)  # только между отправками в канал, не scan round
+MAX_ACCOUNT_LEVEL = 2
+MAX_NFTS = 12
+POST_INTERVAL = 4.0
 
-# Женский gate: якорь имени/отчества/female-name в нике. Эмодзи/фото/подарки не пол.
-GIRL_MIN_SCORE = env_int("GIRL_MIN_SCORE", 5)
-GIRL_REQUIRE_IDENTITY = True
-
+# Курс для строки «X Stars / Y TON» (как в tracker market)
 TON_RATE = 0.0102
 TZ_OFFSET = 3.0  # МСК
 
-POLL_INTERVAL = env_float("POLL_INTERVAL", 0.05)  # между проходами сканера ≠ POST_INTERVAL
-PAGE_LIMIT = env_int("PAGE_LIMIT", 12)  # верх newest одной страницы
-SCAN_PARALLEL = env_int("SCAN_PARALLEL", 12)
-# 0 = все eligible коллекции за round. Env >0 — кольцо по N.
-SCAN_BATCH = env_int("SCAN_BATCH", 0)
-# Реальный in-flight GetResaleStarGifts. Не поднимаем ради «быстрее» — FloodWait.
-RPC_CONCURRENCY = max(1, min(env_int("RPC_CONCURRENCY", 6), SCAN_PARALLEL))
-# 0 = все eligible модели одним RPC (новые лоты сразу наверху newest).
-SCAN_MODEL_CHUNK = env_int("SCAN_MODEL_CHUNK", 0)
-# Live: newest-страницы до первого уже известного лота. 2 — если page1 вся новая.
-SCAN_MAX_PAGES = env_int("SCAN_MAX_PAGES", 2)
-# Первый визит коллекции (без блокирующего sync на старте). 2 стр ≈ 1–2с, не 8×8с.
-SCAN_SEED_PAGES = env_int("SCAN_SEED_PAGES", 2)
-# Накопленный снимок id коллекции (не только последние 12) — меньше ложных fresh.
-PAGE_SNAPSHOT_KEEP = env_int("PAGE_SNAPSHOT_KEEP", 120)
-REQUEST_GAP = env_float("REQUEST_GAP", 0.02)
-# 4s на GetResaleStarGifts давало retry-шторм (to≈90). 8s — тот же RPC, меньше таймаутов.
-REQUEST_TIMEOUT = env_float("REQUEST_TIMEOUT", 8.0)
-# Live scan: 1 попытка. Второй 8s-retry раздувал round до 50с при to=30.
-REQUEST_ATTEMPTS_LIVE = env_int("REQUEST_ATTEMPTS_LIVE", 1)
-ENRICH_TIMEOUT = env_float("ENRICH_TIMEOUT", 4.0)
-MIN_COLLECTIONS = env_int("MIN_COLLECTIONS", 50)
+POLL_INTERVAL = 0.08
+PAGE_LIMIT = 12
+SCAN_BATCH = 16
+SCAN_PARALLEL = 2
+REQUEST_GAP = 0.02
+REQUEST_TIMEOUT = 8.0
+ENRICH_TIMEOUT = 5.0
 
-TRACKER_VERSION = "5.13.4"
-TELEGRAM_TEXT_LIMIT = 4096
-TELEGRAM_SAFE_LIMIT = 3900
-DEBUG_FILTERS = True
+TRACKER_VERSION = "4.0.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -118,8 +65,24 @@ def catalog_path() -> Path:
     return data_dir() / "tracker_catalog.json"
 
 
-def floor_cache_path() -> Path:
-    return data_dir() / "model_floors.json"
+def env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def bot_token() -> str:
@@ -135,4 +98,4 @@ def api_hash() -> str:
 
 
 def channel_id() -> int:
-    return int(CHANNEL_ID)
+    return env_int("CHANNEL_ID", CHANNEL_ID)

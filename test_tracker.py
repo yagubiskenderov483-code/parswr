@@ -72,30 +72,30 @@ def test_skips_male_nick() -> None:
 
 
 def test_price_range() -> None:
-    ok = _lot(stars=3000)
-    assert filter_lot(ok, min_stars=3000, max_stars=25000) == ""
-    low = _lot(stars=2999)
-    assert filter_lot(low, min_stars=3000, max_stars=25000) == "цена"
-    high = _lot(stars=25001)
-    assert filter_lot(high, min_stars=3000, max_stars=25000) == "цена"
+    ok = _lot(stars=500)
+    assert filter_lot(ok, min_stars=500, max_stars=1000) == ""
+    low = _lot(stars=499)
+    assert filter_lot(low, min_stars=500, max_stars=1000) == "цена"
+    high = _lot(stars=1001)
+    assert filter_lot(high, min_stars=500, max_stars=1000) == "цена"
 
 
 def test_level_max_2() -> None:
-    assert filter_lot(_lot(account_level=2), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(account_level=3), min_stars=3000, max_stars=25000) == "level"
-    assert filter_lot(_lot(account_level=None), min_stars=3000, max_stars=25000) == "level"
+    assert filter_lot(_lot(stars=800, account_level=2), min_stars=500, max_stars=1000) == ""
+    assert filter_lot(_lot(stars=800, account_level=3), min_stars=500, max_stars=1000) == "level"
+    assert filter_lot(_lot(stars=800, account_level=None), min_stars=500, max_stars=1000) == "level"
 
 
 def test_max_12_nfts() -> None:
-    assert filter_lot(_lot(gifts_count=12), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(gifts_count=13), min_stars=3000, max_stars=25000) == "много NFT"
-    assert filter_lot(_lot(gifts_count=None), min_stars=3000, max_stars=25000) == "много NFT"
+    assert filter_lot(_lot(stars=800, gifts_count=12), min_stars=500, max_stars=1000) == ""
+    assert filter_lot(_lot(stars=800, gifts_count=13), min_stars=500, max_stars=1000) == "много NFT"
+    assert filter_lot(_lot(stars=800, gifts_count=None), min_stars=500, max_stars=1000) == "много NFT"
 
 
 def test_free_dm_only() -> None:
-    assert filter_lot(_lot(free_dm=True), min_stars=3000, max_stars=25000) == ""
-    assert filter_lot(_lot(free_dm=False), min_stars=3000, max_stars=25000) == "платные ЛС"
-    assert filter_lot(_lot(free_dm=None), min_stars=3000, max_stars=25000) == "ЛС неизвестно"
+    assert filter_lot(_lot(stars=800, free_dm=True), min_stars=500, max_stars=1000) == ""
+    assert filter_lot(_lot(stars=800, free_dm=False), min_stars=500, max_stars=1000) == "платные ЛС"
+    assert filter_lot(_lot(stars=800, free_dm=None), min_stars=500, max_stars=1000) == "ЛС неизвестно"
 
 
 def test_girl_from_bio_emoji() -> None:
@@ -104,8 +104,8 @@ def test_girl_from_bio_emoji() -> None:
 
 
 def test_hardcoded_filters() -> None:
-    assert config.MIN_STARS == 3000
-    assert config.MAX_STARS == 25000
+    assert config.MIN_STARS == 500
+    assert config.MAX_STARS == 1000
     assert config.MAX_ACCOUNT_LEVEL == 2
     assert config.MAX_NFTS == 12
     assert config.POST_INTERVAL == 4.0

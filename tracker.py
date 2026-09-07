@@ -261,7 +261,7 @@ class Config:
     poll_interval: float = 0.02
     page_limit: int = 8  # верх resale-листа (только самые свежие)
     parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
-    gap: float = 0.04
+    gap: float = 0.25
     timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
@@ -333,7 +333,7 @@ class Config:
             poll_interval=_f("POLL_INTERVAL", 0.02),
             page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
-            gap=_f("REQUEST_GAP", 0.04),
+            gap=_f("REQUEST_GAP", 0.25),
             timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
@@ -363,6 +363,7 @@ SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше н
 SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
 MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
 SNAPSHOT_SCHEMA = 2  # bump → полный снимок заново, без старых лотов
+SELLER_BAN_SCHEMA = 1  # 1 = баним продавца только после поста, не после отсева
 
 
 def load_state(path: Path) -> dict:
@@ -375,6 +376,7 @@ def load_state(path: Path) -> dict:
             data.setdefault("price_samples", {})
             data.setdefault("channel_id", None)
             data.setdefault("snapshot_schema", 0)
+            data.setdefault("seller_ban_schema", 0)
             return data
     except (OSError, ValueError):
         pass
@@ -385,6 +387,7 @@ def load_state(path: Path) -> dict:
         "price_samples": {},
         "channel_id": None,
         "snapshot_schema": 0,
+        "seller_ban_schema": 0,
     }
 
 
@@ -1493,6 +1496,7 @@ class PostQueue:
         if not lots:
             return 0
         added = 0
+        dropped_dup = 0
         now = time.time()
         for lot in rank_for_queue(lots):
             # extract уже пишет lot.id в seen, чтобы не поймать дважды.
@@ -1502,6 +1506,7 @@ class PostQueue:
             keys = seller_identity_keys(lot) if lot.seller_key else set()
             if keys and (keys & self._queued_sellers):
                 _mark_lot_seen(self._seen, lot, now)
+                dropped_dup += 1
                 continue
             if keys and any(
                 self._seen_sellers.get(k) is not None
@@ -1509,6 +1514,7 @@ class PostQueue:
                 for k in keys
             ):
                 _mark_lot_seen(self._seen, lot, now)
+                dropped_dup += 1
                 continue
             self._queued_ids.add(lot.id)
             self._queued_sellers |= keys
@@ -1516,6 +1522,14 @@ class PostQueue:
             prio = -float(lot.discovered_at or time.time())
             self._pq.put_nowait((prio, self._seq, lot))
             added += 1
+        if dropped_dup:
+            self._runtime.last_skip_dup += dropped_dup
+            self._runtime.skip_dup_total += dropped_dup
+            logger.info(
+                "Очередь: +%s, дубль продавца −%s (уже в посте/очереди)",
+                added,
+                dropped_dup,
+            )
         self._runtime.queue_pending = self.pending
         return added
 
@@ -1620,10 +1634,9 @@ class PostQueue:
                         )
                     )
                     if skip_permanent:
+                        # лот жжём, продавца нет — иначе lvl/gifts бан на 90 дней
+                        # глушит всех следующих с того же аккаунта
                         _mark_lot_seen(self._seen, lot, now)
-                        if lot.seller_key:
-                            for k in seller_identity_keys(lot):
-                                self._seen_sellers[k] = now
                     elif incomplete:
                         retries = self._send_retries.get(lot.id, 0) + 1
                         self._send_retries[lot.id] = retries
@@ -1718,8 +1731,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.2"
-BUILD_TAG = "v3.10.2-ru-girls-yield"
+TRACKER_VERSION = "3.10.3"
+BUILD_TAG = "v3.10.3-ru-girls-live"
 
 
 @dataclass
@@ -1959,8 +1972,8 @@ async def scanner_loop(
         runtime.last_fresh = len(fresh)
         runtime.last_posted = enqueued_this_pass
         if len(fresh) and enqueued_this_pass == 0:
-            logger.error(
-                "Найдено %s новых, в очередь 0 — enqueue отбросил лоты",
+            logger.info(
+                "Найдено %s новых, в очередь 0 — те же продавцы уже были",
                 len(fresh),
             )
         if fresh:
@@ -2006,9 +2019,15 @@ async def scanner_loop(
             # не поднимаем parallel — FloodWait от параллельных RPC
             cfg.parallel = 1
             runtime.scan_parallel = 1
-            cfg.gap = min(0.35, max(float(cfg.gap or 0.04), 0.12))
+            long_flood = floods >= 6
+            cfg.gap = min(0.6, max(float(cfg.gap or 0.25), 0.45 if long_flood else 0.3))
+            if long_flood and (cfg.scan_batch <= 0 or cfg.scan_batch > 40):
+                cfg.scan_batch = 40
             logger.warning(
-                "FloodWait x%s — RPC по одному, gap %.2fs", floods, cfg.gap
+                "FloodWait x%s — gap %.2fs · batch %s",
+                floods,
+                cfg.gap,
+                cfg.scan_batch or "все",
             )
 
         await asyncio.sleep(max(cfg.poll_interval - spent, 0.0))
@@ -2048,6 +2067,15 @@ async def run() -> None:
 
     state_path = Path(cfg.state_file)
     state = load_state(state_path)
+    if int(state.get("seller_ban_schema", 0) or 0) < SELLER_BAN_SCHEMA:
+        n_ban = len(state.get("seen_sellers") or {})
+        state["seen_sellers"] = {}
+        state["seller_ban_schema"] = SELLER_BAN_SCHEMA
+        logger.warning(
+            "Сброс бана продавцов (%s) — баним только после поста, не после отсева",
+            n_ban,
+        )
+        save_state(state_path, state)
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
     market_ids: set[str] = set(state.get("market_ids") or [])

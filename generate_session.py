@@ -1,4 +1,10 @@
-"""Одноразовый вход: python3 generate_session.py → SESSION_STRING в .env."""
+"""
+Одноразовый вход в Telegram: создаёт SESSION_STRING для tracker.py.
+
+Запуск:  python3 generate_session.py
+Спросит номер телефона, код из Telegram и пароль 2FA (если стоит).
+Результат сам пропишется в .env (строка SESSION_STRING=...).
+"""
 
 from __future__ import annotations
 
@@ -9,9 +15,8 @@ from pathlib import Path
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-import config
-
-ENV_PATH = Path(__file__).resolve().parent / ".env"
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
 
 
 def _load_dotenv() -> None:
@@ -27,7 +32,7 @@ def _load_dotenv() -> None:
             os.environ.setdefault(key, value)
 
 
-def _write_session(session: str) -> None:
+def _write_session_to_env(session: str) -> None:
     lines: list[str] = []
     replaced = False
     if ENV_PATH.exists():
@@ -40,22 +45,25 @@ def _write_session(session: str) -> None:
     if not replaced:
         lines.append(f"SESSION_STRING={session}")
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    path = config.session_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(session, encoding="utf-8")
 
 
 async def main() -> None:
     _load_dotenv()
-    client = TelegramClient(StringSession(), config.api_id(), config.api_hash())
-    await client.start()
+    api_id = int(os.environ.get("API_ID", "0") or 0)
+    api_hash = os.environ.get("API_HASH", "").strip()
+    if not api_id or not api_hash:
+        raise SystemExit("Сначала заполни API_ID и API_HASH в .env")
+
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    await client.start()  # спросит телефон, код, пароль 2FA
     me = await client.get_me()
     session = StringSession.save(client.session)
     await client.disconnect()
-    _write_session(session)
+
+    _write_session_to_env(session)
     print()
     print(f"Готово! Вошёл как: {me.first_name} (@{me.username or '—'})")
-    print("Сессия записана. Запускай: python3 main.py")
+    print("SESSION_STRING записан в .env — теперь запускай: python3 tracker.py")
 
 
 if __name__ == "__main__":

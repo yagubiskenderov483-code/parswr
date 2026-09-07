@@ -1601,8 +1601,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.5"
-BUILD_TAG = "v3.9.5-api"
+TRACKER_VERSION = "3.9.6"
+BUILD_TAG = "v3.9.6-token"
 
 
 @dataclass

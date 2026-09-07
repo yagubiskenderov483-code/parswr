@@ -5,7 +5,7 @@ import os
 # Трекер: @jsjeigiejwhnewbot (отображается как Trsjjsjsbot)
 CONTROL_BOT_USERNAME = "jsjeigiejwhnewbot"
 DEFAULT_CHANNEL_ID = -1003784435307
-_DEFAULT_BOT_TOKEN = "8825465611:AAEVL0_8DFLmpaqK2AP4JZHXrlkIPmKDVoI"
+_DEFAULT_BOT_TOKEN = "8825465611:AAGiIJBKrsaQ1BjTfgN4GQIGU_t5foETx_I"
 # hardcoded важнее env Bothost — иначе там часто висит старый BOT_TOKEN
 BOT_TOKEN = (_DEFAULT_BOT_TOKEN or os.environ.get("BOT_TOKEN") or "").strip()
 # App api_id / api_hash (my.telegram.org)

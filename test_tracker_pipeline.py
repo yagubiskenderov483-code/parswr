@@ -117,7 +117,8 @@ def test_scenario_23_like_bothost() -> None:
     assert stats["overprice"] == 1
     assert stats["not_female"] == 3
     assert stats["non_ru"] == 1
-    assert len(passed) == 8
+    assert stats["unknown_ru"] == 3
+    assert len(passed) == 5
 
 
 def test_typical_post_ready_lot() -> None:
@@ -133,13 +134,12 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_ru_unknown_passes() -> None:
+def test_latin_ru_unknown_skipped() -> None:
     lot = _lot(seller="cryptogifts", first_name="", lang_code="")
     assert is_russian_lot(lot) is None
     passed, stats = _filter_batch([lot])
-    assert stats["non_ru"] == 0
     assert stats["unknown_ru"] == 1
-    assert len(passed) == 1
+    assert passed == []
 
 
 def test_boy_blocked_girl_passes() -> None:
@@ -327,49 +327,58 @@ def test_enqueue_drops_only_already_posted_seller() -> None:
     assert q2.enqueue([other]) == 1
 
 
-def test_thin_profile_posts_like_before() -> None:
+def test_thin_profile_needs_ru() -> None:
     lot = _lot(first_name="", seller="nftgifts2024", lang_code="", about="")
     assert profile_is_thin(lot) is True
     passed, stats = _filter_batch([lot])
-    assert stats["not_female"] == 0
-    assert stats["non_ru"] == 0
-    assert len(passed) == 1
+    assert stats["unknown_ru"] == 1
+    assert passed == []
+    assert skip_is_incomplete(lot, stats) is True
 
 
-def test_volume_defaults_keep_wifob_and_farm() -> None:
-    """Логи Bothost: lvl 19 и gifts 100 резались — для 5/мин пропускаем."""
-    wifob = _lot(
-        id="sw-20735",
-        first_name="ya",
-        seller="wifob",
+def test_live_ru_gifts15_keeps_maria_cuts_farm() -> None:
+    """RU + gifts≤15 + рынок; девушка не обязательна."""
+    girl = _lot(
+        id="ok",
+        first_name="Мария",
+        seller="mariagifts",
         seller_id=501,
-        account_level=19,
-        gifts_count=15,
-        stars=19999.0,
+        lang_code="ru",
+        gifts_count=12,
+        stars=8000.0,
     )
     farm = _lot(
-        id="st-2355",
-        first_name="Reonchck",
-        seller="Reonchck",
+        id="farm",
+        first_name="Олег",
+        seller="olegfarm",
         seller_id=502,
-        account_level=2,
-        gifts_count=100,
-        stars=12500.0,
+        lang_code="ru",
+        gifts_count=16,
+        stars=8000.0,
+    )
+    boy_ru = _lot(
+        id="boy",
+        first_name="Иван",
+        seller="ivangifts",
+        seller_id=503,
+        lang_code="ru",
+        gifts_count=8,
+        stars=8000.0,
     )
     passed, stats = filter_for_post(
-        [wifob, farm],
+        [girl, farm, boy_ru],
         {},
         now=time.time(),
         strict_ru=True,
         strict_free=False,
         max_account_level=99,
-        max_gifts=999,
-        female_only=True,
+        max_gifts=15,
+        female_only=False,
         strict_fair_price=False,
     )
-    assert stats["level"] == 0
-    assert stats["many_gifts"] == 0
-    assert len(passed) == 2
+    assert stats["many_gifts"] == 1
+    ids = {x.id for x in passed}
+    assert ids == {"ok", "boy"}
 
 
 def test_known_boy_skip_is_complete() -> None:
@@ -384,7 +393,7 @@ def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_ru_unknown_passes,
+        test_latin_ru_unknown_skipped,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,
@@ -392,8 +401,8 @@ def main() -> None:
         test_fresh_lot_marked_seen,
         test_enqueue_accepts_fresh_lot_already_marked_seen,
         test_enqueue_drops_only_already_posted_seller,
-        test_thin_profile_posts_like_before,
-        test_volume_defaults_keep_wifob_and_farm,
+        test_thin_profile_needs_ru,
+        test_live_ru_gifts15_keeps_maria_cuts_farm,
         test_known_boy_skip_is_complete,
     ]
     for fn in tests:

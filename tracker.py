@@ -269,7 +269,7 @@ class Config:
     scan_batch: int = 35  # крутим пачками — полный 151 = FloodWait 3 мин
     hot_limit: int = 8  # топ свежих в коллекции
     max_account_level: int = 99  # не режем по lvl — иначе 1 пост из 14
-    max_gifts: int = 999  # фермы не режем
+    max_gifts: int = 15  # фермы 16+ режем
     post_interval: float = 1.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -279,9 +279,9 @@ class Config:
     channel_id: int | None = None
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
-    female_only: bool = True
-    strict_fair_price: bool = False
-    fair_price_ratio: float = 3.0
+    female_only: bool = False  # женщины в приоритете, не обязательны
+    strict_fair_price: bool = True
+    fair_price_ratio: float = 2.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -341,7 +341,7 @@ class Config:
             scan_batch=int(_f("SCAN_BATCH", 35)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 99)),
-            max_gifts=max(1, int(_f("MAX_GIFTS", 999))),
+            max_gifts=max(1, int(_f("MAX_GIFTS", 15))),
             post_interval=_f("POST_INTERVAL", 1.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -351,9 +351,9 @@ class Config:
             channel_id=channel_id,
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
-            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") == "1",
-            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
-            fair_price_ratio=_f("FAIR_PRICE_RATIO", 3.0),
+            female_only=os.environ.get("TRACKER_FEMALE_ONLY", "0") == "1",
+            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "1") == "1",
+            fair_price_ratio=_f("FAIR_PRICE_RATIO", 2.0),
         )
 
 
@@ -1341,6 +1341,7 @@ def filter_for_post(
                 continue
             if ru is None:
                 stats["unknown_ru"] += 1
+                continue
         if max_gifts < 999:
             gifts = lot.gifts_count
             if gifts is not None and gifts > max_gifts:
@@ -1376,6 +1377,8 @@ def profile_is_thin(lot: Lot) -> bool:
 def skip_is_incomplete(lot: Lot, fstats: dict[str, int]) -> bool:
     """Отсев из-за пустого профиля — повторить, не банить продавца."""
     if fstats.get("no_seller"):
+        return True
+    if fstats.get("unknown_ru") and profile_is_thin(lot):
         return True
     return False
 
@@ -1433,8 +1436,14 @@ def _skip_reason(stats: dict[str, int]) -> str:
 
 
 def rank_for_queue(lots: list[Lot]) -> list[Lot]:
-    """Сначала самые свежие (только что увидели на маркете)."""
-    return sorted(lots, key=lambda lot: -float(lot.discovered_at or 0))
+    """Сначала девушки, внутри — самые свежие."""
+    return sorted(
+        lots,
+        key=lambda lot: (
+            0 if _looks_female(lot) else 1,
+            -float(lot.discovered_at or 0),
+        ),
+    )
 
 
 class PostQueue:
@@ -1461,9 +1470,9 @@ class PostQueue:
         self._state_path = state_path
         self._runtime = runtime
         self._interval = max(0.5, float(post_interval))
-        self._pq: asyncio.PriorityQueue[tuple[float, int, Lot | None]] = (
-            asyncio.PriorityQueue()
-        )
+        self._pq: asyncio.PriorityQueue[
+            tuple[tuple[int, float], int, Lot | None]
+        ] = asyncio.PriorityQueue()
         self._seq = 0
         self._task: asyncio.Task | None = None
         self._closed = False
@@ -1485,7 +1494,7 @@ class PostQueue:
         self._closed = True
         if self._task and not self._task.done():
             self._seq += 1
-            await self._pq.put((0.0, self._seq, None))
+            await self._pq.put(((0, 0.0), self._seq, None))
             try:
                 await asyncio.wait_for(self._task, timeout=self._interval + 10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -1519,7 +1528,8 @@ class PostQueue:
             self._queued_ids.add(lot.id)
             self._queued_sellers |= keys
             self._seq += 1
-            prio = -float(lot.discovered_at or time.time())
+            female_rank = 0 if _looks_female(lot) else 1
+            prio = (female_rank, -float(lot.discovered_at or time.time()))
             self._pq.put_nowait((prio, self._seq, lot))
             added += 1
         if dropped_dup:
@@ -1621,6 +1631,7 @@ class PostQueue:
                         and (
                             fstats["dup"]
                             or fstats["non_ru"]
+                            or fstats["unknown_ru"]
                             or fstats["paid"]
                             or fstats["not_female"]
                             or (
@@ -1731,8 +1742,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.11.0"
-BUILD_TAG = "v3.11.0-five-per-min"
+TRACKER_VERSION = "3.11.1"
+BUILD_TAG = "v3.11.1-ru-new-gifts15"
 
 
 @dataclass

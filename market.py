@@ -411,13 +411,11 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
-    if not looks_female(lot):
-        return "не девушка"
     return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Только девушки: нужен женский сигнал, без мужчин/рекламы."""
+    """Без мужчин/рекламы. Пустое имя и латинский ник — ок, иначе 0 постов."""
     return not female_filter_reason(lot)
 
 
@@ -665,6 +663,7 @@ class TelegramMarket:
         self._gifts_hash = 0
         self._cursor = 0
         self._flood_until = 0.0
+        self._urgent = 0
         self._gap_lock = asyncio.Lock()
         self._rpc_lock = asyncio.Lock()
         self._last_req = 0.0
@@ -690,6 +689,15 @@ class TelegramMarket:
             self._bad_until.pop(int(gift_id), None)
         return False
 
+    def is_flooding(self) -> bool:
+        return self._flood_until > time.monotonic()
+
+    def begin_urgent(self) -> None:
+        self._urgent += 1
+
+    def end_urgent(self) -> None:
+        self._urgent = max(0, self._urgent - 1)
+
     def set_catalog_hooks(
         self,
         load_cb: Any | None = None,
@@ -707,6 +715,7 @@ class TelegramMarket:
         self._found_users.clear()
         self._progress_cb = None
         self._flood_until = 0.0
+        self._urgent = 0
         self.check_no = 0
         self.last_error = ""
         if self._refresh_task and not self._refresh_task.done():
@@ -1537,6 +1546,7 @@ class TelegramMarket:
             timeout,
             max_attempts=1,
             sort_by_price=True,
+            urgent=True,
         )
         if result is None:
             return []
@@ -1626,11 +1636,20 @@ class TelegramMarket:
         offset: str = "",
         max_attempts: int = 2,
         sort_by_price: bool = False,
+        urgent: bool = False,
     ) -> Any | None:
-        for attempt in range(max(1, int(max_attempts))):
+        attempts = 0
+        max_att = max(1, int(max_attempts))
+        while attempts < max_att:
             try:
+                if not urgent:
+                    t0 = time.monotonic()
+                    while self._urgent > 0 and time.monotonic() - t0 < 3.0:
+                        await asyncio.sleep(0.05)
+                await self._wait_flood()
                 async with self._rpc_lock:
-                    await self._wait_flood()
+                    if not urgent and self._urgent > 0:
+                        continue
                     await self.ensure_connected()
                     wait = gap - (time.monotonic() - self._last_req)
                     if wait > 0:
@@ -1649,20 +1668,22 @@ class TelegramMarket:
                         timeout=timeout,
                     )
             except FloodWaitError as exc:
+                attempts += 1
                 stats["floods"] += 1
                 wait_s = min(float(exc.seconds) + 1.0, 45.0)
                 self._flood_until = time.monotonic() + wait_s
                 self.last_error = f"FloodWait {exc.seconds}s · торможу"
                 logger.warning(
-                    "FloodWait %ss GetResaleStarGifts — пауза %.0fs (все RPC ждут)",
+                    "FloodWait %ss GetResaleStarGifts — пауза %.0fs",
                     exc.seconds,
                     wait_s,
                 )
                 await asyncio.sleep(wait_s)
             except Exception as exc:  # noqa: BLE001
+                attempts += 1
                 stats["errors"] += 1
                 self.last_error = str(exc)
-                await asyncio.sleep(0.2 * (attempt + 1))
+                await asyncio.sleep(0.2 * attempts)
         return None
 
     async def _wait_flood(self) -> None:

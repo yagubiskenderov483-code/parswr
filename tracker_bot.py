@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -445,7 +446,14 @@ def build_router(
             await message.answer("❌ Не авторизован — /start")
             return
         me = await client.get_me()
-        name = me.username or me.first_name or me.id
+        un = (getattr(me, "username", None) or "").strip()
+        fn = (getattr(me, "first_name", None) or "").strip()
+        if un:
+            name = un
+        elif fn and fn not in {".", "·", "-", "—"}:
+            name = fn
+        else:
+            name = str(getattr(me, "id", "") or "?")
         rt = control.runtime if control else None
         cfg = rt.cfg if rt else None
         lines = [
@@ -490,6 +498,15 @@ def build_router(
                     f"В очереди: {rt.queue_pending}",
                     f"Обработано из очереди: {rt.queue_processed}",
                     f"Последний проход: +{rt.last_fresh} новых (в очередь {rt.last_posted})",
+                ]
+            )
+            inflight = (getattr(rt, "queue_inflight", "") or "").strip()
+            if inflight:
+                since = float(getattr(rt, "queue_inflight_since", 0) or 0)
+                age = int(time.monotonic() - since) if since else 0
+                lines.append(f"В обработке: {inflight} · {age}с")
+            lines.extend(
+                [
                     f"Отсев (посл.): ru−{rt.last_skip_ru} dm−{rt.last_skip_dm} "
                     f"dup−{rt.last_skip_dup} noseller−{rt.last_skip_noseller} "
                     f"lvl−{rt.last_skip_level} gifts−{rt.last_skip_gifts} "
@@ -533,6 +550,16 @@ def build_router(
                 lines.append(
                     "⚠️ Очередь крутится, но в канал 0 постов — "
                     "фильтры отсекают все лоты (см. Отсев) или ошибка отправки"
+                )
+            elif (
+                rt.last_fresh > 0
+                and rt.last_posted == 0
+                and rt.queue_processed == 0
+                and rt.posted_total == 0
+            ):
+                lines.append(
+                    "⚠️ Новые лоты нашлись, но в очередь не попали — "
+                    "перезалей трекер (баг seen/enqueue)"
                 )
             elif rt.passes > 0 and rt.last_fresh == 0 and rt.posted_total == 0:
                 lines.append(

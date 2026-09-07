@@ -5,9 +5,18 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from market import Lot, MarketPriceBook, is_russian_lot
-from tracker import Config, _extract_fresh_from_collection, filter_for_post
+from tracker import (
+    Config,
+    PostQueue,
+    TrackerRuntime,
+    _extract_fresh_from_collection,
+    filter_for_post,
+    profile_is_thin,
+    skip_is_incomplete,
+)
 
 
 def _lot(**kwargs) -> Lot:
@@ -48,7 +57,7 @@ def _filter_batch(
 
 
 def test_scenario_23_like_bothost() -> None:
-    """Нейтральные и фермы режутся; русские девушки проходят."""
+    """Мальчики и арабы режутся; девушки и нейтральные проходят."""
     book = MarketPriceBook()
     book.set_floor(["desk calendar", "cid:99"], 5500.0)
     lots: list[Lot] = []
@@ -61,6 +70,16 @@ def test_scenario_23_like_bothost() -> None:
                 first_name="Мария",
                 lang_code="ru",
                 stars=5600.0 + i,
+            )
+        )
+    for i in range(3):
+        lots.append(
+            _lot(
+                id=f"n{i}",
+                seller=f"nfttrader{i}",
+                seller_id=150 + i,
+                first_name="",
+                stars=5650.0 + i,
             )
         )
     for i in range(3):
@@ -96,8 +115,9 @@ def test_scenario_23_like_bothost() -> None:
     )
     passed, stats = _filter_batch(lots, book)
     assert stats["overprice"] == 1
-    assert stats["not_female"] + stats["non_ru"] == 4
-    assert len(passed) == 5
+    assert stats["not_female"] == 3
+    assert stats["non_ru"] == 1
+    assert len(passed) == 8
 
 
 def test_typical_post_ready_lot() -> None:
@@ -113,12 +133,13 @@ def test_typical_post_ready_lot() -> None:
     assert sum(stats.values()) == 0
 
 
-def test_latin_ru_unknown_skipped() -> None:
+def test_latin_ru_unknown_passes() -> None:
     lot = _lot(seller="cryptogifts", first_name="", lang_code="")
     assert is_russian_lot(lot) is None
     passed, stats = _filter_batch([lot])
-    assert stats["unknown_ru"] == 1 or stats["not_female"] == 1
-    assert passed == []
+    assert stats["non_ru"] == 0
+    assert stats["unknown_ru"] == 1
+    assert len(passed) == 1
 
 
 def test_boy_blocked_girl_passes() -> None:
@@ -225,16 +246,80 @@ def test_fresh_lot_marked_seen() -> None:
     assert stats2["skipped_seen"] == 1
 
 
+def test_enqueue_accepts_fresh_lot_already_marked_seen() -> None:
+    """Баг /status: +1 новых, очередь 0 — extract писал seen, enqueue дропал."""
+    lot = _lot(
+        id="new-ok",
+        stars=8000.0,
+        first_name="Мария",
+        seller="mariagifts",
+        slug="DeskCalendar-99",
+        lang_code="ru",
+    )
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    cfg.strict_fair_price = False
+    cfg.min_stars = 5000
+    cfg.max_stars = 25000
+    cfg.hot_limit = 4
+    seen: dict[str, float] = {}
+    fresh, _stats = _extract_fresh_from_collection(
+        [lot],
+        cfg=cfg,
+        seen=seen,
+        snapshot_ids=set(),
+        batch_market_ids=set(),
+        baseline=False,
+        now=time.time(),
+        price_book=None,
+    )
+    assert len(fresh) == 1
+    assert "new-ok" in seen
+    rt = TrackerRuntime()
+    q = PostQueue(
+        sender=None,
+        market=None,
+        cfg=cfg,
+        seen=seen,
+        seen_sellers={},
+        state={},
+        state_path=Path("/tmp/tracker-test-state.json"),
+        runtime=rt,
+    )
+    assert q.enqueue(fresh) == 1
+    assert q.pending == 1
+    assert q.enqueue(fresh) == 0
+
+
+def test_thin_profile_posts_like_before() -> None:
+    lot = _lot(first_name="", seller="nftgifts2024", lang_code="", about="")
+    assert profile_is_thin(lot) is True
+    passed, stats = _filter_batch([lot])
+    assert stats["not_female"] == 0
+    assert stats["non_ru"] == 0
+    assert len(passed) == 1
+
+
+def test_known_boy_skip_is_complete() -> None:
+    lot = _lot(first_name="Alex", seller="alexgifts", lang_code="")
+    assert profile_is_thin(lot) is False
+    _passed, stats = _filter_batch([lot])
+    assert stats["not_female"] == 1
+    assert skip_is_incomplete(lot, stats) is False
+
+
 def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
         test_typical_post_ready_lot,
-        test_latin_ru_unknown_skipped,
+        test_latin_ru_unknown_passes,
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,
         test_overprice_extract_does_not_burn_seen,
         test_fresh_lot_marked_seen,
+        test_enqueue_accepts_fresh_lot_already_marked_seen,
+        test_thin_profile_posts_like_before,
+        test_known_boy_skip_is_complete,
     ]
     for fn in tests:
         fn()

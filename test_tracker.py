@@ -113,7 +113,7 @@ def test_hardcoded_filters() -> None:
     assert config.BOT_USERNAME == "jsjeigiejwhnewbot"
     assert config.API_ID == 28687552
     assert config.API_HASH == "1abf9a58d0c22f62437bec89bd6b27a3"
-    assert config.BOT_TOKEN == "8825465611:AAGVEabGitYdpQeACvJDkN3pkmrGqK9Ze5g"
+    assert config.BOT_TOKEN == "8825465611:AAEVL0_8DFLmpaqK2AP4JZHXrlkIPmKDVoI"
 
 
 def test_girl_from_gifts_and_stories() -> None:

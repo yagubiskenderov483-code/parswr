@@ -32,6 +32,15 @@ import config
 logger = logging.getLogger("bot")
 
 
+def _is_unauthorized(exc: BaseException) -> bool:
+    return "unauthorized" in f"{type(exc).__name__} {exc}".lower()
+
+
+def _token_tail() -> str:
+    raw = config.bot_token()
+    return raw[-4:] if len(raw) >= 4 else "?"
+
+
 class LoginStates(StatesGroup):
     phone = State()
     code = State()
@@ -175,8 +184,15 @@ class ControlBot:
             me = await asyncio.wait_for(self._bot.get_me(), timeout=15.0)
             if me.username:
                 self.bot_username = me.username
+            logger.info("Bot API ok @%s token=…%s", self.bot_username, _token_tail())
         except Exception as exc:  # noqa: BLE001
-            logger.warning("bot get_me: %s", exc)
+            if _is_unauthorized(exc):
+                logger.error(
+                    "Токен бота недействителен (Unauthorized, …%s).",
+                    _token_tail(),
+                )
+            else:
+                logger.warning("bot get_me: %s", exc)
         self._task = asyncio.create_task(self._poll_loop(), name="control-bot")
         logger.info("Бот @%s слушает команды", self.bot_username)
 
@@ -199,6 +215,13 @@ class ControlBot:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if _is_unauthorized(exc):
+                    logger.error(
+                        "polling Unauthorized (токен …%s). Жду 60с, не ддосю Telegram.",
+                        _token_tail(),
+                    )
+                    await asyncio.sleep(60.0)
+                    continue
                 logger.error("polling упал: %s — рестарт через 3с", exc)
             await asyncio.sleep(3.0)
 

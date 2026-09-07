@@ -7,7 +7,7 @@ from pathlib import Path
 
 # @jsjeigiejwhnewbot
 BOT_USERNAME = "jsjeigiejwhnewbot"
-BOT_TOKEN = "8825465611:AAGVEabGitYdpQeACvJDkN3pkmrGqK9Ze5g"
+BOT_TOKEN = "8825465611:AAEVL0_8DFLmpaqK2AP4JZHXrlkIPmKDVoI"
 
 # User API (my.telegram.org) — из реп Stars / ParserUs / Zayavki
 # старый 36101343 (ParserGift) забанен
@@ -34,7 +34,7 @@ REQUEST_GAP = 0.02
 REQUEST_TIMEOUT = 8.0
 ENRICH_TIMEOUT = 5.0
 
-TRACKER_VERSION = "4.0.3"
+TRACKER_VERSION = "4.0.4"
 BASE_DIR = Path(__file__).resolve().parent
 
 

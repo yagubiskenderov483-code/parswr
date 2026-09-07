@@ -1333,12 +1333,11 @@ def filter_for_post(
             continue
         if strict_ru:
             ru = is_russian_lot(lot)
-            if ru is not True:
-                if ru is False:
-                    stats["non_ru"] += 1
-                else:
-                    stats["unknown_ru"] += 1
+            if ru is False:
+                stats["non_ru"] += 1
                 continue
+            if ru is None:
+                stats["unknown_ru"] += 1
         if max_gifts < 999:
             gifts = lot.gifts_count
             if gifts is not None and gifts > max_gifts:
@@ -1374,14 +1373,6 @@ def profile_is_thin(lot: Lot) -> bool:
 def skip_is_incomplete(lot: Lot, fstats: dict[str, int]) -> bool:
     """Отсев из-за пустого профиля — повторить, не банить продавца."""
     if fstats.get("no_seller"):
-        return True
-    if fstats.get("unknown_ru") and profile_is_thin(lot):
-        return True
-    if (
-        fstats.get("not_female")
-        and female_filter_reason(lot) == "не девушка"
-        and profile_is_thin(lot)
-    ):
         return True
     return False
 
@@ -1616,7 +1607,6 @@ class PostQueue:
                         and (
                             fstats["dup"]
                             or fstats["non_ru"]
-                            or fstats["unknown_ru"]
                             or fstats["paid"]
                             or fstats["not_female"]
                             or (
@@ -1728,8 +1718,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.1"
-BUILD_TAG = "v3.10.1-ru-girls-post"
+TRACKER_VERSION = "3.10.2"
+BUILD_TAG = "v3.10.2-ru-girls-yield"
 
 
 @dataclass

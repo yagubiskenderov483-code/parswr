@@ -411,13 +411,11 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
-    if not looks_female(lot):
-        return "не девушка"
     return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Только девушки: нужен женский сигнал, без мужчин/рекламы."""
+    """Без мужчин/рекламы. Пустое имя и латинский ник — ок, иначе 0 постов."""
     return not female_filter_reason(lot)
 
 

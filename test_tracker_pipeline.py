@@ -290,6 +290,43 @@ def test_enqueue_accepts_fresh_lot_already_marked_seen() -> None:
     assert q.enqueue(fresh) == 0
 
 
+def test_enqueue_drops_only_already_posted_seller() -> None:
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    now = time.time()
+    seen_sellers = {"mariagifts": now, "id:1": now}
+    other = _lot(
+        id="next-gift",
+        stars=8100.0,
+        seller="mariagifts",
+        seller_id=1,
+        slug="HeartLocket-1",
+        first_name="Мария",
+        lang_code="ru",
+    )
+    q = PostQueue(
+        sender=None,
+        market=None,
+        cfg=cfg,
+        seen={},
+        seen_sellers=seen_sellers,
+        state={},
+        state_path=Path("/tmp/tracker-test-state.json"),
+        runtime=TrackerRuntime(),
+    )
+    assert q.enqueue([other]) == 0
+    q2 = PostQueue(
+        sender=None,
+        market=None,
+        cfg=cfg,
+        seen={},
+        seen_sellers={},
+        state={},
+        state_path=Path("/tmp/tracker-test-state.json"),
+        runtime=TrackerRuntime(),
+    )
+    assert q2.enqueue([other]) == 1
+
+
 def test_thin_profile_posts_like_before() -> None:
     lot = _lot(first_name="", seller="nftgifts2024", lang_code="", about="")
     assert profile_is_thin(lot) is True
@@ -318,6 +355,7 @@ def main() -> None:
         test_overprice_extract_does_not_burn_seen,
         test_fresh_lot_marked_seen,
         test_enqueue_accepts_fresh_lot_already_marked_seen,
+        test_enqueue_drops_only_already_posted_seller,
         test_thin_profile_posts_like_before,
         test_known_boy_skip_is_complete,
     ]

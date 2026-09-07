@@ -1671,14 +1671,15 @@ class TelegramMarket:
                 attempts += 1
                 stats["floods"] += 1
                 wait_s = min(float(exc.seconds) + 1.0, 45.0)
-                self._flood_until = time.monotonic() + wait_s
+                extra = 8.0 if exc.seconds >= 15 else 1.0
+                self._flood_until = time.monotonic() + wait_s + extra
                 self.last_error = f"FloodWait {exc.seconds}s · торможу"
                 logger.warning(
                     "FloodWait %ss GetResaleStarGifts — пауза %.0fs",
                     exc.seconds,
-                    wait_s,
+                    wait_s + extra,
                 )
-                await asyncio.sleep(wait_s)
+                await asyncio.sleep(wait_s + extra)
             except Exception as exc:  # noqa: BLE001
                 attempts += 1
                 stats["errors"] += 1

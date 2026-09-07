@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 8
+FILTER_SCHEMA = 9
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -105,11 +105,11 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "strict_ru": True,
     "strict_free": False,
     "max_account_level": 99,
-    "max_gifts": 999,
+    "max_gifts": 15,
     "post_interval": 1.0,
-    "female_only": True,
-    "strict_fair_price": False,
-    "fair_price_ratio": 3.0,
+    "female_only": False,
+    "strict_fair_price": True,
+    "fair_price_ratio": 2.0,
 }
 
 
@@ -156,17 +156,19 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
         out["strict_ru"] = True
         out["post_interval"] = min(float(out.get("post_interval", 1.0) or 1.0), 1.0)
     if schema < FILTER_SCHEMA:
-        # 5 лотов/мин: не режем lvl/фермы/рынок — только мужчины и явный не-RU
+        # новые лоты + рынок + RU + gifts≤15; девушки желательны, не обязательны
         out["filter_schema"] = FILTER_SCHEMA
         out["max_account_level"] = 99
-        out["max_gifts"] = 999
-        out["strict_fair_price"] = False
+        out["max_gifts"] = 15
+        out["strict_fair_price"] = True
+        out["strict_ru"] = True
+        out["female_only"] = False
         out["post_interval"] = 1.0
         try:
-            ratio = float(out.get("fair_price_ratio", 3.0) or 3.0)
+            ratio = float(out.get("fair_price_ratio", 2.0) or 2.0)
         except (TypeError, ValueError):
-            ratio = 3.0
-        out["fair_price_ratio"] = max(ratio, 3.0)
+            ratio = 2.0
+        out["fair_price_ratio"] = min(max(ratio, 2.0), 2.5)
     return out
 
 
@@ -187,7 +189,11 @@ def filters_summary(cfg: Any) -> str:
     rid = current_preset_id(cfg.min_stars, cfg.max_stars)
     preset = _preset_by_id(rid)
     price = preset[1] if preset else f"{int(cfg.min_stars):,}–{int(cfg.max_stars):,}⭐"
-    female = "без мужчин" if getattr(cfg, "female_only", False) else "все"
+    female = (
+        "без мужчин"
+        if getattr(cfg, "female_only", False)
+        else "все, девушки выше"
+    )
     fair = "да" if getattr(cfg, "strict_fair_price", False) else "нет"
     return (
         f"Цена: <b>{price}</b>\n"

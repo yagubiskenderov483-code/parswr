@@ -89,13 +89,12 @@ def test_ahmed_latin_is_not_ru() -> None:
     assert is_russian_lot(lot) is False
 
 
-def test_filter_posts_latin_seller_with_strict_ru() -> None:
-    """Латинский ник без lang — неизвестно, не режем (иначе 0 постов)."""
+def test_filter_skips_unknown_latin_seller() -> None:
+    """Без русского сигнала не постим."""
     lot = _lot()
     out, stats = _filter([lot])
-    assert stats["non_ru"] == 0
     assert stats["unknown_ru"] == 1
-    assert len(out) == 1
+    assert out == []
 
 
 def test_filter_posts_cyrillic_seller() -> None:
@@ -225,10 +224,10 @@ def test_migrate_schema4_file_upgrades() -> None:
         ensure_default_filters(path)
         migrated = migrate_legacy_filters(load_filters(path))
         assert migrated["filter_schema"] == FILTER_SCHEMA
-        assert migrated["female_only"] is True
-        assert migrated["strict_fair_price"] is False
+        assert migrated["female_only"] is False
+        assert migrated["strict_fair_price"] is True
         assert migrated["max_account_level"] == 99
-        assert migrated["max_gifts"] == 999
+        assert migrated["max_gifts"] == 15
 
 
 def test_female_skips_boys() -> None:
@@ -254,8 +253,8 @@ def test_woman_bio_is_female_not_male() -> None:
 
 
 def test_neutral_profile_passes_female_filter() -> None:
-    """Пустое имя + нейтральный ник — не режем (иначе female− все лоты)."""
-    lot = _lot(first_name="", seller="nftgifts2024", seller_id=222)
+    """Пустое имя + нейтральный ник — не мужчина; RU нужен отдельно."""
+    lot = _lot(first_name="Мария", seller="nftgifts2024", seller_id=222, lang_code="ru")
     assert is_clean_female_profile(lot) is True
     out, stats = _filter_strict([lot])
     assert stats["not_female"] == 0
@@ -290,12 +289,12 @@ def test_migrate_schema5_enables_girls_and_market() -> None:
         }
     )
     assert out["filter_schema"] == FILTER_SCHEMA
-    assert out["female_only"] is True
-    assert out["strict_fair_price"] is False
+    assert out["female_only"] is False
+    assert out["strict_fair_price"] is True
     assert out["post_interval"] == 1.0
     assert out["max_account_level"] == 99
-    assert out["max_gifts"] == 999
-    assert out["fair_price_ratio"] >= 3.0
+    assert out["max_gifts"] == 15
+    assert out["fair_price_ratio"] >= 2.0
 
 
 def main() -> None:
@@ -309,7 +308,7 @@ def main() -> None:
         test_lang_ar_is_not_ru,
         test_saudi_flag_is_not_ru,
         test_ahmed_latin_is_not_ru,
-        test_filter_posts_latin_seller_with_strict_ru,
+        test_filter_skips_unknown_latin_seller,
         test_filter_posts_cyrillic_seller,
         test_filter_skips_arabic_seller,
         test_filter_skips_muslim_latin_name,

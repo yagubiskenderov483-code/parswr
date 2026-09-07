@@ -8,9 +8,9 @@ DEFAULT_CHANNEL_ID = -1003784435307
 _DEFAULT_BOT_TOKEN = "8825465611:AAEVL0_8DFLmpaqK2AP4JZHXrlkIPmKDVoI"
 # hardcoded важнее env Bothost — иначе там часто висит старый BOT_TOKEN
 BOT_TOKEN = (_DEFAULT_BOT_TOKEN or os.environ.get("BOT_TOKEN") or "").strip()
-# Stars / ParserUs / Zayavki — старый 36101343 (ParserGift) забанен
-API_ID = 28687552
-API_HASH = "1abf9a58d0c22f62437bec89bd6b27a3"
+# App api_id / api_hash (my.telegram.org)
+API_ID = 34943462
+API_HASH = "5356e2a3587e81aeac6f8aa4ee8a79ed"
 
 # Bothost: персистентный volume ТОЛЬКО /app/data (не /data — он стирается)
 _BOTHOST_DB = "/app/data/gifts.db"

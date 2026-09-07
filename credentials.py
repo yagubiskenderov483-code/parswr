@@ -8,9 +8,9 @@ DEFAULT_CHANNEL_ID = -1003784435307
 _DEFAULT_BOT_TOKEN = "8825465611:AAGiIJBKrsaQ1BjTfgN4GQIGU_t5foETx_I"
 # hardcoded важнее env Bothost — иначе там часто висит старый BOT_TOKEN
 BOT_TOKEN = (_DEFAULT_BOT_TOKEN or os.environ.get("BOT_TOKEN") or "").strip()
-# App api_id / api_hash (my.telegram.org)
-API_ID = 34943462
-API_HASH = "5356e2a3587e81aeac6f8aa4ee8a79ed"
+# App api_id / api_hash из репы bot.py (не 34943462 и не забаненный ParserGift)
+API_ID = 27798369
+API_HASH = "47e0988636b0d97036a2824368142719"
 
 # Bothost: персистентный volume ТОЛЬКО /app/data (не /data — он стирается)
 _BOTHOST_DB = "/app/data/gifts.db"

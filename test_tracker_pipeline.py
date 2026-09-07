@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 
 from market import Lot, MarketPriceBook, is_russian_lot
-from tracker import filter_for_post
+from tracker import Config, _extract_fresh_from_collection, filter_for_post
 
 
 def _lot(**kwargs) -> Lot:
@@ -151,6 +151,32 @@ def test_telegram_value_dump_blocked() -> None:
     assert "завышено" in reason and "280" in reason
 
 
+def test_overprice_extract_does_not_burn_seen() -> None:
+    book = MarketPriceBook()
+    book.set_floor(["desk calendar", "cid:99"], 3500.0)
+    lot = _lot(id="new-dump", stars=12000.0, first_name="Мария", seller="mariagifts")
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    cfg.strict_fair_price = True
+    cfg.fair_price_ratio = 2.0
+    cfg.min_stars = 5000
+    cfg.max_stars = 25000
+    cfg.hot_limit = 8
+    seen: dict[str, float] = {}
+    fresh, stats = _extract_fresh_from_collection(
+        [lot],
+        cfg=cfg,
+        seen=seen,
+        snapshot_ids=set(),
+        batch_market_ids=set(),
+        baseline=False,
+        now=time.time(),
+        price_book=book,
+    )
+    assert fresh == []
+    assert stats["skipped_overprice"] == 1
+    assert "new-dump" not in seen
+
+
 def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
@@ -159,6 +185,7 @@ def main() -> None:
         test_boy_blocked_girl_passes,
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,
+        test_overprice_extract_does_not_burn_seen,
     ]
     for fn in tests:
         fn()

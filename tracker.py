@@ -258,19 +258,19 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 0.3
-    page_limit: int = 8  # верх resale-листа (свежие)
-    parallel: int = 6  # не выше 6 — иначе Telegram кикает сессию
-    gap: float = 0.02
-    timeout: float = 3.0
+    poll_interval: float = 0.05
+    page_limit: int = 12  # верх resale-листа (свежие)
+    parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
+    gap: float = 0.12
+    timeout: float = 8.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
-    enrich_parallel: int = 6
+    enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 24  # ротация: быстрее полный круг по 150 коллекциям
-    hot_limit: int = 3  # топ свежих в коллекции (1 часто фермер)
+    scan_batch: int = 0  # 0 = все коллекции за проход
+    hot_limit: int = 8  # топ свежих в коллекции
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    max_gifts: int = 20  # фермы 50+; обычный продавец 6–15 NFT — ок
-    post_interval: float = 1.5  # сек между постами в канал (строгий тикер)
+    max_gifts: int = 30  # фермы 50+ режем; обычный продавец ок
+    post_interval: float = 4.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -281,7 +281,7 @@ class Config:
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
     female_only: bool = True
     strict_fair_price: bool = True
-    fair_price_ratio: float = 1.55
+    fair_price_ratio: float = 2.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -330,19 +330,19 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 0.3),
-            page_limit=int(_f("PAGE_LIMIT", 8)),
-            parallel=min(6, int(_f("PARALLEL", 6))),
-            gap=_f("REQUEST_GAP", 0.02),
-            timeout=_f("REQUEST_TIMEOUT", 3.0),
+            poll_interval=_f("POLL_INTERVAL", 0.05),
+            page_limit=int(_f("PAGE_LIMIT", 12)),
+            parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
+            gap=_f("REQUEST_GAP", 0.12),
+            timeout=_f("REQUEST_TIMEOUT", 8.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
-            enrich_parallel=max(2, min(6, int(_f("ENRICH_PARALLEL", 6)))),
+            enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 24)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 3))),
+            scan_batch=int(_f("SCAN_BATCH", 0)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            max_gifts=max(1, int(_f("MAX_GIFTS", 20))),
-            post_interval=_f("POST_INTERVAL", 1.5),
+            max_gifts=max(1, int(_f("MAX_GIFTS", 30))),
+            post_interval=_f("POST_INTERVAL", 4.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -353,6 +353,7 @@ class Config:
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
             female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") == "1",
             strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "1") == "1",
+            fair_price_ratio=_f("FAIR_PRICE_RATIO", 2.0),
         )
 
 
@@ -871,6 +872,7 @@ async def _reconnect_client(client: TelegramClient, m: TelegramMarket) -> None:
         pass
     await asyncio.sleep(1.0)
     await client.connect()
+    _tune_telethon(client)
     if not await client.is_user_authorized():
         raise RuntimeError("Сессия Telethon недействительна — /start в боте")
     m.set_client(client)
@@ -933,18 +935,8 @@ async def _fetch_collection_pages(
         local,
         cfg.gap,
         cfg.timeout,
-        max_attempts=2,
+        max_attempts=1,
     )
-    if result is None:
-        result = await m._request(
-            gid,
-            cfg.page_limit,
-            False,
-            local,
-            cfg.gap,
-            min(cfg.timeout + 1.0, 5.0),
-            max_attempts=1,
-        )
     stats["floods"] += local.get("floods", 0)
     if result is None:
         stats["errors"] += 1
@@ -1003,7 +995,7 @@ def _extract_fresh_from_collection(
             and price_book is not None
             and not price_book.is_fair_price(lot, max_ratio=cfg.fair_price_ratio)
         ):
-            seen[lot.id] = now
+            # не жжём seen — пол мог быть кривой, лот ещё свежий
             stats["skipped_overprice"] += 1
             continue
         lot.discovered_at = now
@@ -1410,7 +1402,7 @@ class PostQueue:
         state: dict,
         state_path: Path,
         runtime: TrackerRuntime,
-        post_interval: float = 1.5,
+        post_interval: float = 4.0,
     ) -> None:
         self._sender = sender
         self._m = market
@@ -1527,17 +1519,16 @@ class PostQueue:
                             fstats["many_gifts"]
                             and lot.gifts_count is not None
                         )
-                        or (
-                            fstats["not_female"]
-                            and female_filter_reason(lot) in {
-                                "мужской",
-                                "реклама",
-                                "отзывы",
-                                "giftdouble",
-                            }
-                        )
-                        or fstats["overprice"]
-                    )
+        or (
+            fstats["not_female"]
+            and female_filter_reason(lot) in {
+                "мужской",
+                "реклама",
+                "отзывы",
+                "giftdouble",
+            }
+        )
+    )
                     if skip_permanent and lot.seller_key:
                         self._seen[lot.id] = now
                     reason = (
@@ -1610,8 +1601,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.3"
-BUILD_TAG = "v3.9.3-verified"
+TRACKER_VERSION = "3.9.4"
+BUILD_TAG = "v3.9.4-faster"
 
 
 @dataclass
@@ -1643,7 +1634,7 @@ class TrackerRuntime:
     send_errors_total: int = 0
     last_send_error: str = ""
     post_via: str = ""
-    scan_parallel: int = 8
+    scan_parallel: int = 1
     seen_lots: int = 0
     queue_pending: int = 0
     collections_total: int = 0
@@ -1700,12 +1691,18 @@ async def _load_session_string(cfg: Config) -> str:
     return fallback
 
 
+def _tune_telethon(client: TelegramClient) -> TelegramClient:
+    """Не даём Telethon самому спать пачкой — FloodWait ловим сами под rpc_lock."""
+    client.flood_sleep_threshold = 0
+    return client
+
+
 async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient, ControlBot]:
     session_string = await _load_session_string(cfg)
     client: TelegramClient
     if session_string:
-        client = TelegramClient(
-            StringSession(session_string), cfg.api_id, cfg.api_hash
+        client = _tune_telethon(
+            TelegramClient(StringSession(session_string), cfg.api_id, cfg.api_hash)
         )
         await client.connect()
         if not await client.is_user_authorized():
@@ -1714,10 +1711,14 @@ async def _get_client(cfg: Config, store: ChannelStore) -> tuple[TelegramClient,
                 "Сессия в %s недействительна — нужен повторный вход",
                 cfg.session_file,
             )
-            client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+            client = _tune_telethon(
+                TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+            )
             await client.connect()
     else:
-        client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+        client = _tune_telethon(
+            TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+        )
         await client.connect()
 
     bot = ControlBot(
@@ -1872,32 +1873,11 @@ async def scanner_loop(
 
         spent = time.monotonic() - started
         floods = int(scan.get("floods", 0) or 0)
-        err_ratio = (errors / scanned) if scanned > 0 else 0.0
-        if err_ratio > 0.35 and runtime.scan_parallel > 3:
-            runtime.scan_parallel -= 1
-            cfg.parallel = runtime.scan_parallel
-            logger.warning(
-                "Много ошибок API (%s/%s) — parallel=%s · %s",
-                errors,
-                scanned,
-                runtime.scan_parallel,
-                m.last_error or "",
-            )
-        elif floods > 3 and runtime.scan_parallel > 4:
-            runtime.scan_parallel -= 1
-            cfg.parallel = runtime.scan_parallel
-            logger.warning(
-                "FloodWait x%s — parallel=%s",
-                floods,
-                runtime.scan_parallel,
-            )
-        elif (
-            floods == 0
-            and err_ratio < 0.15
-            and runtime.scan_parallel < 6
-        ):
-            runtime.scan_parallel += 1
-            cfg.parallel = runtime.scan_parallel
+        if floods:
+            # не поднимаем parallel — FloodWait от параллельных RPC
+            cfg.parallel = 1
+            runtime.scan_parallel = 1
+            logger.warning("FloodWait x%s — RPC строго по одному", floods)
 
         await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
 

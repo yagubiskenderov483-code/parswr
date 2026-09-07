@@ -558,6 +558,7 @@ class TelegramMarket:
         self._cursor = 0
         self._flood_until = 0.0
         self._gap_lock = asyncio.Lock()
+        self._rpc_lock = asyncio.Lock()
         self._last_req = 0.0
         self._owner_cache: dict[str, str] = {}
         self._profile_cache: dict[int, dict[str, Any]] = {}
@@ -1520,31 +1521,36 @@ class TelegramMarket:
     ) -> Any | None:
         for attempt in range(max(1, int(max_attempts))):
             try:
-                await self._wait_flood()
-                await self.ensure_connected()
-                async with self._gap_lock:
+                async with self._rpc_lock:
+                    await self._wait_flood()
+                    await self.ensure_connected()
                     wait = gap - (time.monotonic() - self._last_req)
                     if wait > 0:
                         await asyncio.sleep(wait)
                     self._last_req = time.monotonic()
-                return await asyncio.wait_for(
-                    self.client(
-                        GetResaleStarGiftsRequest(
-                            gift_id=gift_id,
-                            offset=offset or "",
-                            limit=min(limit, 50),
-                            stars_only=True if stars_only else None,
-                            sort_by_price=True if sort_by_price else None,
-                        )
-                    ),
-                    timeout=timeout,
-                )
+                    return await asyncio.wait_for(
+                        self.client(
+                            GetResaleStarGiftsRequest(
+                                gift_id=gift_id,
+                                offset=offset or "",
+                                limit=min(limit, 50),
+                                stars_only=True if stars_only else None,
+                                sort_by_price=True if sort_by_price else None,
+                            )
+                        ),
+                        timeout=timeout,
+                    )
             except FloodWaitError as exc:
                 stats["floods"] += 1
-                wait_s = float(exc.seconds) + 1.5
-                self._flood_until = time.monotonic() + min(wait_s, 300.0)
+                wait_s = min(float(exc.seconds) + 1.0, 45.0)
+                self._flood_until = time.monotonic() + wait_s
                 self.last_error = f"FloodWait {exc.seconds}s · торможу"
-                await asyncio.sleep(min(wait_s, 120.0))
+                logger.warning(
+                    "FloodWait %ss GetResaleStarGifts — пауза %.0fs (все RPC ждут)",
+                    exc.seconds,
+                    wait_s,
+                )
+                await asyncio.sleep(wait_s)
             except Exception as exc:  # noqa: BLE001
                 stats["errors"] += 1
                 self.last_error = str(exc)

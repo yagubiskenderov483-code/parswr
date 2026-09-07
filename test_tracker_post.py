@@ -263,6 +263,9 @@ def test_migrate_schema5_enables_girls_and_market() -> None:
     assert out["filter_schema"] == FILTER_SCHEMA
     assert out["female_only"] is True
     assert out["strict_fair_price"] is True
+    assert out["post_interval"] == 4.0
+    assert out["max_gifts"] >= 30
+    assert out["fair_price_ratio"] >= 2.0
 
 
 def main() -> None:

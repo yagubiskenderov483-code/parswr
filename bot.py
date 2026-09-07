@@ -168,33 +168,57 @@ class ControlBot:
         self._auth = AuthFlow(client, session_file)
         self._dp.include_router(self._router())
         self._task: asyncio.Task | None = None
+        self._stopping = False
 
     async def start(self) -> None:
         try:
-            me = await self._bot.get_me()
+            me = await asyncio.wait_for(self._bot.get_me(), timeout=15.0)
             if me.username:
                 self.bot_username = me.username
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            await self._bot.delete_webhook(drop_pending_updates=True)
-        except Exception:  # noqa: BLE001
-            pass
-        self._task = asyncio.create_task(
-            self._dp.start_polling(self._bot), name="control-bot"
-        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bot get_me: %s", exc)
+        self._task = asyncio.create_task(self._poll_loop(), name="control-bot")
         logger.info("Бот @%s слушает команды", self.bot_username)
 
+    async def _poll_loop(self) -> None:
+        # handle_signals=True в фоне сразу гасит polling (Bothost/Docker).
+        while not self._stopping:
+            try:
+                await self._bot.delete_webhook(drop_pending_updates=True)
+                logger.info("polling старт @%s", self.bot_username)
+                await self._dp.start_polling(
+                    self._bot,
+                    handle_signals=False,
+                    allowed_updates=["message", "callback_query"],
+                    close_bot_session=False,
+                    handle_as_tasks=True,
+                )
+                if self._stopping:
+                    return
+                logger.warning("polling остановился без ошибки — рестарт через 2с")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error("polling упал: %s — рестарт через 3с", exc)
+            await asyncio.sleep(3.0)
+
     async def stop(self) -> None:
-        if self._task:
+        self._stopping = True
+        try:
             await self._dp.stop_polling()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._task:
             self._task.cancel()
         await self._bot.session.close()
 
     async def wait_login(self) -> None:
-        if await self.client.is_user_authorized():
-            self._login_done.set()
-            return
+        try:
+            if await asyncio.wait_for(self.client.is_user_authorized(), timeout=5.0):
+                self._login_done.set()
+                return
+        except Exception:  # noqa: BLE001
+            pass
         await self._login_done.wait()
 
     def _router(self) -> Router:
@@ -203,7 +227,9 @@ class ControlBot:
 
         async def _ok() -> bool:
             try:
-                return await self.client.is_user_authorized()
+                return bool(
+                    await asyncio.wait_for(self.client.is_user_authorized(), timeout=2.0)
+                )
             except Exception:  # noqa: BLE001
                 return False
 

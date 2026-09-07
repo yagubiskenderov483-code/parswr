@@ -56,6 +56,89 @@ _NON_RU_LANG_PREFIXES = (
     "kk",
     "ky",
     "tg",
+    "tk",
+    "ar-sa",
+    "ar-ae",
+    "ar-eg",
+)
+_ARAB_FLAGS = (
+    "🇸🇦",
+    "🇦🇪",
+    "🇪🇬",
+    "🇮🇶",
+    "🇶🇦",
+    "🇰🇼",
+    "🇧🇭",
+    "🇴🇲",
+    "🇾🇪",
+    "🇵🇸",
+    "🇯🇴",
+    "🇱🇧",
+    "🇸🇾",
+    "🇲🇦",
+    "🇩🇿",
+    "🇹🇳",
+    "🇱🇾",
+    "🇸🇩",
+    "🇲🇷",
+    "🇸🇴",
+    "🇩🇯",
+    "🇰🇲",
+)
+# Латиница: типичные арабские/мусульманские имена (не «said» — слишком общее слово).
+_ARAB_NAME_TAIL = r"(?:gifts?|nfts?|shop|store|\d|[_\-.\s]|$)"
+_ARAB_LATIN_RE = re.compile(
+    r"(?<![a-z])(?:"
+    r"mohammed|muhammad|mohamed|muhamed|mohammad|muhammed|"
+    r"ahmed|ahmad|mahoud|mahmoud|mahmud|"
+    r"hassan|hasan|hussein|husain|hussain|hosein|hossein|"
+    r"omar|umar|osman|usman|othman|"
+    r"fatima|fatimah|aisha|aishah|khadija|khadijah|"
+    r"abdullah|abdellah|abdulrahman|abdurrahman|abdul|"
+    r"karim|kareem|rashid|rasheed|nasser|naser|"
+    r"youssef|yousef|yusuf|ibrahim|ebrahim|mustafa|mostafa|"
+    r"khalid|khaled|tariq|tareq|walid|waleed|"
+    r"hamza|zaid|zayd|zayn|zain|"
+    r"fadi|rami|ameer|habib|hakim|jamal|jamil|nabil|samir|"
+    r"mehdi|reza|farhad|parviz|babak|"
+    r"sheikh|shaikh|islam|muslim|"
+    r"allahu|inshallah|mashallah|"
+    r"ali"
+    r")" + _ARAB_NAME_TAIL,
+    re.IGNORECASE,
+)
+_ARAB_CYR_RE = re.compile(
+    r"(?<![а-яё])(?:"
+    r"мухаммад|мухаммед|мохаммед|мохамед|"
+    r"ахмед|ахмад|махмуд|"
+    r"хасан|хассан|хусейн|хусейн|"
+    r"омар|усман|осман|"
+    r"фатима|айша|хадиджа|"
+    r"абдулла|абдуллах|абдул|"
+    r"карим|рашид|насер|насир|"
+    r"юсуф|ибрагим|мустафа|"
+    r"халид|халед|тарик|валид|"
+    r"хамза|зайн|"
+    r"мехди|реза|"
+    r"ислам|мусульм|"
+    r"али"
+    r")(?![а-яё])",
+    re.IGNORECASE,
+)
+_RU_LATIN_NAME_RE = re.compile(
+    r"(?<![a-z])(?:"
+    r"maria|mary|anna|anya|elena|olga|natalia|natalya|daria|darya|"
+    r"anastasia|nastya|polina|alina|victoria|viktoria|ekaterina|katya|"
+    r"yulia|julia|irina|tatyana|tatiana|svetlana|sveta|marina|"
+    r"ksenia|kseniya|arina|sofia|sophie|veronika|alisa|kristina|"
+    r"valeria|valeriya|alexandra|evgenia|oksana|yana|diana|milana|"
+    r"kira|ulyana|varvara|elizaveta|liza|zlata|agatha|dasha|masha|"
+    r"nadya|galina|lyudmila|nadezhda|evgeniya|"
+    r"ivan|dmitry|dmitriy|nikita|alexey|alexei|sergey|andrey|pavel|"
+    r"ilya|vlad|vladimir|denis|roman|victor|kirill|egor|igor|oleg|"
+    r"anton|yaroslav|matvey|gleb|boris|maxim|maksim"
+    r")(?:gifts?|nfts?|shop|store|\d|[_\-.\s]|$)",
+    re.IGNORECASE,
 )
 
 
@@ -134,30 +217,39 @@ class Lot:
 # --- Фильтры профиля: только девочки, без рекламы/отзывов/GiftDouble ---
 
 _FEMALE_HINT_RE = re.compile(
-    r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀|💖|💕|💗|🌸)",
+    r"(девоч|девуш|\bgirl\b|\bwoman\b|she/her|👩|💅|💄|🎀|💖|💕|💗|🌸)",
     re.IGNORECASE,
 )
 _MALE_HINT_RE = re.compile(
-    r"(парень|мужчин|мальчик|пацан|boy|man|he/him|👨|🧔|брат|бро\b|bro\b)",
+    r"(парень|мужчин|мальчик|пацан|\bboy\b|\bman\b|he/him|👨|🧔|брат|\bбро\b|\bbro\b)",
     re.IGNORECASE,
 )
 _MALE_NAMES_RE = re.compile(
     r"^(?:"
-    r"никита|илья|саша|женя|ваня|петя|петя|коля|вася|дима|миша|паша|фома|лука|савва|"
+    r"никита|илья|саша|женя|ваня|петя|коля|вася|дима|миша|паша|фома|лука|савва|"
     r"валера|слава|вова|лёша|леша|гоша|костя|артём|артем|макс|рома|"
     r"кирилл|егор|игорь|олег|влад|данил|даниил|андрей|алексей|сергей|павел|"
     r"иван|денис|роман|виктор|стас|тимур|глеб|борис|антон|ярослав|матвей|"
-    r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|andrey|pavel|ilya|vlad"
+    r"stepan|ivan|nikita|alex|max|dmitry|daniil|artem|roman|sergey|andrey|"
+    r"pavel|ilya|vlad|misha|dima|kolya|vanya|petya|sasha|zhenya|kostya|"
+    r"lesha|gosha|slava|vova|egor|oleg|igor|kirill|anton|gleb|boris|"
+    r"timur|matvey|yaroslav|denis|victor|maxim|maksim|alexey|alexander|"
+    r"vitya|tolya|seryozha|serezha|andryusha|dimon|tema"
     r")$",
     re.IGNORECASE,
 )
 _STRICT_FEMALE_NAME_RE = re.compile(
     r"(?:"
-    r"ия|ья|ина|ела|ёна|юна|ита|лия|ея|"
+    r"ия|ья|ина|ела|ёна|юна|ита|лия|ея|ася|уся|есса|"
     r"овна|евна|ична|"
-    r"анна|мария|елена|ольга|наташа|катя|юля|даша|маша|"
-    r"света|лена|ира|вика|настя|полина|алина|диана|вероника|"
-    r"vera|maria|anna|elena|olga|kate|julia|diana"
+    r"анна|мария|маша|даша|катя|юля|настя|полина|алина|вика|лена|света|"
+    r"елена|ольга|наташа|диана|вероника|ксения|арина|софия|софья|"
+    r"кристина|валерия|александра|евгения|людмила|надежда|галина|"
+    r"оксана|марина|яна|милана|василиса|кира|ульяна|варвара|"
+    r"елизавета|злата|агата|татьяна|ирина|екатерина|наталья|"
+    r"vera|maria|mary|anna|elena|olga|kate|katya|julia|yulia|diana|"
+    r"nastya|polina|alina|vika|sveta|dasha|masha|irina|marina|"
+    r"ksenia|arina|sofia|alisa|milana|kira|liza|yana"
     r")$",
     re.IGNORECASE,
 )
@@ -184,15 +276,22 @@ _REVIEW_RE = re.compile(
     re.IGNORECASE,
 )
 _FEMALE_USER_RE = re.compile(
-    r"(?:"
+    r"(?<![a-zа-яё])(?:"
     r"girl|woman|lady|queen|princess|devoch|devush|miss|mrs|"
-    r"ann|maria|elena|olga|kate|julia|diana|vika|nastya|polina|alina|"
-    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света"
+    r"maria|mary|anna|anya|elena|olga|kate|katya|julia|yulia|diana|"
+    r"vika|nastya|polina|alina|dasha|masha|irina|marina|"
+    r"ksenia|arina|sofia|alisa|milana|kira|"
+    r"маша|даша|катя|юля|настя|полина|алина|вика|лена|света|"
+    r"мария|анна|елена|ольга"
     r")",
     re.IGNORECASE,
 )
 _FEMALE_NAME_END_RE = re.compile(
-    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична)$"
+    r"(ия|ья|ина|ела|ёна|юна|ита|лия|ея|овна|евна|ична|ова|ева|ёва)$"
+)
+_FEMALE_USER_END_RE = re.compile(
+    r"(iya|ya|sha|nya|lia|ina|ena|ana|ovna|ova|eva)$",
+    re.IGNORECASE,
 )
 
 
@@ -246,13 +345,20 @@ def _username_looks_female(username: str) -> bool:
     u = _normalize_handle(username)
     if len(u) < 3:
         return False
-    if _MALE_NAMES_RE.search(u):
+    if _MALE_NAMES_RE.fullmatch(u) or _MALE_NAMES_RE.search(u):
         return False
+    raw = (username or "").strip().lower().lstrip("@")
+    for part in re.split(r"[_.\-0-9]+", raw):
+        part_norm = _normalize_handle(part)
+        if part_norm and _MALE_NAMES_RE.fullmatch(part_norm):
+            return False
+        if part_norm and _STRICT_FEMALE_NAME_RE.search(part_norm):
+            return True
     if _FEMALE_USER_RE.search(u):
         return True
     if _FEMALE_NAME_END_RE.search(u):
         return True
-    if u.endswith(("ka", "ya", "na", "sha", "nya", "lia", "iya")):
+    if _FEMALE_USER_END_RE.search(u):
         return True
     return False
 
@@ -305,11 +411,13 @@ def female_filter_reason(lot: Lot) -> str:
         return "отзывы"
     if has_giftdouble(lot):
         return "giftdouble"
+    if not looks_female(lot):
+        return "не девушка"
     return ""
 
 
 def is_clean_female_profile(lot: Lot) -> bool:
-    """Без мужчин/рекламы. Неизвестный профиль (пустое имя, латинский ник) — ок."""
+    """Только девушки: нужен женский сигнал, без мужчин/рекламы."""
     return not female_filter_reason(lot)
 
 
@@ -1616,14 +1724,37 @@ def _normalize_level(raw: Any) -> int | None:
         return None
 
 
-def is_russian_lot(lot: Lot) -> bool | None:
-    """RU-фильтр: True/False если уверены; None — нет данных (не отбрасываем)."""
+def is_arab_or_muslim_lot(lot: Lot) -> bool:
+    """Арабский скрипт, флаги, арабские/мусульманские имена."""
     lc = (getattr(lot, "lang_code", "") or "").lower().strip()
-    if lc:
-        if lc.startswith("ru"):
+    if lc and any(lc.startswith(p) for p in _NON_RU_LANG_PREFIXES):
+        return True
+    parts = [
+        lot.seller or "",
+        lot.first_name or "",
+        lot.last_name or "",
+        lot.about or "",
+    ]
+    blob = " ".join(p for p in parts if p).strip()
+    if not blob:
+        return False
+    if _ARAB_RE.search(blob):
+        return True
+    for flag in _ARAB_FLAGS:
+        if flag in blob:
             return True
-        if any(lc.startswith(p) for p in _NON_RU_LANG_PREFIXES):
-            return False
+    if _ARAB_LATIN_RE.search(blob) or _ARAB_CYR_RE.search(blob):
+        return True
+    return False
+
+
+def is_russian_lot(lot: Lot) -> bool | None:
+    """RU-фильтр: True только при русском сигнале; арабы/мусульмане — False."""
+    if is_arab_or_muslim_lot(lot):
+        return False
+    lc = (getattr(lot, "lang_code", "") or "").lower().strip()
+    if lc.startswith("ru"):
+        return True
     parts = [
         lot.seller or "",
         lot.first_name or "",
@@ -1633,17 +1764,12 @@ def is_russian_lot(lot: Lot) -> bool | None:
     blob = " ".join(p for p in parts if p).strip()
     if not blob:
         return None
-    if _ARAB_RE.search(blob):
-        return False
-    for flag in ("🇸🇦", "🇦🇪", "🇪🇬", "🇮🇶", "🇶🇦", "🇰🇼", "🇧🇭", "🇴🇲", "🇾🇪", "🇵🇸"):
-        if flag in blob:
-            return False
     if "🇷🇺" in blob:
         return True
     if _CYR_RE.search(blob):
         return True
-    # Латинский ник/имя без явных чужих сигналов — неизвестно, не режем.
-    # У русских почти всегда латинский username; lang_code Telegram часто пустой.
+    if _RU_LATIN_NAME_RE.search(blob):
+        return True
     return None
 
 

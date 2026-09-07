@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 6
+FILTER_SCHEMA = 7
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -106,7 +106,7 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "strict_free": False,
     "max_account_level": 2,
     "max_gifts": 30,
-    "post_interval": 4.0,
+    "post_interval": 1.0,
     "female_only": True,
     "strict_fair_price": True,
     "fair_price_ratio": 2.0,
@@ -155,7 +155,8 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
         out["filter_schema"] = FILTER_SCHEMA
         out["female_only"] = True
         out["strict_fair_price"] = True
-        out["post_interval"] = 4.0
+        out["strict_ru"] = True
+        out["post_interval"] = min(float(out.get("post_interval", 1.0) or 1.0), 1.0)
         try:
             gifts = int(out.get("max_gifts", 20) or 20)
         except (TypeError, ValueError):
@@ -194,6 +195,6 @@ def filters_summary(cfg: Any) -> str:
         f"ЛС free: <b>{'строго' if cfg.strict_free else 'не платные'}</b>\n"
         f"Level ≤ <b>{int(cfg.max_account_level)}</b> · "
         f"gifts ≤ <b>{int(getattr(cfg, 'max_gifts', 5))}</b> · "
-        f"Пост / <b>{int(cfg.post_interval)}</b>с\n"
+        f"Пост / <b>{cfg.post_interval:g}</b>с\n"
         f"Профиль: <b>{female}</b> · рынок коллекции: <b>{fair}</b>"
     )

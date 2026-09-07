@@ -258,19 +258,19 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 0.05
-    page_limit: int = 12  # верх resale-листа (свежие)
+    poll_interval: float = 0.02
+    page_limit: int = 8  # верх resale-листа (только самые свежие)
     parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
-    gap: float = 0.12
-    timeout: float = 8.0
+    gap: float = 0.04
+    timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
     scan_batch: int = 0  # 0 = все коллекции за проход
-    hot_limit: int = 8  # топ свежих в коллекции
+    hot_limit: int = 4  # только топ свежих в коллекции — не старые с середины
     max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
     max_gifts: int = 30  # фермы 50+ режем; обычный продавец ок
-    post_interval: float = 4.0  # сек между постами в канал
+    post_interval: float = 1.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -330,19 +330,19 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 0.05),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
+            poll_interval=_f("POLL_INTERVAL", 0.02),
+            page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
-            gap=_f("REQUEST_GAP", 0.12),
-            timeout=_f("REQUEST_TIMEOUT", 8.0),
+            gap=_f("REQUEST_GAP", 0.04),
+            timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 30))),
-            post_interval=_f("POST_INTERVAL", 4.0),
+            post_interval=_f("POST_INTERVAL", 1.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -361,7 +361,8 @@ class Config:
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
 SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
-MIN_MARKET_SNAPSHOT_IDS = 400  # меньше — снимок неполный, пересобираем
+MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
+SNAPSHOT_SCHEMA = 2  # bump → полный снимок заново, без старых лотов
 
 
 def load_state(path: Path) -> dict:
@@ -373,6 +374,7 @@ def load_state(path: Path) -> dict:
             data.setdefault("market_ids", [])
             data.setdefault("price_samples", {})
             data.setdefault("channel_id", None)
+            data.setdefault("snapshot_schema", 0)
             return data
     except (OSError, ValueError):
         pass
@@ -382,6 +384,7 @@ def load_state(path: Path) -> dict:
         "market_ids": [],
         "price_samples": {},
         "channel_id": None,
+        "snapshot_schema": 0,
     }
 
 
@@ -837,6 +840,28 @@ async def resolve_channel(client: TelegramClient, raw: str) -> int:
 # ---------------------------------------------------------------- tracker
 
 
+def _lot_seen_keys(lot: Lot) -> list[str]:
+    keys = [lot.id]
+    slug = (lot.slug or "").strip()
+    if slug:
+        keys.append(f"slug:{slug}")
+    return keys
+
+
+def _mark_lot_seen(seen: dict[str, float], lot: Lot, now: float) -> None:
+    for key in _lot_seen_keys(lot):
+        seen[key] = now
+
+
+def _is_lot_seen(
+    lot: Lot, seen: dict[str, float], snapshot_ids: set[str]
+) -> bool:
+    if lot.id in snapshot_ids or lot.id in seen:
+        return True
+    slug = (lot.slug or "").strip()
+    return bool(slug and f"slug:{slug}" in seen)
+
+
 def _select_scan_batch(
     gift_ids: list[int],
     m: TelegramMarket,
@@ -975,19 +1000,19 @@ def _extract_fresh_from_collection(
         batch_market_ids.add(lot.id)
         if i >= cfg.hot_limit:
             if baseline:
-                seen[lot.id] = now
+                _mark_lot_seen(seen, lot, now)
             continue
         if baseline:
-            seen[lot.id] = now
+            _mark_lot_seen(seen, lot, now)
             continue
-        if lot.id in snapshot_ids:
-            stats["skipped_market"] += 1
-            continue
-        if lot.id in seen:
-            stats["skipped_seen"] += 1
+        if _is_lot_seen(lot, seen, snapshot_ids):
+            if lot.id in snapshot_ids:
+                stats["skipped_market"] += 1
+            else:
+                stats["skipped_seen"] += 1
             continue
         if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
-            seen[lot.id] = now
+            _mark_lot_seen(seen, lot, now)
             stats["skipped_price"] += 1
             continue
         if (
@@ -999,6 +1024,8 @@ def _extract_fresh_from_collection(
             stats["skipped_overprice"] += 1
             continue
         lot.discovered_at = now
+        _mark_lot_seen(seen, lot, now)
+        snapshot_ids.add(lot.id)
         fresh.append(lot)
     return fresh, stats
 
@@ -1099,34 +1126,27 @@ async def enrich_one(m: TelegramMarket, lot: Lot, cfg: Config) -> None:
     """Профиль продавца: level, язык, gifts — нужны для RU/level/NFT фильтров."""
     if not lot.seller or lot.seller_id is None:
         try:
-            await m.resolve_owner(lot, timeout=5.0)
+            await m.resolve_owner(lot, timeout=2.5)
         except Exception:  # noqa: BLE001
             pass
     if lot.seller_id is None:
         return
-    delays = (0.0, 0.3, 0.8)
-    for attempt, delay in enumerate(delays):
-        if delay:
-            await asyncio.sleep(delay)
-        need_profile = (
-            not (lot.first_name or "").strip()
-            or lot.account_level is None
-            or lot.gifts_count is None
-            or lot.free_dm is None
-            or lot.is_premium is None
-            or (cfg.strict_ru and not lot.lang_code)
-        )
-        if not need_profile:
-            break
+    need_profile = (
+        not (lot.first_name or "").strip()
+        or lot.account_level is None
+        or lot.gifts_count is None
+        or lot.free_dm is None
+        or lot.is_premium is None
+        or (cfg.strict_ru and not lot.lang_code)
+    )
+    if need_profile:
         try:
-            await m.enrich_profiles([lot], timeout=3.0, parallel=1)
+            await m.enrich_profiles([lot], timeout=2.0, parallel=1)
         except Exception:  # noqa: BLE001
             pass
-        if attempt == len(delays) - 1:
-            break
     if lot.free_dm is None:
         try:
-            await m.check_free_dm([lot], timeout=2.5)
+            await m.check_free_dm([lot], timeout=1.5)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1166,7 +1186,7 @@ def mark_processed_lots(
         if not lot.seller_key:
             retry += 1
             continue
-        seen[lot.id] = now
+        _mark_lot_seen(seen, lot, now)
     return retry
 
 
@@ -1183,6 +1203,9 @@ async def ensure_market_floor(
     if cached and cached > 0:
         lot.market_floor = cached
         return cached
+    if lot.telegram_value and lot.telegram_value > 0:
+        lot.market_floor = float(lot.telegram_value)
+        return lot.market_floor
     cid = lot.collection_id
     if cid is None:
         fair = book.fair_price(lot)
@@ -1280,6 +1303,7 @@ def filter_for_post(
             stats["no_seller"] += 1
             continue
         if seller_keys_overlap(lot, used):
+            stats["dup"] += 1
             continue
         prev = seen_sellers.get(key)
         if prev is not None and now - float(prev) < SELLER_TTL:
@@ -1304,11 +1328,12 @@ def filter_for_post(
             continue
         if strict_ru:
             ru = is_russian_lot(lot)
-            if ru is False:
-                stats["non_ru"] += 1
+            if ru is not True:
+                if ru is False:
+                    stats["non_ru"] += 1
+                else:
+                    stats["unknown_ru"] += 1
                 continue
-            if ru is None:
-                stats["unknown_ru"] += 1
         if max_gifts < 999:
             gifts = lot.gifts_count
             if gifts is not None and gifts > max_gifts:
@@ -1402,7 +1427,7 @@ class PostQueue:
         state: dict,
         state_path: Path,
         runtime: TrackerRuntime,
-        post_interval: float = 4.0,
+        post_interval: float = 1.0,
     ) -> None:
         self._sender = sender
         self._m = market
@@ -1421,6 +1446,8 @@ class PostQueue:
         self._closed = False
         self._send_retries: dict[str, int] = {}
         self._max_send_retries = 3
+        self._queued_ids: set[str] = set()
+        self._queued_sellers: set[str] = set()
 
     @property
     def pending(self) -> int:
@@ -1445,12 +1472,40 @@ class PostQueue:
     def enqueue(self, lots: list[Lot]) -> int:
         if not lots:
             return 0
+        added = 0
+        now = time.time()
         for lot in rank_for_queue(lots):
+            if lot.id in self._queued_ids or lot.id in self._seen:
+                continue
+            slug_key = f"slug:{lot.slug}" if lot.slug else ""
+            if slug_key and slug_key in self._seen:
+                continue
+            keys = seller_identity_keys(lot) if lot.seller_key else set()
+            if keys and (keys & self._queued_sellers):
+                _mark_lot_seen(self._seen, lot, now)
+                continue
+            if keys and any(
+                self._seen_sellers.get(k) is not None
+                and now - float(self._seen_sellers[k]) < SELLER_TTL
+                for k in keys
+            ):
+                _mark_lot_seen(self._seen, lot, now)
+                continue
+            self._queued_ids.add(lot.id)
+            self._queued_sellers |= keys
             self._seq += 1
             prio = -float(lot.discovered_at or time.time())
             self._pq.put_nowait((prio, self._seq, lot))
+            added += 1
         self._runtime.queue_pending = self.pending
-        return len(lots)
+        return added
+
+    def _release_queue_slot(self, lot: Lot, *, keep_seller: bool = False) -> None:
+        self._queued_ids.discard(lot.id)
+        if keep_seller:
+            return
+        if lot.seller_key:
+            self._queued_sellers -= seller_identity_keys(lot)
 
     def set_interval(self, seconds: float) -> None:
         self._interval = max(0.5, float(seconds))
@@ -1459,7 +1514,7 @@ class PostQueue:
     async def _drip_worker(self) -> None:
         logger.info(
             "Drip: свежие первые · enrich+send /%ss (сканер параллельно)",
-            int(self._interval),
+            self._interval,
         )
         while not self._closed:
             _, _, lot = await self._pq.get()
@@ -1510,7 +1565,9 @@ class PostQueue:
                     skip_permanent = (
                         fstats["dup"]
                         or fstats["non_ru"]
+                        or fstats["unknown_ru"]
                         or fstats["paid"]
+                        or fstats["not_female"]
                         or (
                             fstats["level"]
                             and lot.account_level is not None
@@ -1519,18 +1576,12 @@ class PostQueue:
                             fstats["many_gifts"]
                             and lot.gifts_count is not None
                         )
-        or (
-            fstats["not_female"]
-            and female_filter_reason(lot) in {
-                "мужской",
-                "реклама",
-                "отзывы",
-                "giftdouble",
-            }
-        )
-    )
-                    if skip_permanent and lot.seller_key:
-                        self._seen[lot.id] = now
+                    )
+                    if skip_permanent:
+                        _mark_lot_seen(self._seen, lot, now)
+                        if lot.seller_key:
+                            for k in seller_identity_keys(lot):
+                                self._seen_sellers[k] = now
                     reason = (
                         self._runtime.price_book.overprice_reason(lot)
                         if fstats["overprice"] and self._runtime.price_book
@@ -1552,11 +1603,12 @@ class PostQueue:
                             lot.account_level if lot.account_level is not None else "—",
                             lot.gifts_count if lot.gifts_count is not None else "—",
                         )
+                    self._release_queue_slot(lot)
                     continue
                 lot = to_post[0]
                 via = await self._sender.send(lot)
                 self._runtime.post_via = via
-                self._seen[lot.id] = now
+                _mark_lot_seen(self._seen, lot, now)
                 self._send_retries.pop(lot.id, None)
                 key = lot.seller_key
                 if key:
@@ -1574,6 +1626,7 @@ class PostQueue:
                     self.pending,
                     format_account_level(lot),
                 )
+                self._release_queue_slot(lot)
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
                 self._runtime.last_send_error = err
@@ -1589,6 +1642,7 @@ class PostQueue:
                         self._max_send_retries,
                     )
                     await asyncio.sleep(2.0)
+                    self._queued_ids.discard(lot.id)
                     self.enqueue([lot])
                 else:
                     logger.error(
@@ -1596,13 +1650,14 @@ class PostQueue:
                         getattr(lot, "id", "?"),
                         retries,
                     )
+                    self._release_queue_slot(lot)
             finally:
                 self._runtime.queue_pending = self.pending
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.9.8"
-BUILD_TAG = "v3.9.8-api"
+TRACKER_VERSION = "3.10.0"
+BUILD_TAG = "v3.10.0-ru-girls-fast"
 
 
 @dataclass
@@ -1879,7 +1934,7 @@ async def scanner_loop(
             runtime.scan_parallel = 1
             logger.warning("FloodWait x%s — RPC строго по одному", floods)
 
-        await asyncio.sleep(max(cfg.poll_interval - spent, 0.02))
+        await asyncio.sleep(max(cfg.poll_interval - spent, 0.0))
 
 
 async def run() -> None:
@@ -1977,7 +2032,7 @@ async def run() -> None:
         "Коллекций: %s · scan page1 hot=%s · drip %ss · RU=%s · lvl≤%s · gifts≤%s",
         len(gift_ids),
         cfg.hot_limit,
-        int(cfg.post_interval),
+        cfg.post_interval,
         "да" if cfg.strict_ru else "нет",
         cfg.max_account_level,
         cfg.max_gifts,
@@ -1987,46 +2042,38 @@ async def run() -> None:
     runtime.gift_ids = gift_ids
 
     need_snapshot = (
-        len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
+        int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA
+        or len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
         or (not seen and not cfg.post_on_first_run)
     )
     snapshot_ready = asyncio.Event()
 
     async def _build_snapshot() -> None:
-        logger.info("Снимок маркета: до 2 проходов (макс 90с)…")
-        deadline = time.monotonic() + 90.0
-        for pass_n in range(2):
-            if time.monotonic() >= deadline:
-                logger.warning("Снимок: таймаут 90с — запускаю сканер")
-                break
-            try:
-                snap_stats = await poll_once(
-                    m,
-                    gift_ids,
-                    seen,
-                    cfg,
-                    baseline=True,
-                    market_ids=market_ids,
-                    price_book=price_book,
-                )
-                logger.info(
-                    "Снимок проход %s/2: %s лотов в снимке · API %s",
-                    pass_n + 1,
-                    len(market_ids),
-                    snap_stats.get("parsed", 0),
-                )
-                if len(market_ids) >= MIN_MARKET_SNAPSHOT_IDS:
-                    logger.info("Снимок достаточный — досрочный старт сканера")
-                    break
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Снимок маркета: %s", exc)
-            if pass_n < 1 and time.monotonic() < deadline:
-                await asyncio.sleep(1.5)
+        logger.info("Снимок маркета: полный проход всех коллекций — старые лоты не постим")
+        try:
+            snap_stats = await poll_once(
+                m,
+                gift_ids,
+                seen,
+                cfg,
+                baseline=True,
+                market_ids=market_ids,
+                price_book=price_book,
+            )
+            logger.info(
+                "Снимок: %s лотов · API %s · колл %s",
+                len(market_ids),
+                snap_stats.get("parsed", 0),
+                snap_stats.get("scanned", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Снимок маркета: %s", exc)
         state["market_ids"] = list(market_ids)
         state["price_samples"] = price_book.to_dict()
+        state["snapshot_schema"] = SNAPSHOT_SCHEMA
         save_state(state_path, state)
         logger.info(
-            "Снимок готов: %s лотов · seen %s",
+            "Снимок готов: %s лотов · seen %s — ловим только новые",
             len(market_ids),
             len(seen),
         )

@@ -283,7 +283,7 @@ def tracker_filters_keyboard(cfg: Any) -> InlineKeyboardMarkup:
                     callback_data="tf:lvl",
                 ),
                 InlineKeyboardButton(
-                    text=f"Пост {int(cfg.post_interval)}с",
+                    text=f"Пост {cfg.post_interval:g}с",
                     callback_data="tf:post",
                 ),
             ],
@@ -462,7 +462,7 @@ def build_router(
                 f"free={'строго' if cfg.strict_free else 'не платные'} · "
                 f"lvl≤{getattr(cfg, 'max_account_level', 2)} · "
                 f"gifts≤{getattr(cfg, 'max_gifts', 5)} · "
-                f"пост/{int(cfg.post_interval)}с · "
+                f"пост/{cfg.post_interval:g}с · "
                 f"{'без мужчин' if getattr(cfg, 'female_only', False) else 'все'} · "
                 f"рынок={'да' if getattr(cfg, 'strict_fair_price', False) else 'нет'}"
             )
@@ -673,10 +673,10 @@ def build_router(
             _apply_tracker_filters(control, max_account_level=nxt)
             note = f"level≤{nxt}"
         elif action == "post":
-            cur = int(cfg.post_interval)
-            nxt = {4: 6, 6: 8, 8: 4}.get(cur, 4)
+            cur = float(cfg.post_interval)
+            nxt = {0.5: 1.0, 1.0: 2.0, 2.0: 0.5}.get(cur, 1.0)
             _apply_tracker_filters(control, post_interval=float(nxt))
-            note = f"пост/{nxt}с"
+            note = f"пост/{nxt:g}с"
         elif action == "refresh":
             note = "обновлено"
         else:

@@ -336,6 +336,42 @@ def test_thin_profile_posts_like_before() -> None:
     assert len(passed) == 1
 
 
+def test_volume_defaults_keep_wifob_and_farm() -> None:
+    """Логи Bothost: lvl 19 и gifts 100 резались — для 5/мин пропускаем."""
+    wifob = _lot(
+        id="sw-20735",
+        first_name="ya",
+        seller="wifob",
+        seller_id=501,
+        account_level=19,
+        gifts_count=15,
+        stars=19999.0,
+    )
+    farm = _lot(
+        id="st-2355",
+        first_name="Reonchck",
+        seller="Reonchck",
+        seller_id=502,
+        account_level=2,
+        gifts_count=100,
+        stars=12500.0,
+    )
+    passed, stats = filter_for_post(
+        [wifob, farm],
+        {},
+        now=time.time(),
+        strict_ru=True,
+        strict_free=False,
+        max_account_level=99,
+        max_gifts=999,
+        female_only=True,
+        strict_fair_price=False,
+    )
+    assert stats["level"] == 0
+    assert stats["many_gifts"] == 0
+    assert len(passed) == 2
+
+
 def test_known_boy_skip_is_complete() -> None:
     lot = _lot(first_name="Alex", seller="alexgifts", lang_code="")
     assert profile_is_thin(lot) is False
@@ -357,6 +393,7 @@ def main() -> None:
         test_enqueue_accepts_fresh_lot_already_marked_seen,
         test_enqueue_drops_only_already_posted_seller,
         test_thin_profile_posts_like_before,
+        test_volume_defaults_keep_wifob_and_farm,
         test_known_boy_skip_is_complete,
     ]
     for fn in tests:

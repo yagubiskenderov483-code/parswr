@@ -1206,6 +1206,11 @@ async def ensure_market_floor(
     if lot.telegram_value and lot.telegram_value > 0:
         lot.market_floor = float(lot.telegram_value)
         return lot.market_floor
+    if getattr(m, "is_flooding", lambda: False)():
+        fair = book.fair_price(lot)
+        if fair:
+            lot.market_floor = fair
+        return fair
     cid = lot.collection_id
     if cid is None:
         fair = book.fair_price(lot)
@@ -1357,6 +1362,30 @@ def filter_for_post(
     return out, stats
 
 
+def profile_is_thin(lot: Lot) -> bool:
+    """Нет имени/bio/языка — enrich не успел, рано жечь лот."""
+    name = (lot.first_name or "").strip().strip(".")
+    last = (lot.last_name or "").strip().strip(".")
+    about = (lot.about or "").strip()
+    lang = (getattr(lot, "lang_code", "") or "").strip()
+    return not name and not last and not about and not lang
+
+
+def skip_is_incomplete(lot: Lot, fstats: dict[str, int]) -> bool:
+    """Отсев из-за пустого профиля — повторить, не банить продавца."""
+    if fstats.get("no_seller"):
+        return True
+    if fstats.get("unknown_ru") and profile_is_thin(lot):
+        return True
+    if (
+        fstats.get("not_female")
+        and female_filter_reason(lot) == "не девушка"
+        and profile_is_thin(lot)
+    ):
+        return True
+    return False
+
+
 _FEMALE_HINT_RE = re.compile(
     r"(девоч|девуш|girl|woman|she/her|👩|💅|💄|🎀)",
     re.IGNORECASE,
@@ -1475,10 +1504,9 @@ class PostQueue:
         added = 0
         now = time.time()
         for lot in rank_for_queue(lots):
-            if lot.id in self._queued_ids or lot.id in self._seen:
-                continue
-            slug_key = f"slug:{lot.slug}" if lot.slug else ""
-            if slug_key and slug_key in self._seen:
+            # extract уже пишет lot.id в seen, чтобы не поймать дважды.
+            # Не скипаем _seen здесь — иначе /status «+1 в очередь» и 0 постов.
+            if lot.id in self._queued_ids:
                 continue
             keys = seller_identity_keys(lot) if lot.seller_key else set()
             if keys and (keys & self._queued_sellers):
@@ -1520,15 +1548,35 @@ class PostQueue:
             _, _, lot = await self._pq.get()
             if lot is None:
                 break
+            self._runtime.queue_inflight = lot_slug(lot)
+            self._runtime.queue_inflight_since = time.monotonic()
             try:
-                await enrich_one(self._m, lot, self._cfg)
-                if self._cfg.strict_fair_price:
+                begin_urgent = getattr(self._m, "begin_urgent", None)
+                end_urgent = getattr(self._m, "end_urgent", None)
+                if callable(begin_urgent):
+                    begin_urgent()
+                try:
                     try:
-                        await ensure_market_floor(
-                            self._m, lot, self._runtime.price_book, self._cfg
+                        await asyncio.wait_for(
+                            enrich_one(self._m, lot, self._cfg), timeout=6.0
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("ensure_market_floor: %s", exc)
+                    except asyncio.TimeoutError:
+                        logger.warning("enrich timeout %s", getattr(lot, "id", "?"))
+                    if self._cfg.strict_fair_price:
+                        try:
+                            await asyncio.wait_for(
+                                ensure_market_floor(
+                                    self._m, lot, self._runtime.price_book, self._cfg
+                                ),
+                                timeout=3.0,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("floor timeout %s", getattr(lot, "id", "?"))
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("ensure_market_floor: %s", exc)
+                finally:
+                    if callable(end_urgent):
+                        end_urgent()
                 now = time.time()
                 to_post, fstats = filter_for_post(
                     [lot],
@@ -1562,19 +1610,23 @@ class PostQueue:
                 self._runtime.skip_unknown_ru_total += fstats["unknown_ru"]
                 self._runtime.queue_processed += 1
                 if not to_post:
+                    incomplete = skip_is_incomplete(lot, fstats)
                     skip_permanent = (
-                        fstats["dup"]
-                        or fstats["non_ru"]
-                        or fstats["unknown_ru"]
-                        or fstats["paid"]
-                        or fstats["not_female"]
-                        or (
-                            fstats["level"]
-                            and lot.account_level is not None
-                        )
-                        or (
-                            fstats["many_gifts"]
-                            and lot.gifts_count is not None
+                        not incomplete
+                        and (
+                            fstats["dup"]
+                            or fstats["non_ru"]
+                            or fstats["unknown_ru"]
+                            or fstats["paid"]
+                            or fstats["not_female"]
+                            or (
+                                fstats["level"]
+                                and lot.account_level is not None
+                            )
+                            or (
+                                fstats["many_gifts"]
+                                and lot.gifts_count is not None
+                            )
                         )
                     )
                     if skip_permanent:
@@ -1582,6 +1634,24 @@ class PostQueue:
                         if lot.seller_key:
                             for k in seller_identity_keys(lot):
                                 self._seen_sellers[k] = now
+                    elif incomplete:
+                        retries = self._send_retries.get(lot.id, 0) + 1
+                        self._send_retries[lot.id] = retries
+                        self._release_queue_slot(lot)
+                        if retries <= 2 and not self._closed:
+                            logger.info(
+                                "Профиль не дотянулся %s — повтор %s/2",
+                                getattr(lot, "id", "?"),
+                                retries,
+                            )
+                            await asyncio.sleep(1.0)
+                            self.enqueue([lot])
+                        else:
+                            logger.info(
+                                "Профиль так и не открылся %s — не баним продавца",
+                                getattr(lot, "id", "?"),
+                            )
+                        continue
                     reason = (
                         self._runtime.price_book.overprice_reason(lot)
                         if fstats["overprice"] and self._runtime.price_book
@@ -1652,12 +1722,14 @@ class PostQueue:
                     )
                     self._release_queue_slot(lot)
             finally:
+                self._runtime.queue_inflight = ""
+                self._runtime.queue_inflight_since = 0.0
                 self._runtime.queue_pending = self.pending
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.0"
-BUILD_TAG = "v3.10.0-ru-girls-fast"
+TRACKER_VERSION = "3.10.1"
+BUILD_TAG = "v3.10.1-ru-girls-post"
 
 
 @dataclass
@@ -1692,6 +1764,8 @@ class TrackerRuntime:
     scan_parallel: int = 1
     seen_lots: int = 0
     queue_pending: int = 0
+    queue_inflight: str = ""
+    queue_inflight_since: float = 0.0
     collections_total: int = 0
     last_scan_batch: int = 0
     last_scan_parsed: int = 0
@@ -1840,8 +1914,12 @@ async def scanner_loop(
             await asyncio.sleep(15)
             continue
         try:
+            enqueued_this_pass = 0
+
             def _stream_enqueue(batch: list[Lot]) -> None:
+                nonlocal enqueued_this_pass
                 n = post_queue.enqueue(batch)
+                enqueued_this_pass += n
                 runtime.queue_pending = post_queue.pending
                 if n:
                     logger.info(
@@ -1889,12 +1967,18 @@ async def scanner_loop(
             runtime.zero_parse_streak = 0
 
         runtime.last_fresh = len(fresh)
-        runtime.last_posted = len(fresh)
+        runtime.last_posted = enqueued_this_pass
+        if len(fresh) and enqueued_this_pass == 0:
+            logger.error(
+                "Найдено %s новых, в очередь 0 — enqueue отбросил лоты",
+                len(fresh),
+            )
         if fresh:
             logger.info(
-                "Проход #%s: +%s новых · очередь %s · %ss",
+                "Проход #%s: +%s новых · в очередь %s · ждут %s · %ss",
                 pass_no,
                 len(fresh),
+                enqueued_this_pass,
                 post_queue.pending,
                 scan.get("elapsed", "?"),
             )
@@ -1932,7 +2016,10 @@ async def scanner_loop(
             # не поднимаем parallel — FloodWait от параллельных RPC
             cfg.parallel = 1
             runtime.scan_parallel = 1
-            logger.warning("FloodWait x%s — RPC строго по одному", floods)
+            cfg.gap = min(0.35, max(float(cfg.gap or 0.04), 0.12))
+            logger.warning(
+                "FloodWait x%s — RPC по одному, gap %.2fs", floods, cfg.gap
+            )
 
         await asyncio.sleep(max(cfg.poll_interval - spent, 0.0))
 

@@ -696,7 +696,7 @@ def build_router(
             _apply_tracker_filters(control, strict_fair_price=not cur)
             note = "честная цена" if not cur else "без проверки рынка"
         elif action == "lvl":
-            nxt = {2: 10, 10: 20, 20: 99, 99: 2}.get(int(cfg.max_account_level), 99)
+            nxt = {2: 5, 5: 10, 10: 2}.get(int(cfg.max_account_level), 10)
             _apply_tracker_filters(control, max_account_level=nxt)
             note = f"level≤{nxt}"
         elif action == "post":

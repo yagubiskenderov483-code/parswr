@@ -268,7 +268,7 @@ class Config:
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
     scan_batch: int = 35  # крутим пачками — полный 151 = FloodWait 3 мин
     hot_limit: int = 8  # топ свежих в коллекции
-    max_account_level: int = 99  # не режем по lvl — иначе 1 пост из 14
+    max_account_level: int = 10
     max_gifts: int = 15  # фермы 16+ режем
     post_interval: float = 1.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
@@ -340,7 +340,7 @@ class Config:
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 35)),
             hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
-            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 99)),
+            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 10)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 15))),
             post_interval=_f("POST_INTERVAL", 1.0),
             ton_rate=_f("TON_RATE", 0.0102),
@@ -1742,8 +1742,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.11.1"
-BUILD_TAG = "v3.11.1-ru-new-gifts15"
+TRACKER_VERSION = "3.11.2"
+BUILD_TAG = "v3.11.2-ru-lvl10"
 
 
 @dataclass

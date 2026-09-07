@@ -226,7 +226,7 @@ def test_migrate_schema4_file_upgrades() -> None:
         assert migrated["filter_schema"] == FILTER_SCHEMA
         assert migrated["female_only"] is False
         assert migrated["strict_fair_price"] is True
-        assert migrated["max_account_level"] == 99
+        assert migrated["max_account_level"] == 10
         assert migrated["max_gifts"] == 15
 
 
@@ -292,7 +292,7 @@ def test_migrate_schema5_enables_girls_and_market() -> None:
     assert out["female_only"] is False
     assert out["strict_fair_price"] is True
     assert out["post_interval"] == 1.0
-    assert out["max_account_level"] == 99
+    assert out["max_account_level"] == 10
     assert out["max_gifts"] == 15
     assert out["fair_price_ratio"] >= 2.0
 

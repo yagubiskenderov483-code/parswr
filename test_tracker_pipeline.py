@@ -371,7 +371,7 @@ def test_live_ru_gifts15_keeps_maria_cuts_farm() -> None:
         now=time.time(),
         strict_ru=True,
         strict_free=False,
-        max_account_level=99,
+        max_account_level=10,
         max_gifts=15,
         female_only=False,
         strict_fair_price=False,
@@ -389,6 +389,39 @@ def test_known_boy_skip_is_complete() -> None:
     assert skip_is_incomplete(lot, stats) is False
 
 
+def test_account_level_11_blocked() -> None:
+    lot = _lot(first_name="Мария", seller="mariagifts", lang_code="ru", account_level=11)
+    passed, stats = filter_for_post(
+        [lot],
+        {},
+        now=time.time(),
+        strict_ru=True,
+        strict_free=False,
+        max_account_level=10,
+        max_gifts=15,
+        female_only=False,
+        strict_fair_price=False,
+    )
+    assert passed == []
+    assert stats["level"] == 1
+
+
+def test_account_level_10_passes() -> None:
+    lot = _lot(first_name="Мария", seller="mariagifts", lang_code="ru", account_level=10)
+    passed, _stats = filter_for_post(
+        [lot],
+        {},
+        now=time.time(),
+        strict_ru=True,
+        strict_free=False,
+        max_account_level=10,
+        max_gifts=15,
+        female_only=False,
+        strict_fair_price=False,
+    )
+    assert passed == [lot]
+
+
 def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
@@ -404,6 +437,8 @@ def main() -> None:
         test_thin_profile_needs_ru,
         test_live_ru_gifts15_keeps_maria_cuts_farm,
         test_known_boy_skip_is_complete,
+        test_account_level_11_blocked,
+        test_account_level_10_passes,
     ]
     for fn in tests:
         fn()

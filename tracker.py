@@ -266,10 +266,10 @@ class Config:
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 0  # 0 = все коллекции за проход
-    hot_limit: int = 4  # только топ свежих в коллекции — не старые с середины
-    max_account_level: int = 2  # level <= 2 или отрицательный рейтинг
-    max_gifts: int = 30  # фермы 50+ режем; обычный продавец ок
+    scan_batch: int = 35  # крутим пачками — полный 151 = FloodWait 3 мин
+    hot_limit: int = 8  # топ свежих в коллекции
+    max_account_level: int = 99  # не режем по lvl — иначе 1 пост из 14
+    max_gifts: int = 999  # фермы не режем
     post_interval: float = 1.0  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
@@ -280,8 +280,8 @@ class Config:
     strict_ru: bool = True
     strict_free: bool = False  # False = скип только платных; True = только free_dm=True
     female_only: bool = True
-    strict_fair_price: bool = True
-    fair_price_ratio: float = 2.0
+    strict_fair_price: bool = False
+    fair_price_ratio: float = 3.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -338,10 +338,10 @@ class Config:
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 0)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 4))),
-            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 2)),
-            max_gifts=max(1, int(_f("MAX_GIFTS", 30))),
+            scan_batch=int(_f("SCAN_BATCH", 35)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 99)),
+            max_gifts=max(1, int(_f("MAX_GIFTS", 999))),
             post_interval=_f("POST_INTERVAL", 1.0),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
@@ -352,15 +352,15 @@ class Config:
             strict_ru=os.environ.get("TRACKER_STRICT_RU", "1") == "1",
             strict_free=os.environ.get("TRACKER_STRICT_FREE", "0") == "1",
             female_only=os.environ.get("TRACKER_FEMALE_ONLY", "1") == "1",
-            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "1") == "1",
-            fair_price_ratio=_f("FAIR_PRICE_RATIO", 2.0),
+            strict_fair_price=os.environ.get("TRACKER_STRICT_FAIR_PRICE", "0") == "1",
+            fair_price_ratio=_f("FAIR_PRICE_RATIO", 3.0),
         )
 
 
 # ---------------------------------------------------------------- state
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
-SELLER_TTL = 90 * 24 * 3600  # одного продавца не постим повторно 90 дней
+SELLER_TTL = 8 * 60  # один продавец раз в 8 мин — иначе 10 лотов/час
 MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
 SNAPSHOT_SCHEMA = 2  # bump → полный снимок заново, без старых лотов
 SELLER_BAN_SCHEMA = 1  # 1 = баним продавца только после поста, не после отсева
@@ -1563,7 +1563,7 @@ class PostQueue:
                 try:
                     try:
                         await asyncio.wait_for(
-                            enrich_one(self._m, lot, self._cfg), timeout=6.0
+                            enrich_one(self._m, lot, self._cfg), timeout=2.5
                         )
                     except asyncio.TimeoutError:
                         logger.warning("enrich timeout %s", getattr(lot, "id", "?"))
@@ -1731,8 +1731,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.10.3"
-BUILD_TAG = "v3.10.3-ru-girls-live"
+TRACKER_VERSION = "3.11.0"
+BUILD_TAG = "v3.11.0-five-per-min"
 
 
 @dataclass

@@ -96,7 +96,7 @@ def apply_filters_to_config(cfg: Any, data: dict[str, Any]) -> None:
         cfg.fair_price_ratio = max(1.1, float(data["fair_price_ratio"]))
 
 
-FILTER_SCHEMA = 7
+FILTER_SCHEMA = 8
 
 DEFAULT_FILTER_DATA: dict[str, Any] = {
     "filter_schema": FILTER_SCHEMA,
@@ -104,12 +104,12 @@ DEFAULT_FILTER_DATA: dict[str, Any] = {
     "max_stars": 25000.0,
     "strict_ru": True,
     "strict_free": False,
-    "max_account_level": 2,
-    "max_gifts": 30,
+    "max_account_level": 99,
+    "max_gifts": 999,
     "post_interval": 1.0,
     "female_only": True,
-    "strict_fair_price": True,
-    "fair_price_ratio": 2.0,
+    "strict_fair_price": False,
+    "fair_price_ratio": 3.0,
 }
 
 
@@ -151,22 +151,22 @@ def migrate_legacy_filters(data: dict[str, Any]) -> dict[str, Any]:
             prev_gifts = 5
         if prev_gifts <= 5:
             out["max_gifts"] = 20
-    if schema < FILTER_SCHEMA:
-        out["filter_schema"] = FILTER_SCHEMA
+    if schema < 7:
         out["female_only"] = True
-        out["strict_fair_price"] = True
         out["strict_ru"] = True
         out["post_interval"] = min(float(out.get("post_interval", 1.0) or 1.0), 1.0)
+    if schema < FILTER_SCHEMA:
+        # 5 лотов/мин: не режем lvl/фермы/рынок — только мужчины и явный не-RU
+        out["filter_schema"] = FILTER_SCHEMA
+        out["max_account_level"] = 99
+        out["max_gifts"] = 999
+        out["strict_fair_price"] = False
+        out["post_interval"] = 1.0
         try:
-            gifts = int(out.get("max_gifts", 20) or 20)
+            ratio = float(out.get("fair_price_ratio", 3.0) or 3.0)
         except (TypeError, ValueError):
-            gifts = 20
-        out["max_gifts"] = max(gifts, 30)
-        try:
-            ratio = float(out.get("fair_price_ratio", 2.0) or 2.0)
-        except (TypeError, ValueError):
-            ratio = 2.0
-        out["fair_price_ratio"] = max(ratio, 2.0)
+            ratio = 3.0
+        out["fair_price_ratio"] = max(ratio, 3.0)
     return out
 
 

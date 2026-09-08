@@ -1738,8 +1738,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.12.0"
-BUILD_TAG = "v3.12.0-five-min"
+TRACKER_VERSION = "3.12.1"
+BUILD_TAG = "v3.12.1-bot-token"
 
 
 @dataclass

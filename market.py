@@ -656,6 +656,15 @@ class CheckResult:
     all_lots: list[Lot] | None = None  # все найденные (для БД), не только matched
 
 
+def flood_pause_seconds(telegram_wait: float) -> float:
+    """Ждём столько, сколько просит Telegram, плюс буфер. Не режем до 20с."""
+    try:
+        waited = float(telegram_wait)
+    except (TypeError, ValueError):
+        waited = 3.0
+    return min(max(waited + 1.5, 2.0), 90.0)
+
+
 class TelegramMarket:
     def __init__(self, client: TelegramClient) -> None:
         self.client = client
@@ -663,6 +672,8 @@ class TelegramMarket:
         self._gifts_hash = 0
         self._cursor = 0
         self._flood_until = 0.0
+        self._last_flood_at = 0.0
+        self.last_flood_seconds = 0
         self._urgent = 0
         self._gap_lock = asyncio.Lock()
         self._rpc_lock = asyncio.Lock()
@@ -692,6 +703,16 @@ class TelegramMarket:
     def is_flooding(self) -> bool:
         return self._flood_until > time.monotonic()
 
+    def flood_remaining(self) -> float:
+        return max(0.0, self._flood_until - time.monotonic())
+
+    def recently_flooded(self, window: float = 45.0) -> bool:
+        if self.is_flooding():
+            return True
+        if self._last_flood_at <= 0:
+            return False
+        return (time.monotonic() - self._last_flood_at) < window
+
     def begin_urgent(self) -> None:
         self._urgent += 1
 
@@ -715,6 +736,8 @@ class TelegramMarket:
         self._found_users.clear()
         self._progress_cb = None
         self._flood_until = 0.0
+        self._last_flood_at = 0.0
+        self.last_flood_seconds = 0
         self._urgent = 0
         self.check_no = 0
         self.last_error = ""
@@ -1644,7 +1667,7 @@ class TelegramMarket:
             try:
                 if not urgent:
                     t0 = time.monotonic()
-                    while self._urgent > 0 and time.monotonic() - t0 < 3.0:
+                    while self._urgent > 0 and time.monotonic() - t0 < 12.0:
                         await asyncio.sleep(0.05)
                 await self._wait_flood()
                 async with self._rpc_lock:
@@ -1670,16 +1693,19 @@ class TelegramMarket:
             except FloodWaitError as exc:
                 attempts += 1
                 stats["floods"] += 1
-                wait_s = min(float(exc.seconds) + 0.4, 20.0)
-                extra = 2.0 if exc.seconds >= 15 else 0.2
-                self._flood_until = time.monotonic() + wait_s + extra
+                pause = flood_pause_seconds(exc.seconds)
+                self.last_flood_seconds = int(exc.seconds)
+                self._last_flood_at = time.monotonic()
+                self._flood_until = time.monotonic() + pause
                 self.last_error = f"FloodWait {exc.seconds}s"
                 logger.warning(
                     "FloodWait %ss GetResaleStarGifts — пауза %.1fs",
                     exc.seconds,
-                    wait_s + extra,
+                    pause,
                 )
-                await asyncio.sleep(wait_s + extra)
+                await asyncio.sleep(pause)
+                if exc.seconds >= 8:
+                    break
             except Exception as exc:  # noqa: BLE001
                 attempts += 1
                 stats["errors"] += 1

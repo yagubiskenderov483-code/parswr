@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from market import Lot, MarketPriceBook, is_russian_lot
+from market import Lot, MarketPriceBook, flood_pause_seconds, is_russian_lot
 from tracker import (
     Config,
     PostQueue,
@@ -493,6 +493,15 @@ def test_account_level_10_passes() -> None:
     assert passed == [lot]
 
 
+def test_flood_pause_honors_telegram_32s() -> None:
+    """Раньше ждали max 20с при FloodWait 32с — Telegram эскалировал по кругу."""
+    pause = flood_pause_seconds(32)
+    assert pause >= 33.0
+    assert pause <= 90.0
+    assert flood_pause_seconds(3) >= 4.0
+    assert flood_pause_seconds(3) < 10.0
+
+
 def main() -> None:
     tests = [
         test_scenario_23_like_bothost,
@@ -513,6 +522,7 @@ def main() -> None:
         test_known_boy_skip_is_complete,
         test_account_level_11_blocked,
         test_account_level_10_passes,
+        test_flood_pause_honors_telegram_32s,
     ]
     for fn in tests:
         fn()

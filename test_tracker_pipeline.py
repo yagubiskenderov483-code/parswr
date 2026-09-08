@@ -212,8 +212,8 @@ def test_overprice_extract_does_not_burn_seen() -> None:
     assert "new-dump" not in seen
 
 
-def test_snapshot_id_does_not_block_unposted_lot() -> None:
-    """Снимок маркета больше не жжёт выдачу — иначе 0 постов при 5/мин."""
+def test_snapshot_id_blocks_old_lot() -> None:
+    """Лот из снимка маркета — уже видели, в канал не повторяем."""
     lot = _lot(id="live-ok", stars=8000.0, first_name="Мария", seller="mariagifts")
     cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
     cfg.strict_fair_price = False
@@ -231,12 +231,11 @@ def test_snapshot_id_does_not_block_unposted_lot() -> None:
         now=time.time(),
         price_book=None,
     )
-    assert len(fresh) == 1
-    assert stats["skipped_seen"] == 0
-    assert stats["skipped_market"] == 0
+    assert fresh == []
+    assert stats["skipped_market"] == 1
 
 
-def test_baseline_snapshot_does_not_burn_seen() -> None:
+def test_baseline_snapshot_burns_seen() -> None:
     lot = _lot(id="old-ok", stars=8000.0, first_name="Мария", seller="mariagifts")
     cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
     cfg.strict_fair_price = False
@@ -255,7 +254,7 @@ def test_baseline_snapshot_does_not_burn_seen() -> None:
         price_book=None,
     )
     assert fresh == []
-    assert "old-ok" not in seen
+    assert "old-ok" in seen
 
 
 def test_fresh_lot_marked_seen() -> None:
@@ -477,8 +476,8 @@ def main() -> None:
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,
         test_overprice_extract_does_not_burn_seen,
-        test_snapshot_id_does_not_block_unposted_lot,
-        test_baseline_snapshot_does_not_burn_seen,
+        test_snapshot_id_blocks_old_lot,
+        test_baseline_snapshot_burns_seen,
         test_fresh_lot_marked_seen,
         test_enqueue_accepts_fresh_lot_already_marked_seen,
         test_enqueue_drops_only_already_posted_seller,

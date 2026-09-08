@@ -482,9 +482,9 @@ def build_router(
             lines.append(f"Последний пост: через {via}")
         if rt:
             snap = (
-                "пол рынка"
+                "готов"
                 if rt.snapshot_ready
-                else "прогрев…"
+                else "строится… (старые лоты не постим)"
             )
             lines.extend(
                 [
@@ -497,7 +497,7 @@ def build_router(
                     f"Всего отправлено: {rt.posted_total}",
                     f"В очереди: {rt.queue_pending}",
                     f"Обработано из очереди: {rt.queue_processed}",
-                    f"Последний проход: +{rt.last_fresh} в выдачу (в очередь {rt.last_posted})",
+                    f"Последний проход: +{rt.last_fresh} новых (в очередь {rt.last_posted})",
                 ]
             )
             inflight = (getattr(rt, "queue_inflight", "") or "").strip()
@@ -536,7 +536,9 @@ def build_router(
                     + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
                 )
             if rt.passes == 0 and not rt.snapshot_ready:
-                lines.append("⏳ Сканер стартует — первая страница сразу в выдачу")
+                lines.append(
+                    "⏳ Сканер ждёт снимок маркета — старые лоты в канал не пойдут"
+                )
             elif rt.passes > 0 and rt.last_scan_parsed == 0:
                 err = (rt.last_api_error or "").strip()
                 lines.append(
@@ -606,7 +608,7 @@ def build_router(
         save_state(rt.state_path, rt.state)
         await message.answer(
             f"✅ Снимок сброшен ({n} id).\n"
-            "Перезапусти бота на Bothost — пол рынка пересоберётся, выдача не стопорится."
+            "Перезапусти бота на Bothost — новый снимок, старые лоты не уйдут в канал."
         )
 
     @router.message(Command("filters"))
@@ -781,7 +783,7 @@ def build_router(
         rt.seen_lots = 0
         await message.answer(
             f"✅ Seen и снимок маркета сброшены ({n} seen, {m} market). "
-            "При перезапуске снова пойдёт живая 1-я страница."
+            "При перезапуске снова снимок — старые лоты не уйдут в канал."
         )
 
     @router.message(StateFilter(LoginStates.phone))

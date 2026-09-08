@@ -1813,8 +1813,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.16.0"
-BUILD_TAG = "v3.16.0-inline-snapshot"
+TRACKER_VERSION = "3.16.1"
+BUILD_TAG = "v3.16.1-fix-slots"
 
 
 @dataclass
@@ -1985,7 +1985,7 @@ async def scanner_loop(
         int(cfg.max_stars),
     )
     catalog_refreshed = time.monotonic()
-    cfg._orig_parallel = cfg.parallel
+    orig_parallel = cfg.parallel
     pass_no = 0
     client = m.client
     while True:
@@ -2161,8 +2161,8 @@ async def scanner_loop(
                 cfg.gap = max(0.45, cfg.gap - 0.05)
             if cfg.scan_batch < 20:
                 cfg.scan_batch = min(20, cfg.scan_batch + 2)
-            if cfg.parallel < (cfg._orig_parallel if hasattr(cfg, '_orig_parallel') else 1):
-                cfg.parallel = cfg._orig_parallel if hasattr(cfg, '_orig_parallel') else 1
+            if cfg.parallel < orig_parallel:
+                cfg.parallel = orig_parallel
 
         await asyncio.sleep(cool)
 

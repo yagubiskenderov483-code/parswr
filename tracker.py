@@ -374,6 +374,8 @@ def load_state(path: Path) -> dict:
             data.setdefault("seen", {})
             data.setdefault("seen_sellers", {})
             data.setdefault("market_ids", [])
+            data.setdefault("sent_lots", [])
+            data.setdefault("baseline_initialized", False)
             data.setdefault("price_samples", {})
             data.setdefault("channel_id", None)
             data.setdefault("snapshot_schema", 0)
@@ -385,6 +387,8 @@ def load_state(path: Path) -> dict:
         "seen": {},
         "seen_sellers": {},
         "market_ids": [],
+        "sent_lots": [],
+        "baseline_initialized": False,
         "price_samples": {},
         "channel_id": None,
         "snapshot_schema": 0,
@@ -407,6 +411,10 @@ def save_state(path: Path, state: dict) -> None:
     mids = state.get("market_ids", [])
     if isinstance(mids, list) and len(mids) > 250_000:
         state["market_ids"] = mids[-250_000:]
+    # sent_lots — жёсткий блок «уже отправлено», НЕ чистим по TTL, только FIFO-кап
+    sent = state.get("sent_lots", [])
+    if isinstance(sent, list) and len(sent) > 500_000:
+        state["sent_lots"] = sent[-500_000:]
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
     tmp.replace(path)
@@ -868,6 +876,37 @@ def _is_lot_seen(
     return bool(slug and f"slug:{slug}" in seen)
 
 
+def is_new_lot(
+    lot: Lot,
+    *,
+    seen: dict[str, float],
+    sent_lots: set[str],
+    snapshot_ids: set[str],
+    baseline_initialized: bool,
+) -> bool:
+    """ЕДИНАЯ точка решения о новизне listing (спека п.11).
+
+    Логика:
+      - нет стабильного lot_id            → не новый (missing_id);
+      - lot_id уже реально отправлен       → не новый (жёсткий блок sent_lots);
+      - baseline ещё не инициализирован    → не новый (первый запуск: только запоминаем);
+      - lot_id был в снимке рынка / seen   → не новый (SKIP_OLD_OR_SEEN);
+      - иначе                              → НОВЫЙ.
+
+    ID стабилен (gift_id/slug), поэтому повторный возврат того же listing из API
+    — даже с изменённой ценой — не делает лот новым.
+    """
+    if not lot.id:
+        return False
+    if lot.id in sent_lots:
+        return False
+    if not baseline_initialized:
+        return False
+    if _is_lot_seen(lot, seen, snapshot_ids):
+        return False
+    return True
+
+
 def _select_scan_batch(
     gift_ids: list[int],
     m: TelegramMarket,
@@ -994,16 +1033,37 @@ def _extract_fresh_from_collection(
     baseline: bool,
     now: float,
     price_book: MarketPriceBook | None,
+    sent_lots: set[str] | None = None,
+    baseline_initialized: bool = True,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """Один ответ API → только что появившиеся лоты (топ hot_limit)."""
+    """Один ответ API → только что появившиеся лоты (топ hot_limit).
+
+    Порядок фильтрации (спека): VALIDATE ID → DEDUP (цикл) → CHECK NEW → PRICE.
+    RUSSIAN/free/level/gifts/female применяются позже, в воркере очереди.
+    sent_lots / baseline_initialized опциональны для обратной совместимости
+    (легаси-вызовы ведут себя как раньше: baseline считается инициализированным).
+    """
+    sent = sent_lots if sent_lots is not None else set()
     fresh: list[Lot] = []
     stats = {
         "skipped_market": 0,
         "skipped_seen": 0,
         "skipped_price": 0,
         "skipped_overprice": 0,
+        "skipped_dup_cycle": 0,
+        "skipped_missing_id": 0,
     }
     for i, lot in enumerate(lots):
+        # VALIDATE ID (спека п.1): без стабильного id лот игнорируем
+        if not lot.id:
+            stats["skipped_missing_id"] += 1
+            continue
+        # DEDUP внутри одного цикла сканирования (спека п.5):
+        # тот же lot_id на нескольких страницах/коллекциях/после сортировки
+        # обрабатываем один раз за проход.
+        if lot.id in batch_market_ids:
+            stats["skipped_dup_cycle"] += 1
+            continue
         batch_market_ids.add(lot.id)
         if i >= cfg.hot_limit:
             if baseline:
@@ -1012,12 +1072,22 @@ def _extract_fresh_from_collection(
         if baseline:
             _mark_lot_seen(seen, lot, now)
             continue
-        if _is_lot_seen(lot, seen, snapshot_ids):
-            if lot.id in snapshot_ids:
+        # CHECK NEW — единая точка решения (спека п.11)
+        if not is_new_lot(
+            lot,
+            seen=seen,
+            sent_lots=sent,
+            snapshot_ids=snapshot_ids,
+            baseline_initialized=baseline_initialized,
+        ):
+            if lot.id in sent:
+                stats["skipped_seen"] += 1
+            elif lot.id in snapshot_ids:
                 stats["skipped_market"] += 1
             else:
                 stats["skipped_seen"] += 1
             continue
+        # PRICE — существующий диапазон 5000–25000⭐ (фильтр не трогаем)
         if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
             _mark_lot_seen(seen, lot, now)
             stats["skipped_price"] += 1
@@ -1033,6 +1103,7 @@ def _extract_fresh_from_collection(
         lot.discovered_at = now
         _mark_lot_seen(seen, lot, now)
         snapshot_ids.add(lot.id)
+        logger.info("[NEW] lot_id=%s %s⭐ @%s", lot.id, int(lot.stars), lot.seller or "?")
         fresh.append(lot)
     return fresh, stats
 
@@ -1047,6 +1118,8 @@ async def poll_once(
     market_ids: set[str],
     price_book: MarketPriceBook | None = None,
     on_fresh: Callable[[list[Lot]], Awaitable[None] | None] | None = None,
+    sent_lots: set[str] | None = None,
+    baseline_initialized: bool = True,
 ) -> tuple[list[Lot], dict[str, int | float | str]]:
     """Проход по коллекциям — стриминг: новые лоты в очередь сразу по мере ответа API."""
     started = time.monotonic()
@@ -1145,6 +1218,8 @@ async def poll_once(
             baseline=baseline or force_baseline,
             now=now,
             price_book=price_book,
+            sent_lots=sent_lots,
+            baseline_initialized=baseline_initialized,
         )
         skipped_market += part["skipped_market"]
         skipped_seen += part["skipped_seen"]
@@ -1526,6 +1601,7 @@ class PostQueue:
         state_path: Path,
         runtime: TrackerRuntime,
         post_interval: float = 1.0,
+        sent_lots: set[str] | None = None,
     ) -> None:
         self._sender = sender
         self._m = market
@@ -1546,6 +1622,10 @@ class PostQueue:
         self._max_send_retries = 3
         self._queued_ids: set[str] = set()
         self._queued_sellers: set[str] = set()
+        # Жёсткий блок «уже отправлено» — общий объект-set с поллером (спека п.12).
+        self._sent_lots: set[str] = sent_lots if sent_lots is not None else set()
+        # Atomic: reserve→send→mark→save под одним локом (спека п.6).
+        self._send_lock = asyncio.Lock()
 
     @property
     def pending(self) -> int:
@@ -1576,7 +1656,14 @@ class PostQueue:
         for lot in rank_for_queue(lots):
             # extract уже пишет lot.id в seen, чтобы не поймать дважды.
             # Не скипаем _seen здесь — иначе /status «+1 в очередь» и 0 постов.
+            if not lot.id:
+                continue
+            # Жёсткий блок: этот listing уже был реально отправлен (спека п.4, п.6).
+            if lot.id in self._sent_lots:
+                logger.info("[SKIP] duplicate lot_id=%s (уже отправлен)", lot.id)
+                continue
             if lot.id in self._queued_ids:
+                logger.info("[SKIP] duplicate lot_id=%s (уже в очереди)", lot.id)
                 continue
             mids = getattr(self._runtime, "market_ids", None) or set()
             if lot.id in mids:
@@ -1761,20 +1848,32 @@ class PostQueue:
                     self._release_queue_slot(lot)
                     continue
                 lot = to_post[0]
-                via = await self._sender.send(lot)
-                self._runtime.post_via = via
-                _mark_lot_seen(self._seen, lot, now)
-                self._send_retries.pop(lot.id, None)
-                key = lot.seller_key
-                if key:
-                    for k in seller_identity_keys(lot):
-                        self._seen_sellers[k] = now
-                self._state["seen_sellers"] = self._seen_sellers
-                save_state(self._state_path, self._state)
+                # ATOMIC (спека п.6): lock → повторная проверка → send →
+                # пометить sent → сохранить state. sent пишем ТОЛЬКО после
+                # успешной отправки, иначе лот не считается отправленным.
+                async with self._send_lock:
+                    if lot.id in self._sent_lots:
+                        logger.info("[SKIP] duplicate lot_id=%s (гонка)", lot.id)
+                        self._release_queue_slot(lot)
+                        continue
+                    via = await self._sender.send(lot)
+                    self._runtime.post_via = via
+                    now = time.time()
+                    self._sent_lots.add(lot.id)
+                    _mark_lot_seen(self._seen, lot, now)
+                    self._send_retries.pop(lot.id, None)
+                    key = lot.seller_key
+                    if key:
+                        for k in seller_identity_keys(lot):
+                            self._seen_sellers[k] = now
+                    self._state["seen_sellers"] = self._seen_sellers
+                    self._state["sent_lots"] = list(self._sent_lots)
+                    save_state(self._state_path, self._state)
                 self._runtime.posted_total += 1
                 self._runtime.queue_pending = self.pending
                 logger.info(
-                    "Отправил: %s за %s⭐ (%s) · очередь %s · lvl %s",
+                    "[SENT] lot_id=%s %s за %s⭐ (%s) · очередь %s · lvl %s",
+                    lot.id,
                     lot.title,
                     int(lot.stars),
                     lot_slug(lot),
@@ -1786,7 +1885,10 @@ class PostQueue:
                 err = str(exc)
                 self._runtime.last_send_error = err
                 self._runtime.send_errors_total += 1
-                logger.error("Не отправилось (%s): %s", getattr(lot, "id", "?"), exc)
+                # НЕ помечаем sent — лот не отправлен, уйдёт на повтор (спека п.6)
+                logger.error(
+                    "[ERROR] send_failed lot_id=%s: %s", getattr(lot, "id", "?"), exc
+                )
                 retries = self._send_retries.get(lot.id, 0) + 1
                 self._send_retries[lot.id] = retries
                 if retries <= self._max_send_retries and not self._closed:
@@ -1797,7 +1899,9 @@ class PostQueue:
                         self._max_send_retries,
                     )
                     await asyncio.sleep(2.0)
-                    self._queued_ids.discard(lot.id)
+                    # освобождаем и id, и продавца — иначе повтор дропнется
+                    # как дубль продавца и лот никогда не переотправится
+                    self._release_queue_slot(lot)
                     self.enqueue([lot])
                 else:
                     logger.error(
@@ -1813,8 +1917,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.16.1"
-BUILD_TAG = "v3.16.1-fix-slots"
+TRACKER_VERSION = "3.17.0"
+BUILD_TAG = "v3.17.0-newonly-hardening"
 
 
 @dataclass
@@ -1971,10 +2075,16 @@ async def scanner_loop(
     price_book: MarketPriceBook,
     *,
     snapshot_ready: asyncio.Event,
+    sent_lots: set[str] | None = None,
 ) -> None:
     """Скан маркета — только лоты, которых ещё не было в снимке market_ids."""
     await snapshot_ready.wait()
+    if sent_lots is None:
+        sent_lots = set()
     inline_snapshot = getattr(runtime, '_need_inline_snapshot', False)
+    # baseline инициализирован, если снимок уже есть (из state или не нужен).
+    # При встроенном снимке baseline станет True после pass #1.
+    baseline_initialized = not inline_snapshot
     if not inline_snapshot:
         runtime.snapshot_ready = True
     logger.info(
@@ -2041,14 +2151,18 @@ async def scanner_loop(
                 market_ids=market_ids,
                 price_book=price_book,
                 on_fresh=None if is_baseline else _stream_enqueue,
+                sent_lots=sent_lots,
+                baseline_initialized=baseline_initialized,
             )
 
             if is_baseline:
                 inline_snapshot = False
+                baseline_initialized = True
                 runtime._need_inline_snapshot = False
                 runtime.snapshot_ready = True
                 state["market_ids"] = list(market_ids)
                 state["snapshot_schema"] = SNAPSHOT_SCHEMA
+                state["baseline_initialized"] = True
                 save_state(state_path, state)
                 logger.info(
                     "Встроенный снимок готов: %s лотов · seen %s — ловим новые",
@@ -2227,6 +2341,9 @@ async def run() -> None:
     seen: dict[str, float] = state["seen"]
     seen_sellers: dict[str, float] = state.get("seen_sellers", {})
     market_ids: set[str] = set(state.get("market_ids") or [])
+    # sent_lots — жёсткий блок «уже реально отправлено в канал», один объект-set
+    # на весь процесс: и сканер, и воркер очереди видят одни и те же id.
+    sent_lots: set[str] = set(state.get("sent_lots") or [])
     price_book = MarketPriceBook.from_dict(state.get("price_samples"))
 
     chat_id = await obtain_channel_id(client, cfg, state, state_path, store)
@@ -2274,6 +2391,7 @@ async def run() -> None:
         state_path,
         runtime,
         post_interval=cfg.post_interval,
+        sent_lots=sent_lots,
     )
     post_queue.start()
     control_bot.post_queue = post_queue
@@ -2329,6 +2447,7 @@ async def run() -> None:
     else:
         runtime.snapshot_ready = True
         runtime._need_inline_snapshot = False
+        state["baseline_initialized"] = True
         snapshot_ready.set()
         logger.info(
             "Снимок из state: %s лотов — сразу ловим новые",
@@ -2348,6 +2467,7 @@ async def run() -> None:
             market_ids,
             price_book,
             snapshot_ready=snapshot_ready,
+            sent_lots=sent_lots,
         ),
         name="scanner",
     )

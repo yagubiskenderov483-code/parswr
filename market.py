@@ -2013,6 +2013,19 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
             seller_id = None
 
     number_i = int(number) if number is not None else None
+    # --- Стабильный уникальный ID listing (спека п.1) ---
+    # Приоритет: реальный ID гифта (StarGiftUnique.id) → slug NFT → title+number.
+    # НЕ используем цену, время получения API или случайный ID.
+    stable_id: str | None = None
+    if gift_id is not None and str(gift_id).strip():
+        stable_id = str(gift_id).strip()
+    elif slug:
+        stable_id = slug
+    elif title and number_i is not None:
+        stable_id = f"{title}-{number_i}"
+    if not stable_id:
+        logger.info("[SKIP] missing_id title=%s slug=%s num=%s", title, slug, number_i)
+        return None
     collection_id: int | None = None
     raw_coll = getattr(gift, "gift_id", None)
     if raw_coll is not None:
@@ -2030,7 +2043,7 @@ def _parse(gift: Any, users: dict[int, Any] | None = None) -> Lot | None:
         except (TypeError, ValueError):
             telegram_value = None
     lot = Lot(
-        id=str(gift_id or slug or f"{title}-{number_i}"),
+        id=stable_id,
         title=title,
         number=number_i,
         stars=float(stars),

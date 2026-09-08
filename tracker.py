@@ -1813,8 +1813,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.15.1"
-BUILD_TAG = "v3.15.1-fix-snapshot"
+TRACKER_VERSION = "3.16.0"
+BUILD_TAG = "v3.16.0-inline-snapshot"
 
 
 @dataclass
@@ -1974,9 +1974,12 @@ async def scanner_loop(
 ) -> None:
     """Скан маркета — только лоты, которых ещё не было в снимке market_ids."""
     await snapshot_ready.wait()
-    runtime.snapshot_ready = True
+    inline_snapshot = getattr(runtime, '_need_inline_snapshot', False)
+    if not inline_snapshot:
+        runtime.snapshot_ready = True
     logger.info(
-        "Сканер запущен: снимок %s лотов · только новые · цена %s–%s⭐",
+        "Сканер запущен: %s · снимок %s лотов · только новые · цена %s–%s⭐",
+        "встроенный снимок в pass #1" if inline_snapshot else "готов",
         len(market_ids),
         int(cfg.min_stars),
         int(cfg.max_stars),
@@ -2008,6 +2011,9 @@ async def scanner_loop(
             await asyncio.sleep(max(2.0, float(cfg.post_interval or 1.0)))
             continue
 
+        # Первый проход при пустом state — baseline: помечаем всё как старое
+        is_baseline = inline_snapshot and pass_no == 1
+
         try:
             enqueued_this_pass = 0
 
@@ -2023,16 +2029,32 @@ async def scanner_loop(
                         post_queue.pending,
                     )
 
+            if is_baseline:
+                logger.info("Pass #1 = встроенный снимок — все лоты → seen, не постим")
+
             fresh, scan = await poll_once(
                 m,
                 gift_ids,
                 seen,
                 cfg,
-                baseline=False,
+                baseline=is_baseline,
                 market_ids=market_ids,
                 price_book=price_book,
-                on_fresh=_stream_enqueue,
+                on_fresh=None if is_baseline else _stream_enqueue,
             )
+
+            if is_baseline:
+                inline_snapshot = False
+                runtime._need_inline_snapshot = False
+                runtime.snapshot_ready = True
+                state["market_ids"] = list(market_ids)
+                state["snapshot_schema"] = SNAPSHOT_SCHEMA
+                save_state(state_path, state)
+                logger.info(
+                    "Встроенный снимок готов: %s лотов · seen %s — ловим новые",
+                    len(market_ids),
+                    len(seen),
+                )
         except Exception as exc:  # noqa: BLE001
             logger.error("Проход упал: %s", exc)
             runtime.last_api_error = str(exc)
@@ -2279,37 +2301,6 @@ async def run() -> None:
     )
     snapshot_ready = asyncio.Event()
 
-    async def _build_snapshot() -> None:
-        logger.info("Снимок маркета: полный проход — старые лоты в канал не пойдут")
-        try:
-            _snap_fresh, snap_stats = await poll_once(
-                m,
-                gift_ids,
-                seen,
-                cfg,
-                baseline=True,
-                market_ids=market_ids,
-                price_book=price_book,
-            )
-            logger.info(
-                "Снимок: %s лотов · API %s · колл %s",
-                len(market_ids),
-                snap_stats.get("parsed", 0),
-                snap_stats.get("scanned", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Снимок маркета: %s", exc)
-        state["market_ids"] = list(market_ids)
-        state["price_samples"] = price_book.to_dict()
-        state["snapshot_schema"] = SNAPSHOT_SCHEMA
-        save_state(state_path, state)
-        logger.info(
-            "Снимок готов: %s лотов · seen %s — ловим только новые",
-            len(market_ids),
-            len(seen),
-        )
-        snapshot_ready.set()
-
     probe = await probe_market(m, gift_ids, cfg)
     logger.info(
         "Probe API: %s колл · %s лотов · err=%s %s",
@@ -2325,9 +2316,19 @@ async def run() -> None:
         )
 
     if need_snapshot:
-        asyncio.create_task(_build_snapshot(), name="snapshot")
+        # Вместо отдельного снимка — первый проход сканера сам будет baseline.
+        # Так бот стартует мгновенно: scanner_loop сделает pass #1 как baseline,
+        # пометит все лоты как старые, и со pass #2 начнёт ловить новые.
+        runtime.snapshot_ready = False
+        runtime._need_inline_snapshot = True
+        snapshot_ready.set()  # Не блокируем сканер
+        logger.info(
+            "Снимок маркета: встроен в первый проход сканера — старт без ожидания (%s id в state)",
+            len(market_ids),
+        )
     else:
         runtime.snapshot_ready = True
+        runtime._need_inline_snapshot = False
         snapshot_ready.set()
         logger.info(
             "Снимок из state: %s лотов — сразу ловим новые",

@@ -481,11 +481,12 @@ def build_router(
             via = "бот" if rt.post_via == "bot" else "аккаунт"
             lines.append(f"Последний пост: через {via}")
         if rt:
-            snap = (
-                "готов · только новые"
-                if rt.snapshot_ready
-                else "строится… старые лоты не постим"
-            )
+            if rt.snapshot_ready:
+                snap = "готов · только новые"
+            elif getattr(rt, '_need_inline_snapshot', False):
+                snap = "pass #1 = снимок · не постим старые"
+            else:
+                snap = "строится… старые лоты не постим"
             lines.extend(
                 [
                     f"Снимок маркета: {snap} ({len(rt.market_ids) if rt.market_ids else 0} id)",
@@ -535,10 +536,15 @@ def build_router(
                     f"⚠️ Ошибки API: {rt.last_scan_errors}"
                     + (f" — {rt.last_api_error[:120]}" if rt.last_api_error else "")
                 )
-            if rt.passes == 0 and not rt.snapshot_ready:
-                lines.append(
-                    "⏳ Сканер ждёт снимок маркета — старые лоты в канал не пойдут"
-                )
+            if rt.passes <= 1 and not rt.snapshot_ready:
+                if getattr(rt, '_need_inline_snapshot', False):
+                    lines.append(
+                        "🔄 Pass #1 = снимок маркета — помечаем старые, не постим"
+                    )
+                else:
+                    lines.append(
+                        "⏳ Сканер ждёт снимок маркета — старые лоты в канал не пойдут"
+                    )
             elif rt.passes > 0 and rt.last_scan_parsed == 0:
                 err = (rt.last_api_error or "").strip()
                 lines.append(

@@ -212,6 +212,52 @@ def test_overprice_extract_does_not_burn_seen() -> None:
     assert "new-dump" not in seen
 
 
+def test_snapshot_id_does_not_block_unposted_lot() -> None:
+    """Снимок маркета больше не жжёт выдачу — иначе 0 постов при 5/мин."""
+    lot = _lot(id="live-ok", stars=8000.0, first_name="Мария", seller="mariagifts")
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    cfg.strict_fair_price = False
+    cfg.min_stars = 5000
+    cfg.max_stars = 25000
+    cfg.hot_limit = 8
+    seen: dict[str, float] = {}
+    fresh, stats = _extract_fresh_from_collection(
+        [lot],
+        cfg=cfg,
+        seen=seen,
+        snapshot_ids={"live-ok"},
+        batch_market_ids=set(),
+        baseline=False,
+        now=time.time(),
+        price_book=None,
+    )
+    assert len(fresh) == 1
+    assert stats["skipped_seen"] == 0
+    assert stats["skipped_market"] == 0
+
+
+def test_baseline_snapshot_does_not_burn_seen() -> None:
+    lot = _lot(id="old-ok", stars=8000.0, first_name="Мария", seller="mariagifts")
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    cfg.strict_fair_price = False
+    cfg.min_stars = 5000
+    cfg.max_stars = 25000
+    cfg.hot_limit = 8
+    seen: dict[str, float] = {}
+    fresh, _stats = _extract_fresh_from_collection(
+        [lot],
+        cfg=cfg,
+        seen=seen,
+        snapshot_ids=set(),
+        batch_market_ids=set(),
+        baseline=True,
+        now=time.time(),
+        price_book=None,
+    )
+    assert fresh == []
+    assert "old-ok" not in seen
+
+
 def test_fresh_lot_marked_seen() -> None:
     lot = _lot(id="new-ok", stars=8000.0, first_name="Мария", seller="mariagifts")
     cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
@@ -431,6 +477,8 @@ def main() -> None:
         test_various_prices_pass_filters,
         test_telegram_value_dump_blocked,
         test_overprice_extract_does_not_burn_seen,
+        test_snapshot_id_does_not_block_unposted_lot,
+        test_baseline_snapshot_does_not_burn_seen,
         test_fresh_lot_marked_seen,
         test_enqueue_accepts_fresh_lot_already_marked_seen,
         test_enqueue_drops_only_already_posted_seller,

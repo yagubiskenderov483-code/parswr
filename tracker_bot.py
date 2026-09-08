@@ -482,9 +482,9 @@ def build_router(
             lines.append(f"Последний пост: через {via}")
         if rt:
             snap = (
-                "готов"
+                "готов · только новые"
                 if rt.snapshot_ready
-                else "строится… (старые лоты не постим)"
+                else "строится… старые лоты не постим"
             )
             lines.extend(
                 [

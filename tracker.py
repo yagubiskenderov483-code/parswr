@@ -259,7 +259,7 @@ class Config:
     min_stars: float = 5000.0
     max_stars: float = 25000.0
     poll_interval: float = 0.02
-    page_limit: int = 12  # верх resale-листа
+    page_limit: int = 8  # верх resale по дате смены цены
     parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
     gap: float = 0.4
     timeout: float = 5.0
@@ -267,7 +267,7 @@ class Config:
     enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale
     scan_batch: int = 24  # пачками; очередь полная — скан спит, меньше FloodWait
-    hot_limit: int = 12  # топ первой страницы в выдачу, не только brand-new
+    hot_limit: int = 8  # только самый верх списка (свежие), не весь рынок
     max_account_level: int = 10
     max_gifts: int = 15  # фермы 16+ режем
     post_interval: float = 1.0  # сек между постами в канал
@@ -331,7 +331,7 @@ class Config:
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
             poll_interval=_f("POLL_INTERVAL", 0.02),
-            page_limit=int(_f("PAGE_LIMIT", 12)),
+            page_limit=int(_f("PAGE_LIMIT", 8)),
             parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
             gap=_f("REQUEST_GAP", 0.4),
             timeout=_f("REQUEST_TIMEOUT", 5.0),
@@ -339,7 +339,7 @@ class Config:
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
             scan_batch=int(_f("SCAN_BATCH", 24)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 12))),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 10)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 15))),
             post_interval=_f("POST_INTERVAL", 1.0),
@@ -362,7 +362,7 @@ class Config:
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
 SELLER_TTL = 8 * 60  # один продавец раз в 8 мин
 MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
-SNAPSHOT_SCHEMA = 4  # 4 = снова только новые; seen не чистим
+SNAPSHOT_SCHEMA = 5  # 5 = не чистим market_ids/seen; старые id навсегда в блоке
 SELLER_BAN_SCHEMA = 1  # 1 = баним продавца только после поста, не после отсева
 QUEUE_SCAN_PAUSE = 8  # очередь сытая — не сканим, чтобы FloodWait не душил посты
 
@@ -1515,6 +1515,11 @@ class PostQueue:
             # Не скипаем _seen здесь — иначе /status «+1 в очередь» и 0 постов.
             if lot.id in self._queued_ids:
                 continue
+            mids = getattr(self._runtime, "market_ids", None) or set()
+            if lot.id in mids:
+                _mark_lot_seen(self._seen, lot, now)
+                dropped_dup += 1
+                continue
             keys = seller_identity_keys(lot) if lot.seller_key else set()
             if keys and (keys & self._queued_sellers):
                 _mark_lot_seen(self._seen, lot, now)
@@ -1745,8 +1750,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.12.2"
-BUILD_TAG = "v3.12.2-new-only"
+TRACKER_VERSION = "3.13.0"
+BUILD_TAG = "v3.13.0-new-only"
 
 
 @dataclass
@@ -2099,12 +2104,17 @@ async def run() -> None:
             n_ban,
         )
         save_state(state_path, state)
+    force_snapshot = False
     if int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA:
         n_mids = len(state.get("market_ids") or [])
-        state["market_ids"] = []
+        n_seen = len(state.get("seen") or {})
         state["snapshot_schema"] = SNAPSHOT_SCHEMA
+        force_snapshot = True
         logger.warning(
-            "Новый снимок маркета (%s id) — seen не трогаем, старые лоты не постим",
+            "Схема снимка %s — seen %s и market_ids %s оставляем, "
+            "доснимаем текущий рынок, старые лоты не постим",
+            SNAPSHOT_SCHEMA,
+            n_seen,
             n_mids,
         )
         save_state(state_path, state)
@@ -2179,7 +2189,7 @@ async def run() -> None:
     runtime.gift_ids = gift_ids
 
     need_snapshot = (
-        int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA
+        force_snapshot
         or len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
         or (not seen and not cfg.post_on_first_run)
     )

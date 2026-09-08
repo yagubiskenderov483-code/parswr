@@ -1670,12 +1670,12 @@ class TelegramMarket:
             except FloodWaitError as exc:
                 attempts += 1
                 stats["floods"] += 1
-                wait_s = min(float(exc.seconds) + 1.0, 45.0)
-                extra = 8.0 if exc.seconds >= 15 else 1.0
+                wait_s = min(float(exc.seconds) + 0.4, 20.0)
+                extra = 2.0 if exc.seconds >= 15 else 0.2
                 self._flood_until = time.monotonic() + wait_s + extra
-                self.last_error = f"FloodWait {exc.seconds}s · торможу"
+                self.last_error = f"FloodWait {exc.seconds}s"
                 logger.warning(
-                    "FloodWait %ss GetResaleStarGifts — пауза %.0fs",
+                    "FloodWait %ss GetResaleStarGifts — пауза %.1fs",
                     exc.seconds,
                     wait_s + extra,
                 )

@@ -1,7 +1,7 @@
 """
 Гифт-трекер внутреннего маркета Telegram.
 
-Ловит только что выставленные на перепродажу NFT-подарки (за Stars),
+Ловит лоты с первой страницы resale (ещё не постили),
 фильтрует по цене MIN_STARS..MAX_STARS и постит карточки в канал.
 
 Запуск:  python3 tracker.py
@@ -259,15 +259,15 @@ class Config:
     min_stars: float = 5000.0
     max_stars: float = 25000.0
     poll_interval: float = 0.02
-    page_limit: int = 8  # верх resale-листа (только самые свежие)
+    page_limit: int = 12  # верх resale-листа
     parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
-    gap: float = 0.25
+    gap: float = 0.4
     timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
-    scan_pages: int = 1  # только 1-я страница resale = самые свежие
-    scan_batch: int = 35  # крутим пачками — полный 151 = FloodWait 3 мин
-    hot_limit: int = 8  # топ свежих в коллекции
+    scan_pages: int = 1  # только 1-я страница resale
+    scan_batch: int = 24  # пачками; очередь полная — скан спит, меньше FloodWait
+    hot_limit: int = 12  # топ первой страницы в выдачу, не только brand-new
     max_account_level: int = 10
     max_gifts: int = 15  # фермы 16+ режем
     post_interval: float = 1.0  # сек между постами в канал
@@ -331,15 +331,15 @@ class Config:
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
             poll_interval=_f("POLL_INTERVAL", 0.02),
-            page_limit=int(_f("PAGE_LIMIT", 8)),
+            page_limit=int(_f("PAGE_LIMIT", 12)),
             parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
-            gap=_f("REQUEST_GAP", 0.25),
+            gap=_f("REQUEST_GAP", 0.4),
             timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 35)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            scan_batch=int(_f("SCAN_BATCH", 24)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 12))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 10)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 15))),
             post_interval=_f("POST_INTERVAL", 1.0),
@@ -360,10 +360,10 @@ class Config:
 # ---------------------------------------------------------------- state
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
-SELLER_TTL = 8 * 60  # один продавец раз в 8 мин — иначе 10 лотов/час
-MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
-SNAPSHOT_SCHEMA = 2  # bump → полный снимок заново, без старых лотов
+SELLER_TTL = 8 * 60  # один продавец раз в 8 мин
+SNAPSHOT_SCHEMA = 3  # 3 = снимок не жжёт выдачу; постим живую 1-ю страницу
 SELLER_BAN_SCHEMA = 1  # 1 = баним продавца только после поста, не после отсева
+QUEUE_SCAN_PAUSE = 8  # очередь сытая — не сканим, чтобы FloodWait не душил посты
 
 
 def load_state(path: Path) -> dict:
@@ -857,9 +857,10 @@ def _mark_lot_seen(seen: dict[str, float], lot: Lot, now: float) -> None:
 
 
 def _is_lot_seen(
-    lot: Lot, seen: dict[str, float], snapshot_ids: set[str]
+    lot: Lot, seen: dict[str, float], snapshot_ids: set[str] | None = None
 ) -> bool:
-    if lot.id in snapshot_ids or lot.id in seen:
+    """seen = уже постили или навсегда отсеяли. Снимок маркета сюда не входит."""
+    if lot.id in seen:
         return True
     slug = (lot.slug or "").strip()
     return bool(slug and f"slug:{slug}" in seen)
@@ -991,7 +992,7 @@ def _extract_fresh_from_collection(
     now: float,
     price_book: MarketPriceBook | None,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """Один ответ API → только что появившиеся лоты (топ hot_limit)."""
+    """Один ответ API → первая страница, ещё не постили (топ hot_limit)."""
     fresh: list[Lot] = []
     stats = {
         "skipped_market": 0,
@@ -1002,17 +1003,12 @@ def _extract_fresh_from_collection(
     for i, lot in enumerate(lots):
         batch_market_ids.add(lot.id)
         if i >= cfg.hot_limit:
-            if baseline:
-                _mark_lot_seen(seen, lot, now)
             continue
         if baseline:
-            _mark_lot_seen(seen, lot, now)
+            # снимок только для пола рынка — выдачу не жжём
             continue
         if _is_lot_seen(lot, seen, snapshot_ids):
-            if lot.id in snapshot_ids:
-                stats["skipped_market"] += 1
-            else:
-                stats["skipped_seen"] += 1
+            stats["skipped_seen"] += 1
             continue
         if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
             _mark_lot_seen(seen, lot, now)
@@ -1742,8 +1738,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.11.2"
-BUILD_TAG = "v3.11.2-ru-lvl10"
+TRACKER_VERSION = "3.12.0"
+BUILD_TAG = "v3.12.0-five-min"
 
 
 @dataclass
@@ -1901,12 +1897,11 @@ async def scanner_loop(
     *,
     snapshot_ready: asyncio.Event,
 ) -> None:
-    """Скан маркета — только лоты, которых ещё не было в снимке market_ids."""
+    """Скан маркета — живая 1-я страница, ещё не постили."""
     await snapshot_ready.wait()
     runtime.snapshot_ready = True
     logger.info(
-        "Сканер запущен: снимок %s лотов · цена %s–%s⭐",
-        len(market_ids),
+        "Сканер запущен: 1-я страница в выдачу · цена %s–%s⭐",
         int(cfg.min_stars),
         int(cfg.max_stars),
     )
@@ -1927,6 +1922,15 @@ async def scanner_loop(
             logger.error("Сканер: коллекций 0 — жду 15с")
             await asyncio.sleep(15)
             continue
+        if post_queue.pending >= QUEUE_SCAN_PAUSE:
+            logger.info(
+                "Очередь %s — пауза скана, постим (FloodWait не мешает)",
+                post_queue.pending,
+            )
+            runtime.queue_pending = post_queue.pending
+            await asyncio.sleep(max(2.0, float(cfg.post_interval or 1.0)))
+            continue
+
         try:
             enqueued_this_pass = 0
 
@@ -1989,7 +1993,7 @@ async def scanner_loop(
             )
         if fresh:
             logger.info(
-                "Проход #%s: +%s новых · в очередь %s · ждут %s · %ss",
+                "Проход #%s: +%s в выдачу · в очередь %s · ждут %s · %ss",
                 pass_no,
                 len(fresh),
                 enqueued_this_pass,
@@ -1998,7 +2002,7 @@ async def scanner_loop(
             )
         elif pass_no % 5 == 0:
             logger.info(
-                "Проход #%s: скан %s колл · %s лотов API · новых 0 "
+                "Проход #%s: скан %s колл · %s лотов API · в выдачу 0 "
                 "(снимок %s · вне цены %s · завыш %s · err=%s · %ss)",
                 pass_no,
                 scan.get("batch_size", "?"),
@@ -2031,9 +2035,9 @@ async def scanner_loop(
             cfg.parallel = 1
             runtime.scan_parallel = 1
             long_flood = floods >= 6
-            cfg.gap = min(0.6, max(float(cfg.gap or 0.25), 0.45 if long_flood else 0.3))
-            if long_flood and (cfg.scan_batch <= 0 or cfg.scan_batch > 40):
-                cfg.scan_batch = 40
+            cfg.gap = min(0.8, max(float(cfg.gap or 0.4), 0.55 if long_flood else 0.45))
+            if long_flood and (cfg.scan_batch <= 0 or cfg.scan_batch > 24):
+                cfg.scan_batch = 24
             logger.warning(
                 "FloodWait x%s — gap %.2fs · batch %s",
                 floods,
@@ -2085,6 +2089,16 @@ async def run() -> None:
         logger.warning(
             "Сброс бана продавцов (%s) — баним только после поста, не после отсева",
             n_ban,
+        )
+        save_state(state_path, state)
+    if int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA:
+        n_burned = len(state.get("seen") or {})
+        state["seen"] = {}
+        state["market_ids"] = []
+        state["snapshot_schema"] = SNAPSHOT_SCHEMA
+        logger.warning(
+            "Сброс seen (%s) — снимок больше не режет выдачу, постим 1-ю страницу",
+            n_burned,
         )
         save_state(state_path, state)
     seen: dict[str, float] = state["seen"]
@@ -2157,43 +2171,13 @@ async def run() -> None:
     runtime.collections_total = len(gift_ids)
     runtime.gift_ids = gift_ids
 
-    need_snapshot = (
-        int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA
-        or len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
-        or (not seen and not cfg.post_on_first_run)
-    )
     snapshot_ready = asyncio.Event()
-
-    async def _build_snapshot() -> None:
-        logger.info("Снимок маркета: полный проход всех коллекций — старые лоты не постим")
-        try:
-            snap_stats = await poll_once(
-                m,
-                gift_ids,
-                seen,
-                cfg,
-                baseline=True,
-                market_ids=market_ids,
-                price_book=price_book,
-            )
-            logger.info(
-                "Снимок: %s лотов · API %s · колл %s",
-                len(market_ids),
-                snap_stats.get("parsed", 0),
-                snap_stats.get("scanned", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Снимок маркета: %s", exc)
-        state["market_ids"] = list(market_ids)
-        state["price_samples"] = price_book.to_dict()
-        state["snapshot_schema"] = SNAPSHOT_SCHEMA
-        save_state(state_path, state)
-        logger.info(
-            "Снимок готов: %s лотов · seen %s — ловим только новые",
-            len(market_ids),
-            len(seen),
-        )
-        snapshot_ready.set()
+    runtime.snapshot_ready = True
+    snapshot_ready.set()
+    logger.info(
+        "Сканер сразу в выдачу: 1-я страница, ещё не постили · пол рынка %s id",
+        len(market_ids),
+    )
 
     probe = await probe_market(m, gift_ids, cfg)
     logger.info(
@@ -2207,16 +2191,6 @@ async def run() -> None:
         logger.error(
             "Маркет API пустой на старте — сессия мертва? %s",
             probe.get("error") or m.last_error,
-        )
-
-    if need_snapshot:
-        snapshot_task = asyncio.create_task(_build_snapshot(), name="snapshot")
-    else:
-        runtime.snapshot_ready = True
-        snapshot_ready.set()
-        logger.info(
-            "Снимок из state: %s лотов — сразу ловим новые",
-            len(market_ids),
         )
 
     scan_task = asyncio.create_task(

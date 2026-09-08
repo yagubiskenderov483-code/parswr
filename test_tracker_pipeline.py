@@ -372,6 +372,32 @@ def test_enqueue_drops_only_already_posted_seller() -> None:
     assert q2.enqueue([other]) == 1
 
 
+def test_enqueue_drops_lot_already_on_market_snapshot() -> None:
+    """Лот из снимка не должен уйти в канал, даже если extract его пропустил."""
+    cfg = Config(api_id=1, api_hash="x", session_string="", bot_token="t", target_channel="")
+    lot = _lot(
+        id="old-on-market",
+        stars=8000.0,
+        seller="mariagifts",
+        seller_id=1,
+        first_name="Мария",
+        lang_code="ru",
+    )
+    rt = TrackerRuntime(market_ids={"old-on-market"})
+    q = PostQueue(
+        sender=None,
+        market=None,
+        cfg=cfg,
+        seen={},
+        seen_sellers={},
+        state={},
+        state_path=Path("/tmp/tracker-test-state.json"),
+        runtime=rt,
+    )
+    assert q.enqueue([lot]) == 0
+    assert q.pending == 0
+
+
 def test_thin_profile_needs_ru() -> None:
     lot = _lot(first_name="", seller="nftgifts2024", lang_code="", about="")
     assert profile_is_thin(lot) is True
@@ -481,6 +507,7 @@ def main() -> None:
         test_fresh_lot_marked_seen,
         test_enqueue_accepts_fresh_lot_already_marked_seen,
         test_enqueue_drops_only_already_posted_seller,
+        test_enqueue_drops_lot_already_on_market_snapshot,
         test_thin_profile_needs_ru,
         test_live_ru_gifts15_keeps_maria_cuts_farm,
         test_known_boy_skip_is_complete,

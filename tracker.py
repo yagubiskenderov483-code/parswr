@@ -258,19 +258,19 @@ class Config:
     target_channel: str
     min_stars: float = 5000.0
     max_stars: float = 25000.0
-    poll_interval: float = 2.0
-    page_limit: int = 8  # верх resale по дате смены цены
+    poll_interval: float = 0.5
+    page_limit: int = 10  # верх resale по дате смены цены
     parallel: int = 1  # 1 RPC GetResaleStarGifts — иначе FloodWait стопорит всех
-    gap: float = 0.8
+    gap: float = 0.45
     timeout: float = 5.0
     enrich_cap: int = 60  # legacy; сканер больше не ждёт enrich
     enrich_parallel: int = 4
     scan_pages: int = 1  # только 1-я страница resale
-    scan_batch: int = 12  # меньше пачка — иначе FloodWait 31s по кругу
-    hot_limit: int = 8  # только самый верх списка (свежие), не весь рынок
+    scan_batch: int = 20  # пачка побольше для скорости; FloodWait-адаптация снизит если надо
+    hot_limit: int = 12  # больше лотов на свежесть — ловим быстрее
     max_account_level: int = 10
     max_gifts: int = 15  # фермы 16+ режем
-    post_interval: float = 1.0  # сек между постами в канал
+    post_interval: float = 0.5  # сек между постами в канал
     ton_rate: float = 0.0102  # TON за 1 Star (для строки "X Stars / Y TON")
     tz_offset: float = 3.0  # часовой пояс для времени в карточке (МСК = 3)
     session_file: str = ""
@@ -330,19 +330,19 @@ class Config:
             target_channel=target,
             min_stars=_f("MIN_STARS", 5000),
             max_stars=_f("MAX_STARS", 25000),
-            poll_interval=_f("POLL_INTERVAL", 2.0),
-            page_limit=int(_f("PAGE_LIMIT", 8)),
+            poll_interval=_f("POLL_INTERVAL", 0.5),
+            page_limit=int(_f("PAGE_LIMIT", 10)),
             parallel=max(1, min(2, int(_f("PARALLEL", 1)))),
-            gap=_f("REQUEST_GAP", 0.8),
+            gap=_f("REQUEST_GAP", 0.45),
             timeout=_f("REQUEST_TIMEOUT", 5.0),
             enrich_cap=max(10, int(_f("ENRICH_CAP", 60))),
             enrich_parallel=max(2, min(4, int(_f("ENRICH_PARALLEL", 4)))),
             scan_pages=max(1, int(_f("SCAN_PAGES", 1))),
-            scan_batch=int(_f("SCAN_BATCH", 12)),
-            hot_limit=max(1, int(_f("HOT_LIMIT", 8))),
+            scan_batch=int(_f("SCAN_BATCH", 20)),
+            hot_limit=max(1, int(_f("HOT_LIMIT", 12))),
             max_account_level=int(_f("MAX_ACCOUNT_LEVEL", 10)),
             max_gifts=max(1, int(_f("MAX_GIFTS", 15))),
-            post_interval=_f("POST_INTERVAL", 1.0),
+            post_interval=_f("POST_INTERVAL", 0.5),
             ton_rate=_f("TON_RATE", 0.0102),
             tz_offset=_f("TZ_OFFSET", 3.0),
             session_file=session_file,
@@ -1077,9 +1077,18 @@ async def poll_once(
             break
         remain = float(getattr(m, "flood_remaining", lambda: 0.0)() or 0.0)
         if remain > 3.0:
-            logger.warning("FloodWait ещё %.0fs — обрываю проход", remain)
-            aborted_flood = True
-            break
+            if baseline:
+                # Снапшот: ждём FloodWait и продолжаем — не пропускаем коллекции
+                logger.info(
+                    "Snapshot: FloodWait ещё %.0fs — жду (осталось %s колл)",
+                    remain,
+                    len(batch) - scanned,
+                )
+                await asyncio.sleep(remain + 1.0)
+            else:
+                logger.warning("FloodWait ещё %.0fs — обрываю проход", remain)
+                aborted_flood = True
+                break
         scanned += 1
         gid, result = await one(gid)
         if isinstance(result, BaseException):
@@ -1087,19 +1096,44 @@ async def poll_once(
             logger.warning("коллекция %s: %s", gid, result)
             continue
         if api_stats.get("floods", 0):
-            logger.warning(
-                "FloodWait %ss — стоп скан, не долбим следующие коллекции",
-                getattr(m, "last_flood_seconds", 0),
-            )
-            aborted_flood = True
+            if baseline:
+                # Снапшот: ждём и продолжаем, не обрываем
+                logger.info(
+                    "Snapshot: FloodWait %ss — жду и продолжаю снимок",
+                    getattr(m, "last_flood_seconds", 0),
+                )
+                api_stats["floods"] = 0
+            else:
+                logger.warning(
+                    "FloodWait %ss — стоп скан, не долбим следующие коллекции",
+                    getattr(m, "last_flood_seconds", 0),
+                )
+                aborted_flood = True
         lots = result
+        # Детекция непросканированных коллекций: если ни один лот из коллекции
+        # не знаком (нет в seen/snapshot_ids) — коллекция не попала в снапшот.
+        # Помечаем все её лоты как старые, чтобы не постить мусор.
+        force_baseline = False
+        if not baseline and lots and len(lots) >= 3:
+            known = sum(
+                1
+                for lot in lots[: cfg.hot_limit]
+                if _is_lot_seen(lot, seen, snapshot_ids)
+            )
+            if known == 0:
+                force_baseline = True
+                logger.info(
+                    "Коллекция %s: 0 знакомых лотов из %s — помечаю как старые",
+                    gid,
+                    len(lots),
+                )
         batch_fresh, part = _extract_fresh_from_collection(
             lots,
             cfg=cfg,
             seen=seen,
             snapshot_ids=snapshot_ids,
             batch_market_ids=batch_market_ids,
-            baseline=baseline,
+            baseline=baseline or force_baseline,
             now=now,
             price_book=price_book,
         )
@@ -1770,8 +1804,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.13.1"
-BUILD_TAG = "v3.13.1-flood"
+TRACKER_VERSION = "3.14.0"
+BUILD_TAG = "v3.14.0-fast-newonly"
 
 
 @dataclass
@@ -2069,15 +2103,15 @@ async def scanner_loop(
             cfg.parallel = 1
             runtime.scan_parallel = 1
             if flood_sec >= 15 or floods >= 2:
-                cfg.gap = min(2.5, max(float(cfg.gap or 0.8), 1.5))
-                if cfg.scan_batch <= 0 or cfg.scan_batch > 8:
-                    cfg.scan_batch = 8
-                extra = 20.0 if flood_sec >= 15 else 8.0
+                cfg.gap = min(2.5, max(float(cfg.gap or 0.45), 1.2))
+                if cfg.scan_batch <= 0 or cfg.scan_batch > 10:
+                    cfg.scan_batch = 10
+                extra = 15.0 if flood_sec >= 15 else 6.0
             else:
-                cfg.gap = min(2.0, max(float(cfg.gap or 0.8), 0.9))
-                if cfg.scan_batch <= 0 or cfg.scan_batch > 12:
-                    cfg.scan_batch = 12
-                extra = 4.0
+                cfg.gap = min(1.5, max(float(cfg.gap or 0.45), 0.7))
+                if cfg.scan_batch <= 0 or cfg.scan_batch > 16:
+                    cfg.scan_batch = 16
+                extra = 3.0
             cool = max(cool, extra)
             logger.warning(
                 "FloodWait x%s (%ss) — gap %.2fs · batch %s · пауза %.0fs",
@@ -2087,6 +2121,12 @@ async def scanner_loop(
                 cfg.scan_batch or "все",
                 cool,
             )
+        else:
+            # Без FloodWait — восстанавливаем быстрый режим
+            if cfg.gap > 0.5:
+                cfg.gap = max(0.45, cfg.gap - 0.05)
+            if cfg.scan_batch < 20:
+                cfg.scan_batch = min(20, cfg.scan_batch + 2)
 
         await asyncio.sleep(cool)
 

@@ -1804,8 +1804,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.14.0"
-BUILD_TAG = "v3.14.0-fast-newonly"
+TRACKER_VERSION = "3.15.0"
+BUILD_TAG = "v3.15.0-fix-recovery"
 
 
 @dataclass
@@ -1973,6 +1973,7 @@ async def scanner_loop(
         int(cfg.max_stars),
     )
     catalog_refreshed = time.monotonic()
+    cfg._orig_parallel = cfg.parallel
     pass_no = 0
     client = m.client
     while True:
@@ -2099,7 +2100,8 @@ async def scanner_loop(
         floods = int(scan.get("floods", 0) or 0)
         flood_sec = int(getattr(m, "last_flood_seconds", 0) or 0)
         cool = max(cfg.poll_interval - spent, 0.0)
-        if floods or flood_sec >= 8:
+        if floods:
+            # Были НОВЫЕ FloodWait в этом проходе — штрафуем
             cfg.parallel = 1
             runtime.scan_parallel = 1
             if flood_sec >= 15 or floods >= 2:
@@ -2122,11 +2124,14 @@ async def scanner_loop(
                 cool,
             )
         else:
-            # Без FloodWait — восстанавливаем быстрый режим
+            # Нет новых FloodWait — восстанавливаем быстрый режим
+            m.last_flood_seconds = 0
             if cfg.gap > 0.5:
                 cfg.gap = max(0.45, cfg.gap - 0.05)
             if cfg.scan_batch < 20:
                 cfg.scan_batch = min(20, cfg.scan_batch + 2)
+            if cfg.parallel < (cfg._orig_parallel if hasattr(cfg, '_orig_parallel') else 1):
+                cfg.parallel = cfg._orig_parallel if hasattr(cfg, '_orig_parallel') else 1
 
         await asyncio.sleep(cool)
 

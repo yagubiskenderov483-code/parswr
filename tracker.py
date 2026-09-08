@@ -1072,6 +1072,7 @@ async def poll_once(
             except BaseException as exc:
                 return gid, exc
 
+    total_batch = len(batch)
     for gid in batch:
         if aborted_flood:
             break
@@ -1080,16 +1081,24 @@ async def poll_once(
             if baseline:
                 # Снапшот: ждём FloodWait и продолжаем — не пропускаем коллекции
                 logger.info(
-                    "Snapshot: FloodWait ещё %.0fs — жду (осталось %s колл)",
+                    "Snapshot: FloodWait ещё %.0fs — жду (%s/%s колл)",
                     remain,
-                    len(batch) - scanned,
+                    scanned,
+                    total_batch,
                 )
-                await asyncio.sleep(remain + 1.0)
+                await asyncio.sleep(remain + 0.5)
             else:
                 logger.warning("FloodWait ещё %.0fs — обрываю проход", remain)
                 aborted_flood = True
                 break
         scanned += 1
+        if baseline and scanned % 15 == 0:
+            logger.info(
+                "Snapshot прогресс: %s/%s колл · %s лотов",
+                scanned,
+                total_batch,
+                len(batch_market_ids) + len(market_ids),
+            )
         gid, result = await one(gid)
         if isinstance(result, BaseException):
             exc_errors += 1
@@ -1804,8 +1813,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.15.0"
-BUILD_TAG = "v3.15.0-fix-recovery"
+TRACKER_VERSION = "3.15.1"
+BUILD_TAG = "v3.15.1-fix-snapshot"
 
 
 @dataclass
@@ -2273,7 +2282,7 @@ async def run() -> None:
     async def _build_snapshot() -> None:
         logger.info("Снимок маркета: полный проход — старые лоты в канал не пойдут")
         try:
-            snap_stats = await poll_once(
+            _snap_fresh, snap_stats = await poll_once(
                 m,
                 gift_ids,
                 seen,

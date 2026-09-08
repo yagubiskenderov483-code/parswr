@@ -1,7 +1,7 @@
 """
 Гифт-трекер внутреннего маркета Telegram.
 
-Ловит лоты с первой страницы resale (ещё не постили),
+Ловит только что выставленные на перепродажу NFT-подарки (за Stars),
 фильтрует по цене MIN_STARS..MAX_STARS и постит карточки в канал.
 
 Запуск:  python3 tracker.py
@@ -361,7 +361,8 @@ class Config:
 
 SEEN_TTL = 7 * 24 * 3600  # помним лот неделю — дальше номер уже не «новый»
 SELLER_TTL = 8 * 60  # один продавец раз в 8 мин
-SNAPSHOT_SCHEMA = 3  # 3 = снимок не жжёт выдачу; постим живую 1-ю страницу
+MIN_MARKET_SNAPSHOT_IDS = 800  # меньше — снимок неполный, пересобираем
+SNAPSHOT_SCHEMA = 4  # 4 = снова только новые; seen не чистим
 SELLER_BAN_SCHEMA = 1  # 1 = баним продавца только после поста, не после отсева
 QUEUE_SCAN_PAUSE = 8  # очередь сытая — не сканим, чтобы FloodWait не душил посты
 
@@ -859,8 +860,9 @@ def _mark_lot_seen(seen: dict[str, float], lot: Lot, now: float) -> None:
 def _is_lot_seen(
     lot: Lot, seen: dict[str, float], snapshot_ids: set[str] | None = None
 ) -> bool:
-    """seen = уже постили или навсегда отсеяли. Снимок маркета сюда не входит."""
-    if lot.id in seen:
+    """Уже постили, отсеяли или были на рынке в снимке — не постим повторно."""
+    ids = snapshot_ids or set()
+    if lot.id in ids or lot.id in seen:
         return True
     slug = (lot.slug or "").strip()
     return bool(slug and f"slug:{slug}" in seen)
@@ -992,7 +994,7 @@ def _extract_fresh_from_collection(
     now: float,
     price_book: MarketPriceBook | None,
 ) -> tuple[list[Lot], dict[str, int]]:
-    """Один ответ API → первая страница, ещё не постили (топ hot_limit)."""
+    """Один ответ API → только что появившиеся лоты (топ hot_limit)."""
     fresh: list[Lot] = []
     stats = {
         "skipped_market": 0,
@@ -1003,12 +1005,17 @@ def _extract_fresh_from_collection(
     for i, lot in enumerate(lots):
         batch_market_ids.add(lot.id)
         if i >= cfg.hot_limit:
+            if baseline:
+                _mark_lot_seen(seen, lot, now)
             continue
         if baseline:
-            # снимок только для пола рынка — выдачу не жжём
+            _mark_lot_seen(seen, lot, now)
             continue
         if _is_lot_seen(lot, seen, snapshot_ids):
-            stats["skipped_seen"] += 1
+            if lot.id in snapshot_ids:
+                stats["skipped_market"] += 1
+            else:
+                stats["skipped_seen"] += 1
             continue
         if not (cfg.min_stars <= lot.stars <= cfg.max_stars):
             _mark_lot_seen(seen, lot, now)
@@ -1738,8 +1745,8 @@ class PostQueue:
                 self._pq.task_done()
 
 
-TRACKER_VERSION = "3.12.1"
-BUILD_TAG = "v3.12.1-bot-token"
+TRACKER_VERSION = "3.12.2"
+BUILD_TAG = "v3.12.2-new-only"
 
 
 @dataclass
@@ -1897,11 +1904,12 @@ async def scanner_loop(
     *,
     snapshot_ready: asyncio.Event,
 ) -> None:
-    """Скан маркета — живая 1-я страница, ещё не постили."""
+    """Скан маркета — только лоты, которых ещё не было в снимке market_ids."""
     await snapshot_ready.wait()
     runtime.snapshot_ready = True
     logger.info(
-        "Сканер запущен: 1-я страница в выдачу · цена %s–%s⭐",
+        "Сканер запущен: снимок %s лотов · только новые · цена %s–%s⭐",
+        len(market_ids),
         int(cfg.min_stars),
         int(cfg.max_stars),
     )
@@ -1993,7 +2001,7 @@ async def scanner_loop(
             )
         if fresh:
             logger.info(
-                "Проход #%s: +%s в выдачу · в очередь %s · ждут %s · %ss",
+                "Проход #%s: +%s новых · в очередь %s · ждут %s · %ss",
                 pass_no,
                 len(fresh),
                 enqueued_this_pass,
@@ -2002,7 +2010,7 @@ async def scanner_loop(
             )
         elif pass_no % 5 == 0:
             logger.info(
-                "Проход #%s: скан %s колл · %s лотов API · в выдачу 0 "
+                "Проход #%s: скан %s колл · %s лотов API · новых 0 "
                 "(снимок %s · вне цены %s · завыш %s · err=%s · %ss)",
                 pass_no,
                 scan.get("batch_size", "?"),
@@ -2092,13 +2100,12 @@ async def run() -> None:
         )
         save_state(state_path, state)
     if int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA:
-        n_burned = len(state.get("seen") or {})
-        state["seen"] = {}
+        n_mids = len(state.get("market_ids") or [])
         state["market_ids"] = []
         state["snapshot_schema"] = SNAPSHOT_SCHEMA
         logger.warning(
-            "Сброс seen (%s) — снимок больше не режет выдачу, постим 1-ю страницу",
-            n_burned,
+            "Новый снимок маркета (%s id) — seen не трогаем, старые лоты не постим",
+            n_mids,
         )
         save_state(state_path, state)
     seen: dict[str, float] = state["seen"]
@@ -2171,13 +2178,43 @@ async def run() -> None:
     runtime.collections_total = len(gift_ids)
     runtime.gift_ids = gift_ids
 
-    snapshot_ready = asyncio.Event()
-    runtime.snapshot_ready = True
-    snapshot_ready.set()
-    logger.info(
-        "Сканер сразу в выдачу: 1-я страница, ещё не постили · пол рынка %s id",
-        len(market_ids),
+    need_snapshot = (
+        int(state.get("snapshot_schema", 0) or 0) < SNAPSHOT_SCHEMA
+        or len(market_ids) < MIN_MARKET_SNAPSHOT_IDS
+        or (not seen and not cfg.post_on_first_run)
     )
+    snapshot_ready = asyncio.Event()
+
+    async def _build_snapshot() -> None:
+        logger.info("Снимок маркета: полный проход — старые лоты в канал не пойдут")
+        try:
+            snap_stats = await poll_once(
+                m,
+                gift_ids,
+                seen,
+                cfg,
+                baseline=True,
+                market_ids=market_ids,
+                price_book=price_book,
+            )
+            logger.info(
+                "Снимок: %s лотов · API %s · колл %s",
+                len(market_ids),
+                snap_stats.get("parsed", 0),
+                snap_stats.get("scanned", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Снимок маркета: %s", exc)
+        state["market_ids"] = list(market_ids)
+        state["price_samples"] = price_book.to_dict()
+        state["snapshot_schema"] = SNAPSHOT_SCHEMA
+        save_state(state_path, state)
+        logger.info(
+            "Снимок готов: %s лотов · seen %s — ловим только новые",
+            len(market_ids),
+            len(seen),
+        )
+        snapshot_ready.set()
 
     probe = await probe_market(m, gift_ids, cfg)
     logger.info(
@@ -2191,6 +2228,16 @@ async def run() -> None:
         logger.error(
             "Маркет API пустой на старте — сессия мертва? %s",
             probe.get("error") or m.last_error,
+        )
+
+    if need_snapshot:
+        asyncio.create_task(_build_snapshot(), name="snapshot")
+    else:
+        runtime.snapshot_ready = True
+        snapshot_ready.set()
+        logger.info(
+            "Снимок из state: %s лотов — сразу ловим новые",
+            len(market_ids),
         )
 
     scan_task = asyncio.create_task(

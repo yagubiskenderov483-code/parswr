@@ -50,6 +50,9 @@ rules.ninja
 testrunner\[1\]_include.cmake
 # tidy-alphabetical-end
 
+# Keep the CMake checksum template tracked; checksummed_* ignores generated copies.
+!/cmake/checksummed_extra.txt
+
 /SDL2.framework
 
 # Android

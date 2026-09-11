@@ -1,0 +1,118 @@
+name: Neptun Client patch
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-neptun:
+    if: ${{ !contains(github.event.head_commit.message, 'Apply Neptun Client patch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply Neptun training client integration
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+
+          cfg = root / 'src/engine/shared/config_variables.h'
+          text = cfg.read_text()
+          marker = '// NEPTUN_CLIENT_CONFIG_BEGIN'
+          if marker not in text:
+              block = '''// NEPTUN_CLIENT_CONFIG_BEGIN
+MACRO_CONFIG_INT(ClNeptunEnabled, cl_neptun_enabled, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable Neptun Client training features")
+MACRO_CONFIG_INT(ClNeptunAutoHook, cl_neptun_auto_hook, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable dummy auto-hook training mode")
+MACRO_CONFIG_INT(ClNeptunAimTraining, cl_neptun_aim_training, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable aim-training HUD/assist mode for dummy training")
+MACRO_CONFIG_INT(ClNeptunSpeedProfile, cl_neptun_speed_profile, 100, 25, 300, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Neptun movement profile value (training/config only)")
+MACRO_CONFIG_INT(ClNeptunQuick, cl_neptun_quick, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable Neptun quick-movement training mode")
+MACRO_CONFIG_INT(ClNeptunMoonwalk, cl_neptun_moonwalk, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable Neptun moon-walk training mode")
+// NEPTUN_CLIENT_CONFIG_END
+
+'''
+              text = text.replace('// client\n', '// client\n' + block, 1)
+              cfg.write_text(text)
+
+          menus = root / 'src/game/client/components/menus.h'
+          text = menus.read_text()
+          if 'SETTINGS_NEPTUN' not in text:
+              text = text.replace('''\t\tSETTINGS_CREDITS,\n\n\t\tSETTINGS_LENGTH,''', '''\t\tSETTINGS_CREDITS,\n\t\tSETTINGS_NEPTUN,\n\n\t\tSETTINGS_LENGTH,''', 1)
+              text = text.replace('''\t// found in menus_settings_credits.cpp\n\tvoid RenderSettingsCredits(CUIRect MainView);''', '''\t// found in menus_settings_credits.cpp\n\tvoid RenderSettingsCredits(CUIRect MainView);\n\n\t// found in menus_settings_neptun.cpp\n\tvoid RenderSettingsNeptun(CUIRect MainView);''', 1)
+              menus.write_text(text)
+
+          settings = root / 'src/game/client/components/menus_settings.cpp'
+          text = settings.read_text()
+          if '"Neptun"' not in text:
+              text = text.replace('''\t\tLocalize("Assets"),\n\t\tLocalize("Credits")};''', '''\t\tLocalize("Assets"),\n\t\tLocalize("Credits"),\n\t\t"Neptun"};''', 1)
+          if 'SETTINGS_NEPTUN' not in text:
+              text = text.replace('''\telse if(g_Config.m_UiSettingsPage == SETTINGS_CREDITS)\n\t{\n\t\tGameClient()->m_MenuBackground.ChangePosition(CMenuBackground::POS_SETTINGS_CREDITS);\n\t\tRenderSettingsCredits(MainView);\n\t}\n\telse''', '''\telse if(g_Config.m_UiSettingsPage == SETTINGS_CREDITS)\n\t{\n\t\tGameClient()->m_MenuBackground.ChangePosition(CMenuBackground::POS_SETTINGS_CREDITS);\n\t\tRenderSettingsCredits(MainView);\n\t}\n\telse if(g_Config.m_UiSettingsPage == SETTINGS_NEPTUN)\n\t{\n\t\tRenderSettingsNeptun(MainView);\n\t}\n\telse''', 1)
+          settings.write_text(text)
+
+          cmake = root / 'CMakeLists.txt'
+          text = cmake.read_text()
+          if 'components/menus_settings_neptun.cpp' not in text:
+              text = text.replace('''    components/menus_settings_credits.cpp\n    components/menus_settings_ddnet.cpp''', '''    components/menus_settings_credits.cpp\n    components/menus_settings_ddnet.cpp\n    components/menus_settings_neptun.cpp''', 1)
+              cmake.write_text(text)
+
+          neptun = root / 'src/game/client/components/menus_settings_neptun.cpp'
+          neptun.write_text(r'''#include "menus.h"
+
+#include <engine/shared/config.h>
+#include <game/client/ui.h>
+
+void CMenus::RenderSettingsNeptun(CUIRect MainView)
+{
+    CUIRect Button, Left, Right, Label;
+    MainView.HSplitTop(32.0f, &Label, &MainView);
+    Ui()->DoLabel(&Label, "Neptun Client", 24.0f, TEXTALIGN_ML);
+    MainView.HSplitTop(12.0f, nullptr, &MainView);
+    MainView.VSplitMid(&Left, &Right, 20.0f);
+
+    Left.HSplitTop(30.0f, &Button, &Left);
+    if(DoButton_CheckBox(&g_Config.m_ClNeptunEnabled, "Enable Neptun training", g_Config.m_ClNeptunEnabled, &Button))
+        g_Config.m_ClNeptunEnabled ^= 1;
+
+    Left.HSplitTop(30.0f, &Button, &Left);
+    if(DoButton_CheckBox(&g_Config.m_ClNeptunAutoHook, "Dummy auto-hook (training)", g_Config.m_ClNeptunAutoHook, &Button))
+    {
+        g_Config.m_ClNeptunAutoHook ^= 1;
+        g_Config.m_ClDummyControl = g_Config.m_ClNeptunAutoHook;
+        g_Config.m_ClDummyHook = g_Config.m_ClNeptunAutoHook;
+    }
+
+    Left.HSplitTop(30.0f, &Button, &Left);
+    if(DoButton_CheckBox(&g_Config.m_ClNeptunAimTraining, "Aim training HUD/assist", g_Config.m_ClNeptunAimTraining, &Button))
+        g_Config.m_ClNeptunAimTraining ^= 1;
+
+    Right.HSplitTop(30.0f, &Button, &Right);
+    Ui()->DoScrollbarOption(&g_Config.m_ClNeptunSpeedProfile, &g_Config.m_ClNeptunSpeedProfile, &Button, "Speed profile", 25, 300, &CUi::ms_LinearScrollbarScale, CUi::SCROLLBAR_OPTION_NOCLAMPVALUE);
+
+    Right.HSplitTop(30.0f, &Button, &Right);
+    if(DoButton_CheckBox(&g_Config.m_ClNeptunQuick, "Quick movement training", g_Config.m_ClNeptunQuick, &Button))
+        g_Config.m_ClNeptunQuick ^= 1;
+
+    Right.HSplitTop(30.0f, &Button, &Right);
+    if(DoButton_CheckBox(&g_Config.m_ClNeptunMoonwalk, "Moon-walk training", g_Config.m_ClNeptunMoonwalk, &Button))
+        g_Config.m_ClNeptunMoonwalk ^= 1;
+}
+''')
+          
+          doc = root / 'NEPTUN_CLIENT.md'
+          doc.write_text('''# Neptun Client\n\nNeptun is a DDNet-derived training/client customization focused on dummy practice and configurable movement practice.\n\n## Included\n- Neptun settings tab.\n- Dummy auto-hook training toggle, wired to the existing DDNet dummy controls.\n- Aim-training HUD/assist setting placeholder for local dummy practice.\n- Configurable 25–300 movement profile value.\n- Quick movement and moon-walk training toggles.\n\nThe training settings are client-side configuration only. No server-side speed manipulation or real-player auto-targeting is included.\n''')
+          PY
+      - name: Commit Neptun changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/engine/shared/config_variables.h src/game/client/components/menus.h src/game/client/components/menus_settings.cpp src/game/client/components/menus_settings_neptun.cpp CMakeLists.txt NEPTUN_CLIENT.md
+          if git diff --cached --quiet; then
+            echo "No Neptun changes to commit"
+            exit 0
+          fi
+          git commit -m "Apply Neptun Client patch"
+          git push

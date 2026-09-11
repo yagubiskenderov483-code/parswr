@@ -1,2 +1,0 @@
-aiogram>=3.13,<4
-telethon>=1.36

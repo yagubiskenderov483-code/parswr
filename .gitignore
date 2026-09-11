@@ -157,3 +157,13 @@ tags
 *.vcxproj
 *.zip
 # tidy-alphabetical-end
+
+# Vendor official ddnet-libs (prebuilt third-party binaries) in this repository
+# instead of keeping them as a git submodule.
+!/ddnet-libs/**/*.a
+!/ddnet-libs/**/*.dll
+!/ddnet-libs/**/*.dylib
+!/ddnet-libs/**/*.exe
+!/ddnet-libs/**/*.pdb
+!/ddnet-libs/**/*.so
+!/ddnet-libs/**/*.zip

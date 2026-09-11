@@ -1,1 +1,0 @@
-Neptun Client integration trigger. This file can be removed after the patch is applied.
